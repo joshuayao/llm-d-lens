@@ -2924,13 +2924,15 @@
         "profileForKey",
         "profileForHardware",
         "profileForResource",
+        "acceleratorResourceNames",
+        "acceleratorTotal",
         "imageRepository",
         "managedImageProfile",
         "overlayRoot",
         "matchOverlayPath"
       ],
-      "purpose": "Shared profile identity, managed image and source overlay matching for Node and browser deployment consumers.",
-      "boundaries": "Pure data helpers. No vendor tables or network access. Source variants remain discovered from actual Kustomization files.",
+      "purpose": "Shared profile identity, managed image and source overlay matching for Node and browser deployment consumers, plus extended-resource accelerator counting that avoids double counting a profile's derived/oversubscribed resource names (e.g. NVIDIA GPU time-slicing's nvidia.com/gpu.shared, which multiplexes the same physical cards already counted under nvidia.com/gpu).",
+      "boundaries": "Pure data helpers. No vendor tables or network access. Source variants remain discovered from actual Kustomization files. acceleratorTotal prefers each profile's canonical deployment.modes.plugin.resource_names (or deployment.resource_name) over a broad prefix sweep; the prefix sweep remains a fallback only for resources not covered by any profile's canonical name.",
       "examples": [
         "apps/server/src/routes/guidePlanning.ts",
         "apps/frontend/src/pages/evaluation/ui/benchmark-results/acceleratorDisplay.js"

@@ -31,6 +31,48 @@ export function profileForResource(profiles, resource) {
         && (profile.resource_prefixes || []).some(prefix => resource.startsWith(prefix))) || null;
 }
 
+// A profile's canonical plugin-mode extended-resource name(s) -- the exact
+// keys Lens requests when scheduling workloads (falls back to a single
+// deployment.resource_name when modes.plugin.resource_names is unset).
+export function acceleratorResourceNames(profile) {
+    const pluginNames = profile?.deployment?.modes?.plugin?.resource_names;
+    if (Array.isArray(pluginNames) && pluginNames.length) return pluginNames;
+    return profile?.deployment?.resource_name ? [profile.deployment.resource_name] : [];
+}
+
+// Sum extended-resource accelerator counts (node allocatable, container
+// resources, ...) without double counting a profile's derived/oversubscribed
+// resource names. NVIDIA GPU time-slicing, for example, adds
+// `nvidia.com/gpu.shared` (the replica pool) alongside the unchanged
+// `nvidia.com/gpu` (the physical cards) -- both match the `nvidia.com/gpu`
+// prefix, so naively summing every matching key read 7 physical cards as 77.
+// When a profile's canonical resource name is present, only that exact key is
+// counted and the profile's other matching keys are skipped; the broader
+// prefix match remains a fallback for nodes exposing only a derived/renamed
+// resource (no canonical key at all), so those still count instead of
+// reading zero.
+export function acceleratorTotal(profiles, resources) {
+    const data = resources || {};
+    const counted = new Set();
+    let total = 0;
+    for (const profile of profiles) {
+        const canonical = acceleratorResourceNames(profile).filter(name => Object.prototype.hasOwnProperty.call(data, name));
+        if (!canonical.length) continue;
+        for (const name of canonical) {
+            total += Number(data[name]) || 0;
+            counted.add(name);
+        }
+        for (const key of Object.keys(data)) {
+            if (!counted.has(key) && profileForResource([profile], key)) counted.add(key);
+        }
+    }
+    for (const [name, value] of Object.entries(data)) {
+        if (counted.has(name)) continue;
+        if (profileForResource(profiles, name)) total += Number(value) || 0;
+    }
+    return total;
+}
+
 export function imageRepository(image) {
     const value = String(image || '').split('@')[0];
     return value.slice(value.lastIndexOf('/') + 1).includes(':') ? value.slice(0, value.lastIndexOf(':')) : value;

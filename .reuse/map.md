@@ -1659,11 +1659,11 @@ Resolve a Model Service group id to the deployment execution id and published mo
 
 ## hardware-profile-matching
 
-Shared profile identity, managed image and source overlay matching for Node and browser deployment consumers.
+Shared profile identity, managed image and source overlay matching for Node and browser deployment consumers, plus extended-resource accelerator counting that avoids double counting a profile's derived/oversubscribed resource names (e.g. NVIDIA GPU time-slicing's nvidia.com/gpu.shared, which multiplexes the same physical cards already counted under nvidia.com/gpu).
 
 - Entry point: [packages/shared/src/hardware/profiles.js](../packages/shared/src/hardware/profiles.js)
-- Symbols: `profileForKey`, `profileForHardware`, `profileForResource`, `imageRepository`, `managedImageProfile`, `overlayRoot`, `matchOverlayPath`
-- Boundaries: Pure data helpers. No vendor tables or network access. Source variants remain discovered from actual Kustomization files.
+- Symbols: `profileForKey`, `profileForHardware`, `profileForResource`, `acceleratorResourceNames`, `acceleratorTotal`, `imageRepository`, `managedImageProfile`, `overlayRoot`, `matchOverlayPath`
+- Boundaries: Pure data helpers. No vendor tables or network access. Source variants remain discovered from actual Kustomization files. acceleratorTotal prefers each profile's canonical deployment.modes.plugin.resource_names (or deployment.resource_name) over a broad prefix sweep; the prefix sweep remains a fallback only for resources not covered by any profile's canonical name.
 - Examples: [apps/server/src/routes/guidePlanning.ts](../apps/server/src/routes/guidePlanning.ts), [apps/frontend/src/pages/evaluation/ui/benchmark-results/acceleratorDisplay.js](../apps/frontend/src/pages/evaluation/ui/benchmark-results/acceleratorDisplay.js)
 - Tests: [apps/server/testing/services/guideCatalog.test.ts](../apps/server/testing/services/guideCatalog.test.ts), [apps/frontend/src/pages/evaluation/ui/benchmark-results/acceleratorDisplay.test.js](../apps/frontend/src/pages/evaluation/ui/benchmark-results/acceleratorDisplay.test.js)
 
