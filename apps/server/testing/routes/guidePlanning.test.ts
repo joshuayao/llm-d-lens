@@ -460,6 +460,17 @@ test('zero budget rejects inherited topology when replicas and TP are omitted', 
     assert.ok(result.validation.errors.some(error => error.startsWith('Insufficient resources:')));
 });
 
+test('cluster accelerator budget does not double count an NVIDIA time-sliced shared resource', () => {
+    // Reproduced live: NVIDIA GPU time-slicing keeps the physical `nvidia.com/gpu`
+    // resource unchanged and adds `nvidia.com/gpu.shared` exposing the same
+    // cards' oversubscribed replica pool (7 physical A100s, 10x time-sliced).
+    // Summing every `nvidia.com/gpu*` key read 77 available accelerators
+    // instead of 7, under-flagging insufficient-resource deployments.
+    const cluster = { allocatable: { cpu: 128, memoryGiB: 512, accelerators: { 'nvidia.com/gpu': 7, 'nvidia.com/gpu.shared': 70 } } };
+    const result = planDocuments([deployment('decode', 1, 1)], 'Qwen/Qwen3-0.6B', { cpu: { logicalCores: 128 }, memoryGiB: 512 }, cluster, { replicas: 1, tensorParallelSize: 1 });
+    assert.equal(result.summary.availableAccelerators, 7);
+});
+
 test('final capacity validation catches custom patches increasing replicas', () => {
     const documents = [deployment('decode', 1, 1)];
     const errors: string[] = [];

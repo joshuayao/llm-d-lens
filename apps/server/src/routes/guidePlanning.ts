@@ -1,5 +1,5 @@
 import { loadHardwareProfiles, hardwareProfileSnapshot, type HardwareProfile } from '../services/hardwareProfiles.ts';
-import { profileForKey, profileForResource, overlayRoot, matchOverlayPath } from '@repo/shared/hardware/profiles';
+import { profileForKey, profileForResource, acceleratorTotal, overlayRoot, matchOverlayPath } from '@repo/shared/hardware/profiles';
 // Copyright 2026 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -488,7 +488,7 @@ export function validateManifestCapacity(documents: any[], budget: number, basis
         const containers = pod.containers || [];
         const containerDemand = (container: JsonRecord) => {
             const resources = { ...container.resources?.limits, ...container.resources?.requests };
-            return Object.entries(resources).filter(([name]) => profileForResource(hardwareProfileSnapshot(), name)).reduce((sum, [, value]) => sum + Number(value), 0);
+            return acceleratorTotal(hardwareProfileSnapshot(), resources);
         };
         const regularDemand = containers.reduce((sum: number, container: JsonRecord) => sum + containerDemand(container), 0);
         let persistentInit = 0, initPeak = 0;
@@ -556,7 +556,7 @@ export function planDocuments(documents: any[], model: string, machine: JsonReco
     const modelEstimate = estimateModel(model);
     const clusterAccelerators = cluster
         ? Number(cluster.accelerator?.count || 0)
-            || Object.values(cluster.allocatable?.accelerators || {}).reduce((sum: number, value) => sum + Number(value), 0)
+            || acceleratorTotal(hardwareProfileSnapshot(), cluster.allocatable?.accelerators || {})
         : 0;
     const clusterDevices: JsonRecord[] = cluster?.accelerator?.devices || [];
     const normalizePciAddress = (value: unknown) => String(value || '').trim().toLowerCase();

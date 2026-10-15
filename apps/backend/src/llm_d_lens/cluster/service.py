@@ -1188,23 +1188,11 @@ def _cpu_millicores(value: Any) -> int:
 def _gpu_count(capacity: dict[str, Any]) -> int:
     """Sum extended-resource GPU device counts (e.g. gpu.intel.com/xe: "8") on a node.
 
-    Resource prefixes and scheduling-marker suffixes come from registered
-    hardware profiles (``gpu.intel.com/monitoring`` is a marker for the
-    monitoring workload, not a GPU device, so it is excluded).
+    Delegates to :func:`_gpu_counts_by_profile`, which prefers each profile's
+    canonical resource name(s) over a broad prefix sweep (see that function's
+    docstring for why).
     """
-    prefixes = _gpu_resource_prefixes()
-    suffixes = _gpu_monitor_suffixes()
-    total = 0
-    for key, value in capacity.items():
-        if not any(key.startswith(prefix) for prefix in prefixes):
-            continue
-        if any(key.endswith(f"/{suffix}") for suffix in suffixes):
-            continue
-        try:
-            total += int(value)
-        except (TypeError, ValueError):
-            continue
-    return total
+    return sum(_gpu_counts_by_profile(capacity).values())
 
 
 _GPU_DRIVER = "gpu.intel.com"
@@ -1220,40 +1208,67 @@ def _hardware_profiles() -> list[Any]:
         return []
 
 
-def _gpu_resource_prefixes() -> tuple[str, ...]:
-    """Extended-resource prefixes across registered hardware, with an Intel fallback."""
-    prefixes = tuple(prefix for profile in _hardware_profiles() for prefix in profile.resource_prefixes)
-    return prefixes or (_GPU_RESOURCE_PREFIX,)
-
-
-def _gpu_monitor_suffixes() -> tuple[str, ...]:
-    """Scheduling-marker suffixes (not devices) across registered hardware."""
-    suffixes = tuple(suffix for profile in _hardware_profiles() for suffix in profile.monitor_resource_suffixes)
-    return suffixes or ("monitoring",)
-
-
 def _gpu_device_classes() -> tuple[str, ...]:
     """DRA device classes across registered hardware, with an Intel fallback."""
     classes = tuple(device_class for profile in _hardware_profiles() for device_class in profile.device_classes)
     return classes or (_GPU_DRIVER,)
 
 
-def _gpu_counts_by_profile(capacity: dict[str, Any]) -> dict[str, int]:
-    """Per-profile extended-resource GPU counts for one node."""
-    counts: dict[str, int] = {}
+def _gpu_resource_names_by_profile() -> dict[str, tuple[str, ...]]:
+    """Canonical plugin-mode extended-resource name(s) each profile actually deploys with.
+
+    Sourced from ``deployment.modes.plugin.resource_names`` (falling back to the
+    single ``deployment.resource_name``). These are the exact resource keys Lens
+    requests when scheduling workloads.
+    """
+    names: dict[str, tuple[str, ...]] = {}
     for profile in _hardware_profiles():
-        prefixes = profile.resource_prefixes or (_GPU_RESOURCE_PREFIX,)
-        suffixes = profile.monitor_resource_suffixes
+        plugin_mode = (profile.deployment.modes or {}).get("plugin") or {}
+        plugin_names = plugin_mode.get("resource_names")
+        if plugin_names:
+            names[profile.id] = tuple(str(name) for name in plugin_names)
+        elif profile.deployment.resource_name:
+            names[profile.id] = (profile.deployment.resource_name,)
+    return names
+
+
+def _gpu_counts_by_profile(capacity: dict[str, Any]) -> dict[str, int]:
+    """Per-profile extended-resource GPU counts for one node.
+
+    A node's capacity can expose derived/oversubscribed resource names for the
+    *same* physical devices already counted under a profile's canonical name --
+    e.g. NVIDIA GPU time-slicing adds ``nvidia.com/gpu.shared`` (the replica
+    pool) alongside the unchanged ``nvidia.com/gpu`` (the physical cards); a
+    broad ``nvidia.com/gpu*`` prefix sweep would sum both and wildly overcount
+    actual GPUs (reproduced live: 7 physical cards read as 77). When a
+    profile's canonical resource name is present on the node, only that exact
+    key is counted. The broader resource-prefix sweep remains a fallback for
+    nodes that expose *only* a derived/renamed resource (no canonical key at
+    all), so those are still detected rather than silently dropped to zero.
+    """
+    counts: dict[str, int] = {}
+    canonical_names = _gpu_resource_names_by_profile()
+    for profile in _hardware_profiles():
+        exact_names = [name for name in canonical_names.get(profile.id, ()) if name in capacity]
         total = 0
-        for key, value in capacity.items():
-            if not any(key.startswith(prefix) for prefix in prefixes):
-                continue
-            if any(key.endswith(f"/{suffix}") for suffix in suffixes):
-                continue
-            try:
-                total += int(value)
-            except (TypeError, ValueError):
-                continue
+        if exact_names:
+            for name in exact_names:
+                try:
+                    total += int(capacity[name])
+                except (TypeError, ValueError):
+                    continue
+        else:
+            prefixes = profile.resource_prefixes or (_GPU_RESOURCE_PREFIX,)
+            suffixes = profile.monitor_resource_suffixes
+            for key, value in capacity.items():
+                if not any(key.startswith(prefix) for prefix in prefixes):
+                    continue
+                if any(key.endswith(f"/{suffix}") for suffix in suffixes):
+                    continue
+                try:
+                    total += int(value)
+                except (TypeError, ValueError):
+                    continue
         if total:
             counts[profile.id] = total
     return counts
@@ -1274,6 +1289,24 @@ def _resource_slice_gpu_counts_by_profile(slices: list[dict[str, Any]]) -> dict[
         devices = len(spec.get("devices") or [])
         bucket = by_node.setdefault(node_name, {})
         bucket[profile_id] = bucket.get(profile_id, 0) + devices
+    return by_node
+
+
+def _resource_slice_gpu_models_by_profile(slices: list[dict[str, Any]]) -> dict[str, dict[str, set[str]]]:
+    device_classes = {
+        device_class: profile.id for profile in _hardware_profiles() for device_class in profile.device_classes
+    }
+    by_node: dict[str, dict[str, set[str]]] = {}
+    for item in slices:
+        spec = item.get("spec") or {}
+        profile_id = device_classes.get(spec.get("driver"))
+        node_name = str(spec.get("nodeName") or "").strip()
+        if not profile_id or not node_name:
+            continue
+        for device in spec.get("devices") or []:
+            model = ((device.get("attributes") or {}).get("model") or {}).get("string")
+            if model and str(model).strip():
+                by_node.setdefault(node_name, {}).setdefault(profile_id, set()).add(str(model).strip())
     return by_node
 
 
@@ -1667,6 +1700,7 @@ def _node_summary(
     node: dict[str, Any],
     resource_slice_counts: dict[str, int] | None = None,
     resource_slice_profile_counts: dict[str, dict[str, int]] | None = None,
+    resource_slice_profile_models: dict[str, dict[str, set[str]]] | None = None,
 ) -> dict[str, Any]:
     metadata = node.get("metadata") or {}
     name = str(metadata.get("name") or "unknown")
@@ -1697,6 +1731,7 @@ def _node_summary(
     gpu_models_by_profile = {
         profile_id: sorted(
             {str(labels[key]).strip() for key in get_profile(profile_id).planning.model_label_keys if labels.get(key)}
+            | (resource_slice_profile_models or {}).get(name, {}).get(profile_id, set())
         )
         for profile_id in gpu_by_profile
     }
@@ -1929,6 +1964,7 @@ async def build_overview(cluster: registry.Cluster) -> dict[str, Any]:
     # ResourceSlice CRD is optional; treat "not found" as no DRA slices.
     resource_slice_counts: dict[str, int] = {}
     resource_slice_profile_counts: dict[str, dict[str, int]] = {}
+    resource_slice_profile_models: dict[str, dict[str, set[str]]] = {}
     gpu_devices: dict[tuple[str, str], dict[str, str]] = {}
     resource_slices: list[dict[str, Any]] = []
     if slices_result.returncode == 0:
@@ -1936,9 +1972,13 @@ async def build_overview(cluster: registry.Cluster) -> dict[str, Any]:
         gpu_devices = _resource_slice_gpu_devices(resource_slices)
         resource_slice_counts = _resource_slice_gpu_counts(resource_slices)
         resource_slice_profile_counts = _resource_slice_gpu_counts_by_profile(resource_slices)
+        resource_slice_profile_models = _resource_slice_gpu_models_by_profile(resource_slices)
     node_summaries = [
         summary
-        for summary in (_node_summary(node, resource_slice_counts, resource_slice_profile_counts) for node in nodes)
+        for summary in (
+            _node_summary(node, resource_slice_counts, resource_slice_profile_counts, resource_slice_profile_models)
+            for node in nodes
+        )
         if summary.get("role") == "worker"
     ]
     worker_node_names = {node["name"] for node in node_summaries}

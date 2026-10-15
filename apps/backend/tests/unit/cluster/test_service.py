@@ -1292,3 +1292,66 @@ def test_node_summary_attributes_dra_slices_to_their_profile():
     summary = service._node_summary(node, {"node-a": 3}, {"node-a": {"intel-xpu": 3}})
     assert summary["gpuCount"] == 3
     assert summary["gpuByProfile"] == {"intel-xpu": 3}
+
+
+def test_node_summary_does_not_double_count_nvidia_time_sliced_shared_resource():
+    """Reproduced live: NVIDIA GPU time-slicing (without ``renameByDefault``)
+    keeps the physical ``nvidia.com/gpu`` resource unchanged and adds a
+    separate ``nvidia.com/gpu.shared`` resource exposing the same cards'
+    oversubscribed replica pool (7 physical A100s, 10x time-sliced ->
+    "nvidia.com/gpu.shared": "70"). A naive ``nvidia.com/gpu*`` prefix sweep
+    summed both and read 77 GPUs instead of 7, breaking both the cluster
+    overview and deployment capacity planning.
+    """
+    node = {
+        "metadata": {"name": "node-a", "labels": {}},
+        "spec": {},
+        "status": {
+            "capacity": {"nvidia.com/gpu": "7", "nvidia.com/gpu.shared": "70"},
+            "conditions": [],
+        },
+    }
+    summary = service._node_summary(node)
+    assert summary["gpuCount"] == 7
+    assert summary["gpuByProfile"] == {"nvidia": 7}
+
+
+def test_node_summary_counts_renamed_only_nvidia_shared_resource_as_fallback():
+    """``renameByDefault: true`` replaces ``nvidia.com/gpu`` entirely with the
+    renamed resource; when the canonical name is absent, the broader prefix
+    sweep still detects the renamed resource rather than reading zero GPUs.
+    """
+    node = {
+        "metadata": {"name": "node-a", "labels": {}},
+        "spec": {},
+        "status": {"capacity": {"nvidia.com/gpu.shared": "70"}, "conditions": []},
+    }
+    summary = service._node_summary(node)
+    assert summary["gpuCount"] == 70
+    assert summary["gpuByProfile"] == {"nvidia": 70}
+
+
+def test_node_summary_uses_dra_model_when_node_has_no_product_label():
+    node = {"metadata": {"name": "node-a", "labels": {}}, "spec": {}, "status": {"conditions": []}}
+    slices = [
+        {
+            "spec": {
+                "nodeName": "node-a",
+                "driver": "gpu.intel.com",
+                "devices": [
+                    {"attributes": {"model": {"string": "B60"}}},
+                    {"attributes": {"model": {"string": "B60"}}},
+                ],
+            }
+        }
+    ]
+    summary = service._node_summary(
+        node,
+        service._resource_slice_gpu_counts(slices),
+        service._resource_slice_gpu_counts_by_profile(slices),
+        service._resource_slice_gpu_models_by_profile(slices),
+    )
+    assert summary["gpuModelsByProfile"] == {"intel-xpu": ["B60"]}
+    assert service._hardware_summary([summary], gpu_by_profile={"intel-xpu": 2})["accelerators"] == [
+        {"id": "intel-xpu", "gpuCount": 2, "models": ["B60"]}
+    ]
