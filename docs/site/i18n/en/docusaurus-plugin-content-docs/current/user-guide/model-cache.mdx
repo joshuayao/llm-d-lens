@@ -19,6 +19,17 @@ If **Storage volume** is empty, first [create a model-cache volume](/user-guide/
 The model card shows download progress. Wait for the cache to be ready before deploying.
 Downloads use the token saved with the cluster; public models can download without one.
 
+## Download a model the volume already has
+
+If the storage volume you picked already holds that model and revision, Lens does not
+start the download. The dialog explains what is already there -- downloaded, queued,
+still downloading, or failed -- and waits for you:
+
+- **Download anyway** downloads it again. A finished or failed cache is refreshed from
+  the source in place; a download that is still running simply continues. Either way the
+  volume keeps one entry for the model, never a duplicate.
+- **Cancel** keeps what is already on the volume.
+
 ## Download a model from Model Market
 
 1. Click **Download model**.

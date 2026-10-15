@@ -129,7 +129,7 @@ The UI is only the input and review surface for the workflow above. The entry po
 `src/components/ModelMarketPage.jsx` and
 `src/components/AgenticDeploymentWorkspace.jsx`:
 
-- Model Cache storage sits directly below Cluster in Model Market and is shared by Standard and
+- Model Cache storage sits directly below Cluster in Model Market and is shared by Manual and
   Agentic; users can enter Agentic mode first, and required-field validation runs only when
   generating a recommendation.
 - The Agentic workspace provides Use case, optional SLO/workload/preference inputs, plus

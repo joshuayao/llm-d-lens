@@ -404,6 +404,16 @@ Kubernetes namespace DNS-label validation.
 - Examples: [apps/backend/src/llm_d_lens/monitoring/accelerator/service.py](../apps/backend/src/llm_d_lens/monitoring/accelerator/service.py), [apps/backend/src/llm_d_lens/monitoring/cluster_stack/service.py](../apps/backend/src/llm_d_lens/monitoring/cluster_stack/service.py)
 - Tests: [apps/backend/tests/unit/infrastructure/kubernetes/test_namespace.py](../apps/backend/tests/unit/infrastructure/kubernetes/test_namespace.py), [apps/backend/tests/unit/monitoring/accelerator/test_accelerator.py](../apps/backend/tests/unit/monitoring/accelerator/test_accelerator.py), [apps/backend/tests/unit/monitoring/cluster_stack/test_cluster_stack.py](../apps/backend/tests/unit/monitoring/cluster_stack/test_cluster_stack.py)
 
+## kubernetes-resource-deletion
+
+Idempotent cluster-scoped deletion of a Kubernetes namespace or Secret.
+
+- Entry point: [apps/backend/src/llm_d_lens/infrastructure/kubernetes/__init__.py](../apps/backend/src/llm_d_lens/infrastructure/kubernetes/__init__.py)
+- Symbols: `delete_namespace`, `delete_secret`
+- Boundaries: Best-effort cleanup helpers: both pass --ignore-not-found so a missing object is success, and both return the raw CommandResult without interpreting failures. Callers decide whether a non-zero result blocks their flow. Deleting workload objects such as PVC/PV by label selector stays in the owning domain (storage.service.delete_volume_objects), which needs selector and cross-namespace semantics these helpers do not model.
+- Examples: [apps/backend/src/llm_d_lens/cluster/service.py](../apps/backend/src/llm_d_lens/cluster/service.py)
+- Tests: [apps/backend/tests/unit/cluster/test_service.py](../apps/backend/tests/unit/cluster/test_service.py)
+
 ## upstream-json-transport
 
 Node upstream JSON fetch with timeout through body consumption.
@@ -1796,3 +1806,13 @@ Recover interrupted evaluation records without interrupting tasks owned by anoth
 - Boundaries: Startup hook re-reads records under workflow and benchmark locks. Live owners are skipped; orphaned attempts retain interruption evidence and eligible workflows are scheduled through the same owned execution entry points. Requires shared flock-capable LENS_DATA_DIR across participating updated backends.
 - Examples: [apps/backend/src/llm_d_lens/api/main.py](../apps/backend/src/llm_d_lens/api/main.py)
 - Tests: [apps/backend/tests/unit/evaluation/test_ownership.py](../apps/backend/tests/unit/evaluation/test_ownership.py), [apps/backend/tests/unit/evaluation/test_cancellation.py](../apps/backend/tests/unit/evaluation/test_cancellation.py), [apps/backend/tests/unit/evaluation/test_artifact_storage.py](../apps/backend/tests/unit/evaluation/test_artifact_storage.py)
+
+## cluster-hf-token-secret
+
+Write the cluster-level HF_TOKEN Secret on the target cluster and record its namespace/name on the Lens cluster record so Deploy and Model Cache default to it.
+
+- Entry point: [apps/backend/src/llm_d_lens/cluster/service.py](../apps/backend/src/llm_d_lens/cluster/service.py)
+- Symbols: `create_hf_token_secret`, `update_hf_token_secret`
+- Boundaries: The token value lives only on the target cluster; Lens persists coordinates, never the secret. Creation uses kubectl create so a name collision fails explicitly; rotation uses kubectl apply and defaults the coordinates to the ones already recorded. Namespace-local llm-d-hf-token copies derived by deploy/runtime/composition.py and model_cache/jobs.py are re-derived per run and are not rewritten here.
+- Examples: [apps/backend/src/llm_d_lens/cluster/router.py](../apps/backend/src/llm_d_lens/cluster/router.py), [apps/frontend/src/pages/clusters/ui/EditClusterModal.jsx](../apps/frontend/src/pages/clusters/ui/EditClusterModal.jsx), [apps/frontend/src/pages/clusters/ui/CreateClusterWizard.jsx](../apps/frontend/src/pages/clusters/ui/CreateClusterWizard.jsx)
+- Tests: [apps/backend/tests/unit/cluster/test_service.py](../apps/backend/tests/unit/cluster/test_service.py)

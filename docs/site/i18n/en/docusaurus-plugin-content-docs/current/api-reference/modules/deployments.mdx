@@ -808,6 +808,14 @@ deployment_run_manager.rebind_cluster_session(
 
 List deployment executions without creating new port-forwards.
 
+This route reads stored records; it does not query the cluster itself. A
+background reconciler keeps those records current, re-checking every run that is
+running, succeeded, partially succeeded or **failed** (a failed rollout whose
+Pods later recover is promoted back to `ready`, and one whose namespace is gone
+becomes `cleaned`). Only cleaned and cancelled runs are terminal. Call
+`POST /api/v1/deployments/runs/{run_id}/cases/{case_id}/refresh` when you need an
+immediate re-check instead of waiting for that cycle.
+
 <Tabs>
   <TabItem value="rest-api" label="REST API">
     **`GET /api/v1/deployments/executions`**

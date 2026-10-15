@@ -38,7 +38,7 @@ are no longer supported.
 2. In the page header, click **Create**.
 3. Follow [Create a deployment](/user-guide/model-market). The new deployment appears in this list after submission.
 
-In **Advanced**, open **Advanced settings** in the configuration editor and select **Replica placement**. The default prefers one node but can use others when necessary. The presets group all model-server Pods in the same rendered deployment manifest, including separate Prefill and Decode Deployments; router Pods are excluded. **Require one node** keeps the group on the same node; optionally select a live Node label to restrict eligible nodes. **Distribute evenly across nodes** balances the group across eligible nodes using hostname topology spread (up to one Pod of skew); Pods may remain Pending if the balance cannot be maintained with available capacity. **Require separate nodes** needs one eligible node per Pod in the group and leaves extra Pods Pending if there are not enough nodes. Neither distribution preset supports LeaderWorkerSet workloads. The label list comes from the selected cluster. Standard and Agentic deployments use the soft same-node replica preference without an affinity selector in their forms. Tensor-parallel devices are requested by each model-server Pod, so TP stays within that Pod; multi-Pod LeaderWorkerSet workers prefer the same node but can spread when necessary.
+In **Manual**, open **Advanced settings** in the configuration editor and select **Replica placement**. The default prefers one node but can use others when necessary. The presets group all model-server Pods in the same rendered deployment manifest, including separate Prefill and Decode Deployments; router Pods are excluded. **Require one node** keeps the group on the same node; optionally select a live Node label to restrict eligible nodes. **Distribute evenly across nodes** balances the group across eligible nodes using hostname topology spread (up to one Pod of skew); Pods may remain Pending if the balance cannot be maintained with available capacity. **Require separate nodes** needs one eligible node per Pod in the group and leaves extra Pods Pending if there are not enough nodes. Neither distribution preset supports LeaderWorkerSet workloads. The label list comes from the selected cluster. Agentic deployments use the soft same-node replica preference without an affinity selector in their forms. Tensor-parallel devices are requested by each model-server Pod, so TP stays within that Pod; multi-Pod LeaderWorkerSet workers prefer the same node but can spread when necessary.
 
 ## Find a deployment in the list
 
@@ -57,6 +57,14 @@ In **Advanced**, open **Advanced settings** in the configuration editor and sele
 4. If the deployment failed, read the failure banner before making changes.
 
 Wait for **Ready** before calling the deployment. For **In progress**, check the pod logs for startup progress. For **Failed**, read the failure banner and the affected pod's logs.
+
+**Failed** is not final. A rollout that ran past its progress deadline is recorded
+as failed, but the workload often recovers on its own -- a pod that kept crashing
+until its model cache was complete, for example. Lens keeps re-checking failed
+deployments against the cluster and flips them back to **Ready** once their pods
+serve again, so leave the deployment in place rather than recreating it
+immediately. If the namespace is gone, the deployment is corrected to **Cleaned**
+instead.
 
 ## View pods and stream logs
 
@@ -83,6 +91,10 @@ Wait for **Ready** before calling the deployment. For **In progress**, check the
 1. In the deployment row, click the action with tooltip **Deployment monitoring**.
 2. If monitoring has not been installed yet, click **Install**.
 3. If monitoring is present but paused, click **Enable**.
+
+   **Install** and **Enable** stay unavailable until the deployment itself is
+   ready -- monitoring scrapes the deployment's Pods, so there is nothing to
+   collect before then. The menu says so while you wait.
 4. When monitoring is enabled, use **Open Grafana** or **Open Prometheus** to open the dashboards in a new tab.
 5. Click **Profiling** to jump to the profiling view for that deployment.
 6. Use **Disable** to stop monitoring without uninstalling it.
