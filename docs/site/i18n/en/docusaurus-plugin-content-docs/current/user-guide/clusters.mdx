@@ -131,6 +131,8 @@ Plan any required workload shutdown or migration separately.
 2. Check the cluster name and the deletion warning.
 3. Click **Delete** and confirm the registration disappears from the list.
 
+Deletion also removes this registration's isolated Gateway namespace, normally `lens-gateway-<cluster-id>`, including its Gateway, IPP and authorization resources. The old shared `lens-gateway` namespace and other registrations' namespaces are left alone. If Gateway namespace deletion fails or times out, Lens reports the error and keeps the registration and credentials so you can retry.
+
 Lens also cleans up what it created on the cluster. The cluster's `HF_TOKEN` secret is deleted, and its namespace goes with it when keeping the namespace would serve no purpose: Lens created the namespace, or the secret was the only thing in it. If the namespace still holds anything else, it is kept, and the cluster's built-in namespaces are never touched. For a cluster you are still registering, any storage volume created during the wizard is removed together with its PVC and PV, while model files on NFS or hostPath are kept. A fully registered cluster that still has storage volumes cannot be deleted until you delete those volumes first.
 
 ## Cannot see a cluster?

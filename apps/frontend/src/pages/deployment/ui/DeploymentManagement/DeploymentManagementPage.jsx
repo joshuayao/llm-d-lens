@@ -53,8 +53,8 @@ function StatCard({ label, value, tone = 'text-white' }) {
     );
 }
 
-export function DeploymentManagementPage({ onNavigate } = {}) {
-    const [searchInput, setSearchInput] = useState('');
+export function DeploymentManagementPage({ onNavigate, initialSearch = '' } = {}) {
+    const [searchInput, setSearchInput] = useState(initialSearch);
     const query = useDebouncedValue(searchInput, SEARCH_DEBOUNCE_MS).trim();
     const [statuses, setStatuses] = useState(new Set());
     const [clusterId, setClusterId] = useState('');

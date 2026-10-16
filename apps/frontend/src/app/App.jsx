@@ -68,6 +68,7 @@ function AuthenticatedApp() {
       runKind: params.get('runKind') || null,
       taskId: params.get('taskId') || null,
       clusterId: params.get('clusterId') || null,
+      deploymentSearch: params.get('deploymentSearch') || '',
       profileDeployment,
     };
   });
@@ -100,6 +101,7 @@ function AuthenticatedApp() {
       const view = params.get('view') || 'model-market';
       const resolvedView = resolveView(view);
       setCurrentView(resolvedView);
+      setNavigationParams((previous) => ({ ...previous, deploymentSearch: params.get('deploymentSearch') || '' }));
       if (!['model-market', 'model-cache'].includes(resolvedView)) {
         setCacheFromModelMarket(false);
       }
@@ -117,7 +119,7 @@ function AuthenticatedApp() {
     ));
     setCurrentView(view);
     setIsMobileNavOpen(false); // Close mobile nav on navigation
-    
+
     // Update URL to reflect the current view
     const params = new URLSearchParams(window.location.search);
     params.set('view', view);
@@ -126,6 +128,13 @@ function AuthenticatedApp() {
     const resolvedParams = {
       downloadModel: view === 'model-cache' ? extraParams.downloadModel || null : null,
     };
+    if (view === 'optimization-deployments' && extraParams?.deploymentSearch) {
+      params.set('deploymentSearch', extraParams.deploymentSearch);
+      resolvedParams.deploymentSearch = extraParams.deploymentSearch;
+    } else {
+      params.delete('deploymentSearch');
+      resolvedParams.deploymentSearch = '';
+    }
     if (view === 'optimization-evaluation-details' && extraParams?.evaluationId) {
       params.set('evaluationId', extraParams.evaluationId);
       resolvedParams.evaluationId = extraParams.evaluationId;
@@ -164,7 +173,7 @@ function AuthenticatedApp() {
     setNavigationParams(resolvedParams);
 
     window.history.pushState({}, '', `${window.location.pathname}?${params.toString()}`);
-    
+
     // Reset scroll position on navigation
     window.scrollTo(0, 0);
     if (mainRef.current) {
@@ -208,7 +217,7 @@ function AuthenticatedApp() {
             {currentView === 'api-keys' && <ApiKeysPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'usage' && <ModelUsagePage mode="self" onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'playground' && <PlaygroundPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
-            {currentView === 'optimization-deployments' && <DeploymentManagementPage onNavigate={handleNavigate} />}
+            {currentView === 'optimization-deployments' && <DeploymentManagementPage key={navigationParams.deploymentSearch || ''} initialSearch={navigationParams.deploymentSearch} onNavigate={handleNavigate} />}
             {(currentView === 'model-market' || (currentView === 'model-cache' && cacheFromModelMarket)) && (
               <div hidden={currentView !== 'model-market'}>
                 <ModelMarketPage onNavigate={handleNavigate} isActive={currentView === 'model-market'} />
@@ -231,7 +240,7 @@ function AuthenticatedApp() {
             {currentView === 'admin/master-key' && <SecretKeyPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'admin/sessions' && <SessionsPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'admin/audit' && <AuditLogsPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
-            {currentView === 'admin/model-service' && <ModelServiceAdminPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
+            {currentView === 'admin/model-service' && <ModelServiceAdminPage onNavigate={handleNavigate} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'admin/usage' && <ModelUsagePage mode="admin" onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
           </WorkflowProvider>
           )}

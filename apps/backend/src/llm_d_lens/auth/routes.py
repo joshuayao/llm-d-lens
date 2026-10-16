@@ -323,6 +323,7 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     RoutePermission("POST", "/api/v1/model-service/admin/groups", "model-service:group:manage"),
     RoutePermission("GET", "/api/v1/model-service/admin/groups/{group_id}", "model-service:group:read"),
     RoutePermission("PATCH", "/api/v1/model-service/admin/groups/{group_id}", "model-service:group:manage"),
+    RoutePermission("PUT", "/api/v1/model-service/admin/groups/{group_id}/traffic", "model-service:member:manage"),
     RoutePermission("DELETE", "/api/v1/model-service/admin/groups/{group_id}", "model-service:group:manage"),
     RoutePermission("GET", "/api/v1/model-service/admin/members", "model-service:group:read"),
     RoutePermission("GET", "/api/v1/model-service/admin/deployments", "model-service:group:read"),

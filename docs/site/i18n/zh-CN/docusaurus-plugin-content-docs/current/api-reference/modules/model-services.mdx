@@ -165,7 +165,10 @@ import TabItem from '@theme/TabItem';
 
 ### 列出可访问的模型
 
-列出调用方当前被允许通过模型网关使用的模型组。只会返回已激活、且至少含有一个已授权且处于激活状态成员的组。每个条目都包含根据组的 `clusterId` 解析出的 `clusterName`，这样当调用方需要在多个模型服务之间做选择时——例如同一个公开名称在不同集群中分别发布——无需单独查询集群也能区分它们。
+列出调用方可通过模型网关使用的模型组。活动组需要至少一个已授权、活动且权重为正的提供方。
+网关模型还要求调用方对所有关联部署拥有推理权限，包括零权重和离线提供方，
+因为异步代理更新期间仍可能使用旧分配。条目包含从 `clusterId` 解析出的 `clusterName`，
+用于区分不同集群中相同的公开名称。
 
 <Tabs>
   <TabItem value="rest-api" label="REST API">
@@ -479,7 +482,11 @@ import TabItem from '@theme/TabItem';
 
 ### 创建模型路由组
 
-创建一个在单个集群内公开一个面向用户模型名称的路由组。`name` 和 `clusterId` 为必填项；公开名称在每个集群（`clusterId`）内唯一，并且每个提供方都必须是同一集群内的某个部署。Lens 会根据 `name` 推导出 `modelRef`/`baseModel`，`displayName` 默认为 `name`。
+创建集群内公开模型名称对应的路由组。`name`、`clusterId` 必填，名称在集群内唯一，
+所有提供方必须位于该集群。提供 `executionId` 时，组与初始成员在同一事务中创建，
+供 **Add model** 使用。部署必须就绪且有模型名称；服务端从部署推导 `modelRef`、
+`servedName`，将 `baseModel` 设为公开名称，忽略调用方对这三个字段的覆盖。
+不传 `executionId` 时仍支持单独创建组。
 
 <Tabs>
   <TabItem value="rest-api" label="REST API">
@@ -487,26 +494,28 @@ import TabItem from '@theme/TabItem';
 
     请求体（`GroupCreateRequest`）：
 
-    - `name`（`string`）：客户端使用的模型名称（同时也是路由/模型引用）。
+    - `name`（`string`）：客户端在 Chat Completions API 中使用的公开模型名称。
     - `clusterId`（`string`）：该服务所属的集群（必填）；其提供方必须都位于该集群内，且名称在该集群内唯一。
     - `displayName`（`string`，可选）：便于在 UI 中展示的标签；默认为 `name`。
     - `description`（`string`，可选）：自由格式的描述。
-    - `modelRef` / `servedName` / `baseModel`（`string`，可选，高级选项）：省略时根据 `name` 推导得出。
+    - `executionId`（`string`，可选）：作为初始成员发布的就绪部署；需要该集群中的 `model-service:group:manage` 和 `model-service:member:manage` 权限。
+    - `modelRef` / `servedName` / `baseModel`（`string`，可选，高级选项）：传入 `executionId` 时由服务端推导；否则 `modelRef` 默认为 `name`，`baseModel` 默认为 `modelRef`，`servedName` 为 null。
     - `selectionPolicy`（`string`，遗留字段）：为兼容性而接受此参数；llm-d 数据面会忽略它。
 
     ```json
     {
       "name": "qwen3-8b",
-      "modelRef": "Qwen/Qwen3-8B",
       "clusterId": "cluster-a",
-      "servedName": "Qwen/Qwen3-8B",
-      "baseModel": "Qwen/Qwen3-8B",
+      "executionId": "exec-123",
       "displayName": "Qwen3 8B",
       "description": "Shared Qwen 3 8B service"
     }
     ```
 
-    响应：创建成功后的 `ModelServiceGroup`。
+    响应：`201` 和创建后的 `ModelServiceGroup`。传入 `executionId` 时成员同时提交，
+    并在后台安排 Gateway 调谐。权限或范围不足返回 `403`，目标不存在返回 `404`，
+    名称重复、集群不匹配、部署未就绪或无模型名称返回 `409`，输入无效返回 `422`。
+    事务失败不会留下任一记录。
 
     ```json
     {
@@ -515,7 +524,7 @@ import TabItem from '@theme/TabItem';
       "modelRef": "Qwen/Qwen3-8B",
       "clusterId": "cluster-a",
       "servedName": "Qwen/Qwen3-8B",
-      "baseModel": "Qwen/Qwen3-8B",
+      "baseModel": "qwen3-8b",
       "displayName": "Qwen3 8B",
       "description": "Shared Qwen 3 8B service",
       "selectionPolicy": "random",
@@ -535,17 +544,20 @@ import TabItem from '@theme/TabItem';
     group = service.create_group(
         GroupCreateRequest(
             name="qwen3-8b",
-            modelRef="Qwen/Qwen3-8B",
             clusterId="cluster-a",
-            servedName="Qwen/Qwen3-8B",
-            baseModel="Qwen/Qwen3-8B",
+            executionId="exec-123",
             displayName="Qwen3 8B",
             description="Shared Qwen 3 8B service",
         ),
         created_by="user-123",
     )
     print(group.api_payload())
+    print([member.api_payload() for member in service.list_members(group.id)])
     ```
+
+    `exec-123` 必须是 `cluster-a` 中已有的就绪部署。可信内部 Python 调用可省略
+    `principal`，请求适配器必须传入已认证主体以校验权限和集群范围。
+    `create_group` 只提交记录，HTTP 处理函数还会安排 Gateway 调谐。
   </TabItem>
 </Tabs>
 
@@ -561,7 +573,7 @@ import TabItem from '@theme/TabItem';
 
     - `group_id`（`string`，查询参数，可选）：仅返回某个路由组的成员。
 
-    响应：返回一个 `items` 数组，其中每个元素都是成员载荷。
+    响应：`items` 成员载荷数组，包含整数 `weight`，范围为 0 到 1000000。
 
     ```json
     {
@@ -575,6 +587,7 @@ import TabItem from '@theme/TabItem';
           "targetService": "vllm",
           "targetPort": 8000,
           "endpointKind": "vllm",
+          "weight": 1,
           "status": "active",
           "publishedByUserId": "user-123",
           "createdAt": "2026-09-23T09:12:00Z",
@@ -606,6 +619,9 @@ import TabItem from '@theme/TabItem';
 
 将一个就绪的部署执行发布到某个路由组中。该路由会根据执行 ID 推导出实际的命名空间、服务、端口和端点类型。该执行所在的集群必须与该组所在的集群一致，否则调用会被以 `409`（`model_member_conflict`）拒绝。
 
+每个新提供方默认权重为 1，已有权重保持不变。通过流量分配接口修改权重。
+HTTP 处理函数会安排调谐，直接 Python 调用只持久化记录。
+
 <Tabs>
   <TabItem value="rest-api" label="REST API">
     **`POST /api/v1/model-service/admin/members`**
@@ -636,6 +652,7 @@ import TabItem from '@theme/TabItem';
       "targetService": "qwen-epp",
       "targetPort": 8000,
       "endpointKind": "llm-d-epp",
+      "weight": 1,
       "poolName": "qwen",
       "eppRef": "qwen-epp",
       "status": "active",
@@ -664,6 +681,80 @@ import TabItem from '@theme/TabItem';
     ```
   </TabItem>
 </Tabs>
+
+### 保存并应用流量分配
+
+原子更新全部权重，并可添加部署提供方，然后调谐集群的共享 Gateway 和加权 HTTPRoute。
+需要模型组所在集群中的 `model-service:member:manage` 权限。
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`PUT /api/v1/model-service/admin/groups/{group_id}/traffic`**
+
+    请求体（`TrafficUpdateRequest`）：
+
+    - `members`：完整的 1 到 16 个成员，每项包含 `executionId` 和 **0..1000000** 范围内的整数 `weight`。不能遗漏已有成员；移除成员请使用删除接口。
+    - `expectedWeights`：之前读取的执行 ID 到权重的映射，包含所有已有提供方，不含新提供方。
+
+    ```json
+    {
+      "members": [
+        {"executionId": "stable", "weight": 90},
+        {"executionId": "canary", "weight": 10}
+      ],
+      "expectedWeights": {"stable": 1}
+    }
+    ```
+
+    新部署及从零权重激活的提供方必须就绪、位于同一集群、使用不同的
+    InferencePool/EPP，且提供方模型名称与组一致。至少一个未禁用提供方的权重为正。
+    零权重成员保留但不写入 backendRefs，离线成员也不接收流量。
+
+    响应：`200`，包含完整更新后的 `items`（包括 `weight`）和 `operation`
+    （含 `status`、`message`、`detailJson` 的 `GatewayOperation`）。
+    **操作失败不会回滚已保存权重。** `succeeded` 只表示已提交配置，不代表已测得流量比例。
+
+    格式或范围错误返回 `422`，快照过期或分配无效返回 `409 model_traffic_conflict`，
+    目标不存在返回 `404`，权限不足返回 `403`。保存后的传输或领域异常返回
+    `502 model_traffic_apply_failed`，明确说明配置已保存；重新读取分配，修复后重试 Reconcile。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    `ModelService.update_traffic()` 校验并持久化；调用
+    `GatewayOpsService.reconcile_cluster_gateway()` 提交配置。
+    主体必须来自已认证请求，不能来自用户自行提交的身份。
+
+    ```python
+    from llm_d_lens.auth.access import current_principal
+    from llm_d_lens.model_service.contracts import TrafficUpdateRequest
+    from llm_d_lens.model_service.gateway_ops import GatewayOpsService
+    from llm_d_lens.model_service.service import default_service
+
+    async def configure_traffic(request, group_id, canary_execution_id):
+        service = default_service()
+        principal = current_principal(request)
+        existing = service.list_members(group_id)
+        weights = {member.execution_id: member.weight for member in existing}
+        members = [{"executionId": member.execution_id, "weight": member.weight}
+                   for member in existing]
+        members[0]["weight"] = 90
+        members.append({"executionId": canary_execution_id, "weight": 10})
+        saved = service.update_traffic(
+            group_id,
+            TrafficUpdateRequest(members=members, expectedWeights=weights),
+            principal=principal,
+        )
+        operation = await GatewayOpsService().reconcile_cluster_gateway(
+            saved[0].cluster_id, actor=principal.user_id,
+        )
+        return {"items": [member.api_payload() for member in saved],
+                "operation": operation.api_payload()}
+    ```
+  </TabItem>
+</Tabs>
+
+`render_model_route(..., pools=[PoolBinding(...)])` 生成精确的相对权重、一个 IPP
+模型映射及跨命名空间 ReferenceGrant。保留原有 `pool=PoolBinding(...)` 单后端调用，
+但不能同时传入两种形式。`PoolBinding.weight` 默认为 1。
 
 ### 获取使用量分析数据
 
@@ -841,6 +932,8 @@ import TabItem from '@theme/TabItem';
 
 获取跨集群的当前网关状态：已发布的成员、固定使用的提供方，以及共享 Gateway 的已编程状态。
 
+`gatewayNamespace` 和 `ippNamespace` 返回带集群注册稳定短 ID 的实际命名空间。
+
 <Tabs>
   <TabItem value="rest-api" label="REST API">
     **`GET /api/v1/model-service/admin/gateway/status`**
@@ -853,7 +946,7 @@ import TabItem from '@theme/TabItem';
     {
       "clusters": [
         {
-          "clusterId": "cluster-a",
+          "clusterId": "1234abcd",
           "clusterName": "Primary cluster",
           "members": [
             {
@@ -868,19 +961,19 @@ import TabItem from '@theme/TabItem';
           ],
           "gatewayProvider": "istio",
           "gatewayState": "installed",
-          "gatewayNamespace": "lens-gateway",
+          "gatewayNamespace": "lens-gateway-1234abcd",
           "gatewayName": "lens-inference-gateway",
           "gatewayReady": true,
           "gatewayRunning": true,
           "ippState": "installed",
           "ippReady": false,
           "ippName": "lens-ipp",
-          "ippNamespace": "lens-gateway",
+          "ippNamespace": "lens-gateway-1234abcd",
           "lastOperation": {
             "id": "gop-2a7f0d9c0c11",
             "kind": "reconcile-gateway",
             "status": "succeeded",
-            "clusterId": "cluster-a",
+            "clusterId": "1234abcd",
             "message": "gateway reconciled (istio); 1 model route(s)",
             "createdAt": "2026-09-23T09:15:00Z",
             "finishedAt": "2026-09-23T09:15:18Z"
@@ -945,6 +1038,13 @@ import TabItem from '@theme/TabItem';
 
 安装（或复用）该集群的共享 llm-d Gateway。提供方可由用户选择（`istio`、`gke`、`agentgateway`、`envoy-ai-gateway`）；若省略，则使用集群记录中固定的提供方。
 
+默认命名空间为 `lens-gateway-<cluster-id>`，自定义前缀也附加同一个稳定短 ID，
+Gateway 与 IPP 操作始终使用一致的命名空间。Istio 使用仅作用于该 Gateway Pod 的
+命名空间级 `EnvoyFilter`，HTTP 外部鉴权失败时拒绝访问，不注册全网格共享的鉴权提供方。
+不接管或删除旧无后缀资源；旧 Gateway 占用 NodePort 时仍视为冲突，
+需要选择空闲端口或主动退役旧 Gateway。操作流中的卸载只删除本注册带标签的
+命名空间内资源，不删除其他命名空间、共享 GatewayClass 或部署所属的 InferencePool。
+
 <Tabs>
   <TabItem value="rest-api" label="REST API">
     **`POST /api/v1/model-service/admin/gateway/install`**
@@ -955,7 +1055,7 @@ import TabItem from '@theme/TabItem';
     - `provider`（`string`，可选）：`istio` | `gke` | `agentgateway` | `envoy-ai-gateway`。
 
     ```json
-    { "clusterId": "cluster-a", "provider": "istio" }
+    { "clusterId": "1234abcd", "provider": "istio" }
     ```
 
     响应：记录此次安装所产生的 `GatewayOperation`。
@@ -965,9 +1065,9 @@ import TabItem from '@theme/TabItem';
       "id": "gop-9c1a2b3d4e5f",
       "kind": "install-gateway",
       "status": "succeeded",
-      "clusterId": "cluster-a",
+      "clusterId": "1234abcd",
       "message": "shared Gateway ready (istio)",
-      "detailJson": { "provider": "istio", "namespace": "lens-gateway", "name": "lens-inference-gateway", "programmed": true },
+      "detailJson": { "provider": "istio", "namespace": "lens-gateway-1234abcd", "name": "lens-inference-gateway", "programmed": true },
       "createdAt": "2026-09-24T16:20:00Z",
       "finishedAt": "2026-09-24T16:20:12Z"
     }
@@ -980,7 +1080,7 @@ import TabItem from '@theme/TabItem';
     from llm_d_lens.model_service.gateway_ops import GatewayOpsService
 
     async def main() -> None:
-        operation = await GatewayOpsService().install_cluster_gateway("cluster-a", provider="istio")
+        operation = await GatewayOpsService().install_cluster_gateway("1234abcd", provider="istio")
         print(operation.api_payload())
 
     asyncio.run(main())
@@ -1027,6 +1127,10 @@ import TabItem from '@theme/TabItem';
 
 更新路由组的可变字段（名称、模型引用、显示名称、描述、状态、集群、服务名称、基础模型）。
 
+HTTP 处理函数保存配置并等待受影响集群的调谐提交。`status: "disabled"` 停止公开模型并
+移除路由，`"active"` 恢复在线且正权重提供方的路由，不改变提供方状态、权重或运行中的 Pod。
+调用方需要所有受影响集群的模型组管理权限，控制器收敛是异步的。
+
 <Tabs>
   <TabItem value="rest-api" label="REST API">
     **`PATCH /api/v1/model-service/admin/groups/{group_id}`**
@@ -1037,7 +1141,8 @@ import TabItem from '@theme/TabItem';
     { "displayName": "Qwen3 8B (prod)", "status": "active" }
     ```
 
-    响应：更新后的 `ModelServiceGroup`。
+    响应：成功提交调谐后的 `ModelServiceGroup`。`502 model_publication_apply_failed`
+    表示配置已保存但路由应用失败，请用 Reconcile 重试。越权修改返回 `403`。
   </TabItem>
   <TabItem value="python-api" label="Python API">
     ```python
@@ -1050,6 +1155,10 @@ import TabItem from '@theme/TabItem';
     )
     print(group.api_payload())
     ```
+
+    `update_group(..., principal=principal)` 检查集群范围内的管理权限，只持久化配置。
+    直接 Python 调用还需等待 `GatewayOpsService().reconcile_cluster(group.cluster_id)`
+    并检查操作状态。可信内部调用可省略 `principal`，HTTP 请求始终传入。
   </TabItem>
 </Tabs>
 
@@ -1117,7 +1226,10 @@ import TabItem from '@theme/TabItem';
 
 ### 更新一个成员
 
-更新某个已发布成员的状态。该处理函数会安排一次调谐；一个模型服务会路由到一个 InferencePool（即第一个活跃成员）。
+更新成员状态并等待集群路由调谐。`disabled` 将提供方离线，但不改变保存的权重或缩容 Pod。
+重新上线要求该注册集群中的部署已就绪。权重 0 仍为 standby，已停止的父模型不会恢复。
+允许全部提供方离线；没有在线正权重提供方时移除 HTTPRoute，否则引用所有在线正权重池。
+健康探测不能撤销显式离线选择。
 
 <Tabs>
   <TabItem value="rest-api" label="REST API">
@@ -1126,19 +1238,25 @@ import TabItem from '@theme/TabItem';
     请求体（`MemberUpdateRequest`；所有字段均为可选）：`status`（`active` | `disabled` | `unhealthy`）。
 
     ```json
-    { "status": "unhealthy" }
+    { "status": "disabled" }
     ```
 
-    响应：更新后的 `ModelServiceMember`。
+    响应：成功提交调谐后的 `ModelServiceMember`。未就绪提供方上线返回
+    `409 model_member_conflict`，缺少集群成员管理权限返回 `403`。
+    `502 model_publication_apply_failed` 表示状态已保存但路由应用失败，请用 Reconcile 重试。
   </TabItem>
   <TabItem value="python-api" label="Python API">
     ```python
     from llm_d_lens.model_service.contracts import MemberUpdateRequest
     from llm_d_lens.model_service.service import default_service
 
-    member = default_service().update_member("msm-32d55cb7f9a1", MemberUpdateRequest(status="unhealthy"))
+    member = default_service().update_member("msm-32d55cb7f9a1", MemberUpdateRequest(status="disabled"))
     print(member.api_payload())
     ```
+
+    传入 `principal=principal` 校验调用方权限。该方法只持久化状态，直接 Python 调用还需
+    等待 `GatewayOpsService().reconcile_cluster(member.cluster_id)` 并检查操作状态。
+    两个方法都不缩容提供方的 Pod。
   </TabItem>
 </Tabs>
 
@@ -1163,7 +1281,15 @@ import TabItem from '@theme/TabItem';
 
 ### 探测成员后端
 
-探测每个未被禁用的成员的 Kubernetes Endpoints，并刷新 `health_json` / `last_health_at`，在 `active` 与 `unhealthy` 之间切换 `status`。
+探测启用模型中未禁用的成员，刷新 `health_json` / `last_health_at`，
+并在 `active` 与 `unhealthy` 之间更新状态。跳过已停止模型和离线提供方，
+并发健康写入不能重新启用离线提供方。没有在线正权重提供方时，HTTPRoute 缺失属于预期，
+跳过 Gateway 服务检查，也不触发自动修复。
+
+已有的零权重 InferencePool 没有 Gateway 父状态时报告
+`healthJson.components.inferencePool: "standby"`，不会仅因此将健康提供方判为异常或
+触发 Gateway/IPP 修复。资源缺失、显式池拒绝、EPP 或模型服务器端点故障仍判为异常；
+正权重池仍要求 Gateway 接受。
 
 <Tabs>
   <TabItem value="rest-api" label="REST API">
