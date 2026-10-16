@@ -671,6 +671,13 @@ One Gateway per cluster; **one HTTPRoute per model service**, whose
   `istio.io/enable-inference-extproc: "true"` on the Gateway; the recipe
   requires it for EPP inference ext_proc.
 
+  The request filter order must be **IPP -> ext_authz -> EPP -> router**:
+  IPP provides the model header, then authorization injects the token identity
+  before EPP captures its `fairness_id`. The namespace-local auth EnvoyFilter
+  uses priority `-100` and `INSERT_FIRST`; the IPP's default-priority
+  `INSERT_FIRST` patch subsequently prepends IPP. Auth does not depend on an EPP
+  subfilter being present, so Gateways without routed pools remain protected.
+
 ### 3. Environment variables
 
 - **Variable:** `LENS_IPP_CHART`; **Default:**

@@ -483,9 +483,10 @@ def render_gateway_ext_auth(
                 "metadata": {"name": policy_name, "namespace": namespace, "labels": labels},
                 "spec": {
                     "workloadSelector": {"labels": {"gateway.networking.k8s.io/gateway-name": gateway_name}},
-                    # Apply after the IPP's default-priority filter so its model
-                    # header is available before authorization.
-                    "priority": 100,
+                    # Insert auth first, then let the default-priority IPP
+                    # prepend itself: IPP -> auth -> EPP -> router. Matching an
+                    # EPP subfilter would omit auth when no pool is routed.
+                    "priority": -100,
                     "configPatches": [
                         {
                             "applyTo": "HTTP_FILTER",
@@ -495,13 +496,12 @@ def render_gateway_ext_auth(
                                     "filterChain": {
                                         "filter": {
                                             "name": "envoy.filters.network.http_connection_manager",
-                                            "subFilter": {"name": "envoy.filters.http.router"},
                                         }
                                     }
                                 },
                             },
                             "patch": {
-                                "operation": "INSERT_BEFORE",
+                                "operation": "INSERT_FIRST",
                                 "value": {
                                     "name": "envoy.filters.http.ext_authz",
                                     "typed_config": {

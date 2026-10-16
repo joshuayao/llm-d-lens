@@ -278,7 +278,13 @@ def test_ext_auth_uses_each_provider_policy_kind():
     }
     patch = policy["spec"]["configPatches"][0]
     assert patch["match"]["context"] == "GATEWAY"
-    assert patch["patch"]["operation"] == "INSERT_BEFORE"
+    # IPP prepends itself at priority 0, leaving auth before Istio's EPP.
+    # Do not depend on an EPP subfilter: auth must also cover gateways with no pools.
+    assert policy["spec"]["priority"] < 0
+    assert patch["patch"]["operation"] == "INSERT_FIRST"
+    assert patch["match"]["listener"]["filterChain"]["filter"] == {
+        "name": "envoy.filters.network.http_connection_manager"
+    }
     auth = patch["patch"]["value"]["typed_config"]
     assert auth["failure_mode_allow"] is False
     assert auth["status_on_error"]["code"] == "ServiceUnavailable"
@@ -377,7 +383,7 @@ def test_istio_auth_is_scoped_to_each_gateway_namespace():
         )
         auth_filter = next(doc for doc in docs if doc["kind"] == "EnvoyFilter")
         assert auth_filter["metadata"]["namespace"] == namespace
-        assert auth_filter["spec"]["priority"] > 0
+        assert auth_filter["spec"]["priority"] < 0
         auth = auth_filter["spec"]["configPatches"][0]["patch"]["value"]["typed_config"]
         http = auth["http_service"]
         upstreams.append(http["server_uri"]["cluster"])
