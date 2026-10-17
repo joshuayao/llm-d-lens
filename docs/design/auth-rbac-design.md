@@ -1424,12 +1424,15 @@ src/components/Administration/         # UsersPage/GroupsPage/RolesPage/Director
 
 - Wrap the outermost layer in `<AuthProvider>`; inside the `ErrorBoundary` at `App.jsx:153`.
 - If `status === 'anonymous'` → render `<LoginPage/>`, and do not render navigation or business pages.
+- A successful interactive sign-in selects the first enabled sidebar entry allowed by the principal's
+  effective permissions and clears the previous page's URL parameters. An existing authenticated session
+  preserves explicit supported deep links; missing or unknown views default to that same first accessible
+  entry. No accessible entries means an access-denied state, not an unauthorized default page.
 - If logged in but lacking the permissions required by `currentView` → render `<ForbiddenState/>` (reusing
   `EmptyState`), without changing the URL or redirecting to the first visible page.
-- The route-permission mapping comes from `permissions.js` and stays consistent with the table in §6.4; it is recommended to merge
-  `SUPPORTED_VIEWS` (`src/App.jsx:43`) and `MENU_GROUPS`
-  (`src/components/LeftNavigation.jsx:7`) into a single `routeCatalog`
-  (including `requiredAny`) to eliminate duplicate registration (they are currently maintained independently).
+- The route-permission mapping comes from `permissions.js` and stays consistent with the table in §6.4.
+  `apps/frontend/src/app/routes/views.js` owns `NAVIGATION_GROUPS`, shared by the sidebar and landing-page
+  selection so their order cannot drift. Supported detail views and permission mappings remain explicit.
 
 ### 10.3 Sidebar filtering
 
@@ -1606,8 +1609,8 @@ Pagination/filtering reuse the existing DTO + DAO conventions; import/export is 
 5. **`SIMULATION_ALLOW_UNAUTHENTICATED`**: recognized as an alias for `disabled`, with a warning in logs.
 6. **Existing sessionStorage cluster sessions**: unrelated to user sessions and not changed; however, assigning `owner_user_id`
    to them is a future enhancement (§16 P6).
-7. **Existing frontend behavior**: before login, `App` does not render business pages; after login, the default `model-market`
-   page still falls back by permissions if it is not visible.
+7. **Existing frontend behavior**: before login, `App` does not render business pages; after login, it opens
+   the first accessible page in sidebar order, using the principal's effective permissions.
 8. **Migration downgrade**: every added table/column must provide an executable `downgrade()`,
    with deletion order inverse to FK dependencies; the `owner_user_id` column may be dropped safely; do not delete existing business data
    in downgrade. Before release, rehearse `upgrade → downgrade → upgrade` on a throwaway database (part of migration review, not touching production).

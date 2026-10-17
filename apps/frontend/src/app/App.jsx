@@ -14,7 +14,7 @@
 
 import { useState, useRef, useEffect } from 'react';
 import ErrorBoundary from './providers/ErrorBoundary';
-import { resolveView } from './routes/views';
+import { firstAccessibleView, resolveView } from './routes/views';
 import { ClusterMonitoringStackDashboard, OptimizationClusterOverview } from '../pages/clusters';
 import { DeploymentManagementPage } from '../pages/deployment';
 import { ModelMarketPage } from '../pages/model-market';
@@ -35,6 +35,7 @@ import { SimulationDashboard, SimulationTaskDetails } from '../pages/simulation'
 import LeftNavigation from './ui/LeftNavigation';
 import { EmptyState, LoadingState } from '../shared/ui';
 import { AuthProvider, ChangePasswordPage, LoginPage, useAuth } from '../pages/auth';
+import { canAccessView } from '../pages/auth/permissions';
 import {
   AuditLogsPage,
   GroupsPage,
@@ -45,13 +46,12 @@ import {
   UsersPage,
 } from '../pages/administration';
 
-function AuthenticatedApp() {
+function AuthenticatedApp({ initialView = null }) {
   const { canView } = useAuth();
   const mainRef = useRef(null);
   const [currentView, setCurrentView] = useState(() => {
     const params = new URLSearchParams(window.location.search);
-    const view = params.get('view') || 'model-market';
-    return resolveView(view);
+    return initialView ?? resolveView(params.get('view'), firstAccessibleView(canView));
   });
 
   const [navigationParams, setNavigationParams] = useState(() => {
@@ -87,32 +87,33 @@ function AuthenticatedApp() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const requestedView = params.get('view');
-    if (!requestedView) return;
-    const resolvedView = resolveView(requestedView);
-    if (resolvedView === requestedView) return;
-    params.set('view', resolvedView);
+    if ((params.get('view') || '') === currentView) return;
+    if (currentView) params.set('view', currentView);
+    else params.delete('view');
     window.history.replaceState({}, '', `${window.location.pathname}?${params.toString()}`);
-  }, []);
+  }, [currentView]);
 
   useEffect(() => {
     const onPopState = () => {
       const params = new URLSearchParams(window.location.search);
-      const view = params.get('view') || 'model-market';
-      const resolvedView = resolveView(view);
+      const resolvedView = resolveView(params.get('view'), firstAccessibleView(canView));
       setCurrentView(resolvedView);
-      setNavigationParams((previous) => ({ ...previous, deploymentSearch: params.get('deploymentSearch') || '' }));
+      setNavigationParams((previous) => ({
+        ...previous,
+        clusterId: params.get('clusterId') || null,
+        deploymentSearch: params.get('deploymentSearch') || '',
+      }));
       if (!['model-market', 'model-cache'].includes(resolvedView)) {
         setCacheFromModelMarket(false);
       }
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
-  }, []);
+  }, [canView]);
 
 
   const handleNavigate = (requestedView, extraParams = {}) => {
-    const view = resolveView(requestedView);
+    const view = resolveView(requestedView, firstAccessibleView(canView));
     setCacheFromModelMarket((current) => (
       (currentView === 'model-market' && view === 'model-cache')
       || (current && ['model-market', 'model-cache'].includes(view))
@@ -156,7 +157,7 @@ function AuthenticatedApp() {
       params.delete('taskId');
       resolvedParams.taskId = null;
     }
-    if (view === 'cluster-monitoring-stack' && extraParams?.clusterId) {
+    if (['cluster-monitoring-stack', 'optimization-deployments', 'admin/model-service'].includes(view) && extraParams?.clusterId) {
       params.set('clusterId', extraParams.clusterId);
       resolvedParams.clusterId = extraParams.clusterId;
     } else {
@@ -181,7 +182,7 @@ function AuthenticatedApp() {
     }
   };
 
-  const viewAllowed = canView(currentView);
+  const viewAllowed = Boolean(currentView) && canView(currentView);
 
   return (
       <div className="min-h-screen bg-slate-950 w-full overflow-hidden font-sans relative flex flex-col">
@@ -217,7 +218,7 @@ function AuthenticatedApp() {
             {currentView === 'api-keys' && <ApiKeysPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'usage' && <ModelUsagePage mode="self" onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'playground' && <PlaygroundPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
-            {currentView === 'optimization-deployments' && <DeploymentManagementPage key={navigationParams.deploymentSearch || ''} initialSearch={navigationParams.deploymentSearch} onNavigate={handleNavigate} />}
+            {currentView === 'optimization-deployments' && <DeploymentManagementPage key={JSON.stringify([navigationParams.deploymentSearch, navigationParams.clusterId])} initialSearch={navigationParams.deploymentSearch} initialClusterId={navigationParams.clusterId || ''} onNavigate={handleNavigate} />}
             {(currentView === 'model-market' || (currentView === 'model-cache' && cacheFromModelMarket)) && (
               <div hidden={currentView !== 'model-market'}>
                 <ModelMarketPage onNavigate={handleNavigate} isActive={currentView === 'model-market'} />
@@ -240,7 +241,7 @@ function AuthenticatedApp() {
             {currentView === 'admin/master-key' && <SecretKeyPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'admin/sessions' && <SessionsPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'admin/audit' && <AuditLogsPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
-            {currentView === 'admin/model-service' && <ModelServiceAdminPage onNavigate={handleNavigate} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
+            {currentView === 'admin/model-service' && <ModelServiceAdminPage key={navigationParams.clusterId || ''} initialClusterId={navigationParams.clusterId || ''} onNavigate={handleNavigate} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'admin/usage' && <ModelUsagePage mode="admin" onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
           </WorkflowProvider>
           )}
@@ -252,16 +253,23 @@ function AuthenticatedApp() {
 
 function AuthGate() {
   const { status, principal } = useAuth();
+  const [loginLandingView, setLoginLandingView] = useState(null);
   if (status === 'loading') {
     return <LoadingState fullPage label="Checking your session" />;
   }
   if (status === 'anonymous') {
-    return <LoginPage />;
+    return <LoginPage onSignedIn={(signedInPrincipal) => {
+      const view = firstAccessibleView((candidate) => canAccessView(signedInPrincipal.permissions || [], candidate));
+      const params = new URLSearchParams();
+      if (view) params.set('view', view);
+      window.history.replaceState({}, '', `${window.location.pathname}${params.size ? `?${params}` : ''}`);
+      setLoginLandingView(view);
+    }} />;
   }
   if (principal?.mustChangePassword) {
     return <ChangePasswordPage />;
   }
-  return <AuthenticatedApp />;
+  return <AuthenticatedApp key={loginLandingView ?? 'session'} initialView={loginLandingView} />;
 }
 
 export default function App() {

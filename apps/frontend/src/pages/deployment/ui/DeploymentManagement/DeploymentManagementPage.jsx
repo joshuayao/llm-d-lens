@@ -53,11 +53,11 @@ function StatCard({ label, value, tone = 'text-white' }) {
     );
 }
 
-export function DeploymentManagementPage({ onNavigate, initialSearch = '' } = {}) {
+export function DeploymentManagementPage({ onNavigate, initialSearch = '', initialClusterId = '' } = {}) {
     const [searchInput, setSearchInput] = useState(initialSearch);
     const query = useDebouncedValue(searchInput, SEARCH_DEBOUNCE_MS).trim();
     const [statuses, setStatuses] = useState(new Set());
-    const [clusterId, setClusterId] = useState('');
+    const [clusterId, setClusterId] = useState(initialClusterId);
     const [dialog, setDialog] = useState(null);
     const [selected, setSelected] = useState(null);
     const { can } = useAuth();

@@ -59,12 +59,12 @@ const STATUS_DOT = {
 
 // Admin "Manage models": left picks a model service, right shows its members.
 // Styling mirrors the clusters overview page.
-export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate }) {
+export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialClusterId = '' }) {
     const [groups, setGroups] = useState([]);
     const [members, setMembers] = useState([]);
     const [deployments, setDeployments] = useState([]);
     const [status, setStatus] = useState({ clusters: [] });
-    const [flowClusterId, setFlowClusterId] = useState('');
+    const [flowClusterId, setFlowClusterId] = useState(initialClusterId);
     const [flowModelQuery, setFlowModelQuery] = useState('');
     const [error, setError] = useState('');
     const [notice, setNotice] = useNotice(6000);

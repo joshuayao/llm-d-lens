@@ -1119,7 +1119,35 @@ describe("Flow connectors", () => {
     });
 });
 
-describe("Deployment navigation", () => {
+describe("Page navigation", () => {
+    test('model-service cluster navigation initializes an editable filter before gateway data loads', () => {
+        for (const initialClusterId of [undefined, 'cluster-a']) {
+            const html = renderToStaticMarkup(createElement(
+                AuthContext.Provider,
+                { value: { can: () => true } },
+                createElement(ModelServiceAdminPage, { initialClusterId }),
+            ));
+            const filter = html.match(/<select[^>]*id="service-flow-cluster"[^>]*>[^]*?<\/select>/)?.[0];
+            assert.ok(filter);
+            assert.ok(filter.includes(`<option value="${initialClusterId || ''}" selected="">`));
+            assert.doesNotMatch(filter, /\sdisabled=/);
+        }
+    });
+
+    test('cluster navigation initializes an editable filter even before deployments load', () => {
+        for (const initialClusterId of [undefined, 'cluster-a']) {
+            const html = renderToStaticMarkup(createElement(
+                AuthContext.Provider,
+                { value: { can: () => true } },
+                createElement(DeploymentManagementPage, { initialClusterId }),
+            ));
+            const filter = html.match(/<select[^>]*aria-label="Filter by cluster"[^>]*>[^]*?<\/select>/)?.[0];
+            assert.ok(filter);
+            assert.ok(filter.includes(`<option value="${initialClusterId || ''}" selected="">`));
+            assert.doesNotMatch(filter, /\sdisabled=/);
+        }
+    });
+
     test('deployment search starts with the navigation filter and is empty on ordinary entry', () => {
         for (const initialSearch of [undefined, 'llm-d-qwen-a1b2']) {
             const html = renderToStaticMarkup(createElement(

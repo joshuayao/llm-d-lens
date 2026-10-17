@@ -6,6 +6,12 @@ description: Manage users, roles, role bindings, identity providers, sessions an
 Use the administration pages to give users access and review account activity.
 If a page or action is missing, sign in with an account authorized for that operation.
 
+After signing in, Lens opens the highest page in the sidebar that your permissions
+allow, including combined or custom role permissions. Sidebar ordering, not the
+role name, determines this landing page. If no pages are accessible, Lens shows
+an access-denied message. Refreshing an existing signed-in session preserves a
+valid page URL and its filters; a fresh sign-in starts at the landing page instead.
+
 ## Create a user
 
 1. Open the **Users** page.
