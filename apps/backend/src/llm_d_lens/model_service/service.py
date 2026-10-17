@@ -5,10 +5,11 @@ Design reference: docs/design/model-service-design.md#6-domain-model
 
 from __future__ import annotations
 
+from llm_d_lens.auth.access import owner_for_create
 from llm_d_lens.auth.contracts import Principal, ResourceRef
 from llm_d_lens.auth.policy import authorize
 from llm_d_lens.auth.service import default_service as default_auth_service
-from llm_d_lens.core.exceptions import ForbiddenError
+from llm_d_lens.core.exceptions import ForbiddenError, NotFoundError
 from llm_d_lens.db.dao.model_service_group import ModelServiceGroupDao, ModelServiceGroupDaoError
 from llm_d_lens.db.dao.model_service_member import ModelServiceMemberDao, ModelServiceMemberDaoError
 from llm_d_lens.db.dao.usage_record import UsageRecordDao
@@ -20,6 +21,7 @@ from llm_d_lens.model_service.contracts import (
     MemberCreateRequest,
     MemberUpdateRequest,
     ModelAccessToken,
+    ModelGrantRequest,
     ModelServiceGroup,
     ModelServiceMember,
     ProvidersStatusRequest,
@@ -86,6 +88,12 @@ class ModelService:
         requires both management permissions in the deployment's cluster.
         Gateway reconciliation is scheduled by the HTTP caller after commit.
         """
+        if principal is not None:
+            resource = ResourceRef(
+                resource_type="cluster", resource_id=request.cluster_id, cluster_id=request.cluster_id
+            )
+            if not authorize(principal, "model-service:group:manage", resource=resource).allowed:
+                raise ForbiddenError("model-service group management is required in this cluster")
         target = None
         if request.execution_id is not None:
             try:
@@ -114,6 +122,7 @@ class ModelService:
             served_name=target.model if target else request.served_name,
             base_model=request.name if target else (request.base_model or model_ref),
             created_by_user_id=created_by,
+            owner_user_id=owner_for_create(principal) if principal is not None else created_by,
         )
         member = self._member_for_target(group.id, target, published_by=created_by) if target else None
         try:
@@ -138,9 +147,11 @@ class ModelService:
         if (
             request.cluster_id is not None
             and request.cluster_id != group.cluster_id
-            and self.members.list_by_group(group_id)
+            and (
+                self.members.list_by_group(group_id) or self._auth.list_resource_shares("model_service_group", group_id)
+            )
         ):
-            raise ModelServiceConflictError("cannot move a model service to another cluster while it has providers")
+            raise ModelServiceConflictError("remove all providers and access grants before changing a model's cluster")
         for field in (
             "name",
             "model_ref",
@@ -180,6 +191,78 @@ class ModelService:
             self.groups.delete(group_id)
         except ModelServiceGroupDaoError as error:
             raise ModelServiceConflictError(str(error)) from error
+        self._auth.revoke_resource_shares(resource_type="model_service_group", resource_ids=[group_id])
+
+    def require_group_access(self, group_id: str, principal: Principal, permission: str) -> ModelServiceGroup:
+        group = self.groups.get(group_id)
+        if group is None:
+            raise NotFoundError("model service not found")
+        resource = ResourceRef(
+            resource_type="cluster", resource_id=group.cluster_id or "", cluster_id=group.cluster_id or ""
+        )
+        if principal is None or not authorize(principal, permission, resource=resource).allowed:
+            raise ForbiddenError(f"permission denied: {permission}")
+        return group
+
+    def list_access(self, group_id: str, *, principal: Principal) -> list[dict]:
+        """List inference-only user/group grants, requiring scoped grant management."""
+        self.require_group_access(group_id, principal, "model-service:group:share")
+        entries = []
+        for subject_type, binding in self._auth.list_resource_shares("model_service_group", group_id):
+            subject_id = binding.user_id if subject_type == "user" else binding.group_id
+            subject = (
+                self._auth.user_dao.get(subject_id) if subject_type == "user" else self._auth.group_dao.get(subject_id)
+            )
+            entries.append(
+                {
+                    "id": binding.id,
+                    "subjectType": subject_type,
+                    "subjectId": subject_id,
+                    "subjectName": (subject.username if subject_type == "user" else subject.name)
+                    if subject
+                    else subject_id,
+                    "permission": INFERENCE_PERMISSION,
+                    "createdAt": binding.created_at.isoformat(),
+                }
+            )
+        return entries
+
+    def grant_access(self, group_id: str, request: ModelGrantRequest, *, principal: Principal) -> dict:
+        """Grant model inference to a scoped user/group; never assign caller-selected roles."""
+        group = self.require_group_access(group_id, principal, "model-service:group:share")
+        role = self._auth.role_dao.get_by_name("end-user")
+        if role is None:
+            raise ModelServiceConflictError("built-in end-user role is not initialized")
+        binding = self._auth.share_resource(
+            subject_type=request.subject_type,
+            subject_id=request.subject_id,
+            role_id=role.id,
+            resource_type="model_service_group",
+            resource_id=group.id,
+            cluster_id=group.cluster_id,
+            granted_by=owner_for_create(principal),
+        )
+        return {
+            "id": binding.id,
+            "subjectType": request.subject_type,
+            "subjectId": request.subject_id,
+            "permission": INFERENCE_PERMISSION,
+        }
+
+    def revoke_access(self, group_id: str, binding_id: str, *, principal: Principal) -> None:
+        """Revoke only a grant belonging to this caller-authorized model."""
+        group = self.require_group_access(group_id, principal, "model-service:group:share")
+        self._auth.revoke_resource_share(
+            binding_id,
+            resource_type="model_service_group",
+            resource_id=group.id,
+            cluster_id=group.cluster_id,
+        )
+
+    def access_options(self, group_id: str, *, principal: Principal) -> dict:
+        """Minimal recipient directory restricted to inference-capable cluster scope."""
+        group = self.require_group_access(group_id, principal, "model-service:group:share")
+        return self._auth.model_share_options(group.cluster_id)
 
     def set_providers_status(
         self, group_id: str, request: ProvidersStatusRequest, *, principal: Principal
@@ -382,37 +465,29 @@ class ModelService:
             raise ModelServiceUnauthorizedError("token owner is not an active user")
         return user, self._auth.principal_for(user)
 
-    def _member_authorized(self, principal, member: ModelServiceMember) -> bool:
+    def group_authorized(self, group: ModelServiceGroup, principal: Principal) -> bool:
         resource = ResourceRef(
-            resource_type="deployment_execution",
-            resource_id=member.execution_id,
-            cluster_id=member.cluster_id or "",
-            owner_user_id=member.owner_user_id,
-            owner_group_id=member.owner_group_id,
+            resource_type="model_service_group",
+            resource_id=group.id,
+            cluster_id=group.cluster_id or "",
         )
-        return authorize(principal, INFERENCE_PERMISSION, resource=resource).allowed
+        return principal is not None and authorize(principal, INFERENCE_PERMISSION, resource=resource).allowed
 
     def authorized_members(self, group: ModelServiceGroup, principal) -> list[ModelServiceMember]:
-        published = self.members.list_by_group(group.id)
-        # Gateway chooses the pool after authorization. Never authorize just one
-        # provider while allowing the proxy to send the request to a forbidden one.
-        # Keep staged/draining providers in the permission boundary as the proxy
-        # may still use its previous allocation while reconciliation is pending.
-        if any(member.endpoint_kind == "llm-d-epp" for member in published) and not all(
-            self._member_authorized(principal, member) for member in published
-        ):
+        if not self.group_authorized(group, principal):
             return []
+        published = self.members.list_by_group(group.id)
         return [
             member
             for member in published
-            if member.status == "active" and member.weight > 0 and self._member_authorized(principal, member)
+            if member.cluster_id == group.cluster_id and member.status == "active" and member.weight > 0
         ]
 
     def list_models_for_user(self, user_id: str) -> list[ModelServiceGroup]:
         """Active groups with a healthy positive-weight provider the user may call.
 
-        Gateway-backed groups require access to every attached deployment, including
-        staged and draining providers, because proxy updates are asynchronous.
+        Consumers require inference cluster scope and an explicit model grant.
+        Operators retain non-self-scoped inference within their binding's scope.
         """
         user = self._auth.user_dao.get(user_id)
         if user is None or user.status != "active":

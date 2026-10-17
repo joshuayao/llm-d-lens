@@ -384,12 +384,12 @@ def test_cluster_scope_is_enforced(monkeypatch):
         service.update_traffic(group.id, _request(), principal=principal)
 
 
-def test_gateway_admission_covers_all_attached_pools_during_draining(monkeypatch):
+def test_gateway_admission_uses_model_entitlement_and_preserves_provider_weights(monkeypatch):
     service, group, principal, first, _ = _setup(monkeypatch)
     service.update_traffic(group.id, _request(1, 0), principal=principal)
-    monkeypatch.setattr(service, "_member_authorized", lambda _, member: member.execution_id == "a")
+    monkeypatch.setattr(service, "group_authorized", lambda *_: False)
     assert service.authorized_members(group, principal) == []
-    monkeypatch.setattr(service, "_member_authorized", lambda *_: True)
+    monkeypatch.setattr(service, "group_authorized", lambda *_: True)
     assert [member.id for member in service.authorized_members(group, principal)] == [first.id]
 
 

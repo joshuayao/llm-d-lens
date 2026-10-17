@@ -140,9 +140,37 @@ Successful submission is not proof of controller acceptance or measured traffic
 ratios. Inspect HTTPRoute Accepted/ResolvedRefs and real request counts.
 
 Weights do not rewrite `model` in request bodies or provide automatic failover.
-All providers must accept the same provider model name. Gateway-backed services
-require callers to have inference access to every attached deployment, including
-staged and disabled providers, to remain safe during asynchronous route updates.
+All providers must accept the same provider model name. Authorization applies to
+the model service, not individual deployments. Authorized callers use all online,
+positive-weight providers through the unchanged native HTTPRoute weights.
+
+## Manage model access
+
+Admin and maintainers can manage inference grants in their authorized clusters.
+This does not give maintainers permission to create/delete model services or
+manage the shared Gateway.
+
+1. Open the public model name's menu and choose **Manage access**.
+2. In the right-hand drawer, choose **User** or **Group**, then the recipient.
+3. Click **Grant inference access**. Only recipients with inference permission
+   in the model's cluster are offered; a model grant never adds cluster scope.
+4. Use **Revoke** beside an existing grant to remove it, or **Close** to leave.
+
+Consumers need both inference cluster scope and a direct or group model grant.
+The grant covers all of this model's providers, including future additions, but
+not deployment management or onward sharing. Scoped operators retain their
+existing inference access without an individual model grant. Own API keys and
+usage remain private. New models have no consumer grants.
+
+Revocation affects subsequent inference requests, including existing API keys;
+already-running streams are not interrupted. Models must also be serving with
+an online positive-weight provider to appear in **My services** or `/v1/models`.
+Renaming a model preserves its grants; deletion removes them, and recreating the
+same name does not restore access.
+
+Deployment sharing has been removed. The migration audits and removes old
+deployment grants without converting them into broader model grants. An admin
+or scoped maintainer must grant model access again to affected consumers.
 
 ## Remove a model service or a provider
 

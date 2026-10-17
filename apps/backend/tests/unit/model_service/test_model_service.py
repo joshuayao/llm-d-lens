@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from llm_d_lens.api.main import app
 from llm_d_lens.auth.contracts import Principal, RoleBinding, ScopeType
 from llm_d_lens.auth.records import UserRecord
+from llm_d_lens.auth.service import AuthService
 from llm_d_lens.db.dao.user import UserDao
 from llm_d_lens.model_service.contracts import (
     AuthorizeRequest,
@@ -75,10 +76,7 @@ def _admin_principal(user_id: str, username: str) -> Principal:
     )
 
 
-class _StubAuth:
-    def __init__(self) -> None:
-        self.user_dao = UserDao()
-
+class _StubAuth(AuthService):
     def principal_for(self, user: UserRecord) -> Principal:
         return _admin_principal(user.id, user.username)
 

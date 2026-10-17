@@ -13,6 +13,10 @@ navigation.
   [Native llm-d routing](#lens-model-service-design-per-cluster-native-llm-d);
   **Scope and status:** Current per-cluster routing and control-plane ownership.
 - **Part:**
+  [Authorization alternatives](#authorization-alternatives);
+  **Scope and status:** A (model-service grants) is selected; B
+  (deployment-authorized weighted routing) remains an unimplemented alternative.
+- **Part:**
   [Gateway deployment and operations](#model-service-gateway-deployment-and-operations-guide-llm-d-gateway-mode);
   **Scope and status:** Deployment layers, configuration, acceptance and
   troubleshooting.
@@ -378,13 +382,21 @@ Standard Envoy **ext_authz** points to Lens; no custom ext_proc or subset.
 - Rejection: 401/404, without distinguishing missing resources from forbidden
   ones.
 
-Authorization is at **model-service level**; EPP owns endpoint selection. For
-Gateway-backed services, callers must be authorized for **every attached
-deployment**, including zero-weight and disabled providers. This conservative
-boundary prevents a pending/failed traffic update from admitting callers based
-only on a new allocation while the proxy still uses an older one. At least one
-active positive-weight provider is also required. Lens's legacy authorization
-result member is not evidence of which pool the Gateway actually selected.
+Authorization is at **model-service level**; EPP owns endpoint selection.
+Consumers need an inference-capable binding covering the model's cluster and an
+explicit user/group grant on the stable model-service ID. All providers of that
+model share one inference boundary. Global admins and non-self-scoped operators
+retain inference within their applicable scope; unrelated bindings cannot
+broaden it. Ownership and deployment shares do not authorize consumer inference.
+At least one active positive-weight provider is also required. Lens's legacy
+authorization result member is not evidence of the pool actually selected.
+
+Admin and scoped maintainers manage grants using `model-service:group:share`.
+Inference grants never confer management or onward sharing; token and personal
+usage actions remain self-scoped. Authorization resolves current grants on each
+inference request, without interrupting already-running streams.
+See [Alternative A](#alternative-a-cluster-scope-plus-model-service-grants) and
+auth decision D28 for the approved migration and unchanged routing boundaries.
 
 ### 9. Control-plane components
 
@@ -588,6 +600,371 @@ unimplemented provider TLS, HA or draining paths are already available.
   control-plane instances
 
 <!-- /design-part: gateway-mode -->
+
+## Authorization Alternatives
+
+**Decision (2026-10-17): A is selected.** The user approved admin and scoped
+maintainer grant management, existing scoped operator inference, retirement of
+deployment shares without conversion, and model owner columns backed by the
+existing resource-binding tables. See D28 in the
+[authorization design](auth-rbac-design.md). B remains a design alternative,
+not an enabled behavior or an approved data-plane extension.
+
+### Previous baseline (before A)
+
+- Gateway-backed model access requires inference authorization for every
+  attached deployment, including disabled and zero-weight providers. At least
+  one active positive-weight provider must also exist.
+- `model-service:inference:use` is evaluated against a
+  `deployment_execution` resource. For end-users it is self-scoped: a cluster
+  binding alone is insufficient; resource ownership or a share is required.
+- Deployment sharing uses `deployment:run:share`, resource-scoped user/group
+  role bindings, and the `deployment_run` / `deployment_execution` resource
+  types. It is not a model-service ACL.
+- End-users have only `model-service:inference:use`,
+  `model-service:token:manage`, and `model-service:usage:read`. They cannot view
+  deployment management, cluster management, evaluation, or observability pages.
+- Admin has the full permission catalog. Maintainer has the catalog minus its
+  explicit deny list: it can manage deployments and model members in scope,
+  but not `model-service:group:manage` or `model-service:gateway:manage`.
+  Resource sharing must not silently erase that distinction.
+- Standard HTTPRoute selects an InferencePool using configured backend weights;
+  that pool's EPP chooses a Pod. The legacy `x-lens-member` authorization result
+  does not constrain the current Gateway's selected backend.
+
+### Shared security requirements
+
+Both alternatives preserve the existing public model name and cluster endpoint.
+Neither grants end-users direct access to deployment endpoints, Pod logs,
+configuration, Kubernetes credentials, or deployment management APIs.
+
+Evaluate action and scope through the **same applicable role binding**, not
+through an unrelated union of permissions and reachable clusters. For example,
+being an end-user in cluster X and a maintainer in Y must not confer deployment
+management in X. A resource grant never grants cluster access by itself.
+
+API key ownership and personal usage remain self-scoped. User/group changes,
+grant revocation, user disablement and scope removal affect subsequent requests
+made with existing API keys. Define an explicit cache/invalidation bound; do not
+promise that already-running streams are terminated automatically.
+
+Model listing and invocation must use the same entitlement policy. Separate
+entitlement from operational readiness: an entitled model can be unavailable
+because it is stopped or has no eligible provider. Never route a request to an
+unauthorized provider to avoid an availability error. Preserve the non-disclosing
+401/404 contract for invalid credentials and unauthorized/missing models.
+
+Kubernetes RBAC and ReferenceGrant govern resource administration/references,
+not Lens end-user inference entitlement. Protect workload endpoints against
+bypassing the authenticated Gateway using the deployment's networking policy.
+Hiding a button or removing a page is not an authorization control.
+
+### Alternative A: Cluster Scope Plus Model-Service Grants
+
+**Intent:** Treat a published model service as the inference authorization
+boundary and its deployments as interchangeable internal providers. Remove
+deployment resource sharing; retain scoped deployment management for operators.
+Keep the community routing/scheduling data plane unchanged.
+
+For a consumer request:
+
+```text
+allow =
+  valid API key and active user
+  AND inference permission from a binding covering the model's cluster
+  AND an explicit grant on this model service to the user or one of their groups
+  AND the model is serving with an eligible provider
+```
+
+Cluster scope is a ceiling, not permission to invoke every deployment. An
+end-user can invoke all eligible providers **of an authorized model service**
+through the Gateway, without separate deployment grants. Unpublished workloads
+and other model services remain inaccessible.
+
+For model M in cluster X with providers A, B and C at weights `1:1:1`, a user
+with X scope and a grant on M receives approximately one third of requests on
+each provider. A user missing either X scope or the M grant cannot invoke M.
+HTTPRoute performs the split; each existing EPP retains Pod scheduling.
+
+#### A: Permission and built-in role changes
+
+- **Add:** `model-service:group:share` to list, grant and revoke model
+  inference access and obtain the purpose-limited user/group picker.
+  `group:manage` and `member:manage` must not implicitly include this authority.
+- **Retire:** `deployment:run:share`, its deployment access endpoints, UI, MCP
+  entries and deployment resource grants. Remove persisted role-permission
+  references only through a reviewed migration; catalog deletion alone is not
+  a complete retirement.
+- **Retain code, change target/semantics:** `model-service:inference:use` becomes
+  model-service entitlement, rather than an entitlement to an individual
+  deployment execution. Do not introduce a second end-user "deployment use"
+  permission.
+- **Retain unchanged:** `model-service:token:manage`,
+  `model-service:usage:read`, deployment read/create/update/delete/connect/case
+  actions, and existing model group/member/gateway/router management codes.
+  Other resource domains' grants and ownership rules are out of scope.
+
+| Built-in role | Approved delta |
+| --- | --- |
+| admin | Add model grants; retire deployment sharing |
+| maintainer | Add scoped model grants; retire deployment sharing |
+| end-user | Same codes; require service grants for inference |
+
+Admin retains scoped management authority. Maintainer keeps deployment/member
+operations without new group/gateway management or identity-directory access.
+End-user keys/usage remain private and management pages remain unavailable.
+
+Grant management is intentionally included for maintainer. Its existing
+`group:manage` and `gateway:manage` exclusions remain unchanged.
+
+Do **not** simply remove inference from `_END_USER_SELF_SCOPED`: that would make
+the cluster binding alone sufficient under generic authorization. Replace the
+deployment ownership/share evaluation with an explicit model grant gate.
+
+**Approved operator exception:** preserve the global-admin bypass and
+non-self-scoped inference bindings in their applicable cluster/global scope.
+The inference action and cluster must come from the same applicable binding.
+Grant-management permission alone is not an inference bypass.
+
+#### A: Backend, persistence and UI
+
+Use the existing user/group resource-grant infrastructure where its contract
+fits, with resource type `model_service_group` and the group's stable
+ID. Never key grants by public name. Renaming retains grants; deleting and
+recreating a model does not inherit them.
+
+Existing resource grants store a role ID, not an arbitrary per-resource action
+list. A model grant endpoint must constrain the grant to inference use, rather
+than allowing callers to assign admin/maintainer or arbitrary custom roles.
+The approved representation uses existing user/group resource bindings fixed to
+the built-in end-user role; policy accepts them for model inference only.
+Generic binding APIs enforce the same resource type, role and cluster checks.
+The owner-column migration adds nullable `owner_user_id` / `owner_group_id`
+foreign keys with SET NULL, backfills the former from `created_by_user_id`, and
+leaves historical owner groups empty. Ownership records do not grant consumers
+inference or onward sharing.
+
+Implementation surfaces:
+
+- Add model-service grant list/create/revoke/options APIs in
+  `model_service/router.py`, gated by the new code and resource cluster scope.
+  Register routes in `auth/routes.py`; reuse scoped subject lookup and audit
+  conventions rather than opening administrator user/group APIs to maintainers.
+- Update `model_service/service.py` authorization and visible-model queries,
+  `resolution.py`, and every internal caller that resolves a model service.
+  Remove inference's dependency on deployment shares only for this alternative.
+- Update `auth/service.py` grant allowlists, validation, deletion cleanup and
+  principal/group invalidation. Group membership must also be checked at
+  invocation time; granting to a group cannot grant future members cluster access.
+- Remove both run-level and execution-level deployment `/access` and
+  `/access/options` surfaces from `deploy/router.py`, route permission
+  registries, the deployment share drawer/client, and generated MCP catalog.
+  Adjust deployment list/detail visibility paths that currently admit shares.
+  Do not remove generic sharing utilities still used by another resource.
+- Add an access-management action to the model service UI, showing user/group
+  grants without giving recipients management or onward-sharing rights.
+  Keep end-user My services, API keys and My usage as consumer surfaces.
+- Revoke model grants on model deletion, and retain cluster-bound cleanup.
+  Define deletion failure/retry behavior consistently with safe HTTPRoute
+  cleanup. Updating weights or replacing providers does not rewrite model ACLs.
+
+**Tradeoff:** A model maintainer can change where an authorized request executes
+by changing its providers. All providers of a model must therefore belong to the
+same approved service/security boundary, remain in its cluster, and have audited
+publication changes. This still permits different model services in one cluster
+to have different audiences.
+
+#### A: Migration
+
+Inventory existing deployment shares, direct role bindings, users/groups and
+model memberships before changing policy. Do not automatically convert access
+to provider A into access to a model also containing B and C. Existing shares
+may convey non-inference actions too; report that lost access separately.
+
+The approved migration `42a3e9b47726` audits and deletes run/execution resource
+bindings, removes the retired permission from persisted roles, grants model
+access administration to builtin admin/maintainer, and increments user/group
+authorization versions. It does not create any model grants. Affected consumers
+must receive new grants from admin or scoped maintainer after cutover.
+Generic binding APIs reject recreation of retired deployment shares.
+Downgrade audits/removes model grants and drops the owner columns, but never
+restores retired deployment shares. Restoring a backup is a separate reviewed
+operation because it can resurrect revoked access.
+
+Operational visibility remains compatible: stopped models or models without an
+online positive-weight provider do not appear in consumer model listings.
+The provider-count limit remains 16; neither the routing resources nor Gateway
+auth-context headers change for A.
+
+### Alternative B: Deployment Grants Plus Authorized Weighted Routing
+
+**Intent:** Keep deployment-level authorization and sharing. A user is entitled
+to a model service if at least one attached deployment is authorized; requests
+are routed only among authorized, eligible providers. Extend the llm-d/Gateway
+data plane where necessary rather than encoding every permission combination
+as a static route or moving inference forwarding into Lens.
+
+```text
+authorized = attached deployments permitted for this user
+eligible = authorized intersect online, positive-weight, published providers
+
+model entitlement = authorized is nonempty
+request admissible = model is serving AND eligible is nonempty
+P(provider i | this request) = weight(i) / sum(weight(j) for j in eligible)
+```
+
+A share on an offline or zero-weight deployment can preserve entitlement but
+does not make that provider routable. Define how My services displays such
+unavailable models; never confuse permission denial with readiness or silently
+fall back to a forbidden provider. Newly attached unauthorized providers do not
+revoke access to previously authorized providers.
+
+For A:B:C weights `1:1:1`:
+
+| Authorized eligible providers | Request distribution |
+| --- | --- |
+| A, B, C | Approximately one third each |
+| A, B | 50%, 50%, 0% |
+| A only | 100%, 0%, 0% |
+| None | No inference request admitted |
+
+The public model name and client endpoint are unchanged. Model-global traffic
+need not follow `1:1:1`: proportions are conditional on each request's authorized
+set and on which users generate traffic. Keep configured weights separate from
+observed per-provider usage.
+
+#### B: Permission and built-in role changes
+
+No new permission code is required for the baseline proposal:
+
+- Keep `deployment:run:share` and deployment user/group resource grants.
+- Keep `model-service:inference:use` evaluated against deployment resources.
+  Change the model-service aggregation from **all attached providers** to
+  **any authorized provider**, with routing limited to the eligible subset.
+- Keep the end-user inference action self-scoped; a cluster binding does not
+  grant all deployments. Its own-token and own-usage permissions remain unchanged.
+- Keep admin and maintainer's existing scoped deployment/sharing capabilities,
+  including current model group/gateway management restrictions.
+- Do not add deployment read/manage permissions to end-user merely to support
+  inference. Sharing a deployment for inference must not expose its management
+  page, logs, endpoints or onward-sharing actions.
+- Do not add Alternative A's model-service ACL as an implicit extra gate. That
+  would be a third policy, requiring its own product decision.
+
+#### B: Data-plane extension boundary
+
+Lens authorizes a set of stable deployment/provider IDs. A trusted per-request
+context carries that set, its model/cluster identity and relevant policy/route
+revision to a data-plane component that filters **before choosing a pool**.
+The standard shared HTTPRoute backend list cannot itself interpret this context.
+Returning a header from ext_authz without a consumer is not an implementation.
+
+The preferred extension point to investigate is the Gateway/llm-d integration
+that selects among InferencePool backends. It would intersect the trusted set
+with its applied routing snapshot, perform the existing weighted choice over
+that intersection, and invoke the selected pool's EPP. Lens remains an
+authorization/control-plane service, not an inference proxy or scheduler.
+
+An EPP-only filter is insufficient for the current multi-pool architecture:
+the Gateway has already chosen a pool before that EPP runs. Consolidating all
+providers into one pool would be a different architecture, requiring explicit
+validation of per-deployment weights, selectors, EPP configuration,
+prefill/decode behavior and scheduling isolation. Do not present it as a
+drop-in plugin.
+
+No compatible upstream implementation is claimed here. First inspect the
+deployed Gateway/GAIE/llm-d versions and extension contracts, then prove a
+bounded prototype. Prefer upstream contributions or documented extension
+interfaces over maintaining a Lens-specific Gateway fork.
+
+Security and rollout requirements:
+
+- Strip caller-supplied authorization-context headers and accept only trusted
+  auth output. If context crosses another trust boundary, authenticate it with
+  audience, expiry and request/model/cluster binding as appropriate. Treat it
+  as internal data; do not return other users' entitlement information.
+- Bound context size and reject truncation/invalid context. IDs are not
+  arbitrary URLs or caller-selected network destinations.
+- Select from current authorization and the applied route revision together.
+  Permission revocation must exclude a provider even if an old routing snapshot
+  still contains it; newly authorized providers must not be selected before
+  their route exists.
+- Validate route-cache behavior and filter order. Pool selection must precede
+  invocation of that pool's EPP, and must not bypass authentication on rematch.
+- Retries remain within the authorized subset, with limits. Do not transparently
+  reroute once an SSE response has begun. An unavailable/unknown extension or
+  invalid context must fail closed, never fall back to unrestricted weights.
+- Keep token/user attribution intact and record the **actual** selected pool
+  for execution attribution, rather than trusting the legacy Lens-selected
+  member returned by authorization.
+
+Do not create a route for every user/subset. With 64 independently authorized
+providers there can be `2^64 - 1` nonempty subsets; a bounded per-request set and
+linear filtering avoid that configuration explosion. **64 is a proposed scale
+target, not a statement of current support:** the current Lens editor/renderer
+accept at most 16 providers. Supporting 64 separately requires verifying or
+extending the applicable Gateway API schema, controller and renderer limits;
+authorization changes alone do not raise them.
+
+#### B: Implementation scope and cutover
+
+Change `authorized_members`, model listing, invocation and internal model
+resolution consistently. Keep deployment share APIs and UI. Add validated
+authorization-context contracts and the corresponding Gateway/llm-d extension,
+provider-specific installation/reconciliation support, readiness checks and
+observability. Capabilities must come from the configured provider integration,
+not vendor branches scattered through consumers.
+
+**Do not change the all-provider authorization check first.** Enable any-provider
+admission only after the data plane proves it enforces the allowed subset for
+every request. Upgrade/rollback must keep policy and routing capability coupled;
+an old Gateway must never receive newly admitted restricted requests.
+When upgrading the previous deployment-based policy to B, its safe all-provider
+behavior must remain until that acceptance gate passes. A uses the model-level
+boundary instead and does not enable B's any-deployment admission.
+
+### Comparison and Decisions Required Before Implementation
+
+| Dimension | Alternative A | Alternative B |
+| --- | --- | --- |
+| Inference grant target | Model service | Deployment |
+| Different audiences within one model | Not supported | Supported |
+| Native weighted HTTPRoute | Unchanged | Extension required |
+| Routing choice owner | Gateway + EPP | Gateway extension + EPP |
+| Permission catalog | Replace sharing target | Codes unchanged |
+| Migration risk | Grant conversion | Policy/data-plane mismatch |
+| Operational cost | Lower; control plane | Higher; extension lifecycle |
+
+Choose A if a model service is the intended security boundary and standard
+llm-d behavior is the priority. Choose B if retaining arbitrary deployment
+entitlements behind the same model name is a requirement and maintaining or
+upstreaming the necessary extension is acceptable. The user selected A; this
+comparison does not approve implementation of B.
+
+The A decisions above are recorded in D28. Implementing B or changing these
+approved grant-management, operator, migration or schema rules requires a new
+decision; historical decisions remain in the ledger.
+
+### Required Verification
+
+- Matrix of user/group grants, same/different clusters, global/cluster/custom
+  roles and mixed bindings; no permission/scope union escalation.
+- API key ownership and personal usage isolation; API, UI and MCP denial for
+  end-user deployment management; direct endpoint bypass threat checks.
+- Grant/role/group changes, deletions, renamed/recreated model IDs, cache
+  invalidation and multiple Lens instances.
+- Model-list/invocation consistency, stopped models, no providers, zero weights,
+  offline providers and provider membership changes during reconciliation.
+- A: unauthorized models in an otherwise authorized cluster stay inaccessible;
+  all authorized model backends use standard configured weights; new providers
+  do not create a deployment-level grant requirement.
+- B: `1:1:1` becomes `1:1` for a two-provider authorized subset; forbidden
+  providers receive zero requests, including retries and stale-route scenarios.
+  Use statistical distribution checks, not an exact split for a small sample.
+- B: forged/missing/oversized/stale context, pool/EPP pairing, streaming,
+  compatibility with old controllers, extension failure and rollback.
+- Update REST/Python API descriptions, permission/role documentation and both
+  published documentation locales when an alternative is implemented.
 
 <!-- design-part: gateway-operations -->
 

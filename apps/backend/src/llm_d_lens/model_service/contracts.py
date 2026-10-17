@@ -73,6 +73,8 @@ class ModelServiceGroup(StrictModel):
     served_name: str | None = Field(default=None, alias="servedName")
     base_model: str | None = Field(default=None, alias="baseModel")
     created_by_user_id: str | None = Field(default=None, alias="createdByUserId")
+    owner_user_id: str | None = Field(default=None, alias="ownerUserId")
+    owner_group_id: str | None = Field(default=None, alias="ownerGroupId")
     created_at: datetime = Field(default_factory=utcnow, alias="createdAt")
     updated_at: datetime = Field(default_factory=utcnow, alias="updatedAt")
 
@@ -142,6 +144,13 @@ class UsageRecord(StrictModel):
 
 
 # --- request contracts -------------------------------------------------------
+
+
+class ModelGrantRequest(StrictModel):
+    """Grant inference only; cluster and grant role are derived by the server."""
+
+    subject_type: Literal["user", "group"] = Field(alias="subjectType", description="Recipient kind.")
+    subject_id: str = Field(min_length=1, alias="subjectId", description="Existing user or group ID.")
 
 
 class TokenCreateRequest(StrictModel):

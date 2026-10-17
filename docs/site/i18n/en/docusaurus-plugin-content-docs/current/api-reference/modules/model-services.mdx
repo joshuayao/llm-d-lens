@@ -165,7 +165,12 @@ Revoke one previously issued model access token for the caller. After revocation
 
 ### List accessible models
 
-List the model groups that the caller is currently allowed to use through the model gateway. Active groups require an authorized active positive-weight provider. Gateway-backed groups additionally require inference access to every attached deployment, including staged and disabled providers, because asynchronous proxy updates may still use an earlier allocation. Each entry includes `clusterName` (resolved from the group's `clusterId`) so callers can distinguish the same public name published in different clusters.
+List callable active models with online positive-weight providers. Consumers need
+inference permission in the model's cluster plus a direct or group model grant;
+non-self-scoped operators retain inference access in their binding's scope.
+Deployment shares and ownership do not grant consumer inference. This policy
+also applies to `/v1/models` and Gateway authorization. Entries include
+`clusterName` to distinguish identical public names in different clusters.
 
 <Tabs>
   <TabItem value="rest-api" label="REST API">
@@ -434,7 +439,84 @@ Aggregate the caller's recent usage records into daily token totals. The handler
 
 ### List model routing groups
 
-List all configured model routing groups. Each group is a cluster-scoped user-facing model name that routes to one or more deployment-owned InferencePools.
+List configured model groups in the caller's cluster-scoped read authority.
+Each group is a public model name routing to deployment-owned InferencePools.
+`GET /api/v1/model-service/admin/groups/{group_id}` enforces the same scoped
+`model-service:group:read` permission. Group payloads also include nullable
+`ownerUserId` and `ownerGroupId`; ownership alone does not grant consumer inference.
+
+### Model inference grants
+
+All access-management endpoints require `model-service:group:share` in the
+model's cluster. Admin and maintainer have this permission; it does not imply
+group or Gateway management. Grants cover every provider of the model, not its
+management APIs. Model deletion revokes grants; renaming preserves them.
+An empty model cannot move clusters while grants remain.
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+
+| Method | Path below `/api/v1/model-service/admin/groups/{group_id}` | Result |
+| --- | --- | --- |
+| GET | `/access` | `{"items":[...]}` with grant IDs, `subjectType`, `subjectId`, `subjectName`, `permission`, `createdAt` |
+| GET | `/access/options` | `{"users":[{"id":"user-123","username":"alice"}],"groups":[{"id":"group-123","name":"team"}]}` |
+| POST | `/access` | HTTP 201 with grant ID, recipient and inference permission |
+| DELETE | `/access/{binding_id}` | HTTP 204, empty body |
+
+POST body:
+
+```json
+{"subjectType":"user","subjectId":"user-123"}
+```
+
+Response example:
+
+```json
+{"id":"binding-123","subjectType":"user","subjectId":"user-123","permission":"model-service:inference:use"}
+```
+
+Use `subjectType: "group"` for a group. No role, cluster or owner field is accepted.
+The server fixes the grant role and derives the cluster from the stored model.
+Recipients must already have inference permission in that cluster. The options
+endpoint exposes only eligible recipient IDs and display names, not full
+identity records. Disabled/protected users are not selectable.
+
+Insufficient scope returns 403, missing resources or a mismatched revoke binding
+return 404, duplicates return 409, and invalid/extra fields return 422.
+Revocation re-evaluates subsequent requests using existing API keys without
+interrupting already-running streams or changing HTTPRoute weights.
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+
+```python
+from llm_d_lens.model_service.contracts import ModelGrantRequest
+from llm_d_lens.model_service.service import default_service
+
+def grant_model(model_id: str, user_id: str, principal):
+    service = default_service()
+    return service.grant_access(
+        model_id,
+        ModelGrantRequest(subject_type="user", subject_id=user_id),
+        principal=principal,
+    )
+
+def read_model_access(model_id: str, principal):
+    service = default_service()
+    return (
+        service.list_access(model_id, principal=principal),
+        service.access_options(model_id, principal=principal),
+    )
+
+def revoke_model(model_id: str, binding_id: str, principal):
+    default_service().revoke_access(model_id, binding_id, principal=principal)
+```
+
+Pass the authenticated caller's resolved principal. These methods enforce
+grant-management action and model cluster scope, including for internal callers.
+  </TabItem>
+</Tabs>
+
+### List model routing groups: examples
 
 <Tabs>
   <TabItem value="rest-api" label="REST API">

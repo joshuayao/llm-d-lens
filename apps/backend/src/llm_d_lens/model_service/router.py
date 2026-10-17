@@ -30,6 +30,7 @@ from llm_d_lens.auth.access import (
     filter_by_cluster,
     owner_for_create,
     require_cluster_access,
+    resource_readable,
     visible_cluster_ids,
 )
 from llm_d_lens.cluster.registry import gateway_lock
@@ -39,6 +40,7 @@ from llm_d_lens.model_service.contracts import (
     GroupUpdateRequest,
     MemberCreateRequest,
     MemberUpdateRequest,
+    ModelGrantRequest,
     ProvidersStatusRequest,
     TokenCreateRequest,
     TrafficUpdateRequest,
@@ -197,9 +199,10 @@ async def revoke_token(token_id: str, request: Request) -> Response:
 @router.get(
     "/models",
     summary="List the model names the caller may call.",
-    description="Return active model groups with an authorized active positive-weight provider. Gateway-backed groups "
-    "require inference access to every attached deployment, including staged and disabled providers, because Gateway "
-    "updates are asynchronous. Includes the cluster display name.",
+    description="Return active services with positive-weight online providers. Consumers need inference permission "
+    "in the model's cluster and a user/group grant on the model service. Operators retain non-self-scoped inference "
+    "access in their binding's cluster scope. Deployment grants do not confer access. "
+    "Includes the cluster display name.",
 )
 async def list_models(request: Request) -> dict:
     user_id = _user_id(request)
@@ -248,8 +251,9 @@ async def model_service_connection(request: Request) -> dict:
 @public_router.get(
     "/v1/models",
     summary="OpenAI-compatible model list for a model token.",
-    description="Validate the model token and list visible active services with positive-weight healthy providers. "
-    "Gateway-backed services require access to every attached deployment, including staged and disabled providers.",
+    description="Validate the model token and list callable active services with positive-weight online providers. "
+    "Consumers require inference cluster scope plus a model-service user/group grant; non-self-scoped operators "
+    "retain inference access in scope. Uses the same entitlement rule as Gateway authorization.",
 )
 async def public_list_models(request: Request) -> Response:
     """OpenAI ``GET /v1/models`` served by the control plane (decision D13).
@@ -315,9 +319,21 @@ def _daily_totals(records) -> list[dict]:
 # --- admin: groups / members / usage -----------------------------------------
 
 
-@admin_router.get("/groups", summary="List model routing groups.")
-async def admin_list_groups() -> dict:
-    return {"items": [group.api_payload() for group in _service.list_groups()]}
+@admin_router.get("/groups", summary="List model routing groups in the caller's cluster scope.")
+async def admin_list_groups(request: Request) -> dict:
+    principal = current_principal(request)
+    groups = [
+        group
+        for group in _service.list_groups()
+        if resource_readable(
+            principal,
+            permission="model-service:group:read",
+            resource_type="cluster",
+            resource_id=group.cluster_id or "",
+            cluster_id=group.cluster_id,
+        )
+    ]
+    return {"items": [group.api_payload() for group in groups]}
 
 
 @admin_router.post(
@@ -344,12 +360,58 @@ async def admin_create_group(request: Request, body: GroupCreateRequest, backgro
     return group.api_payload()
 
 
-@admin_router.get("/groups/{group_id}", summary="Get a model routing group.")
-async def admin_get_group(group_id: str) -> dict:
-    group = _service.get_group(group_id)
-    if group is None:
-        raise HTTPException(status_code=404, detail=f"group not found: {group_id}")
+@admin_router.get("/groups/{group_id}", summary="Get a model routing group with cluster-scoped read permission.")
+async def admin_get_group(group_id: str, request: Request) -> dict:
+    group = _service.require_group_access(group_id, current_principal(request), "model-service:group:read")
     return group.api_payload()
+
+
+@admin_router.get(
+    "/groups/{group_id}/access",
+    summary="List a model service's inference grants.",
+    description="Requires model-service:group:share in the model's cluster. Returns user/group grants with display "
+    "names, binding IDs and inference permission. A missing model returns 404; insufficient scope returns 403.",
+)
+async def list_model_access(group_id: str, request: Request) -> dict:
+    return {"items": _service.list_access(group_id, principal=current_principal(request))}
+
+
+@admin_router.get(
+    "/groups/{group_id}/access/options",
+    summary="List eligible model inference grant recipients.",
+    description="Requires scoped model-service:group:share. Returns only user IDs/usernames and group IDs/names "
+    "for recipients with inference permission in this model's cluster; does not expose the full identity directory. "
+    "Only active, non-protected users are selectable. Model grants do not establish cluster scope.",
+)
+async def model_access_options(group_id: str, request: Request) -> dict:
+    return _service.access_options(group_id, principal=current_principal(request))
+
+
+@admin_router.post(
+    "/groups/{group_id}/access",
+    status_code=201,
+    summary="Grant inference access to a model service.",
+    description="Requires model-service:group:share in the model's cluster. Accepts subjectType (user/group) and "
+    "subjectId only. The server derives cluster and inference-only grant role; no management, direct deployment "
+    "access or onward sharing is granted. Recipient must already have inference cluster scope. Returns the grant "
+    "ID and recipient (201), 403 for insufficient scope, 404 for missing resources, or 409 for duplicate grants. "
+    "The grant covers all providers of this model without changing HTTPRoute weights.",
+)
+async def grant_model_access(group_id: str, body: ModelGrantRequest, request: Request) -> dict:
+    return _service.grant_access(group_id, body, principal=current_principal(request))
+
+
+@admin_router.delete(
+    "/groups/{group_id}/access/{binding_id}",
+    status_code=204,
+    summary="Revoke a model service's inference grant.",
+    description="Requires scoped model-service:group:share. Deletes only the specified model's grant and invalidates "
+    "recipient authorization. New inference requests re-evaluate access; existing streams are not interrupted. "
+    "A missing or mismatched binding returns 404. Other grants and HTTPRoute weights are unchanged.",
+)
+async def revoke_model_access(group_id: str, binding_id: str, request: Request) -> Response:
+    _service.revoke_access(group_id, binding_id, principal=current_principal(request))
+    return Response(status_code=204)
 
 
 @admin_router.put(
@@ -421,7 +483,7 @@ async def admin_update_group(group_id: str, body: GroupUpdateRequest, request: R
     "while any provider remains, including offline providers. Removes the model's Lens-managed HTTPRoute "
     "and IPP mapping and confirms deletion before deleting the record. Returns 404 for a missing model; "
     "502 model_removal_failed preserves the record for retry when cleanup fails. Deployments, Pods, "
-    "other models and shared Gateway resources are not deleted.",
+    "other models and shared Gateway resources are not deleted. Associated model inference grants are revoked.",
 )
 async def admin_delete_group(group_id: str, request: Request) -> Response:
     principal = current_principal(request)
@@ -774,9 +836,10 @@ async def admin_gateway_logs(body: ComponentLogsRequest, request: Request) -> St
 @internal_router.post(
     "/authorize",
     summary="ext_authz: validate token and authorize model access.",
-    description="Validate the inference token and authorize the model in the requested cluster. Gateway-backed models "
-    "require access to every attached deployment, including staged and disabled providers, and an active "
-    "positive-weight provider. Gateway independently selects its weighted pool; the legacy member is not actual "
+    description="Validate the inference token and authorize the model in the requested cluster. Consumers require "
+    "inference cluster scope and a direct or group model grant. Non-self-scoped operators retain inference in scope. "
+    "An active positive-weight provider is required. Gateway independently selects its weighted pool; "
+    "the legacy member is not actual "
     "Gateway destination attribution. Invalid tokens return 401; unavailable or forbidden models return 404.",
 )
 async def internal_authorize(request: Request) -> Response:

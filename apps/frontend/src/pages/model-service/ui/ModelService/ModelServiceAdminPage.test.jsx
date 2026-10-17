@@ -7,7 +7,7 @@ import { AuthContext } from '../../../auth/AuthContext.js';
 import { availableModelProviders, filterServiceFlow, parseTrafficWeight, trafficDistributionError, trafficShare, trafficTotal } from '../../model/modelService.js';
 import { ComponentLogAction, DataPlaneTopology, ManageDeploymentAction, PublicationToggleAction, ProvidersToggleAction, Flow as FlowConnector } from './DataPlaneTopology.jsx';
 import { ComponentLogViewer } from './GatewayOperationLogDrawer.jsx';
-import { addModel, deleteGroup, setProvidersStatus } from './modelServiceBackend.js';
+import { addModel, deleteGroup, getModelAccess, grantModelAccess, revokeModelAccess, setProvidersStatus } from './modelServiceBackend.js';
 import { DeploymentManagementPage } from '../../../deployment/ui/DeploymentManagement/DeploymentManagementPage.jsx';
 
 describe("Add model", () => {
@@ -892,6 +892,45 @@ describe("Component logs", () => {
         for (const lines of [[], ['Ready']]) {
             assert.match(render(lines), /<input[^>]*type="checkbox"[^>]*checked=""/);
         }
+    });
+});
+
+describe("Model inference access client", () => {
+    test('loads grants and only the purpose-limited recipient catalog', async (t) => {
+        const urls = [];
+        t.mock.method(globalThis, 'fetch', async (url, options) => {
+            urls.push(url);
+            assert.equal(options.credentials, 'include');
+            return Response.json(url.endsWith('/options') ? { users: [{ id: 'u' }], groups: [] } : { items: [{ id: 'binding' }] });
+        });
+        assert.deepEqual(await getModelAccess('model/id'), { grants: [{ id: 'binding' }], users: [{ id: 'u' }], groups: [] });
+        assert.deepEqual(urls.sort(), [
+            '/api/v1/model-service/admin/groups/model%2Fid/access',
+            '/api/v1/model-service/admin/groups/model%2Fid/access/options',
+        ]);
+    });
+
+    test('grant and revoke use authenticated transport without caller-selected roles or scope', async (t) => {
+        const calls = [];
+        t.mock.method(globalThis, 'fetch', async (url, options) => {
+            calls.push({ url, ...options });
+            return options.method === 'DELETE' ? new Response(null, { status: 204 }) : Response.json({ id: 'binding' });
+        });
+        await grantModelAccess('m', { subjectType: 'group', subjectId: 'g', roleId: 'admin', clusterId: 'other' });
+        await revokeModelAccess('m', 'binding/id');
+        assert.deepEqual(JSON.parse(calls[0].body), { subjectType: 'group', subjectId: 'g' });
+        assert.equal(calls[0].method, 'POST');
+        assert.equal(calls[0].credentials, 'include');
+        assert.equal(calls[1].method, 'DELETE');
+        assert.equal(calls[1].credentials, 'include');
+        assert.match(calls[1].url, /\/access\/binding%2Fid$/);
+    });
+
+    test('invalid catalogs and authorization errors are not presented as empty success', async (t) => {
+        t.mock.method(globalThis, 'fetch', async () => Response.json({}));
+        await assert.rejects(getModelAccess('m'), /Model access response is invalid/);
+        t.mock.method(globalThis, 'fetch', async () => Response.json({ detail: 'Grant denied' }, { status: 403 }));
+        await assert.rejects(grantModelAccess('m', { subjectType: 'user', subjectId: 'u' }), /Grant denied/);
     });
 });
 

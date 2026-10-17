@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowDown, Boxes, Plus, Repeat, RotateCcw, Search } from 'lucide-react';
 import { usePolling } from '../../../../shared/lib/usePolling';
+import { useResourceList } from '../../../../shared/lib/useResourceList';
 import { useNotice } from '../../../../shared/lib/useNotice';
 import { useSubmission } from '../../../../shared/lib/useSubmission';
 import { cn } from '../../../../shared/lib/cn';
@@ -23,6 +24,9 @@ import {
     deleteMember,
     getGatewayIppConfig,
     getGatewayStatus,
+    getModelAccess,
+    grantModelAccess,
+    revokeModelAccess,
     listGroups,
     listMembers,
     listPublishableDeployments,
@@ -76,6 +80,7 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
     const [serviceEdit, setServiceEdit] = useState(null);
     const [memberDelete, setMemberDelete] = useState(null);
     const [modelDelete, setModelDelete] = useState(null);
+    const [accessGroup, setAccessGroup] = useState(null);
     const [ippConfigEdit, setIppConfigEdit] = useState(null);
     const [operationLog, setOperationLog] = useState(null);
     const [logsTarget, setLogsTarget] = useState(null);
@@ -633,6 +638,7 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
                             statusDot={STATUS_DOT}
                             onComponentAction={handleComponentAction}
                             onEditTraffic={openTrafficDistribution}
+                            onManageAccess={(id) => setAccessGroup(groups.find((group) => group.id === id))}
                             onInstallGateway={installGatewayForCluster}
                             savingGateway={gatewaySubmission.pending}
                             onToggleDeployment={(deployment) => {
@@ -878,6 +884,7 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
                 <ComponentLogViewer entries={logsLines} />
             </Modal>
 
+            {accessGroup && <ModelAccessDrawer key={accessGroup.id} group={accessGroup} onClose={() => setAccessGroup(null)} />}
             <GatewayOperationLogDrawer
                 isOpen={Boolean(operationLog)}
                 onClose={() => setOperationLog(null)}
@@ -891,6 +898,83 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
 }
 
 export default ModelServiceAdminPage;
+
+export function ModelAccessDrawer({ group, onClose }) {
+    const [subjectType, setSubjectType] = useState('user');
+    const [subjectId, setSubjectId] = useState('');
+    const fetchAccess = useCallback(({ signal }) => getModelAccess(group.id, { signal }), [group.id]);
+    const { items: access, loading, error, load } = useResourceList(fetchAccess, {
+        retainOnError: true, errorFallback: 'Failed to load model access',
+    });
+    const { pending, error: saveError, run } = useSubmission('Failed to update model access');
+    usePolling(() => load({ quiet: true }), { enabled: !pending });
+    const grants = access.grants || [];
+    const subjects = (subjectType === 'group' ? access.groups : access.users) || [];
+    const grant = (event) => {
+        event.preventDefault();
+        run(async () => {
+            await grantModelAccess(group.id, { subjectType, subjectId });
+            setSubjectId('');
+            await load();
+        });
+    };
+    const revoke = (bindingId) => run(async () => {
+        await revokeModelAccess(group.id, bindingId);
+        await load();
+    });
+    return (
+        <Modal isOpen variant="drawer" size="md" title="Manage access" subtitle={group.name}
+            onClose={pending ? undefined : onClose} closeOnBackdrop={!pending} closeOnEscape={!pending}
+            footer={<Button variant="secondary" onClick={onClose} disabled={pending}>Close</Button>}>
+            <div className="flex flex-col gap-5">
+                <p className="text-sm text-theme-muted">
+                    Grant inference through this model to a user or group with inference access to its cluster.
+                    Access covers all of this model&apos;s providers, including providers added later.
+                    It does not grant deployment management or permission to share.
+                    Scoped operators retain their existing inference access.
+                </p>
+                <FormError message={error || saveError} />
+                <form onSubmit={grant} className="flex flex-col gap-3">
+                    <div>
+                        <Label htmlFor="model-access-type" help="Grant this model to one user or to members of a group. Each caller still needs inference permission in the model's cluster.">Grant to</Label>
+                        <Select id="model-access-type" value={subjectType} disabled={pending}
+                            onChange={(event) => { setSubjectType(event.target.value); setSubjectId(''); }}>
+                            <option value="user">User</option><option value="group">Group</option>
+                        </Select>
+                    </div>
+                    <div>
+                        <Label htmlFor="model-access-subject" help="Only recipients with inference permission in this model's cluster are listed. Grants never add cluster access.">
+                            {subjectType === 'group' ? 'Group' : 'User'}
+                        </Label>
+                        <Select id="model-access-subject" value={subjectId} required disabled={pending || loading || Boolean(error)}
+                            onChange={(event) => setSubjectId(event.target.value)}>
+                            <option value="">Select a {subjectType}</option>
+                            {subjects.map((subject) => <option key={subject.id} value={subject.id}>{subject.username || subject.name}</option>)}
+                        </Select>
+                    </div>
+                    <Button type="submit" variant="primary" isLoading={pending}
+                        disabled={loading || Boolean(error) || !subjects.some((subject) => subject.id === subjectId)}>
+                        Grant inference access
+                    </Button>
+                </form>
+                {loading ? <p role="status" className="text-sm text-theme-muted">Loading model access...</p>
+                    : grants.length === 0 ? <EmptyState title="No consumer grants" message="Consumers cannot call this model until access is granted." />
+                        : <ul className="flex flex-col gap-2">
+                            {grants.map((entry) => (
+                                <li key={entry.id} className="flex items-center justify-between gap-3 rounded-lg border border-theme-border p-3">
+                                    <div className="min-w-0">
+                                        <p className="truncate text-sm text-theme-text">{entry.subjectName || entry.subjectId}</p>
+                                        <p className="text-xs text-theme-muted">{entry.subjectType === 'group' ? 'Group' : 'User'} · Inference only</p>
+                                    </div>
+                                    <Button variant="dangerOutline" size="sm" disabled={pending} onClick={() => revoke(entry.id)}
+                                        aria-label={`Revoke access for ${entry.subjectName || entry.subjectId}`}>Revoke</Button>
+                                </li>
+                            ))}
+                        </ul>}
+            </div>
+        </Modal>
+    );
+}
 
 export function AddModelForm({ form, onChange, clusters, deployments, models = [], selectedDeployment, existingModel, pending, error }) {
     return (

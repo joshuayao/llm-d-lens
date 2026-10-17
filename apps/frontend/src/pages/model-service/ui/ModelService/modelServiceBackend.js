@@ -57,6 +57,28 @@ export async function listUsageTimeseries({ days = 30, signal } = {}) {
 // --- admin -------------------------------------------------------------------
 
 const admin = `${base}/admin`;
+const accessPath = (groupId) => `${admin}/groups/${encodeURIComponent(groupId)}/access`;
+
+export async function getModelAccess(groupId, { signal } = {}) {
+    const [grants, options] = await Promise.all([
+        requestJson(accessPath(groupId), { signal }),
+        requestJson(`${accessPath(groupId)}/options`, { signal }),
+    ]);
+    if (!Array.isArray(grants?.items) || !Array.isArray(options?.users) || !Array.isArray(options?.groups)) {
+        throw new Error('Model access response is invalid');
+    }
+    return { grants: grants.items, users: options.users, groups: options.groups };
+}
+
+export function grantModelAccess(groupId, { subjectType, subjectId }) {
+    return requestJson(accessPath(groupId), {
+        method: 'POST', headers: jsonHeaders, body: JSON.stringify({ subjectType, subjectId }),
+    });
+}
+
+export function revokeModelAccess(groupId, bindingId) {
+    return requestJson(`${accessPath(groupId)}/${encodeURIComponent(bindingId)}`, { method: 'DELETE' });
+}
 
 export async function listGroups({ signal } = {}) {
     const payload = await requestJson(`${admin}/groups`, { signal });

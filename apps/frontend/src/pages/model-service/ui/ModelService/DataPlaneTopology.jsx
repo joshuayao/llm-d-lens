@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
-    Boxes, Cpu, GitBranch, Layers, Menu, Network, Play, Plus, RotateCw, Router, Square, Settings, Terminal, Trash2, Unlink, Waypoints,
+    Boxes, Cpu, GitBranch, Layers, Menu, Network, Play, Plus, RotateCw, Router, ShieldCheck, Square, Settings, Terminal, Trash2, Unlink, Waypoints,
 } from 'lucide-react';
 import { cn } from '../../../../shared/lib/cn';
 import { Badge, StatusChip } from '../../../../shared/ui/Badge';
@@ -206,6 +206,7 @@ export function DataPlaneTopology({
     onToggleService,
     onSetProvidersStatus,
     onRemoveModel,
+    onManageAccess,
     onToggleDeployment,
     onNavigate,
     publicationPending = false,
@@ -336,6 +337,11 @@ export function DataPlaneTopology({
                             disabled={publicationPending || row.members.length > 0}
                             title={row.members.length ? 'Remove every deployment from this model first.' : 'Safely remove this empty model and its HTTPRoute.'}
                             onClick={() => choose(() => onRemoveModel(row.serviceId))} />
+                    </PermissionGate>}
+                    {onManageAccess && <PermissionGate permission="model-service:group:share">
+                        <MenuAction icon={<ShieldCheck size={12} />} label="Manage access"
+                            title="Grant or revoke model inference for users and groups in this cluster."
+                            onClick={() => choose(() => onManageAccess(row.serviceId))} />
                     </PermissionGate>}
                 </>
             );
@@ -579,9 +585,10 @@ export function DataPlaneTopology({
                                                 <span className="truncate text-xs font-semibold text-theme-text" title={row.serviceName}>{row.serviceName}</span>
                                                 <StatusChip variant="compact" className="shrink-0" status={routed ? 'active' : 'inactive'}
                                                     label={stopped ? 'Stopped' : routed ? 'Serving' : 'No traffic'} />
-                                                {(onEditTraffic || onToggleService || onSetProvidersStatus || onRemoveModel) && <PermissionGate permission={[
+                                                {(onEditTraffic || onToggleService || onSetProvidersStatus || onRemoveModel || onManageAccess) && <PermissionGate permission={[
                                                     ...(onEditTraffic || onSetProvidersStatus ? ['model-service:member:manage'] : []),
                                                     ...(onToggleService || onRemoveModel ? ['model-service:group:manage'] : []),
+                                                    ...(onManageAccess ? ['model-service:group:share'] : []),
                                                 ]}>
                                                     <Button variant="ghost" size="icon" className="shrink-0"
                                                         aria-label={`${row.serviceName} actions`} aria-haspopup="menu"

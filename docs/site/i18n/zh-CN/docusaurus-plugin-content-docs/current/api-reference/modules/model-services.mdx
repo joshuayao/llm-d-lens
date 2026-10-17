@@ -165,9 +165,10 @@ import TabItem from '@theme/TabItem';
 
 ### 列出可访问的模型
 
-列出调用方可通过模型网关使用的模型组。活动组需要至少一个已授权、活动且权重为正的提供方。
-网关模型还要求调用方对所有关联部署拥有推理权限，包括零权重和离线提供方，
-因为异步代理更新期间仍可能使用旧分配。条目包含从 `clusterId` 解析出的 `clusterName`，
+列出有在线且权重为正的提供方、并且调用方可访问的活动模型。
+消费者必须在模型所属集群拥有推理权限，并获得直接或经用户组授予的模型授权；
+非 self-scoped 操作者保留其绑定 scope 内的推理权限。部署分享或所有权不授予消费者推理权限。
+`/v1/models` 和 Gateway 鉴权使用同一规则。条目包含从 `clusterId` 解析出的 `clusterName`，
 用于区分不同集群中相同的公开名称。
 
 <Tabs>
@@ -437,7 +438,78 @@ import TabItem from '@theme/TabItem';
 
 ### 列出模型路由组
 
-列出所有已配置的模型路由组。每个组都是一个作用域限定在特定集群内、面向用户展示的模型名称，会路由到一个或多个由部署所拥有的 InferencePool。
+列出调用方具备集群级读取权限的模型组。每个组是路由到部署 InferencePool 的公开模型名称。
+`GET /api/v1/model-service/admin/groups/{group_id}` 也要求相应 scope 内的
+`model-service:group:read`。模型响应还包含可空的 `ownerUserId`、`ownerGroupId`；
+所有权本身不授予消费者推理权限。
+
+### 模型推理授权
+
+所有访问管理端点都要求调用方在模型所属集群拥有 `model-service:group:share`。
+admin 和 maintainer 具备该权限，但它不包含模型本身或 Gateway 的管理权限。
+授权覆盖该模型的所有提供方，不包含管理 API。重命名保留授权，删除模型清理授权；
+即使模型为空，只要还有授权，也不能迁移到其他集群。
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+
+| 方法 | `/api/v1/model-service/admin/groups/{group_id}` 下的路径 | 响应 |
+| --- | --- | --- |
+| GET | `/access` | `{"items":[...]}`，包含授权 ID、`subjectType`、`subjectId`、`subjectName`、`permission`、`createdAt` |
+| GET | `/access/options` | `{"users":[{"id":"user-123","username":"alice"}],"groups":[{"id":"group-123","name":"team"}]}` |
+| POST | `/access` | HTTP 201，包含授权 ID、对象和推理权限 |
+| DELETE | `/access/{binding_id}` | HTTP 204，空响应体 |
+
+POST 请求体：
+
+```json
+{"subjectType":"user","subjectId":"user-123"}
+```
+
+响应示例：
+
+```json
+{"id":"binding-123","subjectType":"user","subjectId":"user-123","permission":"model-service:inference:use"}
+```
+
+向用户组授权时使用 `subjectType: "group"`。不接受角色、集群或所有者字段；
+服务器固定授权角色，并从模型记录确定集群。对象必须已在该集群拥有推理权限。
+options 只返回符合条件对象的 ID 和显示名称，不暴露完整身份记录；禁用或受保护用户不能选择。
+
+scope 不足返回 403；资源不存在或撤权绑定不匹配返回 404；重复授权返回 409；
+无效或多余字段返回 422。撤权影响使用已有 API key 的后续请求，不中断已开始的流，
+也不修改 HTTPRoute 权重。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+
+```python
+from llm_d_lens.model_service.contracts import ModelGrantRequest
+from llm_d_lens.model_service.service import default_service
+
+def grant_model(model_id: str, user_id: str, principal):
+    service = default_service()
+    return service.grant_access(
+        model_id,
+        ModelGrantRequest(subject_type="user", subject_id=user_id),
+        principal=principal,
+    )
+
+def read_model_access(model_id: str, principal):
+    service = default_service()
+    return (
+        service.list_access(model_id, principal=principal),
+        service.access_options(model_id, principal=principal),
+    )
+
+def revoke_model(model_id: str, binding_id: str, principal):
+    default_service().revoke_access(model_id, binding_id, principal=principal)
+```
+
+传入已认证调用方解析后的 principal。这些方法对内部调用同样校验授权管理权限及模型集群 scope。
+  </TabItem>
+</Tabs>
+
+### 模型路由组列表示例
 
 <Tabs>
   <TabItem value="rest-api" label="REST API">
