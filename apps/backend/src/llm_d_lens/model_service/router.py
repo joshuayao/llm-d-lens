@@ -32,12 +32,14 @@ from llm_d_lens.auth.access import (
     require_cluster_access,
     visible_cluster_ids,
 )
+from llm_d_lens.cluster.registry import gateway_lock
 from llm_d_lens.model_service.contracts import (
     AuthorizeRequest,
     GroupCreateRequest,
     GroupUpdateRequest,
     MemberCreateRequest,
     MemberUpdateRequest,
+    ProvidersStatusRequest,
     TokenCreateRequest,
     TrafficUpdateRequest,
     UsageRecordRequest,
@@ -411,12 +413,62 @@ async def admin_update_group(group_id: str, body: GroupUpdateRequest, request: R
     return group.api_payload()
 
 
-@admin_router.delete("/groups/{group_id}", status_code=204, summary="Delete a model routing group.")
-async def admin_delete_group(group_id: str, background: BackgroundTasks) -> Response:
-    cluster_ids = [member.cluster_id for member in _service.list_members(group_id)]
-    _service.delete_group(group_id)
-    background.add_task(_reconcile_clusters, cluster_ids)
+@admin_router.delete(
+    "/groups/{group_id}",
+    status_code=204,
+    summary="Safely remove an empty model.",
+    description="Requires group management in the model's cluster. Returns 409 model_group_conflict "
+    "while any provider remains, including offline providers. Removes the model's Lens-managed HTTPRoute "
+    "and IPP mapping and confirms deletion before deleting the record. Returns 404 for a missing model; "
+    "502 model_removal_failed preserves the record for retry when cleanup fails. Deployments, Pods, "
+    "other models and shared Gateway resources are not deleted.",
+)
+async def admin_delete_group(group_id: str, request: Request) -> Response:
+    principal = current_principal(request)
+    try:
+        group = _service.require_empty_group(group_id, principal=principal)
+        async with gateway_lock(group.cluster_id):
+            group = _service.require_empty_group(group_id, principal=principal)
+            await _gateway_ops.remove_model_route(group)
+            _service.delete_group(group_id, principal=principal)
+    except ModelServiceNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ModelServiceConflictError as error:
+        return problem(409, "Model group conflict", str(error), "model_group_conflict")
+    except (GatewayOpsError, FileNotFoundError, TimeoutError, OSError, ValueError) as error:
+        logger.warning("Model removal cleanup failed for %s: %s", group_id, error)
+        return problem(
+            502,
+            "Model removal failed",
+            "Route cleanup could not be confirmed. The model record was retained; retry Remove model.",
+            "model_removal_failed",
+        )
     return Response(status_code=204)
+
+
+@admin_router.put(
+    "/groups/{group_id}/providers/status",
+    summary="Start or stop all model providers.",
+    description="Requires member management in the model's cluster. Atomically sets every provider active "
+    "or disabled, preserving weights, model status and Pods, then reconciles routing. Starting requires "
+    "every deployment to be ready in its registered cluster. Empty models, unready deployments or concurrent "
+    "provider changes return 409 model_member_conflict without partial status updates; a missing model returns "
+    "404. A 502 model_publication_apply_failed means statuses were saved but routing failed; use Reconcile.",
+)
+async def admin_set_providers_status(group_id: str, body: ProvidersStatusRequest, request: Request) -> dict:
+    principal = current_principal(request)
+    try:
+        members = _service.set_providers_status(group_id, body, principal=principal)
+    except ModelServiceNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ModelServiceConflictError as error:
+        return problem(409, "Model member conflict", str(error), "model_member_conflict")
+    failure = await _apply_publication_change(
+        [member.cluster_id for member in members], actor=principal.user_id if principal else None
+    )
+    if failure is not None:
+        return failure
+    return {"items": [member.api_payload() for member in members]}
 
 
 @admin_router.get("/members", summary="List published model service members.")

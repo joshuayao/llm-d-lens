@@ -238,6 +238,13 @@ class MemberUpdateRequest(StrictModel):
     )
 
 
+class ProvidersStatusRequest(StrictModel):
+    status: Literal["active", "disabled"] = Field(
+        description="Bring every provider online (active) or offline (disabled). "
+        "Preserves weights, model status and Pods. Starting requires all deployments to be ready."
+    )
+
+
 class AuthorizeRequest(StrictModel):
     token: str
     model: str = Field(min_length=1, max_length=100)

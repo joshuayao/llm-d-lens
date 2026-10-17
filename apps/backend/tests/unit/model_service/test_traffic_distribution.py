@@ -23,6 +23,7 @@ from llm_d_lens.model_service.contracts import (
     GroupUpdateRequest,
     MemberCreateRequest,
     MemberUpdateRequest,
+    ProvidersStatusRequest,
     TrafficUpdateRequest,
 )
 from llm_d_lens.model_service.gateway_contracts import GatewayOperation
@@ -68,6 +69,151 @@ def _request(first_weight=90, second_weight=10, expected=None):
         members=[{"executionId": "a", "weight": first_weight}, {"executionId": "b", "weight": second_weight}],
         expectedWeights={"a": 1} if expected is None else expected,
     )
+
+
+def test_bulk_provider_status_preserves_weights_and_model_state(monkeypatch):
+    service, group, principal, _, _ = _setup(monkeypatch)
+    service.update_traffic(group.id, _request(7, 0), principal=principal)
+    service.update_group(group.id, GroupUpdateRequest(status="disabled"), principal=principal)
+    for status in ("disabled", "active"):
+        saved = service.set_providers_status(group.id, ProvidersStatusRequest(status=status), principal=principal)
+        assert {m.execution_id: (m.weight, m.status) for m in saved} == {"a": (7, status), "b": (0, status)}
+        assert service.groups.get(group.id).status == "disabled"
+
+
+def test_bulk_start_rejects_unready_provider_without_partial_updates(monkeypatch):
+    service, group, principal, _, targets = _setup(monkeypatch)
+    service.update_traffic(group.id, _request(), principal=principal)
+    service.set_providers_status(group.id, ProvidersStatusRequest(status="disabled"), principal=principal)
+    targets["b"] = replace(targets["b"], status="failed")
+    with pytest.raises(ModelServiceConflictError, match="all providers must be ready"):
+        service.set_providers_status(group.id, ProvidersStatusRequest(status="active"), principal=principal)
+    assert all(m.status == "disabled" for m in service.list_members(group.id))
+
+
+def test_bulk_status_rejects_stale_membership_and_empty_model(monkeypatch):
+    service, group, principal, first, _ = _setup(monkeypatch)
+    from llm_d_lens.db.dao.model_service_member import ModelServiceMemberDaoError
+
+    with pytest.raises(ModelServiceMemberDaoError, match="providers changed"):
+        service.members.set_group_status(group.id, "disabled", {})
+    assert service.members.get(first.id).status == "active"
+    service.delete_member(first.id)
+    with pytest.raises(ModelServiceConflictError, match="no providers"):
+        service.set_providers_status(group.id, ProvidersStatusRequest(status="active"), principal=principal)
+
+
+def test_group_deletion_rejects_even_offline_providers_at_service_and_dao(monkeypatch):
+    service, group, principal, first, _ = _setup(monkeypatch)
+    from llm_d_lens.db.dao.model_service_group import ModelServiceGroupDaoError
+
+    service.update_member(first.id, MemberUpdateRequest(status="disabled"), principal=principal)
+    with pytest.raises(ModelServiceConflictError, match="remove every provider"):
+        service.delete_group(group.id, principal=principal)
+    with pytest.raises(ModelServiceGroupDaoError, match="remove every provider"):
+        service.groups.delete(group.id)
+    assert service.groups.get(group.id) and service.members.get(first.id)
+
+
+def test_bulk_status_and_model_removal_enforce_cluster_scope(monkeypatch):
+    service, group, _, first, _ = _setup(monkeypatch)
+    principal = Principal(
+        user_id="other",
+        username="other",
+        bindings=(RoleBinding(role="maintainer", scope_type=ScopeType.CLUSTER, scope_cluster_id="other"),),
+    )
+    with pytest.raises(ForbiddenError):
+        service.set_providers_status(group.id, ProvidersStatusRequest(status="disabled"), principal=principal)
+    service.delete_member(first.id)
+    with pytest.raises(ForbiddenError):
+        service.delete_group(group.id, principal=principal)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, True])
+async def test_remove_model_confirms_cleanup_before_deleting_record(monkeypatch, failure):
+    from llm_d_lens.model_service.gateway_ops import GatewayOpsError
+
+    service, group, principal, first, _ = _setup(monkeypatch)
+    service.delete_member(first.id)
+    monkeypatch.setattr(router, "_service", service)
+    monkeypatch.setattr(router, "current_principal", lambda _: principal)
+
+    async def cleanup(model):
+        assert service.groups.get(model.id) is not None
+        if failure:
+            raise GatewayOpsError("route finalizer blocked")
+
+    monkeypatch.setattr(router._gateway_ops, "remove_model_route", cleanup)
+    response = await router.admin_delete_group(group.id, SimpleNamespace())
+    assert response.status_code == (502 if failure else 204)
+    assert (service.groups.get(group.id) is not None) == failure
+
+
+@pytest.mark.asyncio
+async def test_remove_model_does_not_clean_up_attached_providers(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    service, group, principal, _, _ = _setup(monkeypatch)
+    monkeypatch.setattr(router, "_service", service)
+    monkeypatch.setattr(router, "current_principal", lambda _: principal)
+    cleanup = AsyncMock()
+    monkeypatch.setattr(router._gateway_ops, "remove_model_route", cleanup)
+    response = await router.admin_delete_group(group.id, SimpleNamespace())
+    assert response.status_code == 409
+    cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remove_model_rechecks_membership_after_cleanup(monkeypatch):
+    service, group, principal, first, _ = _setup(monkeypatch)
+    service.delete_member(first.id)
+    monkeypatch.setattr(router, "_service", service)
+    monkeypatch.setattr(router, "current_principal", lambda _: principal)
+
+    async def cleanup(_):
+        service.create_member(MemberCreateRequest(groupId=group.id, executionId="a"), published_by=None)
+
+    monkeypatch.setattr(router._gateway_ops, "remove_model_route", cleanup)
+    response = await router.admin_delete_group(group.id, SimpleNamespace())
+    assert response.status_code == 409
+    assert service.groups.get(group.id)
+    assert len(service.list_members(group.id)) == 1
+
+
+def test_lifecycle_openapi_contracts():
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(router.admin_router)
+    schema = app.openapi()
+    assert (
+        "model_removal_failed"
+        in schema["paths"]["/api/v1/model-service/admin/groups/{group_id}"]["delete"]["description"]
+    )
+    operation = schema["paths"]["/api/v1/model-service/admin/groups/{group_id}/providers/status"]["put"]
+    assert "model_publication_apply_failed" in operation["description"]
+    assert schema["components"]["schemas"]["ProvidersStatusRequest"]["properties"]["status"]["enum"] == [
+        "active",
+        "disabled",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bulk_provider_api_reconciles_once_and_reports_apply_failure(monkeypatch):
+    service, group, principal, _, _ = _setup(monkeypatch)
+    monkeypatch.setattr(router, "_service", service)
+    monkeypatch.setattr(router, "current_principal", lambda _: principal)
+    from unittest.mock import AsyncMock
+
+    reconcile = AsyncMock(return_value=GatewayOperation(kind="reconcile-gateway", status="failed"))
+    monkeypatch.setattr(router._gateway_ops, "reconcile_cluster", reconcile)
+    response = await router.admin_set_providers_status(
+        group.id, ProvidersStatusRequest(status="disabled"), SimpleNamespace()
+    )
+    assert response.status_code == 502
+    assert all(m.status == "disabled" for m in service.list_members(group.id))
+    reconcile.assert_awaited_once_with(group.cluster_id, actor=principal.user_id)
 
 
 @pytest.mark.parametrize("weight", [-1, 1000001, 1.5, True, "10", None])

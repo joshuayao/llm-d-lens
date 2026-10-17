@@ -147,6 +147,20 @@ scaling workloads. Online at weight 0 remains standby. Resuming a group never
 enables offline members, and enabling a member never resumes its stopped group.
 All providers may be offline; no eligible pool means no HTTPRoute.
 
+The model menu has one bulk-action slot: **Bring providers online** if every
+provider is disabled, otherwise **Take providers offline** (including mixed
+states). The member-management API validates every deployment before bringing
+providers online and saves the whole snapshot atomically. It preserves weights,
+parent model state and Pods; a concurrent membership/status change is a conflict.
+
+Detaching the final provider retains an empty, manageable model. **Remove model**
+requires all providers to be detached, including offline/zero-weight providers.
+Under the cluster Gateway lock, cleanup checks ownership and confirms deletion
+of only that model's HTTPRoute and IPP map before deleting the database record.
+The DAO locks the group and rechecks empty membership to prevent cascading away
+a newly attached provider. Cleanup failure retains the record for retry. The
+Gateway lock is process-local, not coordination between competing Lens instances.
+
 PATCH group/member handlers await routing reconciliation and report a persisted
 state separately from apply failures (`502 model_publication_apply_failed`).
 Health probes skip stopped groups/offline members; health-only DAO writes lock

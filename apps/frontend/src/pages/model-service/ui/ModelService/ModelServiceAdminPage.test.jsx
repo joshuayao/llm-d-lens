@@ -5,9 +5,9 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { AddModelForm, ModelServiceAdminPage, TrafficDistributionForm } from './ModelServiceAdminPage.jsx';
 import { AuthContext } from '../../../auth/AuthContext.js';
 import { availableModelProviders, filterServiceFlow, parseTrafficWeight, trafficDistributionError, trafficShare, trafficTotal } from '../../model/modelService.js';
-import { ComponentLogAction, DataPlaneTopology, ManageDeploymentAction, PublicationToggleAction, Flow as FlowConnector } from './DataPlaneTopology.jsx';
+import { ComponentLogAction, DataPlaneTopology, ManageDeploymentAction, PublicationToggleAction, ProvidersToggleAction, Flow as FlowConnector } from './DataPlaneTopology.jsx';
 import { ComponentLogViewer } from './GatewayOperationLogDrawer.jsx';
-import { addModel } from './modelServiceBackend.js';
+import { addModel, deleteGroup, setProvidersStatus } from './modelServiceBackend.js';
 import { DeploymentManagementPage } from '../../../deployment/ui/DeploymentManagement/DeploymentManagementPage.jsx';
 
 describe("Add model", () => {
@@ -187,6 +187,24 @@ describe("Traffic distribution", () => {
         assert.match(html, /Gateway API weight specification/);
     });
 
+    test('deployment status follows its name and weight controls share one row', () => {
+        for (const row of [
+            draft.rows[0],
+            { ...draft.rows[0], status: 'disabled' },
+            { ...draft.rows[0], isNew: true },
+        ]) {
+            const html = renderToStaticMarkup(createElement(TrafficDistributionForm, {
+                draft: { ...draft, rows: [row] }, deployments,
+            }));
+            const status = row.isNew ? 'New provider \\(not saved\\)' : row.status;
+            assert.match(html, new RegExp(`Stable deployment</p><span[^>]*>${status}</span></div>`));
+            assert.match(html, /<div class="flex items-center gap-3"><label[^>]*for="traffic-weight-0">Weight<\/label><input[^>]*id="traffic-weight-0"[^>]*\/><output[^>]*>/);
+            assert.equal(findElement(TrafficDistributionForm({
+                draft: { ...draft, rows: [row] }, deployments,
+            }), 'traffic-weight-0').props.disabled, row.status === 'disabled');
+        }
+    });
+
     test('adding a provider defaults to weight one and preserves the concurrency snapshot', () => {
         let changed;
         const tree = TrafficDistributionForm({ draft, deployments, onChange: (next) => { changed = next; } });
@@ -243,11 +261,76 @@ describe("Service flow", () => {
     test('one route exposes a model-name action menu and configured weighted branch shares', () => {
         const html = renderTopology(1, 2);
         assert.equal((html.match(/>HTTPRoute<\/span>/g) || []).length, 1);
-        assert.match(html, /title="chat-0">chat-0<\/span><button[^>]*aria-label="chat-0 actions"[^>]*aria-haspopup="menu"[^>]*aria-expanded="false"/);
+        assert.match(html, /title="chat-0">chat-0<\/span><span[^>]*>Serving<\/span><button[^>]*aria-label="chat-0 actions"[^>]*aria-haspopup="menu"[^>]*aria-expanded="false"/);
         assert.doesNotMatch(html, />Traffic distribution<\/button>/);
         assert.match(html, /90%<\/text>/);
         assert.match(html, /10%<\/text>/);
         assert.match(html, /Configured request share; not measured traffic/);
+        assert.match(html, /aria-label="chat-0 traffic distribution"/);
+        assert.match(html, /title="Configure relative traffic weights[^"]*Weight 0[^"]*offline providers receive no traffic/);
+        assert.match(html, /bg-sky-500[^"]*rounded-full/);
+        assert.match(html, /style="left:276px;top:168px"/);
+    });
+
+    test('empty models remain visible and searchable after detaching the last provider', () => {
+        const html = renderTopology(1, 0);
+        assert.match(html, /aria-label="Model chat-0"/);
+        assert.match(html, /aria-label="chat-0 actions"/);
+        assert.match(html, /No providers/);
+        assert.doesNotMatch(html, /aria-label="chat-0 traffic distribution"/);
+        assert.doesNotMatch(html, /NaN|height:-/);
+        const filtered = filterServiceFlow(
+            [{ clusterId: 'cluster-a' }],
+            [{ id: 'empty', name: 'chat', clusters: [{ clusterId: 'cluster-a', deployments: [] }] }],
+            { modelQuery: 'chat' },
+        );
+        assert.equal(filtered.memberGroups[0].id, 'empty');
+        assert.equal(filtered.clusters.length, 1);
+    });
+
+    test('bulk providers action occupies one slot and derives online/offline from all providers', () => {
+        for (const [statuses, expectedOnline] of [
+            [['disabled', 'disabled'], true],
+            [['active', 'active'], false],
+            [['active', 'disabled'], false],
+            [['unhealthy', 'disabled'], false],
+        ]) {
+            let online;
+            const action = ProvidersToggleAction({
+                members: statuses.map((status) => ({ status })),
+                pending: false, onClick: (value) => { online = value; },
+            });
+            assert.equal(action.props.label, expectedOnline ? 'Bring providers online' : 'Take providers offline');
+            assert.equal(action.props.disabled, false);
+            assert.equal((renderToStaticMarkup(action).match(/role="menuitem"/g) || []).length, 1);
+            action.props.onClick();
+            assert.equal(online, expectedOnline);
+        }
+        assert.equal(ProvidersToggleAction({ members: [], pending: false }).props.disabled, true);
+        assert.equal(ProvidersToggleAction({ members: [{ status: 'disabled' }], pending: true }).props.disabled, true);
+    });
+
+    test('model lifecycle client preserves cleanup failures and uses a single batch status request', async () => {
+        const original = globalThis.fetch;
+        const calls = [];
+        try {
+            globalThis.fetch = async (url, options) => {
+                calls.push({ url, options });
+                return new Response(JSON.stringify({ items: [{ id: 'member-a', status: 'disabled', weight: 7 }] }), { status: 200 });
+            };
+            const items = await setProvidersStatus('model/a', 'disabled');
+            assert.equal(items[0].weight, 7);
+            assert.equal(calls.length, 1);
+            assert.match(calls[0].url, /groups\/model%2Fa\/providers\/status$/);
+            assert.equal(calls[0].options.method, 'PUT');
+            assert.deepEqual(JSON.parse(calls[0].options.body), { status: 'disabled' });
+            globalThis.fetch = async () => new Response(JSON.stringify({
+                code: 'model_removal_failed', detail: 'Cleanup failed; model retained.',
+            }), { status: 502 });
+            await assert.rejects(deleteGroup('model/a'), /Cleanup failed; model retained/);
+        } finally {
+            globalThis.fetch = original;
+        }
     });
 
     test('the flow has a centered, bounded, keyboard-focusable scrolling viewport', () => {
@@ -311,7 +394,7 @@ describe("Service flow", () => {
 
     test('publication labels use compact soft badges without dots or heavy typography', () => {
         for (const [html, labels] of [
-            [renderTopology(1), ['Enabled', 'Online']],
+            [renderTopology(1), ['Serving', 'Online']],
             [renderTopology(1, 1, { status: 'disabled' }, { status: 'disabled' }), ['Stopped', 'Offline']],
             [renderTopology(1, 1, { weight: 0 }), ['No traffic', 'Standby']],
         ]) {
@@ -319,7 +402,12 @@ describe("Service flow", () => {
                 const match = html.match(new RegExp(`<span class="([^"]+)">${label}<\\/span>`));
                 assert.ok(match, `${label} contains only text`);
                 assert.match(match[1], /h-4/);
-                assert.match(match[1], /ml-auto/);
+                if (['Serving', 'Stopped', 'No traffic'].includes(label)) {
+                    assert.doesNotMatch(match[1], /ml-auto/);
+                    assert.match(match[1], /shrink-0/);
+                } else {
+                    assert.match(match[1], /ml-auto/);
+                }
                 assert.match(match[1], /text-\[10px\]/);
                 assert.match(match[1], /font-normal/);
                 assert.match(match[1], /border-0/);
@@ -338,6 +426,9 @@ describe("Service flow", () => {
         assert.match(memberOnly, /deployment actions/);
         const readOnly = renderTopology(1, 1, {}, { can: () => false });
         assert.doesNotMatch(readOnly, /aria-label="chat-0 actions"|deployment actions/);
+        assert.doesNotMatch(readOnly, /aria-label="chat-0 traffic distribution"/);
+        assert.match(memberOnly, /aria-label="chat-0 traffic distribution"/);
+        assert.doesNotMatch(groupOnly, /aria-label="chat-0 traffic distribution"/);
         const deploymentReader = renderTopology(1, 1, {}, { can: (code) => code === 'deployment:run:read' });
         assert.match(deploymentReader, /deployment actions/);
         assert.doesNotMatch(deploymentReader, /aria-label="chat-0 actions"/);

@@ -100,6 +100,8 @@ the last routed provider offline removes the route and the model shows
 **No traffic**; all providers may be offline. In-flight requests may finish, and
 Gateway configuration changes take effect after the controller applies them.
 
+The model status badge sits beside its name. **Serving** means the model is enabled
+with at least one online, positive-weight provider; component health is shown separately.
 The page shows **Stopped**, **Offline**, and **Standby** separately from component
 health. Health polling does not undo an offline decision or reinstall a
 deliberately stopped model's route. If routing cannot be updated, Lens reports
@@ -113,7 +115,10 @@ seconds; errors remain until dismissed, cleared by a successful refresh, or retr
 ## Distribute traffic across deployments
 
 1. In the public model frame, open the three-line menu beside the model name and select **Traffic distribution** to open the right-side drawer.
-2. Review the cluster and each deployment's status, **Weight**, and configured traffic share.
+   You can also click the sky-blue circular branch button between HTTPRoute and
+   the deployment providers. Both entry points explain relative weights, standby
+   and offline providers on hover.
+2. Review the cluster and each deployment's status badge beside its name. **Weight**, its input, and the configured traffic percentage appear together on the next line.
 3. Use **Add deployment** to select a ready llm-d deployment in the same cluster with the same provider model name. It defaults to weight **1** and takes effect after saving and reconciliation.
 4. Set relative weights, for example **90** and **10** for approximately 90% and 10% of requests.
 5. Click **Save and apply** to save the complete allocation and reconcile the shared HTTPRoute, or **Cancel** to discard the draft.
@@ -143,11 +148,23 @@ staged and disabled providers, to remain safe during asynchronous route updates.
 
 1. Open **Model services**.
 2. Open the three-line menu beside the provider's deployment name.
-3. Choose **Remove from model** to detach that provider without deleting its deployment or Pods. Removing the last provider also removes its model service.
+3. Choose **Remove from model** to detach that provider without deleting its deployment or Pods. Removing the last provider leaves an empty model in the service flow.
 4. Review the affected service and cluster in the dialog, then confirm.
 
-There is no separate bulk-removal action for a model service. Remove its providers
-individually; removing the last provider also removes the service.
+To remove the model itself, first detach **every** provider, including offline and
+zero-weight providers. Then use the public model name's menu → **Remove model**
+and confirm. The action is disabled while providers remain, and the backend
+enforces the same restriction. Lens removes only this model's managed HTTPRoute
+and IPP mapping, confirms their deletion, then deletes the model record. If
+cleanup fails or times out, the record remains so you can retry.
+
+The model menu uses one slot for **Bring providers online** when all providers
+are offline, or **Take providers offline** otherwise. Mixed states are taken
+offline together. These batch operations preserve weights, model state and running
+Pods; they do not scale workloads. Starting validates that every deployment is
+ready before changing any provider status. A stopped model remains stopped, and
+weight-0 providers remain standby. If routing fails after saving provider states,
+use **Reconcile**; saved states are not rolled back automatically.
 
 **Removing a published route interrupts clients using it.** Notify callers before removal.
 

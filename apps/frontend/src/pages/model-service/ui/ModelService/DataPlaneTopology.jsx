@@ -40,6 +40,7 @@ const GW_BUS = 520;
 const CLUSTER = { x: GW.x - 16, w: MODEL.x + MODEL.w - GW.x + 32, header: 48, bottom: 16 };
 const SECTION_GAP = 40;
 const WIDTH = MODEL.x + MODEL.w + 24;
+const TRAFFIC_HELP = 'Configure relative traffic weights across this model’s deployment providers. Weight 0 keeps a provider on standby; offline providers receive no traffic.';
 
 function Box({ x, y, w = 180, h = BOX_H, label, help, helpSource, helpPlacement = 'top', sub, icon, status, statusText, crd, menuOpen, onToggleMenu }) {
     return (
@@ -103,6 +104,17 @@ export function PublicationToggleAction({ kind, stopped, pending, onClick }) {
                 ? 'Control this public model without changing provider states, weights or running Pods.'
                 : 'Control routing to this deployment without changing its weight or scaling its Pods. Weight 0 remains standby.'} />
     );
+}
+
+export function ProvidersToggleAction({ members, pending, onClick }) {
+    const online = members.length > 0 && members.every((member) => member.status === 'disabled');
+    return <MenuAction icon={online ? <Play size={12} /> : <Square size={12} />}
+        label={online ? 'Bring providers online' : 'Take providers offline'}
+        disabled={pending || members.length === 0}
+        title={online
+            ? 'Bring all providers online. Every deployment must be ready; weights, model state and Pods are unchanged.'
+            : 'Take all providers offline, including a mix of online and offline providers. Weights, model state and Pods are unchanged.'}
+        onClick={() => onClick(online)} />;
 }
 
 export function ManageDeploymentAction({ deployment, onNavigate }) {
@@ -192,6 +204,8 @@ export function DataPlaneTopology({
     onComponentAction,
     onEditTraffic,
     onToggleService,
+    onSetProvidersStatus,
+    onRemoveModel,
     onToggleDeployment,
     onNavigate,
     publicationPending = false,
@@ -233,14 +247,14 @@ export function DataPlaneTopology({
                 const members = group.clusters
                     .filter((gc) => gc.clusterId === cluster.clusterId)
                     .flatMap((gc) => gc.deployments);
-                if (members.length === 0) return [];
+                if (!group.clusters.some((gc) => gc.clusterId === cluster.clusterId)) return [];
                 return [{
                     serviceId: group.id,
                     serviceName: group.name,
                     serviceStatus: group.status || 'active',
                     members,
-                    height: MODEL_H + (members.length - 1) * (DEPLOYMENT_H + DEPLOYMENT_GAP),
-                    routeY: COMPONENT_Y + (members.length - 1) * (DEPLOYMENT_H + DEPLOYMENT_GAP) / 2,
+                    height: MODEL_H + Math.max(0, members.length - 1) * (DEPLOYMENT_H + DEPLOYMENT_GAP),
+                    routeY: COMPONENT_Y + Math.max(0, members.length - 1) * (DEPLOYMENT_H + DEPLOYMENT_GAP) / 2,
                 }];
             });
             return { cluster, rows };
@@ -308,9 +322,20 @@ export function DataPlaneTopology({
                             pending={publicationPending}
                             onClick={() => choose(() => onToggleService({ id: row.serviceId, name: row.serviceName }))} />
                     </PermissionGate>}
+                    {onSetProvidersStatus && <PermissionGate permission="model-service:member:manage">
+                        <ProvidersToggleAction members={row.members} pending={publicationPending}
+                            onClick={(online) => choose(() => onSetProvidersStatus(row.serviceId, online))} />
+                    </PermissionGate>}
                     {onEditTraffic && <PermissionGate permission="model-service:member:manage">
-                    <MenuAction icon={<GitBranch size={12} />} label="Traffic distribution"
-                        onClick={() => choose(() => onEditTraffic(row.serviceId))} />
+                        <MenuAction icon={<GitBranch size={12} />} label="Traffic distribution"
+                            title={TRAFFIC_HELP} disabled={publicationPending}
+                            onClick={() => choose(() => onEditTraffic(row.serviceId))} />
+                    </PermissionGate>}
+                    {onRemoveModel && <PermissionGate permission="model-service:group:manage">
+                        <MenuAction icon={<Unlink size={12} />} label="Remove model"
+                            disabled={publicationPending || row.members.length > 0}
+                            title={row.members.length ? 'Remove every deployment from this model first.' : 'Safely remove this empty model and its HTTPRoute.'}
+                            onClick={() => choose(() => onRemoveModel(row.serviceId))} />
                     </PermissionGate>}
                 </>
             );
@@ -345,13 +370,13 @@ export function DataPlaneTopology({
             return (
                 <>
                     <div className="truncate px-2 py-1 text-[10px] uppercase tracking-wide text-slate-500">{cluster.clusterName || cluster.clusterId} · {cluster.gatewayProvider || 'gateway'}</div>
-                    <MenuAction icon={installed ? <Trash2 size={12} /> : <Plus size={12} />} label={installed ? 'Uninstall' : 'Install'}
-                        onClick={() => choose(() => onComponentAction(cluster, 'gateway', installed ? 'uninstall' : 'install'))} />
-                    <MenuAction icon={<RotateCw size={12} />} label="Reconcile" onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'reconcile'))} />
                     {installed && (
                         <MenuAction icon={running ? <Square size={12} /> : <Play size={12} />} label={running ? 'Stop' : 'Start'}
                             onClick={() => choose(() => onComponentAction(cluster, 'gateway', running ? 'stop' : 'start'))} />
                     )}
+                    <MenuAction icon={<RotateCw size={12} />} label="Reconcile" onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'reconcile'))} />
+                    <MenuAction icon={installed ? <Trash2 size={12} /> : <Plus size={12} />} label={installed ? 'Uninstall' : 'Install'}
+                        onClick={() => choose(() => onComponentAction(cluster, 'gateway', installed ? 'uninstall' : 'install'))} />
                     <ComponentLogAction component="gateway" cluster={cluster}
                         onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'logs'))} />
                 </>
@@ -365,15 +390,15 @@ export function DataPlaneTopology({
             return (
                 <>
                     <div className="truncate px-2 py-1 text-[10px] uppercase tracking-wide text-slate-500">{cluster.clusterName || cluster.clusterId} · IPP</div>
-                    <MenuAction icon={installed ? <Trash2 size={12} /> : <Plus size={12} />} label={installed ? 'Uninstall' : 'Install'}
-                        onClick={() => choose(() => onComponentAction(cluster, 'ipp', installed ? 'uninstall' : 'install'))} />
                     {installed && (
                         <MenuAction icon={running ? <Square size={12} /> : <Play size={12} />} label={running ? 'Stop' : 'Start'}
                             onClick={() => choose(() => onComponentAction(cluster, 'ipp', running ? 'stop' : 'start'))} />
                     )}
+                    <MenuAction icon={<Settings size={12} />} label="Configure" onClick={() => choose(() => onComponentAction(cluster, 'ipp', 'configure'))} />
+                    <MenuAction icon={installed ? <Trash2 size={12} /> : <Plus size={12} />} label={installed ? 'Uninstall' : 'Install'}
+                        onClick={() => choose(() => onComponentAction(cluster, 'ipp', installed ? 'uninstall' : 'install'))} />
                     <ComponentLogAction component="ipp" cluster={cluster}
                         onClick={() => choose(() => onComponentAction(cluster, 'ipp', 'logs'))} />
-                    <MenuAction icon={<Settings size={12} />} label="Configure" onClick={() => choose(() => onComponentAction(cluster, 'ipp', 'configure'))} />
                 </>
             );
         }
@@ -538,11 +563,25 @@ export function DataPlaneTopology({
                                                     </g>
                                                 ))}
                                             </svg>
+                                            {onEditTraffic && row.members.length > 0 && (
+                                                <PermissionGate permission="model-service:member:manage">
+                                                    <Button variant="sky" size="icon"
+                                                        className="absolute z-10 h-7 w-7 -translate-x-1/2 -translate-y-1/2 rounded-full p-0"
+                                                        style={{ left: ROUTE_BRANCH_X, top: row.routeY + BOX_H / 2 }}
+                                                        aria-label={`${row.serviceName} traffic distribution`}
+                                                        title={TRAFFIC_HELP} disabled={publicationPending}
+                                                        onClick={() => onEditTraffic(row.serviceId)}>
+                                                        <GitBranch size={14} aria-hidden="true" />
+                                                    </Button>
+                                                </PermissionGate>
+                                            )}
                                             <div className="flex h-9 items-center gap-2 px-4">
                                                 <span className="truncate text-xs font-semibold text-theme-text" title={row.serviceName}>{row.serviceName}</span>
-                                                {(onEditTraffic || onToggleService) && <PermissionGate permission={[
-                                                    ...(onEditTraffic ? ['model-service:member:manage'] : []),
-                                                    ...(onToggleService ? ['model-service:group:manage'] : []),
+                                                <StatusChip variant="compact" className="shrink-0" status={routed ? 'active' : 'inactive'}
+                                                    label={stopped ? 'Stopped' : routed ? 'Serving' : 'No traffic'} />
+                                                {(onEditTraffic || onToggleService || onSetProvidersStatus || onRemoveModel) && <PermissionGate permission={[
+                                                    ...(onEditTraffic || onSetProvidersStatus ? ['model-service:member:manage'] : []),
+                                                    ...(onToggleService || onRemoveModel ? ['model-service:group:manage'] : []),
                                                 ]}>
                                                     <Button variant="ghost" size="icon" className="shrink-0"
                                                         aria-label={`${row.serviceName} actions`} aria-haspopup="menu"
@@ -551,14 +590,16 @@ export function DataPlaneTopology({
                                                         <Menu size={12} />
                                                     </Button>
                                                 </PermissionGate>}
-                                                <StatusChip variant="compact" className="ml-auto" status={routed ? 'active' : 'inactive'}
-                                                    label={stopped ? 'Stopped' : routed ? 'Enabled' : 'No traffic'} />
                                             </div>
                                             <Box x={COL.httpRoute - MODEL.x} y={row.routeY} w={WB.httpRoute} label="HTTPRoute" icon={<GitBranch size={13} className="shrink-0 text-slate-400" />} crd
                                                 help="HTTPRoute defines rules for routing HTTP requests from a Gateway listener to backend resources."
                                                 helpSource="https://github.com/kubernetes-sigs/gateway-api/blob/main/site/content/en/reference/api-types/httproute.md"
                                                 status={statusDot[routeState] || statusDot.unknown} statusText={`HTTPRoute: ${statusLabel(routeState)}`}
                                                 menuOpen={menu?.key === routeKey} onToggleMenu={(event) => toggleMenu(routeKey, event)} />
+                                            {row.members.length === 0 && <p className="absolute text-xs text-theme-muted"
+                                                style={{ left: DEPLOYMENT.x - MODEL.x, top: COMPONENT_Y, width: DEPLOYMENT.w }}>
+                                                No providers. Add providers through Traffic distribution, or remove this model.
+                                            </p>}
                                             {row.members.map((member, index) => {
                                                 const name = (key) => componentName(member, key);
                                                 const dot = (key) => statusDot[name(key)] || statusDot.unknown;

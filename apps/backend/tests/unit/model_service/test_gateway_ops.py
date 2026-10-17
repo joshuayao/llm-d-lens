@@ -25,6 +25,56 @@ class _Result:
         self.stderr = stderr
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["none", "unmanaged", "delete", "still-present", "missing"])
+async def test_remove_model_route_only_deletes_owned_named_resources(monkeypatch, failure):
+    from llm_d_lens.model_service.gateway_ops import GatewayOpsError
+    from llm_d_lens.model_service.gateway_providers import MANAGED_LABEL, MANAGED_VALUE, resource_name
+
+    group = ModelServiceGroup(name="public", model_ref="provider", cluster_id="cluster-a")
+    monkeypatch.setattr(gateway_ops_module, "get_cluster", lambda _: SimpleNamespace(gateway_namespace="lens-gateway"))
+    ops = GatewayOpsService()
+    deleted = set()
+    calls = []
+
+    async def kubectl(cluster_id, argv, **kwargs):
+        assert cluster_id == group.cluster_id
+        calls.append(argv)
+        kind = argv[1]
+        if argv[0] == "get":
+            if failure == "missing" or (kind in deleted and failure != "still-present"):
+                return _Result()
+            return _Result(
+                stdout=json.dumps(
+                    {
+                        "metadata": {
+                            "labels": {
+                                MANAGED_LABEL: "other" if failure == "unmanaged" else MANAGED_VALUE,
+                            }
+                        }
+                    }
+                )
+            )
+        assert argv[0] == "delete"
+        name = resource_name(f"{group.name}-{group.id}") + ("-model-map" if kind == "configmap" else "")
+        assert argv[argv.index("--field-selector") + 1] == f"metadata.name={name}"
+        assert argv[argv.index("-l") + 1] == f"{MANAGED_LABEL}={MANAGED_VALUE}"
+        assert "--wait=true" in argv and "--timeout=60s" in argv
+        deleted.add(kind)
+        return _Result(
+            returncode=1 if failure == "delete" else 0, stderr="deletion failed" if failure == "delete" else ""
+        )
+
+    monkeypatch.setattr(ops, "_kubectl", kubectl)
+    if failure in ("none", "missing"):
+        await ops.remove_model_route(group)
+        assert deleted == ({"httproute", "configmap"} if failure == "none" else set())
+    else:
+        with pytest.raises(GatewayOpsError):
+            await ops.remove_model_route(group)
+        assert not any(call[1] == "configmap" for call in calls)
+
+
 class _FakeRunner:
     def __init__(self, calls: list) -> None:
         self.calls = calls
@@ -634,6 +684,39 @@ async def test_status_reports_gateway_state(monkeypatch):
     assert cluster_status.members[0].pool_name == "qwen"
     # A gateway operation is not created merely by reading status.
     assert cluster_status.last_operation is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disappeared", [False, True])
+async def test_status_keeps_registered_empty_models_but_never_probes_orphan_clusters(monkeypatch, disappeared):
+    ModelServiceGroupDao().create(ModelServiceGroup(name="empty-model", model_ref="provider", cluster_id="registered"))
+    ModelServiceGroupDao().create(ModelServiceGroup(name="orphan-empty", model_ref="provider", cluster_id="deleted"))
+    _seed_member(cluster_id="deleted-with-members")
+    cluster = SimpleNamespace(
+        id="registered",
+        name="Registered cluster",
+        gateway_provider=None,
+        gateway_namespace="lens-gateway",
+        gateway_name="lens-inference-gateway",
+    )
+    monkeypatch.setattr("llm_d_lens.cluster.registry.list_clusters", lambda: [cluster])
+    looked_up = []
+
+    def get_cluster(cluster_id):
+        looked_up.append(cluster_id)
+        assert cluster_id == "registered"
+        return None if disappeared else cluster
+
+    monkeypatch.setattr(gateway_ops_module, "get_cluster", get_cluster)
+    calls = []
+    service = _service(calls=calls)
+    status = await service.status()
+    assert [item.cluster_id for item in status.clusters] == ([] if disappeared else ["registered"])
+    assert looked_up == ["registered"]
+    if disappeared:
+        assert calls == []
+    else:
+        assert status.clusters[0].members == []
 
 
 class _DriftedProviderRunner(_FakeRunner):

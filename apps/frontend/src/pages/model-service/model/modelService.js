@@ -18,7 +18,7 @@ export function filterServiceFlow(clusters, memberGroups, { clusterId = '', mode
         .filter((group) => group.name.toLowerCase().includes(query))
         .map((group) => ({
             ...group,
-            clusters: group.clusters.filter((cluster) => selectedIds.has(cluster.clusterId) && cluster.deployments.length > 0),
+            clusters: group.clusters.filter((cluster) => selectedIds.has(cluster.clusterId)),
         }))
         .filter((group) => group.clusters.length > 0);
     const matchingIds = new Set(groups.flatMap((group) => group.clusters.map((cluster) => cluster.clusterId)));

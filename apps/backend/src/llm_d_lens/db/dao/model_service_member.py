@@ -144,3 +144,26 @@ class ModelServiceMemberDao(BaseDao):
                     select(ModelServiceGroupRow).where(ModelServiceGroupRow.id == row.group_id).with_for_update()
                 )
                 session.delete(row)
+
+    def set_group_status(
+        self, group_id: str, status: str, expected_statuses: dict[str, str]
+    ) -> list[ModelServiceMember]:
+        """Change the validated provider snapshot atomically without changing weights."""
+        with self._transaction() as session:
+            group = session.scalar(
+                select(ModelServiceGroupRow).where(ModelServiceGroupRow.id == group_id).with_for_update()
+            )
+            if group is None:
+                raise ModelServiceMemberDaoError(f"group not found: {group_id}")
+            rows = list(
+                session.scalars(
+                    select(ModelServiceMemberRow).where(ModelServiceMemberRow.group_id == group_id).with_for_update()
+                )
+            )
+            if {row.id: row.status for row in rows} != expected_statuses:
+                raise ModelServiceMemberDaoError("providers changed; reload the model and retry")
+            for row in rows:
+                row.status = status
+                row.updated_at = utcnow()
+            session.flush()
+            return [row.to_dto() for row in rows]

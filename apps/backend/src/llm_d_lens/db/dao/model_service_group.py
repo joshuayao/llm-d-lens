@@ -71,6 +71,10 @@ class ModelServiceGroupDao(BaseDao):
 
     def delete(self, group_id: str) -> None:
         with self._transaction() as session:
-            row = session.get(ModelServiceGroupRow, group_id)
+            row = session.scalar(
+                select(ModelServiceGroupRow).where(ModelServiceGroupRow.id == group_id).with_for_update()
+            )
             if row is not None:
+                if session.scalar(select(ModelServiceMemberRow.id).where(ModelServiceMemberRow.group_id == group_id)):
+                    raise ModelServiceGroupDaoError("remove every provider from the model before removing it")
                 session.delete(row)

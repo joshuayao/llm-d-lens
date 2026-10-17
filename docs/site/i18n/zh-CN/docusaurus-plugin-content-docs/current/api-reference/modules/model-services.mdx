@@ -1164,7 +1164,11 @@ HTTP 处理函数保存配置并等待受影响集群的调谐提交。`status: 
 
 ### 删除一个模型路由组
 
-删除一个路由组。该处理函数会安排对受影响集群的调谐，以移除它们的模型 HTTPRoute。
+需要模型所在集群的组管理权限，只允许移除空路由组。只要仍有关联提供方（包括离线或
+权重为 0 的提供方），就返回 `409 model_group_conflict`。处理函数与 Gateway 调谐串行，
+仅删除该模型由 Lens 管理的 HTTPRoute 和 IPP 映射，确认资源已删除后才删除记录。
+模型不存在返回 `404`；清理失败返回 `502 model_removal_failed` 并保留记录供重试。
+不删除其他模型、共享 Gateway 资源、部署或 Pod。
 
 <Tabs>
   <TabItem value="rest-api" label="REST API">
@@ -1174,10 +1178,63 @@ HTTP 处理函数保存配置并等待受影响集群的调谐提交。`status: 
   </TabItem>
   <TabItem value="python-api" label="Python API">
     ```python
+    from llm_d_lens.cluster.registry import gateway_lock
+    from llm_d_lens.model_service.gateway_ops import GatewayOpsService
     from llm_d_lens.model_service.service import default_service
 
-    default_service().delete_group("msg-4a8b41f3dd6c")
+    async def remove_model(group_id, principal):
+        service = default_service()
+        group = service.require_empty_group(group_id, principal=principal)
+        async with gateway_lock(group.cluster_id):
+            group = service.require_empty_group(group_id, principal=principal)
+            await GatewayOpsService().remove_model_route(group)
+            service.delete_group(group_id, principal=principal)
     ```
+
+    单独调用 `delete_group()` 只删除数据库记录，并在事务内再次检查提供方是否为空。
+    对实际模型应使用上述完整流程，清理异常必须阻止记录删除。可信内部调用可在服务方法中
+    省略 principal；HTTP 请求始终传入。
+  </TabItem>
+</Tabs>
+
+### 启动或停止所有提供方
+
+需要模型所在集群的成员管理权限。原子修改所有提供方状态，然后对受影响集群各调谐一次。
+保留权重、父模型状态和 Pod。启动时要求每个部署均在其注册集群中就绪。空模型、部署未就绪
+或提供方并发变更返回 `409 model_member_conflict`，不会部分修改状态；模型不存在返回 `404`。
+`502 model_publication_apply_failed` 表示状态已保存但路由应用失败，请重试 **Reconcile**。
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`PUT /api/v1/model-service/admin/groups/{group_id}/providers/status`**
+
+    ```json
+    { "status": "disabled" }
+    ```
+
+    `"active"` 启动所有提供方，`"disabled"` 停止所有提供方。
+    成功返回 `200`，`{"items": [...]}` 中包含更新后的成员对象。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.model_service.contracts import ProvidersStatusRequest
+    from llm_d_lens.model_service.gateway_ops import GatewayOpsService
+    from llm_d_lens.model_service.service import default_service
+
+    async def stop_providers(group_id, principal):
+        members = default_service().set_providers_status(
+            group_id, ProvidersStatusRequest(status="disabled"), principal=principal
+        )
+        for cluster_id in {member.cluster_id for member in members}:
+            operation = await GatewayOpsService().reconcile_cluster(
+                cluster_id, actor=principal.user_id
+            )
+            if operation.status != "succeeded":
+                raise RuntimeError(operation.message)
+        return members
+    ```
+
+    `set_providers_status()` 只持久化状态，直接调用时需如上调谐并检查操作结果。
   </TabItem>
 </Tabs>
 

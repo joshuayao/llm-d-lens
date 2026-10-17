@@ -9,7 +9,7 @@ from llm_d_lens.auth.contracts import Principal, ResourceRef
 from llm_d_lens.auth.policy import authorize
 from llm_d_lens.auth.service import default_service as default_auth_service
 from llm_d_lens.core.exceptions import ForbiddenError
-from llm_d_lens.db.dao.model_service_group import ModelServiceGroupDao
+from llm_d_lens.db.dao.model_service_group import ModelServiceGroupDao, ModelServiceGroupDaoError
 from llm_d_lens.db.dao.model_service_member import ModelServiceMemberDao, ModelServiceMemberDaoError
 from llm_d_lens.db.dao.usage_record import UsageRecordDao
 from llm_d_lens.model_service.contracts import (
@@ -22,6 +22,7 @@ from llm_d_lens.model_service.contracts import (
     ModelAccessToken,
     ModelServiceGroup,
     ModelServiceMember,
+    ProvidersStatusRequest,
     PublishableDeployment,
     TrafficUpdateRequest,
     UsageRecord,
@@ -160,8 +161,52 @@ class ModelService:
         except Exception as error:  # noqa: BLE001
             raise ModelServiceConflictError(str(error)) from error
 
-    def delete_group(self, group_id: str) -> None:
-        self.groups.delete(group_id)
+    def require_empty_group(self, group_id: str, *, principal: Principal | None = None) -> ModelServiceGroup:
+        group = self.groups.get(group_id)
+        if group is None:
+            raise ModelServiceNotFoundError(f"group not found: {group_id}")
+        if principal is not None:
+            resource = ResourceRef(resource_type="cluster", resource_id=group.cluster_id, cluster_id=group.cluster_id)
+            if not authorize(principal, "model-service:group:manage", resource=resource).allowed:
+                raise ForbiddenError("model-service group management is required in this cluster")
+        if self.members.list_by_group(group_id):
+            raise ModelServiceConflictError("remove every provider from the model before removing it")
+        return group
+
+    def delete_group(self, group_id: str, *, principal: Principal | None = None) -> None:
+        """Delete an empty model record; callers must first confirm its route cleanup."""
+        self.require_empty_group(group_id, principal=principal)
+        try:
+            self.groups.delete(group_id)
+        except ModelServiceGroupDaoError as error:
+            raise ModelServiceConflictError(str(error)) from error
+
+    def set_providers_status(
+        self, group_id: str, request: ProvidersStatusRequest, *, principal: Principal
+    ) -> list[ModelServiceMember]:
+        group = self.groups.get(group_id)
+        if group is None:
+            raise ModelServiceNotFoundError(f"group not found: {group_id}")
+        resource = ResourceRef(resource_type="cluster", resource_id=group.cluster_id, cluster_id=group.cluster_id)
+        if not authorize(principal, "model-service:member:manage", resource=resource).allowed:
+            raise ForbiddenError("model-service member management is required in this cluster")
+        members = self.members.list_by_group(group_id)
+        if not members:
+            raise ModelServiceConflictError("model has no providers")
+        if request.status == "active":
+            for member in members:
+                try:
+                    target = resolve_execution_target(member.execution_id)
+                except ExecutionTargetError as error:
+                    raise ModelServiceConflictError(f"provider cannot go online: {error}") from error
+                if target.status != "ready" or target.cluster_id != group.cluster_id:
+                    raise ModelServiceConflictError("all providers must be ready in the model's cluster to go online")
+        try:
+            return self.members.set_group_status(
+                group_id, request.status, {member.id: member.status for member in members}
+            )
+        except ModelServiceMemberDaoError as error:
+            raise ModelServiceConflictError(str(error)) from error
 
     # --- members -------------------------------------------------------------
     def list_members(self, group_id: str | None = None) -> list[ModelServiceMember]:

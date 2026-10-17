@@ -1174,7 +1174,13 @@ permission in every affected cluster. Controller convergence is asynchronous.
 
 ### Delete a model routing group
 
-Delete a routing group. The handler schedules a reconcile of the affected clusters so their model HTTPRoutes are removed.
+Remove an empty routing group with cluster-scoped group-management permission.
+Any attached provider, even offline or weight 0, returns `409 model_group_conflict`.
+The handler serializes with Gateway reconciliation, removes the model's
+Lens-managed HTTPRoute and IPP mapping, and confirms deletion before deleting
+the record. Missing models return `404`; cleanup failure returns
+`502 model_removal_failed` and retains the record for retry. Other models,
+shared Gateway resources, deployments and Pods are not removed.
 
 <Tabs>
   <TabItem value="rest-api" label="REST API">
@@ -1184,10 +1190,68 @@ Delete a routing group. The handler schedules a reconcile of the affected cluste
   </TabItem>
   <TabItem value="python-api" label="Python API">
     ```python
+    from llm_d_lens.cluster.registry import gateway_lock
+    from llm_d_lens.model_service.gateway_ops import GatewayOpsService
     from llm_d_lens.model_service.service import default_service
 
-    default_service().delete_group("msg-4a8b41f3dd6c")
+    async def remove_model(group_id, principal):
+        service = default_service()
+        group = service.require_empty_group(group_id, principal=principal)
+        async with gateway_lock(group.cluster_id):
+            group = service.require_empty_group(group_id, principal=principal)
+            await GatewayOpsService().remove_model_route(group)
+            service.delete_group(group_id, principal=principal)
     ```
+
+    `delete_group()` alone only removes the database record and rechecks empty
+    membership transactionally. Use the complete sequence above for live models;
+    cleanup exceptions must stop deletion. Trusted internal callers may omit the
+    principal in the service calls; HTTP requests always supply it.
+  </TabItem>
+</Tabs>
+
+### Start or stop all providers
+
+Requires member-management permission in the model's cluster. Changes all provider
+statuses atomically, then reconciles routing once per affected cluster. Weights,
+parent model status and Pods are unchanged. Starting requires every deployment
+to be ready in the registered cluster. An empty model, unready deployment or
+concurrent provider change returns `409 model_member_conflict` without partial
+status updates; missing models return `404`. A `502 model_publication_apply_failed`
+means statuses were saved but route application failed: retry **Reconcile**.
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`PUT /api/v1/model-service/admin/groups/{group_id}/providers/status`**
+
+    ```json
+    { "status": "disabled" }
+    ```
+
+    Use `"active"` to start all providers or `"disabled"` to stop all providers.
+    Success: `200` with `{"items": [...]}` containing the updated member payloads.
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.model_service.contracts import ProvidersStatusRequest
+    from llm_d_lens.model_service.gateway_ops import GatewayOpsService
+    from llm_d_lens.model_service.service import default_service
+
+    async def stop_providers(group_id, principal):
+        members = default_service().set_providers_status(
+            group_id, ProvidersStatusRequest(status="disabled"), principal=principal
+        )
+        for cluster_id in {member.cluster_id for member in members}:
+            operation = await GatewayOpsService().reconcile_cluster(
+                cluster_id, actor=principal.user_id
+            )
+            if operation.status != "succeeded":
+                raise RuntimeError(operation.message)
+        return members
+    ```
+
+    `set_providers_status()` persists only; direct callers must reconcile and
+    inspect the operation result as above.
   </TabItem>
 </Tabs>
 

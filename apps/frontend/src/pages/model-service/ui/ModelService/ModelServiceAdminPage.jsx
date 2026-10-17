@@ -6,6 +6,7 @@ import { useSubmission } from '../../../../shared/lib/useSubmission';
 import { cn } from '../../../../shared/lib/cn';
 import { errorMessage } from '../../../../shared/lib/errorMessage';
 import { Button } from '../../../../shared/ui/Button';
+import { StatusChip } from '../../../../shared/ui/Badge';
 import { Input, Label, Select, Textarea } from '../../../../shared/ui/FormControls';
 import { EmptyState } from '../../../../shared/ui/EmptyState';
 import { FormError } from '../../../../shared/ui/FormError';
@@ -31,6 +32,7 @@ import {
     updateGroup,
     updateMember,
     updateTrafficDistribution,
+    setProvidersStatus,
 } from './modelServiceBackend';
 import { DataPlaneTopology } from './DataPlaneTopology';
 import { ComponentLogViewer, GatewayOperationLogDrawer } from './GatewayOperationLogDrawer';
@@ -73,6 +75,7 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate }) {
     const [detail, setDetail] = useState(null);
     const [serviceEdit, setServiceEdit] = useState(null);
     const [memberDelete, setMemberDelete] = useState(null);
+    const [modelDelete, setModelDelete] = useState(null);
     const [ippConfigEdit, setIppConfigEdit] = useState(null);
     const [operationLog, setOperationLog] = useState(null);
     const [logsTarget, setLogsTarget] = useState(null);
@@ -81,7 +84,7 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate }) {
     const memberGroups = groups
         .map((group) => {
             const groupMembers = members.filter((member) => member.groupId === group.id);
-            const clusterIds = [...new Set(groupMembers.map((member) => member.clusterId))];
+            const clusterIds = [...new Set([group.clusterId, ...groupMembers.map((member) => member.clusterId)].filter(Boolean))];
             return {
                 id: group.id,
                 name: group.name,
@@ -218,15 +221,35 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate }) {
             : `Deployment added to ${result.group.name} with weight ${result.weight}. Use Traffic distribution to adjust its share.`);
     });
 
-    // Removing the last provider leaves no row to manage, so that deletes the
-    // whole model service; otherwise only this cluster's provider is removed.
     const removeProvider = () => deleteSubmission.run(async () => {
         if (!memberDelete) return;
-        const providers = members.filter((item) => item.groupId === memberDelete.groupId);
-        if (providers.length <= 1) await deleteGroup(memberDelete.groupId);
-        else await deleteMember(memberDelete.id);
+        await deleteMember(memberDelete.id);
         setMemberDelete(null);
         await load({ quiet: true });
+    });
+
+    const removeModel = () => deleteSubmission.run(async () => {
+        if (!modelDelete) return;
+        try {
+            await deleteGroup(modelDelete.id);
+            setModelDelete(null);
+            setNotice('Model removed. Its HTTPRoute and model mapping were safely cleaned up.');
+        } finally {
+            await load({ quiet: true });
+        }
+    });
+
+    const toggleAllProviders = (groupId, online) => toggleSubmission.run(async () => {
+        setNotice('');
+        serviceToggleSubmission.setError('');
+        try {
+            await setProvidersStatus(groupId, online ? 'active' : 'disabled');
+            setNotice(online
+                ? 'All providers online. Weights and Pods are unchanged; stopped models remain stopped and weight 0 stays standby.'
+                : 'All providers offline. Weights, model state and running Pods are unchanged.');
+        } finally {
+            await load({ quiet: true });
+        }
     });
 
     const runGatewayOperation = (payloadOrList, title) => {
@@ -623,7 +646,12 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate }) {
                             onViewServiceDetails={openServiceDetails}
                             onEditService={openEditService}
                             onToggleService={toggleService}
-                            publicationPending={toggleSubmission.pending || serviceToggleSubmission.pending}
+                            onSetProvidersStatus={toggleAllProviders}
+                            onRemoveModel={(id) => {
+                                deleteSubmission.setError('');
+                                setModelDelete(groups.find((group) => group.id === id) || null);
+                            }}
+                            publicationPending={toggleSubmission.pending || serviceToggleSubmission.pending || deleteSubmission.pending}
                             onViewDeploymentDetails={openDeploymentDetails}
                         />}
                     </div>
@@ -768,6 +796,24 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate }) {
                 )}
             </Modal>
 
+            <Modal isOpen={Boolean(modelDelete)}
+                onClose={() => { if (!deleteSubmission.pending) setModelDelete(null); }}
+                title="Remove model" size="sm"
+                closeOnBackdrop={!deleteSubmission.pending} closeOnEscape={!deleteSubmission.pending}
+                footer={<>
+                    <Button variant="secondary" disabled={deleteSubmission.pending} onClick={() => setModelDelete(null)}>Cancel</Button>
+                    <Button variant="danger" isLoading={deleteSubmission.pending}
+                        disabled={members.some((member) => member.groupId === modelDelete?.id)}
+                        onClick={removeModel}>Remove model</Button>
+                </>}>
+                <p className="text-sm text-theme-muted">
+                    Remove {modelDelete?.name}? All deployments must first be removed from this model.
+                    Its HTTPRoute and model mapping will be cleaned up before the model record is deleted.
+                    Cleanup failure keeps the record for retry. Other models, deployments and Pods are not deleted.
+                </p>
+                <FormError message={deleteSubmission.error} />
+            </Modal>
+
             <Modal
                 isOpen={Boolean(memberDelete)}
                 onClose={() => setMemberDelete(null)}
@@ -788,7 +834,7 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate }) {
                         <>
                             Remove the last provider (<span className="font-semibold text-theme-text">{memberDeleteClusterName}</span>)
                             {' '}of <span className="font-semibold text-theme-text">{memberDeleteGroup?.name}</span>?
-                            {' '}This deletes the model service and reconciles its route away; callers using it will stop working.
+                            {' '}The empty model remains available for adding providers or Remove model. Callers cannot use it without an online, positive-weight provider.
                         </>
                     ) : (
                         <>
@@ -945,24 +991,24 @@ export function TrafficDistributionForm({ draft, onChange, deployments, pending,
             {draft.rows.map((row, index) => (
                 <Panel key={row.executionId} padding="sm">
                     <div className="mb-3 flex items-start justify-between gap-2">
-                        <div className="min-w-0">
-                            <p className="break-words text-sm font-semibold text-theme-text">{row.name}</p>
-                            <p className="text-xs text-theme-muted">{row.isNew ? 'New provider (not saved)' : row.status}</p>
+                        <div className="flex min-w-0 items-center gap-2">
+                            <p className="min-w-0 break-words text-sm font-semibold text-theme-text">{row.name}</p>
+                            <StatusChip variant="compact"
+                                status={row.isNew ? 'pending' : row.status === 'disabled' ? 'inactive' : row.status}
+                                label={row.isNew ? 'New provider (not saved)' : row.status} />
                         </div>
                         {row.isNew && <Button variant="ghost" size="xs" disabled={pending}
                             onClick={() => onChange({ ...draft, rows: draft.rows.filter((item) => item.executionId !== row.executionId) })}>Remove</Button>}
                     </div>
-                    <div className="flex items-center gap-4">
-                        <div className="flex-1">
-                            <Label htmlFor={`traffic-weight-${index}`}>Weight</Label>
-                            <Input id={`traffic-weight-${index}`} type="number" min={0} max={MAX_TRAFFIC_WEIGHT} step={1}
-                                value={row.weight} disabled={pending || row.status === 'disabled'}
-                                onChange={(event) => onChange({
-                                    ...draft,
-                                    rows: draft.rows.map((item, position) => position === index ? { ...item, weight: event.target.value } : item),
-                                })} />
-                        </div>
-                        <output className="w-20 text-right text-sm font-semibold text-theme-text"
+                    <div className="flex items-center gap-3">
+                        <Label className="mb-0 shrink-0" htmlFor={`traffic-weight-${index}`}>Weight</Label>
+                        <Input className="min-w-0 flex-1" id={`traffic-weight-${index}`} type="number" min={0} max={MAX_TRAFFIC_WEIGHT} step={1}
+                            value={row.weight} disabled={pending || row.status === 'disabled'}
+                            onChange={(event) => onChange({
+                                ...draft,
+                                rows: draft.rows.map((item, position) => position === index ? { ...item, weight: event.target.value } : item),
+                            })} />
+                        <output className="w-16 shrink-0 text-right text-sm font-semibold text-theme-text"
                             aria-label={`${row.name} configured traffic share`}>{trafficShare(row, total)}</output>
                     </div>
                 </Panel>

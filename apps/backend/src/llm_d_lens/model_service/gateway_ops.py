@@ -35,7 +35,7 @@ from llm_d_lens.infrastructure.kubernetes import (
     stop_port_forward_for,
 )
 from llm_d_lens.infrastructure.network import hostinfo
-from llm_d_lens.model_service.contracts import utcnow
+from llm_d_lens.model_service.contracts import ModelServiceGroup, utcnow
 from llm_d_lens.model_service.gateway_contracts import (
     GatewayOperation,
     GatewayStatus,
@@ -1469,6 +1469,57 @@ class GatewayOpsService:
             },
         )
 
+    async def remove_model_route(self, group: ModelServiceGroup) -> None:
+        """Remove only this model's managed route/map and wait for deletion.
+
+        The caller holds the cluster Gateway lock and checks that the model is
+        empty before cleanup and again when deleting its database record.
+        """
+        cluster = get_cluster(group.cluster_id)
+        if cluster is None:
+            raise GatewayOpsError("cluster is unavailable; cannot confirm model route cleanup")
+        namespace = gateway_namespace_for(group.cluster_id, cluster.gateway_namespace)
+        route_name = resource_name(f"{group.name}-{group.id}")
+        for kind, name in (("httproute", route_name), ("configmap", f"{route_name}-model-map")):
+            result = await self._kubectl(
+                group.cluster_id,
+                ["get", kind, name, "-n", namespace, "-o", "json", "--ignore-not-found=true"],
+                timeout=30,
+            )
+            if result.returncode != 0:
+                raise GatewayOpsError(result.stderr or f"cannot inspect {kind}/{name}")
+            if not result.stdout.strip():
+                continue
+            metadata = json.loads(result.stdout).get("metadata", {})
+            if metadata.get("labels", {}).get(MANAGED_LABEL) != MANAGED_VALUE:
+                raise GatewayOpsError(f"refusing to remove unmanaged {kind}/{name}")
+            result = await self._kubectl(
+                group.cluster_id,
+                [
+                    "delete",
+                    kind,
+                    "-n",
+                    namespace,
+                    "-l",
+                    f"{MANAGED_LABEL}={MANAGED_VALUE}",
+                    "--field-selector",
+                    f"metadata.name={name}",
+                    "--ignore-not-found=true",
+                    "--wait=true",
+                    "--timeout=60s",
+                ],
+                timeout=70,
+            )
+            if result.returncode != 0:
+                raise GatewayOpsError(result.stderr or f"cannot remove {kind}/{name}")
+            remaining = await self._kubectl(
+                group.cluster_id,
+                ["get", kind, name, "-n", namespace, "-o", "json", "--ignore-not-found=true"],
+                timeout=30,
+            )
+            if remaining.returncode != 0 or remaining.stdout.strip():
+                raise GatewayOpsError(f"cannot confirm removal of {kind}/{name}; retry model removal")
+
     async def scale_component(
         self,
         cluster_id: str,
@@ -1777,7 +1828,8 @@ class GatewayOpsService:
     async def status(self) -> GatewayStatus:
         member_rows = self.members.list_all()
         by_cluster: dict[str, list[GatewayStatusMember]] = {}
-        group_names = {group.id: group.name for group in self.groups.list()}
+        groups = self.groups.list()
+        group_names = {group.id: group.name for group in groups}
         for member in member_rows:
             by_cluster.setdefault(member.cluster_id, []).append(
                 GatewayStatusMember(
@@ -1794,14 +1846,17 @@ class GatewayOpsService:
 
         all_clusters = list_clusters()
         cluster_names = {cluster.id: cluster.name for cluster in all_clusters}
-        # Show a cluster whenever it has members OR a Gateway (a Gateway with no
-        # deployments still exists and must stay visible/ operable).
-        candidate_ids = set(by_cluster) | {
-            cluster.id for cluster in all_clusters if getattr(cluster, "gateway_provider", None)
-        }
+        # Empty models must remain manageable even without an installed Gateway.
+        candidate_ids = (
+            set(by_cluster)
+            | {group.cluster_id for group in groups if group.cluster_id}
+            | {cluster.id for cluster in all_clusters if getattr(cluster, "gateway_provider", None)}
+        ) & cluster_names.keys()
         clusters: list[GatewayStatusCluster] = []
         for cluster_id in sorted(candidate_ids):
             cluster = get_cluster(cluster_id)
+            if cluster is None:
+                continue
             namespace = gateway_namespace_for(cluster_id, cluster.gateway_namespace if cluster else None)
             name = (cluster.gateway_name if cluster else None) or DEFAULT_GATEWAY_NAME
             state, ready = await self._gateway_state(cluster_id, namespace, name)

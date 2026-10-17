@@ -100,6 +100,16 @@ export async function deleteGroup(groupId) {
     await requestJson(`${admin}/groups/${encodeURIComponent(groupId)}`, { method: 'DELETE' });
 }
 
+export async function setProvidersStatus(groupId, status) {
+    const payload = await requestJson(`${admin}/groups/${encodeURIComponent(groupId)}/providers/status`, {
+        method: 'PUT',
+        headers: jsonHeaders,
+        body: JSON.stringify({ status }),
+    });
+    if (!Array.isArray(payload?.items)) throw new Error('Provider status response is invalid; refresh before retrying.');
+    return payload.items;
+}
+
 export async function listMembers(groupId, { signal } = {}) {
     const query = groupId ? `?group_id=${encodeURIComponent(groupId)}` : '';
     const payload = await requestJson(`${admin}/members${query}`, { signal });
