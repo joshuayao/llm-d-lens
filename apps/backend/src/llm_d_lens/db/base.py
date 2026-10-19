@@ -133,6 +133,14 @@ class DeclarativeDtoMixin:
 # --- automatic audit ---------------------------------------------------------
 
 _AUDIT_EXCLUDED_TABLES = {"audit_logs", "sessions"}
+# High-frequency execution bookkeeping: keep the create event (who started the
+# run) but do not emit an audit row for every progress/request update.
+_AUDIT_UPDATE_EXCLUDED_TABLES = {
+    "simulation_tasks",
+    "evaluate_runs",
+    "evaluate_workflows",
+    "evaluate_workflow_cases",
+}
 _AUDIT_REDACT_FIELDS = {
     "password",
     "password_hash",
@@ -179,6 +187,10 @@ def _audit_json_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _audit_json_value(item) for key, item in list(value.items())[:50]}
     return str(value)
+
+
+def audit_tracks_write(table: str, action: str) -> bool:
+    return not (action == "update" and table in _AUDIT_UPDATE_EXCLUDED_TABLES)
 
 
 def redact_audit_detail(value: Any) -> Any:
@@ -303,7 +315,7 @@ def _audit_before_flush(session: Session, flush_context: Any, instances: Any) ->
         if not isinstance(obj, Base):
             continue
         table = getattr(obj, "__tablename__", None)
-        if not table or table in _AUDIT_EXCLUDED_TABLES:
+        if not table or table in _AUDIT_EXCLUDED_TABLES or not audit_tracks_write(table, "update"):
             continue
         state = inspect(obj)
         before: dict[str, Any] = {}
@@ -382,10 +394,10 @@ def _audit_bulk_dml(orm_execute_state: Any) -> Any:
         table = orm_execute_state.statement.table.name
     except AttributeError:
         return None
-    if table in _AUDIT_EXCLUDED_TABLES:
+    action = "delete" if orm_execute_state.is_delete else "update"
+    if table in _AUDIT_EXCLUDED_TABLES or not audit_tracks_write(table, action):
         return None
     result = orm_execute_state.invoke_statement()
-    action = "delete" if orm_execute_state.is_delete else "update"
     session = orm_execute_state.session
     session.add(
         _audit_row(

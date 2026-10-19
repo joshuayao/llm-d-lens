@@ -560,3 +560,14 @@ def test_login_bookkeeping_audit_uses_the_signed_in_user_as_actor():
 
         assert page["items"]
         assert all(item["actor_username"] == "root" for item in page["items"])
+
+
+def test_audit_update_events_are_suppressed_for_high_frequency_workloads():
+    from llm_d_lens.db.base import audit_tracks_write
+
+    for table in ("simulation_tasks", "evaluate_runs", "evaluate_workflows", "evaluate_workflow_cases"):
+        assert audit_tracks_write(table, "create")
+        assert not audit_tracks_write(table, "update")
+        assert audit_tracks_write(table, "delete")
+
+    assert audit_tracks_write("clusters", "update")
