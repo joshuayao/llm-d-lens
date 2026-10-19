@@ -17,9 +17,9 @@ import { ChevronDown, CircleHelp } from 'lucide-react';
 import { cn } from '../lib/cn';
 
 const fieldBase =
-    'w-full rounded-lg border bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 ' +
-    'px-3 py-2 text-sm text-theme-text placeholder:text-theme-muted transition-colors ' +
-    'focus:outline-none focus:ring-2 focus:ring-emerald-500/40 focus:border-emerald-500 ' +
+    'w-full rounded-lg border bg-[#f8fcff] dark:bg-slate-900 border-[#b7d4e6] dark:border-slate-700 shadow-sm hover:border-[#9fc0d6] dark:hover:border-slate-600 ' +
+    'px-3 py-2 text-sm text-theme-text placeholder:text-theme-muted transition-colors focus:bg-white dark:focus:bg-slate-900 ' +
+    'focus:outline-none focus:ring-2 focus:ring-[#15b8fc]/35 focus:border-[#15b8fc] dark:focus:ring-emerald-500/40 dark:focus:border-emerald-500 ' +
     'disabled:opacity-50 disabled:cursor-not-allowed';
 
 const fieldVariants = {
