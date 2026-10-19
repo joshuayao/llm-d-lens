@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -14,6 +14,7 @@ from llm_d_lens.db.dao.model_service_group import ModelServiceGroupDao
 from llm_d_lens.db.dao.model_service_member import ModelServiceMemberDao
 from llm_d_lens.model_service import gateway_ops as gateway_ops_module
 from llm_d_lens.model_service.contracts import ModelServiceGroup, ModelServiceMember
+from llm_d_lens.model_service.gateway_contracts import GatewayOperation
 from llm_d_lens.model_service.gateway_ops import GatewayOpsService
 from llm_d_lens.model_service.targets import ExecutionMissingError
 
@@ -1261,3 +1262,14 @@ def test_resolve_authz_endpoint_uses_live_serving_port(monkeypatch):
 def test_resolve_authz_endpoint_falls_back_before_first_request(monkeypatch):
     monkeypatch.setattr(gateway_ops_module.hostinfo, "current_serving_port", lambda: None)
     assert gateway_ops_module.resolve_authz_endpoint("10.0.0.5") == ("10.0.0.5", 8081)
+
+
+def test_automatic_gateway_operations_do_not_write_audit_events():
+    service = GatewayOpsService(operations=GatewayOperationDao())
+    audit = Mock()
+    service._auth = SimpleNamespace(audit=audit)
+
+    operation = service._record(GatewayOperation(kind="install-gateway", cluster_id="cluster-a"))
+    service._finish(operation, ok=True, message="reconciled")
+
+    audit.assert_not_called()
