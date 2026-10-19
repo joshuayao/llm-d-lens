@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -14,6 +14,7 @@ from llm_d_lens.db.dao.model_service_group import ModelServiceGroupDao
 from llm_d_lens.db.dao.model_service_member import ModelServiceMemberDao
 from llm_d_lens.model_service import gateway_ops as gateway_ops_module
 from llm_d_lens.model_service.contracts import ModelServiceGroup, ModelServiceMember
+from llm_d_lens.model_service.gateway_contracts import GatewayOperation
 from llm_d_lens.model_service.gateway_ops import GatewayOpsService
 from llm_d_lens.model_service.targets import ExecutionMissingError
 
@@ -1300,3 +1301,14 @@ async def test_model_server_health_checks_pods_selected_by_the_inference_pool():
 
     assert await service._model_server_state("cluster-a", "ns", "llm-d.ai/guide=pool") == "ready"
     assert calls == [["get", "pods", "-n", "ns", "-l", "llm-d.ai/guide=pool", "-o", "json"]]
+
+
+def test_automatic_gateway_operations_do_not_write_audit_events():
+    service = GatewayOpsService(operations=GatewayOperationDao())
+    audit = Mock()
+    service._auth = SimpleNamespace(audit=audit)
+
+    operation = service._record(GatewayOperation(kind="install-gateway", cluster_id="cluster-a"))
+    service._finish(operation, ok=True, message="reconciled")
+
+    audit.assert_not_called()

@@ -240,9 +240,11 @@ class GatewayOpsService:
         operation.detail_json = detail
         operation.finished_at = utcnow()
         saved = self.operations.save(operation)
-        # Automatic reconcile runs on a background loop with no actor; those runs
-        # are noise for the audit trail, so only user-initiated operations log.
-        is_automatic = operation.kind == "reconcile-gateway" and operation.created_by_user_id is None
+        # Automatic reconcile runs on a background loop with no actor. Its nested
+        # operations (install-gateway, component-scale, ...) also have no actor;
+        # all of them are noise for the audit trail, so only user-initiated
+        # operations log.
+        is_automatic = operation.created_by_user_id is None
         if not is_automatic:
             self._auth.audit(
                 "model_gateway_operation",
