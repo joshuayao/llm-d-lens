@@ -1835,12 +1835,18 @@ class GatewayOpsService:
         return state, selector
 
     async def _model_server_state(self, cluster_id: str, namespace: str, selector: str | None) -> str:
-        """``ready`` when the InferencePool's selector has a ready endpoint."""
+        """``ready`` when the InferencePool's selector has a ready Pod.
+
+        Query Pods rather than EndpointSlices: the InferencePool controller
+        creates a headless Service/EndpointSlice that does not retain the
+        InferencePool selector as EndpointSlice labels, so filtering
+        EndpointSlices by that selector always returns nothing.
+        """
         if not selector:
             return "missing"
         try:
             result = await self._kubectl(
-                cluster_id, ["get", "endpointslices", "-n", namespace, "-l", selector, "-o", "json"], timeout=15
+                cluster_id, ["get", "pods", "-n", namespace, "-l", selector, "-o", "json"], timeout=15
             )
         except (FileNotFoundError, TimeoutError, OSError):
             return "unknown"
@@ -1851,9 +1857,14 @@ class GatewayOpsService:
         except json.JSONDecodeError:
             return "unknown"
         for item in payload.get("items") or []:
-            for endpoint in item.get("endpoints") or []:
-                if endpoint.get("addresses") and (endpoint.get("conditions") or {}).get("ready", True):
-                    return "ready"
+            status = item.get("status") or {}
+            if status.get("phase") != "Running":
+                continue
+            if any(
+                condition.get("type") == "Ready" and condition.get("status") == "True"
+                for condition in status.get("conditions") or []
+            ):
+                return "ready"
         return "missing"
 
     # --- status --------------------------------------------------------------

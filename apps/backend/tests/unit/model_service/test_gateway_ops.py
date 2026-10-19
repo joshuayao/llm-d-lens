@@ -974,10 +974,21 @@ class _ComponentRunner(_FakeRunner):
             return _Result(
                 stdout=json.dumps({"spec": {"selector": {"matchLabels": {"llm-d.ai/guide": "pool"}}}, "status": status})
             )
-        if list(argv[:3]) == ["kubectl", "get", "endpointslices"]:
-            ready = "true" if self._model_server_ready else "false"
+        if list(argv[:3]) == ["kubectl", "get", "pods"]:
+            ready = "True" if self._model_server_ready else "False"
             return _Result(
-                stdout='{"items":[{"endpoints":[{"addresses":["1.2.3.4"],"conditions":{"ready":' + ready + "}}]}]}"
+                stdout=json.dumps(
+                    {
+                        "items": [
+                            {
+                                "status": {
+                                    "phase": "Running",
+                                    "conditions": [{"type": "Ready", "status": ready}],
+                                }
+                            }
+                        ]
+                    }
+                )
             )
         return await super().run(argv, cwd=cwd, env=env, input=input, timeout=timeout)
 
@@ -1261,3 +1272,31 @@ def test_resolve_authz_endpoint_uses_live_serving_port(monkeypatch):
 def test_resolve_authz_endpoint_falls_back_before_first_request(monkeypatch):
     monkeypatch.setattr(gateway_ops_module.hostinfo, "current_serving_port", lambda: None)
     assert gateway_ops_module.resolve_authz_endpoint("10.0.0.5") == ("10.0.0.5", 8081)
+
+
+@pytest.mark.asyncio
+async def test_model_server_health_checks_pods_selected_by_the_inference_pool():
+    calls: list[list[str]] = []
+    service = GatewayOpsService(operations=GatewayOperationDao())
+
+    async def kubectl(_cluster_id, argv, **_kwargs):
+        calls.append(argv)
+        return _Result(
+            stdout=json.dumps(
+                {
+                    "items": [
+                        {
+                            "status": {
+                                "phase": "Running",
+                                "conditions": [{"type": "Ready", "status": "True"}],
+                            }
+                        }
+                    ]
+                }
+            )
+        )
+
+    service._kubectl = kubectl
+
+    assert await service._model_server_state("cluster-a", "ns", "llm-d.ai/guide=pool") == "ready"
+    assert calls == [["get", "pods", "-n", "ns", "-l", "llm-d.ai/guide=pool", "-o", "json"]]
