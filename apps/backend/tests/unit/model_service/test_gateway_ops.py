@@ -95,7 +95,7 @@ async def test_remove_model_route_treats_sdk_empty_list_as_absent(monkeypatch):
     monkeypatch.setattr(ops, "_kubectl", kubectl)
     await ops.remove_model_route(group)
 
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert all(call[0] == "get" for call in calls)
 
 
@@ -1312,3 +1312,62 @@ def test_automatic_gateway_operations_do_not_write_audit_events():
     service._finish(operation, ok=True, message="reconciled")
 
     audit.assert_not_called()
+
+
+class _ModelRewriteRunner(_FakeRunner):
+    async def run(self, argv, *, cwd=None, env=None, input=None, timeout=10):  # noqa: A002
+        self.calls.append((argv, input))
+        if list(argv[:3]) == ["kubectl", "get", "crd"]:
+            return _Result(stdout="inferencemodelrewrites.llm-d.ai\n")
+        if list(argv[:3]) == ["kubectl", "get", "inferencemodelrewrite"]:
+            return _Result(stdout='{"items": []}')
+        return await super().run(argv, cwd=cwd, env=env, input=input, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_maps_public_model_name_to_served_model_name(monkeypatch):
+    group = ModelServiceGroupDao().create(
+        ModelServiceGroup(
+            name="qwen3-0.6b",
+            model_ref="Qwen/Qwen3-0.6B",
+            cluster_id="cluster-a",
+            served_name="Qwen/Qwen3-0.6B",
+            base_model="qwen3-0.6b",
+        )
+    )
+    ModelServiceMemberDao().create(
+        ModelServiceMember(
+            group_id=group.id,
+            execution_id="exec-alias",
+            cluster_id="cluster-a",
+            target_namespace="ns",
+            target_service="qwen-epp",
+            target_port=80,
+            pool_name="ns/qwen-pool",
+            epp_ref="qwen-epp",
+            endpoint_kind="llm-d-epp",
+        )
+    )
+    calls: list = []
+    service = _service(calls=calls, runner_cls=_ModelRewriteRunner)
+    monkeypatch.setattr(
+        gateway_ops_module,
+        "get_cluster",
+        lambda _cid: SimpleNamespace(
+            gateway_provider="istio", gateway_namespace="lens-gateway", gateway_name="lens-inference-gateway"
+        ),
+    )
+
+    operation = await service.reconcile_cluster_gateway("cluster-a")
+
+    assert operation.status == "succeeded"
+    rewrites = [
+        item[1]
+        for item in calls
+        if list(item[0][:3]) == ["kubectl", "apply", "-f"] and "kind: InferenceModelRewrite" in (item[1] or "")
+    ]
+    assert rewrites
+    manifest = rewrites[-1]
+    assert "value: qwen3-0.6b" in manifest
+    assert "modelRewrite: Qwen/Qwen3-0.6B" in manifest
+    assert "name: qwen-pool" in manifest
