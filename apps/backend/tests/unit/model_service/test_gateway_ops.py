@@ -27,7 +27,7 @@ class _Result:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["none", "unmanaged", "delete", "still-present", "missing"])
-async def test_remove_model_route_only_deletes_owned_named_resources(monkeypatch, failure):
+async def test_remove_model_route_deletes_exactly_the_models_named_resources(monkeypatch, failure):
     from llm_d_lens.model_service.gateway_ops import GatewayOpsError
     from llm_d_lens.model_service.gateway_providers import MANAGED_LABEL, MANAGED_VALUE, resource_name
 
@@ -57,8 +57,12 @@ async def test_remove_model_route_only_deletes_owned_named_resources(monkeypatch
             )
         assert argv[0] == "delete"
         name = resource_name(f"{group.name}-{group.id}") + ("-model-map" if kind == "configmap" else "")
-        assert argv[argv.index("--field-selector") + 1] == f"metadata.name={name}"
-        assert argv[argv.index("-l") + 1] == f"{MANAGED_LABEL}={MANAGED_VALUE}"
+        if failure == "unmanaged":
+            assert name in argv
+            assert "-l" not in argv
+        else:
+            assert argv[argv.index("--field-selector") + 1] == f"metadata.name={name}"
+            assert argv[argv.index("-l") + 1] == f"{MANAGED_LABEL}={MANAGED_VALUE}"
         assert "--wait=true" in argv and "--timeout=60s" in argv
         deleted.add(kind)
         return _Result(
@@ -66,13 +70,32 @@ async def test_remove_model_route_only_deletes_owned_named_resources(monkeypatch
         )
 
     monkeypatch.setattr(ops, "_kubectl", kubectl)
-    if failure in ("none", "missing"):
+    if failure in ("none", "missing", "unmanaged"):
         await ops.remove_model_route(group)
-        assert deleted == ({"httproute", "configmap"} if failure == "none" else set())
+        assert deleted == ({"httproute", "configmap"} if failure in ("none", "unmanaged") else set())
     else:
         with pytest.raises(GatewayOpsError):
             await ops.remove_model_route(group)
         assert not any(call[1] == "configmap" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_remove_model_route_treats_sdk_empty_list_as_absent(monkeypatch):
+    group = ModelServiceGroup(name="public", model_ref="provider", cluster_id="cluster-a")
+    monkeypatch.setattr(gateway_ops_module, "get_cluster", lambda _: SimpleNamespace(gateway_namespace="lens-gateway"))
+    ops = GatewayOpsService()
+    calls = []
+
+    async def kubectl(cluster_id, argv, **kwargs):
+        calls.append(argv)
+        assert argv[0] == "get"
+        return _Result(stdout='{"items": []}')
+
+    monkeypatch.setattr(ops, "_kubectl", kubectl)
+    await ops.remove_model_route(group)
+
+    assert len(calls) == 2
+    assert all(call[0] == "get" for call in calls)
 
 
 class _FakeRunner:

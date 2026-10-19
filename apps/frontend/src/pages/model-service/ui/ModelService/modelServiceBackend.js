@@ -246,7 +246,7 @@ export function scaleComponent({ clusterId, namespace, name, replicas, kind = 'd
 
 // Run any data-plane operation and stream its log lines (SSE `log`/`complete`/`error`).
 export function reconcileGateway(payload, onEvent, signal) {
-    return streamSseRequest(`${gateway}/reconcile/stream`, payload, onEvent, signal);
+    return streamSseRequest(`${gateway}/reconcile/stream`, { clusterId: payload.clusterId }, onEvent, signal);
 }
 
 export function streamGatewayOperation(payload, onEvent, signal) {

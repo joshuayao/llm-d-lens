@@ -189,6 +189,17 @@ def _data_plane_degraded(components: dict) -> bool:
     )
 
 
+def _kubectl_object(stdout: str) -> dict | None:
+    """Parse one kubectl JSON object, accepting the SDK runner's list envelope."""
+    if not stdout.strip():
+        return None
+    payload = json.loads(stdout)
+    if isinstance(payload, dict) and "items" in payload:
+        items = payload.get("items") or []
+        return items[0] if items else None
+    return payload if isinstance(payload, dict) else None
+
+
 class GatewayOpsService:
     def __init__(
         self,
@@ -1488,28 +1499,49 @@ class GatewayOpsService:
             )
             if result.returncode != 0:
                 raise GatewayOpsError(result.stderr or f"cannot inspect {kind}/{name}")
-            if not result.stdout.strip():
+            obj = _kubectl_object(result.stdout)
+            if obj is None:
                 continue
-            metadata = json.loads(result.stdout).get("metadata", {})
-            if metadata.get("labels", {}).get(MANAGED_LABEL) != MANAGED_VALUE:
-                raise GatewayOpsError(f"refusing to remove unmanaged {kind}/{name}")
-            result = await self._kubectl(
-                group.cluster_id,
-                [
-                    "delete",
-                    kind,
-                    "-n",
-                    namespace,
-                    "-l",
-                    f"{MANAGED_LABEL}={MANAGED_VALUE}",
-                    "--field-selector",
-                    f"metadata.name={name}",
-                    "--ignore-not-found=true",
-                    "--wait=true",
-                    "--timeout=60s",
-                ],
-                timeout=70,
-            )
+            metadata = obj.get("metadata", {})
+            managed = metadata.get("labels", {}).get(MANAGED_LABEL) == MANAGED_VALUE
+            if not managed:
+                # Older Lens releases and interrupted reconciles could leave a
+                # route/map with the model's exact deterministic name but no
+                # managed label. The name is unique to this group, so it is
+                # safe to remove that stale object instead of blocking deletion.
+                logger.warning("removing unmanaged %s/%s for model %s", kind, name, group.id)
+                result = await self._kubectl(
+                    group.cluster_id,
+                    [
+                        "delete",
+                        kind,
+                        name,
+                        "-n",
+                        namespace,
+                        "--ignore-not-found=true",
+                        "--wait=true",
+                        "--timeout=60s",
+                    ],
+                    timeout=70,
+                )
+            else:
+                result = await self._kubectl(
+                    group.cluster_id,
+                    [
+                        "delete",
+                        kind,
+                        "-n",
+                        namespace,
+                        "-l",
+                        f"{MANAGED_LABEL}={MANAGED_VALUE}",
+                        "--field-selector",
+                        f"metadata.name={name}",
+                        "--ignore-not-found=true",
+                        "--wait=true",
+                        "--timeout=60s",
+                    ],
+                    timeout=70,
+                )
             if result.returncode != 0:
                 raise GatewayOpsError(result.stderr or f"cannot remove {kind}/{name}")
             remaining = await self._kubectl(
@@ -1517,7 +1549,7 @@ class GatewayOpsService:
                 ["get", kind, name, "-n", namespace, "-o", "json", "--ignore-not-found=true"],
                 timeout=30,
             )
-            if remaining.returncode != 0 or remaining.stdout.strip():
+            if remaining.returncode != 0 or _kubectl_object(remaining.stdout) is not None:
                 raise GatewayOpsError(f"cannot confirm removal of {kind}/{name}; retry model removal")
 
     async def scale_component(

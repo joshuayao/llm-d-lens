@@ -175,7 +175,7 @@ export function DownloadModelModal({ clusters = [], defaultClusterId = '', defau
                         </Select>
                         {clusterId && volumes.length === 0 && (
                             <p className="mt-1.5 text-[11px] text-amber-300">
-                                No ready storage volumes on this cluster. Register one on the Storage page first.
+                                No ready storage volume tagged for Model cache on this cluster. Register one with the Model cache purpose on the Storage page first.
                             </p>
                         )}
                     </div>
