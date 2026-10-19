@@ -76,6 +76,9 @@ Lens Assistant 暂不支持 Anthropic 类型。
 5. 等待 **Transcribing your voice message…**（正在转写你的语音消息…），
    然后让 Lens 发送转写后的消息。
 
+首次转写会通过 Lens 下载 Whisper 模型；输入框下方会显示下载进度，随后显示转写状态。
+音频处理仍在浏览器本地完成；由于代理网络中的浏览器可能无法直接访问 Hugging Face CDN，模型文件由 Lens 代理下载。
+
 ## 连接外部 MCP 客户端
 
 Lens Assistant 使用的是 Lens 内置的 MCP 工具目录。如果想用你自己的 MCP

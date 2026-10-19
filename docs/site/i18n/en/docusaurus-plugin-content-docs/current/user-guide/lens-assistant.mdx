@@ -66,6 +66,11 @@ instead of running it.
 4. Click the microphone again when its tooltip changes to **Stop recording**.
 5. Wait for **Transcribing your voice message…**, then let Lens send the transcribed message.
 
+The first transcription downloads a Whisper model through Lens; the composer
+shows download progress and then the transcription status. Audio processing
+stays in your browser; model files are proxied because browsers on proxy-only
+networks may not reach the Hugging Face CDN directly.
+
 ## Connect an external MCP client
 
 Lens Assistant uses Lens' built-in MCP tool catalog. To drive the same tools from your own

@@ -8,7 +8,7 @@ import { Badge, StatusChip } from '../../../../shared/ui/Badge';
 import { Button } from '../../../../shared/ui/Button';
 import { HelpTooltip } from '../../../../shared/ui/FormControls';
 import { Panel } from '../../../../shared/ui/Panel';
-import { PermissionGate } from '../../../auth';
+import { PermissionGate, useAuth } from '../../../auth';
 import { trafficShare, trafficTotal } from '../../model/modelService';
 
 // Canonical llm-d Gateway Mode data plane.
@@ -42,7 +42,9 @@ const SECTION_GAP = 40;
 const WIDTH = MODEL.x + MODEL.w + 24;
 const TRAFFIC_HELP = 'Configure relative traffic weights across this model’s deployment providers. Weight 0 keeps a provider on standby; offline providers receive no traffic.';
 
-function Box({ x, y, w = 180, h = BOX_H, label, help, helpSource, helpPlacement = 'top', sub, icon, status, statusText, crd, menuOpen, onToggleMenu }) {
+function Box({ x, y, w = 180, h = BOX_H, label, help, helpSource, helpPlacement = 'top', sub, icon, status, statusText, crd, menuOpen, onToggleMenu, menuPermissions = ['model-service:gateway:manage'] }) {
+    const { can } = useAuth();
+    const canOpenMenu = menuPermissions.some((permission) => can(permission));
     return (
         <div className="absolute" style={{ left: x, top: y, width: w, height: h }}>
             <div className={cn(
@@ -66,14 +68,12 @@ function Box({ x, y, w = 180, h = BOX_H, label, help, helpSource, helpPlacement 
                         </HelpTooltip>
                     )}
                     {crd && <Badge tone="neutral" size="xxs">CRD</Badge>}
-                    {onToggleMenu && (
-                        <PermissionGate permission="model-service:gateway:manage">
-                            <span className="ml-auto inline-flex">
-                                <Button variant="ghost" size="icon" aria-label={`${label} actions`} aria-haspopup="menu" aria-expanded={menuOpen} onClick={onToggleMenu}>
-                                    <Menu size={12} />
-                                </Button>
-                            </span>
-                        </PermissionGate>
+                    {onToggleMenu && canOpenMenu && (
+                        <span className="ml-auto inline-flex">
+                            <Button variant="ghost" size="icon" aria-label={`${label} actions`} aria-haspopup="menu" aria-expanded={menuOpen} onClick={onToggleMenu}>
+                                <Menu size={12} />
+                            </Button>
+                        </span>
                     )}
                 </div>
                 {sub && <span className="mt-0.5 truncate text-[9.5px] leading-tight text-slate-500" title={sub}>{sub}</span>}
@@ -318,7 +318,7 @@ export function DataPlaneTopology({
             if (!row) return null;
             return (
                 <>
-                    {onToggleService && <PermissionGate permission="model-service:group:manage">
+                    {onToggleService && <PermissionGate permission="model-service:group:toggle">
                         <PublicationToggleAction kind="model" stopped={row.serviceStatus === 'disabled'}
                             pending={publicationPending}
                             onClick={() => choose(() => onToggleService({ id: row.serviceId, name: row.serviceName }))} />
@@ -332,7 +332,7 @@ export function DataPlaneTopology({
                             title={TRAFFIC_HELP} disabled={publicationPending}
                             onClick={() => choose(() => onEditTraffic(row.serviceId))} />
                     </PermissionGate>}
-                    {onRemoveModel && <PermissionGate permission="model-service:group:manage">
+                    {onRemoveModel && <PermissionGate permission="model-service:group:remove">
                         <MenuAction icon={<Unlink size={12} />} label="Remove model"
                             disabled={publicationPending || row.members.length > 0}
                             title={row.members.length ? 'Remove every deployment from this model first.' : 'Safely remove this empty model and its HTTPRoute.'}
@@ -376,13 +376,23 @@ export function DataPlaneTopology({
             return (
                 <>
                     <div className="truncate px-2 py-1 text-[10px] uppercase tracking-wide text-slate-500">{cluster.clusterName || cluster.clusterId} · {cluster.gatewayProvider || 'gateway'}</div>
-                    {installed && (
-                        <MenuAction icon={running ? <Square size={12} /> : <Play size={12} />} label={running ? 'Stop' : 'Start'}
-                            onClick={() => choose(() => onComponentAction(cluster, 'gateway', running ? 'stop' : 'start'))} />
-                    )}
-                    <MenuAction icon={<RotateCw size={12} />} label="Reconcile" onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'reconcile'))} />
-                    <MenuAction icon={installed ? <Trash2 size={12} /> : <Plus size={12} />} label={installed ? 'Uninstall' : 'Install'}
-                        onClick={() => choose(() => onComponentAction(cluster, 'gateway', installed ? 'uninstall' : 'install'))} />
+                    <PermissionGate permission="cluster:cluster:update">
+                        <MenuAction icon={<Settings size={12} />} label="Configure"
+                            onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'configure'))} />
+                    </PermissionGate>
+                    <PermissionGate permission="model-service:gateway:manage">
+                        {installed && (
+                            <MenuAction icon={running ? <Square size={12} /> : <Play size={12} />} label={running ? 'Stop' : 'Start'}
+                                onClick={() => choose(() => onComponentAction(cluster, 'gateway', running ? 'stop' : 'start'))} />
+                        )}
+                    </PermissionGate>
+                    <PermissionGate permission="model-service:gateway:reconcile">
+                        <MenuAction icon={<RotateCw size={12} />} label="Reconcile" onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'reconcile'))} />
+                    </PermissionGate>
+                    <PermissionGate permission="model-service:gateway:manage">
+                        <MenuAction icon={installed ? <Trash2 size={12} /> : <Plus size={12} />} label={installed ? 'Uninstall' : 'Install'}
+                            onClick={() => choose(() => onComponentAction(cluster, 'gateway', installed ? 'uninstall' : 'install'))} />
+                    </PermissionGate>
                     <ComponentLogAction component="gateway" cluster={cluster}
                         onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'logs'))} />
                 </>
@@ -522,7 +532,8 @@ export function DataPlaneTopology({
                                     helpSource="https://github.com/llm-d/llm-d/blob/f83d4f331ec87a82fa11c84449738705ac4d1424/docs/infrastructure/gateway/README.md"
                                     status={statusDot[gwState] || statusDot.unknown}
                                     statusText={`Gateway: ${gwDetail} (${statusLabel(gwState)})`}
-                                    menuOpen={menu?.key === `gw:${cluster.clusterId}`} onToggleMenu={(event) => toggleMenu(`gw:${cluster.clusterId}`, event)} />
+                                    menuOpen={menu?.key === `gw:${cluster.clusterId}`} onToggleMenu={(event) => toggleMenu(`gw:${cluster.clusterId}`, event)}
+                                    menuPermissions={['model-service:gateway:manage', 'model-service:gateway:reconcile']} />
                                 <Box x={IPP.x} y={section.ippY} w={IPP.w} label="IPP" icon={<Waypoints size={13} className="shrink-0 text-slate-400" />}
                                     help={
                                         <>

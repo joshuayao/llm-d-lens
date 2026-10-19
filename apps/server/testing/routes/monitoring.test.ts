@@ -17,6 +17,7 @@ let upstream: http.Server;
 let proxy: http.Server;
 let proxyUrl = '';
 let delayMs = 0;
+let lastHeaders: http.IncomingHttpHeaders = {};
 
 function listen(server: http.Server): Promise<number> {
     return new Promise((resolve) => {
@@ -25,7 +26,8 @@ function listen(server: http.Server): Promise<number> {
 }
 
 before(async () => {
-    upstream = http.createServer((_req, res) => {
+    upstream = http.createServer((req, res) => {
+        lastHeaders = req.headers;
         setTimeout(() => {
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end('{"ok":true}');
@@ -34,10 +36,15 @@ before(async () => {
     const upstreamPort = await listen(upstream);
     process.env.MONITORING_API_URL = `http://127.0.0.1:${upstreamPort}`;
     process.env.MONITORING_PROXY_TIMEOUT_MS = '100';
+    process.env.LENS_INTERNAL_AUTH_SECRET = 'test-internal-secret';
     process.env.MONITORING_INSTALL_TIMEOUT_MS = '1000';
 
     const app = express();
     app.use(express.json());
+    app.use((req, _res, next) => {
+        (req as express.Request & { principal?: { userId: string } }).principal = { userId: 'user-1' };
+        next();
+    });
     app.use(monitoringRouter);
     proxy = http.createServer(app);
     const proxyPort = await listen(proxy);
@@ -54,6 +61,15 @@ test('read requests use the short monitoring timeout', async () => {
     const response = await fetch(`${proxyUrl}/api/v1/monitoring/gpu-driver/status?access_mode=dra`);
     assert.equal(response.status, 504);
     assert.deepEqual(await response.json(), { detail: 'Monitoring request timed out' });
+});
+
+test('forwards the resolved principal to the Python upstream', async () => {
+    delayMs = 0;
+    const response = await fetch(`${proxyUrl}/api/v1/monitoring/gpu-driver/status`);
+    assert.equal(response.status, 200);
+    assert.equal(lastHeaders['x-prism-principal-id'], 'user-1');
+    assert.ok(lastHeaders['x-prism-internal-ts']);
+    assert.ok(lastHeaders['x-prism-internal-sig']);
 });
 
 test('driver install uses the longer install timeout', async () => {

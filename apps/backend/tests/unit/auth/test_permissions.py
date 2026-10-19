@@ -38,7 +38,6 @@ def test_admin_has_every_permission():
         "session:session:revoke",
         "audit:log:read",
         "model-service:group:manage",
-        "model-service:gateway:manage",
     ],
 )
 def test_maintainer_cannot_administer(code):
@@ -58,7 +57,11 @@ def test_maintainer_cannot_administer(code):
         "ai-provider:provider:create",
         "remote-deploy:deploy:execute",
         "model-service:gateway:read",
+        "model-service:gateway:reconcile",
+        "model-service:gateway:manage",
         "model-service:group:read",
+        "model-service:group:toggle",
+        "model-service:group:remove",
         "model-service:member:manage",
         "model-service:router:manage",
     ],

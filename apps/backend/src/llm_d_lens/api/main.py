@@ -21,6 +21,7 @@ from llm_d_lens.agentic.router import router as agentic_deployment_router
 from llm_d_lens.ai_providers.router import router as ai_providers_router
 from llm_d_lens.aic import router as aic_router
 from llm_d_lens.api.problems import install_problem_handlers
+from llm_d_lens.api.speech_models import router as speech_models_router
 from llm_d_lens.auth.bootstrap import ensure_initial_admin, format_initial_admin_banner
 from llm_d_lens.auth.context import AuthContextMiddleware, require_route_permission
 from llm_d_lens.auth.maintenance import run_maintenance
@@ -36,6 +37,8 @@ from llm_d_lens.cluster.errors import ClusterOverviewError
 from llm_d_lens.cluster.router import legacy_router
 from llm_d_lens.cluster.router import router as cluster_management_router
 from llm_d_lens.configuration import router as configuration_router
+from llm_d_lens.dashboard.collector import reset_collector
+from llm_d_lens.dashboard.router import router as dashboard_router
 from llm_d_lens.db.system_router import router as system_database_router
 from llm_d_lens.deploy.router import router as deploy_router
 from llm_d_lens.evaluation import router as evaluate_router
@@ -104,10 +107,13 @@ _gateway_exposure_task: asyncio.Task[None] | None = None
 _gateway_exposure_stop: asyncio.Event | None = None
 _gateway_usage_task: asyncio.Task[None] | None = None
 _gateway_usage_stop: asyncio.Event | None = None
+_welcome_check_task: asyncio.Task[None] | None = None
+_welcome_check_stop: asyncio.Event | None = None
 MODEL_HEALTH_INTERVAL_SECONDS = float(os.environ.get("LENS_MODEL_HEALTH_INTERVAL_SECONDS", "10"))
 MODEL_RECONCILE_INTERVAL_SECONDS = float(os.environ.get("LENS_MODEL_RECONCILE_INTERVAL_SECONDS", "300"))
 GATEWAY_EXPOSURE_INTERVAL_SECONDS = float(os.environ.get("LENS_GATEWAY_EXPOSURE_INTERVAL_SECONDS", "60"))
 GATEWAY_USAGE_INTERVAL_SECONDS = float(os.environ.get("LENS_GATEWAY_USAGE_INTERVAL_SECONDS", "60"))
+WELCOME_CHECK_INTERVAL_SECONDS = float(os.environ.get("LENS_WELCOME_CHECK_INTERVAL_SECONDS", "60"))
 logger = logging.getLogger(__name__)
 
 
@@ -146,6 +152,20 @@ async def _run_gateway_usage(stop_event: asyncio.Event) -> None:
             logger.exception("model-service gateway usage sync failed")
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop_event.wait(), timeout=GATEWAY_USAGE_INTERVAL_SECONDS)
+
+
+async def _run_welcome_check(stop_event: asyncio.Event) -> None:
+    """Refresh the persisted Welcome issue snapshot for the whole installation."""
+    from llm_d_lens.dashboard.service import default_service as default_dashboard_service  # noqa: PLC0415
+
+    service = default_dashboard_service()
+    while not stop_event.is_set():
+        try:
+            await service.run_snapshot_check()
+        except Exception:  # noqa: BLE001 - a failed check must not kill the loop
+            logger.exception("welcome snapshot check failed")
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=WELCOME_CHECK_INTERVAL_SECONDS)
 
 
 async def _run_model_health(stop_event: asyncio.Event) -> None:
@@ -190,6 +210,7 @@ async def _auth_startup() -> None:
     global _model_reconcile_task, _model_reconcile_stop
     global _gateway_exposure_task, _gateway_exposure_stop
     global _gateway_usage_task, _gateway_usage_stop
+    global _welcome_check_task, _welcome_check_stop
     service = default_auth_service()
     service.ensure_builtin_roles()
     current_settings = get_auth_settings()
@@ -218,6 +239,9 @@ async def _auth_startup() -> None:
     if GATEWAY_USAGE_INTERVAL_SECONDS > 0:
         _gateway_usage_stop = asyncio.Event()
         _gateway_usage_task = asyncio.create_task(_run_gateway_usage(_gateway_usage_stop))
+    if WELCOME_CHECK_INTERVAL_SECONDS > 0:
+        _welcome_check_stop = asyncio.Event()
+        _welcome_check_task = asyncio.create_task(_run_welcome_check(_welcome_check_stop))
 
 
 @app.on_event("shutdown")
@@ -226,6 +250,7 @@ async def _auth_shutdown() -> None:
     global _model_reconcile_task, _model_reconcile_stop
     global _gateway_exposure_task, _gateway_exposure_stop
     global _gateway_usage_task, _gateway_usage_stop
+    global _welcome_check_task, _welcome_check_stop
     if _maintenance_stop is not None:
         _maintenance_stop.set()
     if _maintenance_task is not None:
@@ -270,6 +295,16 @@ async def _auth_shutdown() -> None:
             logger.warning("gateway usage task did not stop cleanly", exc_info=True)
         _gateway_usage_task = None
     _gateway_usage_stop = None
+    if _welcome_check_stop is not None:
+        _welcome_check_stop.set()
+    if _welcome_check_task is not None:
+        try:
+            await _welcome_check_task
+        except Exception:  # noqa: BLE001 - shutdown must not fail on snapshot check
+            logger.warning("welcome snapshot task did not stop cleanly", exc_info=True)
+        _welcome_check_task = None
+    _welcome_check_stop = None
+    reset_collector()
 
 
 app.include_router(simulation_router)
@@ -284,6 +319,8 @@ app.include_router(cluster_bootstrap_router)
 app.include_router(legacy_router)
 app.include_router(configuration_router)
 app.include_router(deploy_router)
+app.include_router(dashboard_router)
+app.include_router(speech_models_router)
 app.include_router(evaluate_router)
 app.include_router(hardware_router)
 app.include_router(cluster_monitoring_stack_router)

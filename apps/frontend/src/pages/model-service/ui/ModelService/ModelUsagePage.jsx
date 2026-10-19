@@ -254,19 +254,28 @@ function RequestsTrend({ title, data, byHour }) {
 
 // Usage view. `mode="self"` shows the caller's own usage analytics; `mode="admin"`
 // shows recent usage across users/models/clusters (gated by usage:report:read).
-export function ModelUsagePage({ mode = 'self', onToggleMobileNav }) {
+export function ModelUsagePage({ mode = 'self', onToggleMobileNav, initialClusterId = '', initialGroupId = '', initialUserId = '', initialSince = null, initialUntil = null, initialUsageWindow = '' }) {
     const [records, setRecords] = useState([]);
     const [tokens, setTokens] = useState([]);
     const [error, setError] = useState('');
-    const [range, setRange] = useState('today');
-    const [customFrom, setCustomFrom] = useState('');
-    const [customTo, setCustomTo] = useState('');
+    const [range, setRange] = useState(() => {
+        if (initialSince && initialUntil) return 'custom';
+        if (initialUsageWindow === '24h') return 'today';
+        if (initialUsageWindow === '7d' || initialUsageWindow === '30d') return initialUsageWindow;
+        return 'today';
+    });
+    const [customFrom, setCustomFrom] = useState(initialSince ? String(initialSince).slice(0, 10) : '');
+    const [customTo, setCustomTo] = useState(initialUntil ? String(initialUntil).slice(0, 10) : '');
     const [keyFilter, setKeyFilter] = useState('all');
     const [metric, setMetric] = useState('tokens');
     const [analytics, setAnalytics] = useState(null);
     const [adminLoading, setAdminLoading] = useState(mode === 'admin');
     const [groupBy, setGroupBy] = useState('model');
-    const [dimFilters, setDimFilters] = useState({ user: new Set(), model: new Set(), cluster: new Set() });
+    const [dimFilters, setDimFilters] = useState(() => ({
+        user: new Set(initialUserId ? [initialUserId] : []),
+        model: new Set(initialGroupId ? [initialGroupId] : []),
+        cluster: new Set(initialClusterId ? [initialClusterId] : []),
+    }));
     const loadedOnceRef = useRef(false);
 
     const load = useCallback(async () => {

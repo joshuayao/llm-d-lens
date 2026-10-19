@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Database, Webcam, Rocket, Gauge, Network, HardDrive, Download, Plug, Bot, ChevronDown,
-    Users, UserCog, ShieldCheck, KeyRound, Monitor, ScrollText, Menu, Boxes, Activity, Waypoints
+    Users, UserCog, ShieldCheck, KeyRound, Monitor, ScrollText, Menu, Boxes, Activity, Waypoints,
+    Sparkles, Fingerprint
 } from 'lucide-react';
 import { cn } from '../../shared/lib/cn';
 import { SimulationIcon } from '../../pages/simulation';
@@ -10,7 +11,7 @@ import { NAVIGATION_GROUPS } from '../routes/views';
 const MENU_ICONS = {
     Database, Webcam, Rocket, Gauge, Network, HardDrive, Download, Plug, Bot,
     Users, UserCog, ShieldCheck, KeyRound, Monitor, ScrollText, Boxes, Activity,
-    Waypoints, SimulationIcon,
+    Waypoints, SimulationIcon, Sparkles, Fingerprint,
 };
 
 // Groups that start collapsed. Everything else opens with the sidebar.

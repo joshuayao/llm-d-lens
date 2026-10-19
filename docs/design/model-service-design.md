@@ -626,8 +626,10 @@ not an enabled behavior or an approved data-plane extension.
   deployment management, cluster management, evaluation, or observability pages.
 - Admin has the full permission catalog. Maintainer has the catalog minus its
   explicit deny list: it can manage deployments and model members in scope,
-  but not `model-service:group:manage` or `model-service:gateway:manage`.
-  Resource sharing must not silently erase that distinction.
+  but not `model-service:group:manage`. A maintainer may publish a ready
+  deployment as a new public model name through the member-manage publish route
+  and may maintain the shared Gateway and IPP; group metadata/policy edits
+  remain admin-only. Resource sharing must not silently erase that distinction.
 - Standard HTTPRoute selects an InferencePool using configured backend weights;
   that pool's EPP chooses a Pod. The legacy `x-lens-member` authorization result
   does not constrain the current Gateway's selected backend.
@@ -715,7 +717,10 @@ operations without new group/gateway management or identity-directory access.
 End-user keys/usage remain private and management pages remain unavailable.
 
 Grant management is intentionally included for maintainer. Its existing
-`group:manage` and `gateway:manage` exclusions remain unchanged.
+`group:manage` exclusion remains unchanged; gateway management is included so
+maintainers can install, start/stop and reconcile the shared Gateway and IPP.
+Deployment publication uses `model-service:member:manage` and does not grant
+group metadata edits.
 
 Do **not** simply remove inference from `_END_USER_SELF_SCOPED`: that would make
 the cluster binding alone sufficient under generic authorization. Replace the

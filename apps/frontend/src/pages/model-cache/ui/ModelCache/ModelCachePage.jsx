@@ -5,7 +5,7 @@ import { PaginationControls } from '../../../../shared/ui/PaginationControls';
 import { useClusterNames } from '../../../optimization';
 import { useResourceList } from '../../../../shared/lib/useResourceList';
 import { AsyncState } from '../../../../shared/ui/AsyncState';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { usePolling } from '../../../../shared/lib/usePolling';
 import { ArrowLeft, CheckCircle2, ChevronLeft, ChevronRight, Download, Plus, RefreshCw, Search, Server, ServerCog } from 'lucide-react';
 import { createModelCacheEntry, deleteModelCacheEntry, listModelCacheEntries, retryModelCacheEntry, syncAllModelCacheEntryNodes, syncModelCacheEntryNodes } from './modelCacheBackend';
@@ -40,19 +40,21 @@ function StatCard({ label, value, tone = 'text-white' }) {
     );
 }
 
-export function ModelCachePage({ onNavigateBack, initialDownload, onDownloadHandled } = {}) {
+export function ModelCachePage({ onNavigateBack, initialDownload, onDownloadHandled, initialClusterId = '', initialEntryId = '', initialAction = '' } = {}) {
     const [searchInput, setSearchInput] = useState('');
     const query = useDebouncedValue(searchInput, SEARCH_DEBOUNCE_MS).trim();
     const [typeFilter, setTypeFilter] = useState('');
-    const [clusterId, setClusterId] = useState('');
+    const [clusterId, setClusterId] = useState(initialClusterId || '');
     const [storageVolumeId, setStorageVolumeId] = useState('');
-    const [dialog, setDialog] = useState(initialDownload ? 'download' : null);
+    const [dialog, setDialog] = useState(initialDownload || initialAction === 'download' ? 'download' : null);
     const [selected, setSelected] = useState(null);
     const [mutatingId, setMutatingId] = useState(null);
     const [syncingAll, setSyncingAll] = useState(false);
     const [notice, setNotice] = useNotice();
     const [page, setPage] = useState(0);
     const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+    const focusedEntryId = useRef('');
+    const handledInitialAction = useRef(false);
 
     const { clusters, clusterNameById } = useClusterNames();
     const [volumeNameById, setVolumeNameById] = useState({});
@@ -174,6 +176,25 @@ export function ModelCachePage({ onNavigateBack, initialDownload, onDownloadHand
         () => paginate(filteredItems, page, pageSize),
         [filteredItems, page, pageSize]
     );
+
+    useEffect(() => {
+        setClusterId(initialClusterId || '');
+    }, [initialClusterId]);
+
+    useEffect(() => {
+        if (initialAction !== 'download' || handledInitialAction.current) return;
+        handledInitialAction.current = true;
+        setDialog('download');
+    }, [initialAction]);
+
+    useEffect(() => {
+        if (!initialEntryId || focusedEntryId.current === initialEntryId) return;
+        const index = items.findIndex((item) => item.id === initialEntryId);
+        if (index >= 0) {
+            focusedEntryId.current = initialEntryId;
+            setPage(Math.floor(index / pageSize));
+        }
+    }, [initialEntryId, items, pageSize]);
 
     const closeDialog = () => {
         setDialog(null);

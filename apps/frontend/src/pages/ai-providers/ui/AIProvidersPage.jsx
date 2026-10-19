@@ -1,5 +1,5 @@
 import { useResourceList } from '../../../shared/lib/useResourceList';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { usePolling } from '../../../shared/lib/usePolling';
 import { CheckCircle2, Loader2, Pencil, Plug, Plus, RefreshCw, Search, Trash2, XCircle } from 'lucide-react';
 import { deleteAIProvider, listAIProviders, testSavedAIProvider } from './aiProvidersBackend';
@@ -16,8 +16,9 @@ import { MultiSelectDropdown } from '../../../shared/ui/MultiSelectDropdown';
 // Manage external AI providers ("External providers") that power optional
 // AI capabilities across Agentic components. Backed by /api/v1/ai-providers
 // (llm_d_lens/ai_providers/router.py).
-export function AIProvidersPage({ onToggleMobileNav }) {
-    const [dialog, setDialog] = useState(null); // { mode: 'add' | 'edit', provider? }
+export function AIProvidersPage({ onToggleMobileNav, initialAction = '' }) {
+    const [dialog, setDialog] = useState(null);
+    const handledInitialAction = useRef(false); // { mode: 'add' | 'edit', provider? }
     const [pendingDelete, setPendingDelete] = useState(null);
     const [testingId, setTestingId] = useState(null);
     const [testResults, setTestResults] = useState({});
@@ -28,6 +29,12 @@ export function AIProvidersPage({ onToggleMobileNav }) {
     });
 
     usePolling(() => load({ quiet: true }));
+
+    useEffect(() => {
+        if (initialAction !== 'add' || handledInitialAction.current) return;
+        handledInitialAction.current = true;
+        setDialog({ mode: 'add' });
+    }, [initialAction]);
 
     const runTest = async (provider) => {
         setTestingId(provider.id);

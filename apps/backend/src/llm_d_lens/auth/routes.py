@@ -117,6 +117,10 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     # --- capacity planning ---
     RoutePermission("POST", "/api/v1/capacity/estimate", "deployment:agentic:read"),
     # --- cluster ---
+    # --- welcome ---
+    RoutePermission("GET", "/api/v1/welcome/overview", "cluster:cluster:read"),
+    RoutePermission("GET", "/api/v1/welcome/issues", "cluster:cluster:read"),
+    RoutePermission("GET", "/api/v1/speech-models/{rest}", "playground:chat:use"),
     RoutePermission("GET", "/api/cluster/clusters", "cluster:cluster:read"),
     RoutePermission("POST", "/api/cluster/clusters", "cluster:cluster:create"),
     RoutePermission("DELETE", "/api/cluster/clusters/{cluster_id}", "cluster:cluster:delete"),
@@ -311,8 +315,10 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     # --- model service: admin ---
     RoutePermission("GET", "/api/v1/model-service/admin/groups", "model-service:group:read"),
     RoutePermission("POST", "/api/v1/model-service/admin/groups", "model-service:group:manage"),
+    RoutePermission("POST", "/api/v1/model-service/admin/groups/publish", "model-service:member:manage"),
     RoutePermission("GET", "/api/v1/model-service/admin/groups/{group_id}", "model-service:group:read"),
     RoutePermission("PATCH", "/api/v1/model-service/admin/groups/{group_id}", "model-service:group:manage"),
+    RoutePermission("POST", "/api/v1/model-service/admin/groups/{group_id}/status", "model-service:group:toggle"),
     RoutePermission("GET", "/api/v1/model-service/admin/groups/{group_id}/access", "model-service:group:share"),
     RoutePermission("POST", "/api/v1/model-service/admin/groups/{group_id}/access", "model-service:group:share"),
     RoutePermission("GET", "/api/v1/model-service/admin/groups/{group_id}/access/options", "model-service:group:share"),
@@ -323,7 +329,7 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     RoutePermission(
         "PUT", "/api/v1/model-service/admin/groups/{group_id}/providers/status", "model-service:member:manage"
     ),
-    RoutePermission("DELETE", "/api/v1/model-service/admin/groups/{group_id}", "model-service:group:manage"),
+    RoutePermission("DELETE", "/api/v1/model-service/admin/groups/{group_id}", "model-service:group:remove"),
     RoutePermission("GET", "/api/v1/model-service/admin/members", "model-service:group:read"),
     RoutePermission("GET", "/api/v1/model-service/admin/deployments", "model-service:group:read"),
     RoutePermission("POST", "/api/v1/model-service/admin/members", "model-service:member:manage"),
@@ -334,6 +340,7 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     # --- model service: gateway operations (shared Gateway) ---
     RoutePermission("GET", "/api/v1/model-service/admin/gateway/status", "model-service:gateway:read"),
     RoutePermission("POST", "/api/v1/model-service/admin/gateway/reconcile", "model-service:gateway:manage"),
+    RoutePermission("POST", "/api/v1/model-service/admin/gateway/reconcile/stream", "model-service:gateway:reconcile"),
     RoutePermission("POST", "/api/v1/model-service/admin/gateway/probe", "model-service:gateway:manage"),
     RoutePermission("POST", "/api/v1/model-service/admin/gateway/usage/sync", "model-service:gateway:manage"),
     RoutePermission("GET", "/api/v1/model-service/admin/gateway/ipp-config", "model-service:gateway:read"),

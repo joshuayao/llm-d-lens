@@ -1,6 +1,6 @@
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
-  <img alt="Lens" src="public/lens_logo.png" width="150">
+  <img alt="Lens" src="apps/frontend/public/lens_logo.png" width="150">
 </p>
 
 <h3 align="center">

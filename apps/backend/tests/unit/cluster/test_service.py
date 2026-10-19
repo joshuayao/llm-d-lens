@@ -1272,6 +1272,46 @@ def test_cluster_record_exposes_hf_token_secret_coordinates():
     assert "token" not in payload["hfTokenSecret"]
 
 
+@pytest.mark.asyncio
+async def test_monitoring_component_evaluates_expected_dashboards(monkeypatch):
+    cluster = SimpleNamespace(id="cluster-a")
+    captured = {}
+
+    async def fake_expected_dashboard_names(cluster_id=None):
+        captured["cluster_id"] = cluster_id
+        return ["dashboard-a", "dashboard-b"]
+
+    async def fake_discover(namespace, runner, *, expected_dashboards=None):
+        captured["namespace"] = namespace
+        captured["expected_dashboards"] = expected_dashboards
+        return SimpleNamespace(
+            status="degraded",
+            components=[
+                SimpleNamespace(name="prometheus", status="ready"),
+                SimpleNamespace(name="llm_d_dashboards", status="missing"),
+            ],
+            message="Monitoring stack requires attention",
+        )
+
+    monkeypatch.setattr(
+        "llm_d_lens.monitoring.cluster_stack.service.expected_dashboard_names", fake_expected_dashboard_names
+    )
+    monkeypatch.setattr(service, "discover_cluster_stack", fake_discover)
+    monkeypatch.setattr(service, "scoped_runner", lambda cluster_id: object())
+    service._MONITORING_CACHE.clear()
+
+    result = await service.monitoring_component(cluster)
+
+    assert result["status"] == "degraded"
+    assert result["dashboardsReady"] is False
+    assert result["dashboardOnly"] is True
+    assert captured == {
+        "cluster_id": "cluster-a",
+        "namespace": "llm-d-monitoring",
+        "expected_dashboards": ["dashboard-a", "dashboard-b"],
+    }
+
+
 def test_component_status_exposes_per_profile_device_plugins():
     resources = [
         {

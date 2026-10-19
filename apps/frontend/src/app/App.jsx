@@ -16,6 +16,7 @@ import { useState, useRef, useEffect } from 'react';
 import ErrorBoundary from './providers/ErrorBoundary';
 import { firstAccessibleView, resolveView } from './routes/views';
 import { ClusterMonitoringStackDashboard, OptimizationClusterOverview } from '../pages/clusters';
+import { WelcomeIssuesPage, WelcomePage } from '../pages/welcome';
 import { DeploymentManagementPage } from '../pages/deployment';
 import { ModelMarketPage } from '../pages/model-market';
 import { StorageManagementPage } from '../pages/storage';
@@ -70,9 +71,25 @@ function AuthenticatedApp({ initialView = null }) {
       clusterId: params.get('clusterId') || null,
       deploymentSearch: params.get('deploymentSearch') || '',
       profileDeployment,
+      action: params.get('action') || null,
+      groupId: params.get('groupId') || null,
+      executionId: params.get('executionId') || null,
+      volumeId: params.get('volumeId') || null,
+      entryId: params.get('entryId') || null,
+      purpose: params.get('purpose') || null,
+      severity: params.get('severity') || '',
+      category: params.get('category') || '',
+      issueSearch: params.get('search') || '',
+      usageWindow: params.get('usageWindow') || '24h',
+      since: params.get('since') || null,
+      until: params.get('until') || null,
+      userId: params.get('userId') || null,
     };
   });
 
+  const [welcomeClusterId, setWelcomeClusterId] = useState(() => (
+    currentView === 'welcome' ? navigationParams.clusterId || '' : ''
+  ));
   const [isMobileNavOpen, setIsMobileNavOpen] = useState(false);
   const [cacheFromModelMarket, setCacheFromModelMarket] = useState(false);
   const [isSidebarExpanded, setIsSidebarExpanded] = useState(() => {
@@ -97,11 +114,32 @@ function AuthenticatedApp({ initialView = null }) {
     const onPopState = () => {
       const params = new URLSearchParams(window.location.search);
       const resolvedView = resolveView(params.get('view'), firstAccessibleView(canView));
+      let profileDeployment = null;
+      try {
+        const raw = params.get('profileDeployment');
+        profileDeployment = raw ? JSON.parse(raw) : null;
+      } catch {
+        profileDeployment = null;
+      }
       setCurrentView(resolvedView);
       setNavigationParams((previous) => ({
         ...previous,
+        profileDeployment,
         clusterId: params.get('clusterId') || null,
         deploymentSearch: params.get('deploymentSearch') || '',
+        action: params.get('action') || null,
+        groupId: params.get('groupId') || null,
+        executionId: params.get('executionId') || null,
+        volumeId: params.get('volumeId') || null,
+        entryId: params.get('entryId') || null,
+        purpose: params.get('purpose') || null,
+        severity: params.get('severity') || '',
+        category: params.get('category') || '',
+        issueSearch: params.get('search') || '',
+        usageWindow: params.get('usageWindow') || '24h',
+        since: params.get('since') || null,
+        until: params.get('until') || null,
+        userId: params.get('userId') || null,
       }));
       if (!['model-market', 'model-cache'].includes(resolvedView)) {
         setCacheFromModelMarket(false);
@@ -119,6 +157,7 @@ function AuthenticatedApp({ initialView = null }) {
       || (current && ['model-market', 'model-cache'].includes(view))
     ));
     setCurrentView(view);
+    if (view === 'welcome') setWelcomeClusterId(extraParams?.clusterId || '');
     setIsMobileNavOpen(false); // Close mobile nav on navigation
 
     // Update URL to reflect the current view
@@ -157,20 +196,49 @@ function AuthenticatedApp({ initialView = null }) {
       params.delete('taskId');
       resolvedParams.taskId = null;
     }
-    if (['cluster-monitoring-stack', 'optimization-deployments', 'admin/model-service'].includes(view) && extraParams?.clusterId) {
+    if (
+      ['welcome', 'welcome/issues', 'admin/usage', 'storage-management', 'model-cache',
+        'clusters', 'cluster-monitoring-stack', 'optimization-deployments', 'admin/model-service'].includes(view)
+      && extraParams?.clusterId
+    ) {
       params.set('clusterId', extraParams.clusterId);
       resolvedParams.clusterId = extraParams.clusterId;
     } else {
       params.delete('clusterId');
       resolvedParams.clusterId = null;
     }
-    if (view === 'cluster-monitoring-stack' && extraParams?.profileDeployment) {
-      params.set('profileDeployment', JSON.stringify(extraParams.profileDeployment));
-      resolvedParams.profileDeployment = extraParams.profileDeployment;
+    const profileDeployment = extraParams?.profileDeployment
+      || (view === 'cluster-monitoring-stack' && extraParams?.executionId
+        ? {
+          execution_id: extraParams.executionId,
+          display_name: extraParams.executionName || extraParams.executionId,
+        }
+        : null);
+    if (view === 'cluster-monitoring-stack' && profileDeployment) {
+      params.set('profileDeployment', JSON.stringify(profileDeployment));
+      resolvedParams.profileDeployment = profileDeployment;
     } else {
       params.delete('profileDeployment');
       resolvedParams.profileDeployment = null;
     }
+    const assign = (key, value, urlKey = key) => {
+      if (value) params.set(urlKey, value);
+      else params.delete(urlKey);
+      resolvedParams[key] = value || null;
+    };
+    assign('action', ['clusters', 'admin/model-service', 'model-cache', 'optimization-simulate', 'ai-providers', 'storage-management'].includes(view) ? extraParams?.action || null : null);
+    assign('groupId', view === 'admin/model-service' ? extraParams?.groupId || null : null);
+    assign('executionId', ['cluster-monitoring-stack', 'admin/model-service'].includes(view) ? extraParams?.executionId || null : null);
+    assign('volumeId', view === 'storage-management' ? extraParams?.volumeId || null : null);
+    assign('purpose', view === 'storage-management' ? extraParams?.purpose || null : null);
+    assign('entryId', view === 'model-cache' ? extraParams?.entryId || null : null);
+    assign('severity', view === 'welcome/issues' ? extraParams?.severity || null : null);
+    assign('category', view === 'welcome/issues' ? extraParams?.category || null : null);
+    assign('issueSearch', view === 'welcome/issues' ? extraParams?.search || null : null, 'search');
+    assign('usageWindow', view === 'admin/usage' ? extraParams?.usageWindow || null : null);
+    assign('since', view === 'admin/usage' ? extraParams?.since || null : null);
+    assign('until', view === 'admin/usage' ? extraParams?.until || null : null);
+    assign('userId', ['admin/usage', 'admin/users'].includes(view) ? extraParams?.userId || null : null);
     setNavigationParams(resolvedParams);
 
     window.history.pushState({}, '', `${window.location.pathname}?${params.toString()}`);
@@ -200,6 +268,16 @@ function AuthenticatedApp({ initialView = null }) {
         </a>
         <LeftNavigation currentView={currentView} onNavigate={handleNavigate} isMobileOpen={isMobileNavOpen} isExpanded={isSidebarExpanded} onExpandedChange={setIsSidebarExpanded} />
         <main ref={mainRef} className={`relative flex h-screen min-w-0 flex-1 flex-col overflow-y-auto transition-[margin] duration-300 ${isSidebarExpanded ? 'md:ml-[18rem]' : 'md:ml-24'}`}>
+          {canView('welcome') && (
+            <div className={currentView === 'welcome' ? '' : 'hidden'} aria-hidden={currentView !== 'welcome'}>
+              <WelcomePage
+                onNavigate={handleNavigate}
+                onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)}
+                initialClusterId={welcomeClusterId}
+                isActive={currentView === 'welcome'}
+              />
+            </div>
+          )}
           {!viewAllowed ? (
             <div className="flex flex-1 items-center justify-center p-6">
               <EmptyState
@@ -209,11 +287,12 @@ function AuthenticatedApp({ initialView = null }) {
             </div>
           ) : (
           <WorkflowProvider>
+            {currentView === 'welcome/issues' && <WelcomeIssuesPage onNavigate={handleNavigate} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} initialClusterId={navigationParams.clusterId || ''} initialSeverity={navigationParams.severity || ''} initialCategory={navigationParams.category || ''} initialSearch={navigationParams.issueSearch || ''} />}
             {currentView === 'cluster-monitoring-stack' && <ClusterMonitoringStackDashboard onNavigateBack={() => handleNavigate('home')} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} initialClusterId={navigationParams.clusterId} initialProfileDeployment={navigationParams.profileDeployment} />}
-            {currentView === 'clusters' && <OptimizationClusterOverview onNavigate={handleNavigate} onNavigateBack={() => handleNavigate('home')} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
-            {currentView === 'storage-management' && <StorageManagementPage onNavigate={handleNavigate} />}
-            {currentView === 'model-cache' && <ModelCachePage onNavigate={handleNavigate} initialDownload={navigationParams.downloadModel} onDownloadHandled={() => setNavigationParams((current) => ({ ...current, downloadModel: null }))} onNavigateBack={cacheFromModelMarket ? () => handleNavigate('model-market') : undefined} />}
-            {currentView === 'ai-providers' && <AIProvidersPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
+            {currentView === 'clusters' && <OptimizationClusterOverview onNavigate={handleNavigate} initialClusterId={navigationParams.clusterId || ''} initialAction={navigationParams.action || ''} onNavigateBack={() => handleNavigate('home')} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
+            {currentView === 'storage-management' && <StorageManagementPage onNavigate={handleNavigate} initialClusterId={navigationParams.clusterId || ''} initialVolumeId={navigationParams.volumeId || ''} initialAction={navigationParams.action || ''} initialPurpose={navigationParams.purpose || ''} />}
+            {currentView === 'model-cache' && <ModelCachePage onNavigate={handleNavigate} initialClusterId={navigationParams.clusterId || ''} initialEntryId={navigationParams.entryId || ''} initialAction={navigationParams.action || ''} initialDownload={navigationParams.downloadModel} onDownloadHandled={() => setNavigationParams((current) => ({ ...current, downloadModel: null }))} onNavigateBack={cacheFromModelMarket ? () => handleNavigate('model-market') : undefined} />}
+            {currentView === 'ai-providers' && <AIProvidersPage initialAction={navigationParams.action || ''} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'model-service' && <ModelServicePage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'api-keys' && <ApiKeysPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'usage' && <ModelUsagePage mode="self" onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
@@ -229,20 +308,20 @@ function AuthenticatedApp({ initialView = null }) {
             {currentView === 'optimization-evaluation-details' && <OptimizationEvaluationDetails onNavigate={handleNavigate} />}
             {currentView === 'optimization-deploy' && <OptimizationEvaluateWorkspace onNavigate={handleNavigate} />}
             {currentView === 'optimization-workspace' && <OptimizationOverview onNavigateBack={() => handleNavigate('home')} onNavigate={handleNavigate} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
-            {currentView === 'optimization-simulate' && <SimulationDashboard onNavigate={handleNavigate} onNavigateBack={() => handleNavigate('home')} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
+            {currentView === 'optimization-simulate' && <SimulationDashboard onNavigate={handleNavigate} onNavigateBack={() => handleNavigate('home')} initialAction={navigationParams.action || ''} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'optimization-simulate-details' && <SimulationTaskDetails onNavigate={handleNavigate} />}
             {['opt-define', 'opt-search', 'opt-deploy', 'opt-benchmark', 'opt-performance'].includes(currentView) && (
               <OptimizationStage stageView={currentView} onNavigateBack={() => handleNavigate('home')} onNavigate={handleNavigate} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />
             )}
-            {currentView === 'admin/users' && <UsersPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
+            {currentView === 'admin/users' && <UsersPage initialUserId={navigationParams.userId || ''} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'admin/groups' && <GroupsPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'admin/roles' && <RolesPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'admin/identity-providers' && <IdentityProvidersPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'admin/master-key' && <SecretKeyPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'admin/sessions' && <SessionsPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
             {currentView === 'admin/audit' && <AuditLogsPage onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
-            {currentView === 'admin/model-service' && <ModelServiceAdminPage key={navigationParams.clusterId || ''} initialClusterId={navigationParams.clusterId || ''} onNavigate={handleNavigate} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
-            {currentView === 'admin/usage' && <ModelUsagePage mode="admin" onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
+            {currentView === 'admin/model-service' && <ModelServiceAdminPage key={navigationParams.clusterId || ''} initialClusterId={navigationParams.clusterId || ''} initialGroupId={navigationParams.groupId || ''} initialAction={navigationParams.action || ''} initialExecutionId={navigationParams.executionId || ''} onNavigate={handleNavigate} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
+            {currentView === 'admin/usage' && <ModelUsagePage mode="admin" initialClusterId={navigationParams.clusterId || ''} initialGroupId={navigationParams.groupId || ''} initialUserId={navigationParams.userId || ''} initialSince={navigationParams.since} initialUntil={navigationParams.until} initialUsageWindow={navigationParams.usageWindow || ''} onToggleMobileNav={() => setIsMobileNavOpen(!isMobileNavOpen)} />}
           </WorkflowProvider>
           )}
 

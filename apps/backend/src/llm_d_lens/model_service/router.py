@@ -37,6 +37,8 @@ from llm_d_lens.cluster.registry import gateway_lock
 from llm_d_lens.model_service.contracts import (
     AuthorizeRequest,
     GroupCreateRequest,
+    GroupPublishRequest,
+    GroupStatusRequest,
     GroupUpdateRequest,
     MemberCreateRequest,
     MemberUpdateRequest,
@@ -50,6 +52,7 @@ from llm_d_lens.model_service.gateway_contracts import (
     ClusterGatewayRequest,
     ComponentLogsRequest,
     ComponentScaleRequest,
+    GatewayReconcileRequest,
     GatewayStreamRequest,
     IppConfigRequest,
 )
@@ -360,6 +363,29 @@ async def admin_create_group(request: Request, body: GroupCreateRequest, backgro
     return group.api_payload()
 
 
+@admin_router.post(
+    "/groups/publish",
+    status_code=201,
+    summary="Publish a ready deployment as a new public model name.",
+    description=(
+        "Create a cluster-scoped public model name and its first provider from a ready deployment. "
+        "Requires model-service:member:manage in the deployment's cluster; group metadata and "
+        "selection policy remain admin-managed. Returns 409 for duplicate names, non-ready "
+        "providers or cluster mismatch."
+    ),
+)
+async def admin_publish_group(request: Request, body: GroupPublishRequest, background: BackgroundTasks) -> dict:
+    try:
+        principal = current_principal(request)
+        group = _service.publish_group(body, created_by=owner_for_create(principal), principal=principal)
+    except ModelServiceNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ModelServiceConflictError as error:
+        return problem(409, "Model group conflict", str(error), "model_group_conflict")
+    background.add_task(_reconcile_clusters, [group.cluster_id])
+    return group.api_payload()
+
+
 @admin_router.get("/groups/{group_id}", summary="Get a model routing group with cluster-scoped read permission.")
 async def admin_get_group(group_id: str, request: Request) -> dict:
     group = _service.require_group_access(group_id, current_principal(request), "model-service:group:read")
@@ -475,6 +501,40 @@ async def admin_update_group(group_id: str, body: GroupUpdateRequest, request: R
     return group.api_payload()
 
 
+@admin_router.post(
+    "/groups/{group_id}/status",
+    summary="Enable or disable a model service.",
+    description=(
+        "Start or stop serving a public model without changing provider states, weights or running Pods. "
+        "Requires model-service:group:toggle in the model's cluster; provider and metadata edits keep "
+        "their existing permissions."
+    ),
+)
+async def admin_set_group_status(group_id: str, body: GroupStatusRequest, request: Request) -> dict:
+    principal = current_principal(request)
+    previous = _service.groups.get(group_id)
+    cluster_ids = [member.cluster_id for member in _service.list_members(group_id)]
+    if previous and previous.cluster_id:
+        cluster_ids.append(previous.cluster_id)
+    try:
+        group = _service.update_group(
+            group_id,
+            GroupUpdateRequest(status=body.status),
+            principal=principal,
+            required_permission="model-service:group:toggle",
+        )
+    except ModelServiceNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ModelServiceConflictError as error:
+        return problem(409, "Model group conflict", str(error), "model_group_conflict")
+    if group.cluster_id:
+        cluster_ids.append(group.cluster_id)
+    failure = await _apply_publication_change(cluster_ids, actor=principal.user_id if principal else None)
+    if failure is not None:
+        return failure
+    return group.api_payload()
+
+
 @admin_router.delete(
     "/groups/{group_id}",
     status_code=204,
@@ -488,11 +548,15 @@ async def admin_update_group(group_id: str, body: GroupUpdateRequest, request: R
 async def admin_delete_group(group_id: str, request: Request) -> Response:
     principal = current_principal(request)
     try:
-        group = _service.require_empty_group(group_id, principal=principal)
+        group = _service.require_empty_group(
+            group_id, principal=principal, required_permission="model-service:group:remove"
+        )
         async with gateway_lock(group.cluster_id):
-            group = _service.require_empty_group(group_id, principal=principal)
+            group = _service.require_empty_group(
+                group_id, principal=principal, required_permission="model-service:group:remove"
+            )
             await _gateway_ops.remove_model_route(group)
-            _service.delete_group(group_id, principal=principal)
+            _service.delete_group(group_id, principal=principal, required_permission="model-service:group:remove")
     except ModelServiceNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ModelServiceConflictError as error:
@@ -800,6 +864,25 @@ async def admin_gateway_stream(body: GatewayStreamRequest, request: Request) -> 
                 on_log=on_log,
             )
         raise ValueError(f"unknown operation: {body.op}")
+
+    return _stream_gateway_operation(run)
+
+
+@admin_router.post(
+    "/gateway/reconcile/stream",
+    summary="Reconcile a cluster's shared Gateway and model routes (SSE).",
+    description=(
+        "Re-render and reapply the shared Gateway, HTTPRoutes and provider wiring for one cluster. "
+        "This is an idempotent maintenance action available to scoped maintainers."
+    ),
+)
+async def admin_gateway_reconcile_cluster(body: GatewayReconcileRequest, request: Request) -> StreamingResponse:
+    principal = current_principal(request)
+    require_cluster_access(principal, body.cluster_id)
+    actor = owner_for_create(principal)
+
+    async def run(on_log):
+        return await _gateway_ops.reconcile_cluster_gateway(body.cluster_id, actor=actor, on_log=on_log)
 
     return _stream_gateway_operation(run)
 

@@ -843,7 +843,7 @@ describe("Component logs", () => {
 
     test('nested fields and embedded line breaks stay inline without losing content', () => {
         const html = render([JSON.stringify({ msg: 'First line\nSecond line\tindented', fields: { items: [1, 2] } })]);
-        assert.match(html, /First line\\nSecond line\\tindented/);
+        assert.match(html, /First line\\nSecond line\tindented/);
         assert.match(html, /\{&quot;items&quot;:\[1,2\]\}/);
         assert.doesNotMatch(html, /\n/);
     });
@@ -1105,6 +1105,33 @@ describe("Model state", () => {
         for (const filters of [{ clusterId: 'a', modelQuery: 'code' }, { clusterId: 'deleted' }]) {
             assert.deepEqual(filterServiceFlow(clusters, memberGroups, filters), { clusters: [], memberGroups: [] });
         }
+    });
+
+    test('model service status filters active and disabled groups', () => {
+        const disabled = filterServiceFlow(clusters, memberGroups, { status: 'disabled' });
+        assert.deepEqual(disabled.clusters, clusters.slice(0, 2));
+        assert.deepEqual(disabled.memberGroups.map((group) => group.id), ['chat']);
+
+        const active = filterServiceFlow(clusters, memberGroups, { status: 'active' });
+        assert.deepEqual(active.clusters, [clusters[1]]);
+        assert.deepEqual(active.memberGroups.map((group) => group.id), ['code']);
+
+        assert.deepEqual(filterServiceFlow(clusters, memberGroups, { status: 'unknown' }), { clusters: [], memberGroups: [] });
+    });
+
+    test('status combines with cluster and public model filters', () => {
+        const result = filterServiceFlow(clusters, memberGroups, {
+            clusterId: 'a',
+            status: 'disabled',
+            modelQuery: 'chat',
+        });
+        assert.deepEqual(result.clusters, [clusters[0]]);
+        assert.deepEqual(result.memberGroups.map((group) => group.id), ['chat']);
+
+        assert.deepEqual(
+            filterServiceFlow(clusters, memberGroups, { clusterId: 'b', status: 'disabled', modelQuery: 'code' }),
+            { clusters: [], memberGroups: [] },
+        );
     });
 
     test('the same public name remains visible in every matching cluster', () => {

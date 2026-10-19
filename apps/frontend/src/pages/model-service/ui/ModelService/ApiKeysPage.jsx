@@ -75,6 +75,10 @@ export function ApiKeysPage({ onToggleMobileNav }) {
         });
     };
 
+    const handleCopyAndSave = async () => {
+        if (await copy(revealed?.token || '')) setRevealed(null);
+    };
+
     const handleRevoke = () => {
         revokeSubmission.run(async () => {
             await revokeModelToken(pendingRevoke.id);
@@ -190,7 +194,7 @@ export function ApiKeysPage({ onToggleMobileNav }) {
                 onClose={() => setRevealed(null)}
                 title="Copy your key now"
                 closeOnBackdrop={false}
-                footer={<Button variant="sky" size="sm" onClick={() => setRevealed(null)}>I saved it</Button>}
+                footer={<Button variant="sky" size="sm" onClick={handleCopyAndSave}>Copy and save</Button>}
             >
                 <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
                     <ShieldAlert size={16} className="mt-0.5 shrink-0" />

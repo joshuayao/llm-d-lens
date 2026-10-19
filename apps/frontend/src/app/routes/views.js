@@ -1,12 +1,14 @@
 const VIEW_ALIASES = {
   home: 'clusters',
+  dashboard: 'welcome',
+  'dashboard/alerts': 'welcome/issues',
   simulation: 'optimization-simulate',
   'opt-simulation': 'optimization-simulate',
   'optimization-cluster': 'clusters',
   'optimization-explore': 'optimization-evaluate-new',
 };
 
-const SUPPORTED_VIEWS = new Set(['cluster-monitoring-stack', 'clusters', 'storage-management', 'model-cache', 'ai-providers', 'model-service', 'api-keys', 'usage', 'playground', 'optimization-deployments', 'model-market', 'optimization-evaluate', 'optimization-evaluate-new', 'optimization-evaluation-details', 'optimization-deploy', 'optimization-workspace', 'optimization-simulate', 'optimization-simulate-details', 'opt-define', 'opt-search', 'opt-deploy', 'opt-benchmark', 'opt-performance', 'admin/users', 'admin/groups', 'admin/roles', 'admin/identity-providers', 'admin/master-key', 'admin/sessions', 'admin/audit', 'admin/model-service', 'admin/usage']);
+const SUPPORTED_VIEWS = new Set(['welcome', 'welcome/issues', 'cluster-monitoring-stack', 'clusters', 'storage-management', 'model-cache', 'ai-providers', 'model-service', 'api-keys', 'usage', 'playground', 'optimization-deployments', 'model-market', 'optimization-evaluate', 'optimization-evaluate-new', 'optimization-evaluation-details', 'optimization-deploy', 'optimization-workspace', 'optimization-simulate', 'optimization-simulate-details', 'opt-define', 'opt-search', 'opt-deploy', 'opt-benchmark', 'opt-performance', 'admin/users', 'admin/groups', 'admin/roles', 'admin/identity-providers', 'admin/master-key', 'admin/sessions', 'admin/audit', 'admin/model-service', 'admin/usage']);
 
 export function resolveView(view, fallback = 'model-market') {
   const resolved = VIEW_ALIASES[view] || view;
@@ -14,12 +16,18 @@ export function resolveView(view, fallback = 'model-market') {
 }
 export const NAVIGATION_GROUPS = [
   {
+    id: 'overview',
+    items: [
+      { id: 'welcome', label: 'Welcome', icon: 'Sparkles', view: 'welcome', iconColor: 'text-white' },
+    ],
+  },
+  {
     id: 'services',
     title: 'Services',
     items: [
       { id: 'model-market', label: 'Model market', icon: 'Database', view: 'model-market', iconColor: 'text-white' },
       { id: 'optimization-deployments', label: 'Deployments', icon: 'Rocket', view: 'optimization-deployments', iconColor: 'text-white' },
-      { id: 'admin-model-service', label: 'Model services', icon: 'Boxes', view: 'admin/model-service', iconColor: 'text-white', badge: 'Exp' },
+      { id: 'admin-model-service', label: 'Model services', icon: 'Boxes', view: 'admin/model-service', iconColor: 'text-white' },
       { id: 'admin-usage', label: 'Usage reports', icon: 'Activity', view: 'admin/usage', iconColor: 'text-white' },
       { id: 'optimization-evaluate', label: 'Evaluation', icon: 'Gauge', view: 'optimization-evaluate', iconColor: 'text-white' },
       { id: 'optimization-simulate', label: 'Simulation', icon: 'SimulationIcon', view: 'optimization-simulate', iconColor: 'text-white' },
@@ -32,7 +40,7 @@ export const NAVIGATION_GROUPS = [
     items: [
       { id: 'usage', label: 'My usage', icon: 'Activity', view: 'usage', iconColor: 'text-white' },
       { id: 'api-keys', label: 'API keys', icon: 'KeyRound', view: 'api-keys', iconColor: 'text-white' },
-      { id: 'model-service', label: 'My services', icon: 'Waypoints', view: 'model-service', iconColor: 'text-white', badge: 'Exp' },
+      { id: 'model-service', label: 'My services', icon: 'Waypoints', view: 'model-service', iconColor: 'text-white' },
     ],
   },
   {
@@ -53,7 +61,7 @@ export const NAVIGATION_GROUPS = [
       { id: 'admin-users', label: 'Users', icon: 'Users', view: 'admin/users', iconColor: 'text-white' },
       { id: 'admin-groups', label: 'Groups', icon: 'UserCog', view: 'admin/groups', iconColor: 'text-white' },
       { id: 'admin-roles', label: 'Roles', icon: 'ShieldCheck', view: 'admin/roles', iconColor: 'text-white' },
-      { id: 'admin-identity-providers', label: 'Identity providers', icon: 'KeyRound', view: 'admin/identity-providers', iconColor: 'text-white', badge: 'Exp' },
+      { id: 'admin-identity-providers', label: 'Identity providers', icon: 'Fingerprint', view: 'admin/identity-providers', iconColor: 'text-white', badge: 'Exp' },
       { id: 'admin-master-key', label: 'Master key', icon: 'KeyRound', view: 'admin/master-key', iconColor: 'text-white' },
       { id: 'admin-audit', label: 'Audit log', icon: 'ScrollText', view: 'admin/audit', iconColor: 'text-white' },
       { id: 'admin-sessions', label: 'Sessions', icon: 'Monitor', view: 'admin/sessions', iconColor: 'text-white' },

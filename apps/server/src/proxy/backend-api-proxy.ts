@@ -32,6 +32,8 @@ function problem(res: Response, status: number, title: string, detail: string, c
 backendApiProxyRouter.use([
     '/api/simulation', '/api/cluster', '/api/cluster-overview', '/api/agentic-deployments',
     '/api/v1/configurations', '/api/v1/cluster', '/api/v1/simulation', '/api/v1/deployments', '/api/v1/evaluate',
+    '/api/v1/welcome',
+    '/api/v1/speech-models',
     '/api/v1/storage',
     '/api/v1/capacity',
     '/api/v1/model-cache',

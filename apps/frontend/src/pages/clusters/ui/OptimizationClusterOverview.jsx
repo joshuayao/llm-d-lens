@@ -9,7 +9,7 @@ import { Button, EmptyState, Input, Label, Modal, SectionLabel, Select, Textarea
 import { CreateClusterWizard } from './CreateClusterWizard';
 import { EditClusterModal } from './EditClusterModal';
 import { storePendingModelMarketCluster } from '../../model-market';
-import { PermissionGate } from '../../auth';
+import { PermissionGate, useAuth } from '../../auth';
 import { VIEW_PERMISSIONS } from '../../auth/permissions';
 
 function request(path, options = {}) {
@@ -221,7 +221,8 @@ function ClusterMetricCard({ icon, title, value, unit, status, usagePercent, sho
     );
 }
 
-export default function OptimizationClusterOverview({ onNavigate, onToggleMobileNav }) {
+export default function OptimizationClusterOverview({ onNavigate, onToggleMobileNav, initialClusterId = '', initialAction = '' }) {
+    const { can } = useAuth();
     const [selectedId, setSelectedId] = useState('');
     const [overview, setOverview] = useState(null);
     const [overviewByCluster, setOverviewByCluster] = useState({});
@@ -240,7 +241,9 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
     const [maintenanceError, setMaintenanceError] = useState('');
     const [maintenanceConfirm, setMaintenanceConfirm] = useState(null);
 
-    const preferredClusterId = useRef('');
+    const preferredClusterId = useRef(initialClusterId || '');
+    const handledInitialAction = useRef(false);
+    const handledEditAction = useRef(false);
     const fetchClusters = useCallback(async ({ signal }) => {
         const payload = await request('/api/cluster/clusters', { signal });
         return payload.items || [];
@@ -251,7 +254,7 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
         const ready = items.filter((cluster) => cluster.ready);
         setSelectedId((current) => {
             if (current && ready.some((cluster) => cluster.id === current)) return current;
-            if (preferredId && ready.some((cluster) => cluster.id === preferredId)) return preferredId;
+            if (preferredId && items.some((cluster) => cluster.id === preferredId)) return preferredId;
             return ready[0]?.id || '';
         });
     }, []);
@@ -261,6 +264,26 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
         retainOnError: true,
     });
     usePolling(() => refreshClusters({ quiet: true }));
+
+    useEffect(() => {
+        if (!initialClusterId) return;
+        preferredClusterId.current = initialClusterId;
+        refreshClusters();
+    }, [initialClusterId, refreshClusters]);
+
+    useEffect(() => {
+        if (initialAction !== 'create' || handledInitialAction.current || !can('cluster:cluster:create')) return;
+        handledInitialAction.current = true;
+        setShowCreate(true);
+    }, [initialAction, can]);
+
+    useEffect(() => {
+        if (initialAction !== 'edit' || handledEditAction.current || !initialClusterId) return;
+        const target = clusters.find((cluster) => cluster.id === initialClusterId);
+        if (!target || !can('cluster:cluster:update')) return;
+        handledEditAction.current = true;
+        setEditTarget(target);
+    }, [clusters, initialAction, initialClusterId, can]);
 
     const loadClusters = (preferredId = '') => {
         preferredClusterId.current = preferredId;

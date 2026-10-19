@@ -8,6 +8,8 @@
 
 import { Router } from 'express';
 import { sameOriginUrl } from '../infrastructure/sameOriginUrl.ts';
+import { principalOf } from '../middleware/auth.ts';
+import { internalAuthEnabled, signInternalHeaders } from '../middleware/internalAuth.ts';
 
 export const monitoringRouter = Router();
 
@@ -38,6 +40,17 @@ monitoringRouter.use('/api/v1/monitoring', async (req, res) => {
     if (req.headers.cookie) headers.set('cookie', req.headers.cookie);
     if (req.headers.authorization) headers.set('authorization', req.headers.authorization);
     if (req.headers['x-prism-csrf']) headers.set('x-prism-csrf', req.headers['x-prism-csrf'] as string);
+    // Re-assert the authenticated caller for the Python upstream. This router
+    // sits in the request path for both browser calls and MCP loopback calls;
+    // the latter have no cookie, so forwarding only cookies would turn every
+    // assistant monitoring tool into a false "session expired" (401).
+    const principalId = principalOf(req)?.userId;
+    if (internalAuthEnabled() && principalId) {
+        const upstreamPath = new URL(req.originalUrl, 'http://localhost').pathname;
+        for (const [name, value] of Object.entries(signInternalHeaders(req.method, upstreamPath, principalId))) {
+            headers.set(name, value);
+        }
+    }
     let body: string | undefined;
     if (!['GET', 'HEAD'].includes(req.method)) {
         headers.set('content-type', 'application/json');

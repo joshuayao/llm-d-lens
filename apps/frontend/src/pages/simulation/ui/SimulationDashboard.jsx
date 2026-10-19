@@ -104,7 +104,7 @@ function createShortId() {
         || Date.now().toString(36).slice(-8);
 }
 
-export default function SimulationDashboard({ onNavigate, onToggleMobileNav, embedded = false }) {
+export default function SimulationDashboard({ onNavigate, onToggleMobileNav, embedded = false, initialAction = '' }) {
     const [backends, setBackends] = useState([]);
     const [scenarios, setScenarios] = useState(FALLBACK_SCENARIOS);
     const [datasets, setDatasets] = useState([]);
@@ -148,7 +148,7 @@ export default function SimulationDashboard({ onNavigate, onToggleMobileNav, emb
     const [facets, setFacets] = useState({
         backends: [], models: [], datasets: [], trace_formats: [], endpoints: [],
     });
-    const [isNewTaskOpen, setIsNewTaskOpen] = useState(false);
+    const [isNewTaskOpen, setIsNewTaskOpen] = useState(initialAction === 'new');
     const [wizardStep, setWizardStep] = useState(0);
     const [taskNameSuffix, setTaskNameSuffix] = useState('');
     const modelDiscoveryRequestRef = useRef(0);

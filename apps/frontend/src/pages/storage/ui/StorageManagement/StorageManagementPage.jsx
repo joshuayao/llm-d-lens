@@ -49,15 +49,16 @@ function StatCard({ label, value, tone = 'text-white', hint }) {
     );
 }
 
-export function StorageManagementPage() {
+export function StorageManagementPage({ initialClusterId = '', initialVolumeId = '', initialAction = '', initialPurpose = '' } = {}) {
     const [resourceStatuses, setResourceStatuses] = useState({});
-    const [selectedResourceId, setSelectedResourceId] = useState(null);
+    const [selectedResourceId, setSelectedResourceId] = useState(initialVolumeId || null);
     const [searchInput, setSearchInput] = useState('');
     const query = useDebouncedValue(searchInput, SEARCH_DEBOUNCE_MS).trim();
     const [kind, setKind] = useState('');
     const [purpose, setPurpose] = useState('');
-    const [clusterId, setClusterId] = useState('');
+    const [clusterId, setClusterId] = useState(initialClusterId || '');
     const [dialog, setDialog] = useState(null);
+    const [createPurpose, setCreatePurpose] = useState('');
     const [selected, setSelected] = useState(null);
     const [mutatingId, setMutatingId] = useState(null);
     const [notice, setNotice] = useNotice();
@@ -66,6 +67,8 @@ export function StorageManagementPage() {
     const pageSize = DEFAULT_PAGE_SIZE;
 
     const statusControllerRef = useRef(null);
+    const focusedVolumeId = useRef('');
+    const handledInitialAction = useRef(false);
     // Cluster choices come from the unfiltered list so narrowing by cluster
     // never removes the option the user just picked.
     const [knownClusters, setKnownClusters] = useState([]);
@@ -83,6 +86,27 @@ export function StorageManagementPage() {
 
     const hasInFlightVolume = items.some((item) => item.status === 'pending' || item.status === 'deleting');
     usePolling(() => load({ quiet: true }), { intervalMs: RESOURCE_STATUS_POLL_INTERVAL_MS, enabled: hasInFlightVolume });
+
+    useEffect(() => {
+        setClusterId(initialClusterId || '');
+    }, [initialClusterId]);
+
+    useEffect(() => {
+        if (initialAction !== 'create' || handledInitialAction.current) return;
+        handledInitialAction.current = true;
+        setCreatePurpose(initialPurpose);
+        setDialog('create');
+    }, [initialAction, initialPurpose]);
+
+    useEffect(() => {
+        if (!initialVolumeId || focusedVolumeId.current === initialVolumeId) return;
+        const index = items.findIndex((item) => item.id === initialVolumeId);
+        if (index >= 0) {
+            focusedVolumeId.current = initialVolumeId;
+            setPage(Math.floor(index / pageSize));
+            setSelectedResourceId(initialVolumeId);
+        }
+    }, [initialVolumeId, items, pageSize]);
 
     useEffect(() => {
         const volumeIds = items.map((item) => item.id);
@@ -154,6 +178,12 @@ export function StorageManagementPage() {
     const closeDialog = () => {
         setDialog(null);
         setSelected(null);
+        setCreatePurpose('');
+    };
+
+    const openCreate = () => {
+        setCreatePurpose('');
+        setDialog('create');
     };
 
     const openDelete = (item) => {
@@ -215,7 +245,7 @@ export function StorageManagementPage() {
                             <RefreshCw size={16} className={refreshing ? 'animate-spin' : ''} aria-hidden="true" />
                         </Button>
                         <PermissionGate permission="storage:volume:create">
-                            <Button variant="sky" size="sm" onClick={() => setDialog('create')}>
+                            <Button variant="sky" size="sm" onClick={openCreate}>
                                 <Plus size={14} aria-hidden="true" /> New storage volume
                             </Button>
                         </PermissionGate>
@@ -395,6 +425,7 @@ export function StorageManagementPage() {
                 <CreateStorageVolumeModal
                     clusters={clusters}
                     defaultClusterId={clusterId}
+                    defaultPurpose={createPurpose}
                     onCancel={closeDialog}
                     onCreate={handleCreate}
                 />

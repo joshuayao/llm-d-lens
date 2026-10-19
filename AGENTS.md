@@ -17,6 +17,18 @@ Do not add helpers, frameworks, tests of trivial wiring or repeated documentatio
 just to satisfy a process. Explain non-obvious choices briefly; no mandatory plan
 or decision table for a straightforward fix.
 
+## Human approval for structural changes
+
+- Do not create or delete code files without explicit human confirmation. This
+  covers source, tests, scripts, migrations and executable configuration. A
+  feature request authorizes behavior, not unstated file additions or deletions;
+  describe the proposed paths and wait for approval before acting.
+- Before changing `.gitignore`, assess the impact and obtain explicit human
+  confirmation. Report what becomes ignored, whether tracked files, secrets,
+  generated output or runtime data are affected, and any cleanup or migration
+  required. A request to change ignore rules is not approval until that impact is
+  explained and confirmed.
+
 ## Read only applicable contracts
 
 Read the relevant sections of these skills when the change touches their contracts;

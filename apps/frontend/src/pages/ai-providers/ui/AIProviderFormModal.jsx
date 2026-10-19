@@ -146,6 +146,9 @@ export function AIProviderFormModal({ provider, onCancel, onSaved }) {
                         placeholder={form.providerType === 'anthropic' ? 'https://api.anthropic.com/' : 'https://api.openai.com/'}
                         required
                     />
+                    <p className="mt-1 text-[10px] text-slate-500">
+                        Use the API root. A trailing <code>/v1</code> is accepted; private or non-HTTPS addresses are rejected.
+                    </p>
                 </div>
                 <div>
                     <Label htmlFor="ai-provider-model">Model</Label>
