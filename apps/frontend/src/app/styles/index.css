@@ -1648,22 +1648,22 @@ html:not(.dark) .my-services-page .my-services-card {
 
 /* Light mode: service-flow connectors use slightly deeper strokes. */
 html:not(.dark) .model-services-page .stroke-blue-500 {
-  stroke: #1d4ed8 !important;
+  stroke: #037ffc !important;
 }
 html:not(.dark) .model-services-page .stroke-sky-500 {
-  stroke: #0284c7 !important;
+  stroke: #38bdf8 !important;
 }
 html:not(.dark) .model-services-page .stroke-sky-600 {
-  stroke: #0369a1 !important;
+  stroke: #0ea5e9 !important;
 }
 html:not(.dark) .model-services-page .stroke-emerald-500 {
-  stroke: #059669 !important;
+  stroke: #22c55e !important;
 }
 html:not(.dark) .model-services-page .stroke-emerald-600 {
-  stroke: #047857 !important;
+  stroke: #16a34a !important;
 }
 html:not(.dark) .model-services-page .stroke-slate-600 {
-  stroke: #334155 !important;
+  stroke: #64748b !important;
 }
 
 /* Light mode: secondary Gateway connection details are lighter. */
