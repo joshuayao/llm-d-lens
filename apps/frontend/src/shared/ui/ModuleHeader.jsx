@@ -48,14 +48,14 @@ export function ModuleHeader({
                         <Menu className="h-5 w-5" />
                     </button>
                 )}
-                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-sky-500/25 bg-sky-500/10 text-sky-400 not-dark:border-[var(--brand-accent)]/20 not-dark:bg-[var(--brand-accent-bg)] not-dark:text-[var(--brand-accent)]">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-[#037ffc] bg-[#037ffc] text-white dark:border-sky-500/25 dark:bg-sky-500/10 dark:text-sky-400">
                     {Icon && <Icon className="h-5 w-5" aria-hidden="true" />}
                 </div>
                 <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
                         <h1 className="text-xl font-bold tracking-tight text-slate-900 dark:text-white">{title}</h1>
                         {badge && (
-                            <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-300">
+                            <span className="module-header-badge rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-300">
                                 {badge}
                             </span>
                         )}

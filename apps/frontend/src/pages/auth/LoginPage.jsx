@@ -44,7 +44,7 @@ export default function LoginPage({ onSignedIn, theme = 'dark', onToggleTheme } 
     const externalProviders = providers.filter((provider) => provider.type !== 'local');
 
     return (
-        <div className="relative flex min-h-screen w-full items-center justify-center bg-slate-950 p-6 font-sans text-slate-100 antialiased">
+        <div className="relative flex min-h-screen w-full items-center justify-center bg-theme-bg p-6 font-sans text-theme-text antialiased">
             {onToggleTheme && (
                 <Button
                     type="button"

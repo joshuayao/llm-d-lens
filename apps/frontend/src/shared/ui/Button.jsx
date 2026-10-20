@@ -18,17 +18,17 @@ import { cn } from '../lib/cn';
 
 const VARIANTS = {
     primary:
-        'bg-emerald-600 hover:bg-emerald-500 not-dark:bg-[var(--brand-accent)] not-dark:hover:bg-[var(--brand-accent-hover)] not-dark:text-[#051c2c] text-white border border-transparent shadow-sm',
+        'bg-emerald-600 hover:bg-emerald-500 not-dark:bg-[var(--brand-accent)] not-dark:hover:bg-[var(--brand-accent-hover)] text-white border border-transparent shadow-sm',
     sky:
-        'bg-sky-500 hover:bg-sky-400 not-dark:bg-[var(--brand-accent)] not-dark:hover:bg-[var(--brand-accent-hover)] not-dark:text-[#051c2c] text-white border border-transparent shadow-sm',
+        'bg-sky-500 hover:bg-sky-400 not-dark:bg-[var(--brand-accent)] not-dark:hover:bg-[var(--brand-accent-hover)] text-white border border-transparent shadow-sm',
     secondary:
-        'bg-[#e6f6fe] dark:bg-slate-800 hover:bg-[#d9f1fd] dark:hover:bg-slate-700 text-[#051c2c] dark:text-slate-300 border border-[#a9cfe3] dark:border-slate-700',
+        'bg-[#f3f4f6] dark:bg-slate-800 hover:bg-[#e5e7eb] dark:hover:bg-slate-700 text-[#4b5563] dark:text-slate-300 border border-[#cbd5e1] dark:border-slate-700',
     ghost:
         'bg-transparent hover:bg-[var(--bg-secondary)] dark:hover:bg-slate-800 text-[var(--text-muted)] dark:text-slate-400 hover:text-[var(--text-primary)] dark:hover:text-white border border-transparent',
     danger:
         'bg-red-600 hover:bg-red-500 text-white border border-transparent shadow-sm',
     outline:
-        'bg-transparent hover:bg-[#e6f6fe] dark:hover:bg-slate-800/60 text-[#33475b] dark:text-slate-300 border border-[#a9cfe3] dark:border-slate-600',
+        'bg-transparent hover:bg-[#e6f6fe] dark:hover:bg-slate-800/60 text-[#33475b] dark:text-slate-300 border border-[#cbd5e1] dark:border-slate-600',
     dangerOutline:
         'bg-transparent text-red-600 dark:text-rose-400 border border-red-300 dark:border-rose-500/40 hover:bg-red-50 dark:hover:bg-rose-500/10',
     link:

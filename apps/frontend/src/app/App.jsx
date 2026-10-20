@@ -251,7 +251,7 @@ function AuthenticatedApp({ initialView = null, theme, onToggleTheme }) {
   const viewAllowed = Boolean(currentView) && canView(currentView);
 
   return (
-      <div className="min-h-screen bg-transparent text-theme-text w-full overflow-hidden font-sans relative flex flex-col">
+      <div className="min-h-screen bg-slate-950 w-full overflow-hidden font-sans relative flex flex-col">
         <a
           href="https://llm-d.ai"
           target="_blank"

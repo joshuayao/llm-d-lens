@@ -96,7 +96,7 @@ export default function LeftNavigation({ currentView, onNavigate, isMobileOpen, 
         <aside className={cn(
             'lens-navigation fixed top-20 left-4 h-[calc(100vh-6rem)]',
             isMobileOpen ? 'flex' : 'hidden md:flex',
-            'flex-col border border-slate-200/80 bg-white backdrop-blur-xl rounded-3xl transition-all duration-300 z-50 shadow-[0_20px_50px_rgba(15,23,42,0.12)] dark:border-slate-900/65 dark:bg-slate-950/50 dark:shadow-[0_20px_50px_rgba(0,0,0,0.5)]',
+            'flex-col border-0 dark:border bg-white backdrop-blur-xl rounded-3xl transition-all duration-300 z-50 dark:border-slate-900/65 dark:bg-slate-950/50 dark:shadow-[0_20px_50px_rgba(0,0,0,0.5)]',
             isExpanded ? 'w-64' : 'w-20'
         )}>
 
@@ -178,11 +178,11 @@ export default function LeftNavigation({ currentView, onNavigate, isMobileOpen, 
                                         {isExpanded && (
                                             <div className="flex flex-1 items-center justify-between truncate">
                                                 <span className="flex items-center gap-1.5 min-w-0">
-                                                    <span className={cn('text-sm tracking-wide truncate', isActive ? 'text-slate-950 dark:text-white font-medium' : 'font-normal')}>
+                                                    <span className={cn('text-sm tracking-wide truncate', isActive ? 'lens-navigation-active-label font-medium' : 'font-normal')}>
                                                         {item.label}
                                                     </span>
                                                     {item.badge && (
-                                                        <span className="text-[9px] text-amber-300 font-mono px-1.5 py-0.5 rounded bg-amber-950/40 border border-amber-800/50 shrink-0 tracking-wider">
+                                                        <span className="nav-exp-badge text-[9px] text-amber-300 font-mono px-1.5 py-0.5 rounded bg-amber-950/40 border border-amber-800/50 shrink-0 tracking-wider">
                                                             {item.badge}
                                                         </span>
                                                     )}
@@ -230,7 +230,7 @@ export default function LeftNavigation({ currentView, onNavigate, isMobileOpen, 
                         aria-haspopup="menu"
                         aria-expanded={accountMenuOpen}
                     >
-                        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-slate-300 bg-slate-100 text-sm font-semibold uppercase text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100">
+                        <span className="sidebar-account-avatar flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-slate-300 bg-slate-100 text-sm font-semibold uppercase text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100">
                             {(principal.username || '?').slice(0, 1)}
                         </span>
                         {isExpanded && <span className="truncate text-sm text-slate-800 dark:text-slate-200">{principal.username}</span>}
