@@ -748,7 +748,7 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
                     </>
                 }>
                 {trafficDraft && <TrafficDistributionForm draft={trafficDraft} onChange={setTrafficDraft}
-                    deployments={deployments} pending={trafficSubmission.pending}
+                    deployments={deployments} members={members} pending={trafficSubmission.pending}
                     error={trafficSubmission.error || trafficDistributionError(trafficDraft.rows)} />}
             </Modal>
 
@@ -1282,11 +1282,13 @@ export function AddModelForm({ form, onChange, clusters, deployments, models = [
     );
 }
 
-export function TrafficDistributionForm({ draft, onChange, deployments, pending, error }) {
+export function TrafficDistributionForm({ draft, onChange, deployments, members = [], pending, error }) {
     const total = trafficTotal(draft.rows);
+    const published = new Set(members.map((member) => member.executionId));
     const available = deployments.filter((deployment) => (
         deployment.clusterId === draft.clusterId && deployment.status === 'ready'
         && deployment.endpointKind === 'llm-d-epp' && deployment.model === draft.providerModel
+        && !published.has(deployment.executionId)
         && !draft.rows.some((row) => row.executionId === deployment.executionId)
     ));
     return (
@@ -1326,7 +1328,7 @@ export function TrafficDistributionForm({ draft, onChange, deployments, pending,
             ))}
             <div>
                 <Label htmlFor="traffic-add-deployment"
-                    help="Only ready llm-d deployments in this cluster with the same provider model name can be added. New providers start at weight 1 and are saved with the entire allocation.">
+                    help="Only ready llm-d deployments in this cluster with the same provider model name that are not already attached to a public model can be added. New providers start at weight 1 and are saved with the entire allocation.">
                     Add deployment
                 </Label>
                 <Select id="traffic-add-deployment" value="" disabled={pending || draft.rows.length >= 16 || !available.length}
@@ -1346,7 +1348,7 @@ export function TrafficDistributionForm({ draft, onChange, deployments, pending,
                         {deployment.name || deployment.executionId}
                     </option>)}
                 </Select>
-                {!available.length && <p className="mt-1 text-xs text-theme-muted">No additional compatible ready deployments.</p>}
+                {!available.length && <p className="mt-1 text-xs text-theme-muted">No additional compatible, unpublished ready deployments.</p>}
             </div>
             <p className="text-xs text-theme-muted">
                 Changes take effect only after saving and Gateway reconciliation. Weights do not rewrite the request model name.
