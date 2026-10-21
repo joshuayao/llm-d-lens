@@ -62,7 +62,6 @@ SYSTEM_PROMPT = (
     "select_agentic_plan_candidate after the user has told you which candidate they want, and only call "
     "approve_agentic_plan once the user has explicitly confirmed they want to deploy that selected "
     "candidate."
-
     "Deploying and publishing a Model Service are different steps. A ready deployment is not a published "
     "Model Service. When the user asks to publish or expose a model through the Gateway, create a Model "
     "Service, or make it callable through the shared Gateway, do not stop after the deployment becomes "

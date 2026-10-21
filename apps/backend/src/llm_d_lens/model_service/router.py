@@ -227,7 +227,10 @@ async def list_models(request: Request) -> dict:
 @router.get(
     "/connection",
     summary="Gateway connection info for clients (per cluster).",
-    description="Return per-cluster Gateway base URLs for clients. Use after publishing a Model Service to give the user the callable endpoint; deployment readiness alone does not establish this route.",
+    description=(
+        "Return per-cluster Gateway base URLs for clients. Use after publishing a Model Service to give the user "
+        "the callable endpoint; deployment readiness alone does not establish this route."
+    ),
     operation_id="get_model_service_connection",
 )
 async def model_service_connection(request: Request) -> dict:
@@ -352,7 +355,10 @@ def _daily_totals(records) -> list[dict]:
 @admin_router.get(
     "/groups",
     summary="List model routing groups in the caller's cluster scope.",
-    description="List public Model Services visible in the caller's cluster scope. Use this before publishing to check whether the desired public model name already exists.",
+    description=(
+        "List public Model Services visible in the caller's cluster scope. Use this before publishing to check "
+        "whether the desired public model name already exists."
+    ),
     operation_id="list_model_service_groups",
 )
 async def admin_list_groups(request: Request) -> dict:
@@ -424,7 +430,10 @@ async def admin_publish_group(request: Request, body: GroupPublishRequest, backg
 @admin_router.get(
     "/groups/{group_id}",
     summary="Get a model routing group with cluster-scoped read permission.",
-    description="Return one Model Service's public name, providers and status. Use after publish_model_service or create_model_service_member to verify that publication and its provider are present.",
+    description=(
+        "Return one Model Service's public name, providers and status. Use after publish_model_service or "
+        "create_model_service_member to verify that publication and its provider are present."
+    ),
     operation_id="get_model_service_group",
 )
 async def admin_get_group(group_id: str, request: Request) -> dict:
@@ -666,7 +675,11 @@ async def admin_list_members(request: Request, group_id: str | None = None) -> d
 @admin_router.get(
     "/deployments",
     summary="Ready deployments that can be published as members.",
-    description="List ready deployments that can be published to a Model Service. This does not publish anything: use publish_model_service for a new public model name or create_model_service_member to add a provider to an existing one.",
+    description=(
+        "List ready deployments that can be published to a Model Service. This does not publish anything: use "
+        "publish_model_service for a new public model name or create_model_service_member to add a provider to an "
+        "existing one."
+    ),
     operation_id="list_publishable_deployments",
 )
 async def admin_publishable_deployments(request: Request) -> dict:
@@ -678,7 +691,12 @@ async def admin_publishable_deployments(request: Request) -> dict:
     "/members",
     status_code=201,
     summary="Publish a deployment as a group member.",
-    description="Add a ready deployment as a provider to an existing public Model Service, with default weight 1 and preserving existing provider weights. Use this when the public model name already exists; use publish_model_service to create a new public name. Schedules Gateway reconciliation; use traffic distribution to change the allocation.",
+    description=(
+        "Add a ready deployment as a provider to an existing public Model Service, with default weight 1 and "
+        "preserving existing provider weights. Use this when the public model name already exists; use "
+        "publish_model_service to create a new public name. Schedules Gateway reconciliation; use traffic "
+        "distribution to change the allocation."
+    ),
     operation_id="create_model_service_member",
 )
 async def admin_create_member(request: Request, body: MemberCreateRequest, background: BackgroundTasks) -> dict:

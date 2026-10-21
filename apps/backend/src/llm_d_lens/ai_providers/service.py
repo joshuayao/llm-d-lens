@@ -173,8 +173,6 @@ class AIProviderService:
         self._store.delete(provider_id)
 
 
-
-
 def _entry_context_window(entry: dict | None) -> int | None:
     """Read a context-window hint from a provider model-list entry, if present."""
     if not isinstance(entry, dict):
@@ -195,6 +193,7 @@ def _entry_context_window(entry: dict | None) -> int | None:
             if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 1_000_000_000:
                 return value
     return None
+
 
 async def check_connection(
     base_url: str,
