@@ -44,11 +44,13 @@ from llm_d_lens.model_service.gateway_contracts import (
 )
 from llm_d_lens.model_service.gateway_providers import (
     AUTHZ_TLS_DR_NAME,
+    CLUSTER_LABEL,
     DEFAULT_PROVIDER,
     INFERENCE_MODEL_REWRITE_CRD,
     MANAGED_LABEL,
     MANAGED_VALUE,
     MODEL_SERVICE_LABEL,
+    REWRITE_MANAGED_LABEL,
     PoolBinding,
     authz_tls_insecure_enabled,
     default_pool_name,
@@ -85,21 +87,22 @@ DEFAULT_GATEWAY_NAME = "lens-inference-gateway"
 DEFAULT_IPP_NAME = "lens-ipp"
 #: IPP gRPC (ext_proc) port the gateway connects to.
 IPP_GRPC_PORT = 9004
-#: Fallback ext_authz port used only before the backend has served any request
-#: (so its real listening port is not yet known).
-DEFAULT_AUTHZ_PORT = 8081
 
 
-def resolve_authz_endpoint(value: str | None) -> tuple[str | None, int]:
+def resolve_authz_endpoint(value: str | None) -> tuple[str | None, int | None]:
     """Resolve a per-cluster Lens address into ``(host, destination_port)``.
 
     ``gateway_authz_host`` is the host/IP the cluster can reach Lens on (auto-filled
     in the create/edit form); the destination port is *not* a user setting — Lens
     uses its own live serving port
-    (:func:`llm_d_lens.infrastructure.network.hostinfo.current_serving_port`), falling back to
-    :data:`DEFAULT_AUTHZ_PORT` before the first request. The in-cluster
-    ``lens-authz`` Service keeps a stable port (8081) and its
-    Endpoints route there. An unset host disables ext_authz.
+    (:func:`llm_d_lens.infrastructure.network.hostinfo.current_serving_port`). The
+    in-cluster ``lens-authz`` Service keeps a stable port (8081) and its Endpoints
+    route to that live port. An unset host disables ext_authz.
+
+    The live port is deliberately *not* guessed. A caller that has not observed
+    the backend's listening port (for example a one-off maintenance script) must
+    not rewrite an existing Gateway to the stable Service port: doing so makes
+    Envoy bypass the Service and connect to whatever happens to listen on 8081.
     """
     host = (value or "").strip()
     head, sep, tail = host.rpartition(":")
@@ -107,8 +110,8 @@ def resolve_authz_endpoint(value: str | None) -> tuple[str | None, int]:
         host = head
     host = host or None
     if host is None:
-        return None, DEFAULT_AUTHZ_PORT
-    return host, hostinfo.current_serving_port() or DEFAULT_AUTHZ_PORT
+        return None, None
+    return host, hostinfo.current_serving_port()
 
 
 class GatewayOpsError(Exception):
@@ -450,6 +453,13 @@ class GatewayOpsService:
         return result.returncode == 0 and INFERENCE_MODEL_REWRITE_CRD in (result.stdout or "")
 
     async def _managed_model_rewrites(self, cluster_id: str) -> set[tuple[str, str]]:
+        """Managed rewrites owned by *this* Lens cluster only.
+
+        Rewrites use a dedicated label instead of the shared Gateway label. Older
+        Lens instances only list the shared label, so they cannot see (and cannot
+        delete) rewrites written by this version. The cluster label keeps cleanup
+        scoped even between current instances sharing one Kubernetes cluster.
+        """
         try:
             result = await self._kubectl(
                 cluster_id,
@@ -458,7 +468,7 @@ class GatewayOpsService:
                     "inferencemodelrewrite",
                     "-A",
                     "-l",
-                    f"{MANAGED_LABEL}={MANAGED_VALUE}",
+                    f"{REWRITE_MANAGED_LABEL}=true",
                     "-o",
                     "json",
                 ],
@@ -472,11 +482,14 @@ class GatewayOpsService:
             payload = json.loads(result.stdout or "{}")
         except json.JSONDecodeError:
             return set()
-        return {
-            ((item.get("metadata") or {}).get("namespace", ""), (item.get("metadata") or {}).get("name", ""))
-            for item in payload.get("items") or []
-            if (item.get("metadata") or {}).get("name")
-        }
+        owned: set[tuple[str, str]] = set()
+        for item in payload.get("items") or []:
+            metadata = item.get("metadata") or {}
+            name = metadata.get("name")
+            labels = metadata.get("labels") or {}
+            if name and labels.get(CLUSTER_LABEL) == cluster_id:
+                owned.add((metadata.get("namespace", ""), name))
+        return owned
 
     async def _delete_model_rewrites_for_group(self, cluster_id: str, group_id: str) -> None:
         if not await self._model_rewrite_available(cluster_id):
@@ -948,6 +961,15 @@ class GatewayOpsService:
         # Per-cluster ext_authz host (auto-filled in the wizard/edit form) plus
         # Lens' own live serving port. Unset host = ext_authz disabled.
         authz_host, authz_port = resolve_authz_endpoint(getattr(cluster, "gateway_authz_host", None))
+        if authz_host and authz_port is None:
+            return self._finish(
+                operation,
+                ok=False,
+                message=(
+                    "cannot configure Gateway ext_authz: the Lens serving port is unknown; "
+                    "start the backend with an explicit --port and retry"
+                ),
+            )
         authz_tls_insecure = authz_tls_insecure_enabled()
         if install_prerequisites:
             # Apply the pinned Gateway API / Gateway API Inference Extension CRDs
@@ -1567,6 +1589,7 @@ class GatewayOpsService:
                 public_model=public_model,
                 served_model=group.served_name,
                 pools=bindings,
+                cluster_id=cluster_id,
             )
             if rewrites:
                 rewrite_documents.append(rewrites)
