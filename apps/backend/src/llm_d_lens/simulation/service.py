@@ -173,9 +173,15 @@ async def save_task(task: SimulationTask) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         _set_artifact_references(task)
         task.artifact_error = None
+        if task.benchmark_evidence is None and task.model_service_group_id:
+            task.benchmark_evidence = {"model_service_group_id": task.model_service_group_id}
         if task.status not in {"completed", "failed", "cancelled"}:
             await asyncio.to_thread(_persist_task, task)
             return
+        await asyncio.to_thread(_persist_task, task)
+        from .benchmark_evidence import ingest_simulation_task
+
+        await asyncio.to_thread(ingest_simulation_task, task)
         await asyncio.to_thread(_persist_task, task)
         try:
             dataset = trace_registry.get_variant(task.prompt.dataset.name) if task.prompt.dataset.name else None
@@ -932,6 +938,7 @@ async def rerun_task(
                 "backend_version": None,
                 "backend_version_inferred": False,
                 "configuration_ids": list(resolved_endpoint.configuration_ids),
+                "benchmark_evidence": None,
                 "result": None,
                 "error_message": None,
                 "created_at": _now(),
@@ -984,6 +991,8 @@ async def _ensure_model_service_gateway(task: SimulationTask) -> None:
 
 
 async def _run_task(task: SimulationTask) -> None:
+    from .benchmark_evidence import capture_simulation_context, verify_simulation_context
+
     cancel_event = asyncio.Event()
     controllers[task.id] = cancel_event
 
@@ -1020,6 +1029,7 @@ async def _run_task(task: SimulationTask) -> None:
     task.started_at = _now()
     task.progress_message = "Simulation running"
     await save_task(task)
+    terminal_status: SimulationTaskStatus = "failed"
     try:
         await _ensure_model_service_gateway(task)
         resolved_endpoint = await _resolve_task_endpoint_url(
@@ -1029,19 +1039,23 @@ async def _run_task(task: SimulationTask) -> None:
             force_gateway=bool(task.model_service_group_id),
         )
         task.endpoint_url = resolved_endpoint.url
-        await save_task(task)
+        task.endpoint_deployment_execution_id = _task_execution_id(task)
+        task.endpoint_cluster_id = resolved_endpoint.cluster_id or task.endpoint_cluster_id
+        task.endpoint_namespace = resolved_endpoint.namespace or task.endpoint_namespace
         task.configuration_ids = list(resolved_endpoint.configuration_ids)
+        await capture_simulation_context(task)
+        await save_task(task)
         backend = get_backend(task.simulation.backend)
         task.backend_version = backend.descriptor().version
         task.result = await backend.run(task, context)
-        task.status = "completed"
+        terminal_status = "completed"
         task.progress_percent = 100
         task.progress_message = "Simulation completed"
     except (SimulationCancelledError, asyncio.CancelledError):
-        task.status = "cancelled"
+        terminal_status = "cancelled"
         task.progress_message = "Simulation cancelled"
     except Exception as error:
-        task.status = "failed"
+        terminal_status = "failed"
         task.progress_message = "Simulation failed"
         task.error_message = (
             str(error) if isinstance(error, SimulationError) else f"Unexpected simulation error: {error}"
@@ -1051,8 +1065,11 @@ async def _run_task(task: SimulationTask) -> None:
     finally:
         task.completed_at = _now()
         task.artifacts_incomplete = context.artifacts_incomplete
-        controllers.pop(task.id, None)
+        # Drain progress saves while still running so ingestion cannot replace the snapshot during verification.
         await _await_saves(task.id)
+        task.status = terminal_status
+        await verify_simulation_context(task)
+        controllers.pop(task.id, None)
         await save_task(task)
 
 

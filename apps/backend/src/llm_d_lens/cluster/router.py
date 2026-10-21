@@ -279,12 +279,7 @@ async def update_cluster(
     authz_host = payload.gateway_authz_host
     if authz_host is not None and not authz_host.strip():
         authz_host = _default_lens_host()
-    provider_changed = payload.gateway_provider is not None and payload.gateway_provider != (
-        prior.gateway_provider if prior else None
-    )
-    gateway_changed = provider_changed or any(
-        field is not None for field in (payload.gateway_namespace, payload.gateway_name, authz_host)
-    )
+    gateway_changed = any(field is not None for field in (payload.gateway_namespace, payload.gateway_name, authz_host))
     # A changed exposed port must take effect immediately: validate it, free the old
     # tunnel, then re-render the Gateway Service (NodePort) and re-expose it.
     if payload.gateway_port is not None:
@@ -334,7 +329,7 @@ async def update_cluster(
             _install_cluster_gateway,
             cluster.id,
             cluster.gateway_provider,
-            install_prerequisites=provider_changed,
+            install_prerequisites=False,
         )
     # Applying the node inotify limit is idempotent, so re-apply whenever the
     # client sends it (also lets an existing cluster pick it up on any save).

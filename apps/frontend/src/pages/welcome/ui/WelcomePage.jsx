@@ -20,6 +20,7 @@ import { ProviderSelect } from './ProviderSelect';
 import { QuickActions } from './QuickActions';
 import { WELCOME_CARD } from './welcomeStyles';
 import { visibleWelcomeActions } from '../model/quickActions';
+import { formatAge } from '../model/welcomePresentation';
 
 const LENS_DOCUMENTATION_URL = 'https://llm-d-incubation.github.io/llm-d-lens/';
 const LENS_SLACK_URL = 'https://llm-d.slack.com/';
@@ -29,6 +30,82 @@ function scopeOptions(scope) {
         { value: '', label: 'All accessible clusters' },
         ...(scope?.clusters || []).map((cluster) => ({ value: cluster.id, label: cluster.name || cluster.id })),
     ];
+}
+
+function SystemBrief({ clusters, clusterId, issueCounts, clusterIssueCounts, lastChecked, loading, onSelectCluster }) {
+    const critical = issueCounts.critical || 0;
+    const warning = issueCounts.warning || 0;
+    const total = issueCounts.total || 0;
+    const stateColor = critical ? 'bg-rose-500' : warning ? 'bg-amber-500' : 'bg-emerald-500';
+    const headline = critical
+        ? `${critical} critical signal${critical === 1 ? '' : 's'} need${critical === 1 ? 's' : ''} attention`
+        : warning
+            ? `${warning} signal${warning === 1 ? '' : 's'} need${warning === 1 ? 's' : ''} attention`
+            : 'All monitored systems are operational';
+    const detail = critical || warning
+        ? 'Start with the highest-severity signal below, or ask Lens Assistant to investigate a cluster.'
+        : 'Health checks and telemetry are reporting normally. You can ask Lens Assistant to summarize the fleet.';
+    return (
+        <section className="relative overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-800/70 dark:bg-slate-900/70">
+            <span className={`absolute inset-y-0 left-0 w-1 ${stateColor}`} aria-hidden="true" />
+            <div className="flex flex-col gap-5 p-5 pl-6 sm:p-6 sm:pl-7 lg:flex-row lg:items-end lg:justify-between">
+                <div className="min-w-0">
+                    <div className="flex items-center gap-2 text-xs font-medium text-slate-500">
+                        <span className={`h-1.5 w-1.5 rounded-full ${stateColor} motion-safe:animate-pulse [animation-duration:2.4s]`} aria-hidden="true" />
+                        {loading ? 'Checking fleet status' : `Live · checked ${formatAge(lastChecked)}`}
+                    </div>
+                    <h2 className="mt-2 max-w-3xl text-3xl font-semibold leading-tight tracking-[-0.03em] text-slate-950 dark:text-slate-50 sm:text-4xl">
+                        {headline}
+                    </h2>
+                    <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500 dark:text-slate-400">{detail}</p>
+                </div>
+                <div className="grid shrink-0 grid-cols-3 gap-5 border-t border-slate-200 pt-4 dark:border-slate-800/70 lg:border-t-0 lg:pt-0">
+                    <div>
+                        <div className="text-2xl font-semibold tabular-nums text-slate-950 dark:text-slate-50">{clusters.length}</div>
+                        <div className="mt-0.5 text-[11px] text-slate-500">clusters</div>
+                    </div>
+                    <div>
+                        <div className="text-2xl font-semibold tabular-nums text-slate-950 dark:text-slate-50">{total}</div>
+                        <div className="mt-0.5 text-[11px] text-slate-500">signals</div>
+                    </div>
+                    <div>
+                        <div className={`text-2xl font-semibold tabular-nums ${critical ? 'text-rose-600 dark:text-rose-300' : 'text-slate-950 dark:text-slate-50'}`}>{critical}</div>
+                        <div className="mt-0.5 text-[11px] text-slate-500">critical</div>
+                    </div>
+                </div>
+            </div>
+            {clusters.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5 border-t border-slate-200 px-5 pb-4 pt-3 dark:border-slate-800/70 sm:px-6 lg:pl-7">
+                    <button
+                        type="button"
+                        onClick={() => onSelectCluster('')}
+                        aria-pressed={!clusterId}
+                        className={`cluster-scope-chip rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors ${!clusterId ? 'border-[#037ffc] bg-[#037ffc] text-[#ffffff]' : 'border-slate-200 bg-white text-slate-600 hover:border-[#037ffc] hover:text-[#037ffc] dark:border-slate-700 dark:bg-transparent dark:text-slate-300 dark:hover:border-sky-500/50 dark:hover:text-sky-300'}`}
+                    >
+                        All clusters
+                    </button>
+                    {clusters.map((cluster) => {
+                        const clusterIdValue = cluster.id || cluster.clusterId;
+                        const selected = clusterId === clusterIdValue;
+                        const issueCount = clusterIssueCounts[clusterIdValue] || 0;
+                        return (
+                            <button
+                                key={clusterIdValue}
+                                type="button"
+                                onClick={() => onSelectCluster(clusterIdValue)}
+                                aria-pressed={selected}
+                                className={`cluster-scope-chip inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors ${selected ? 'border-[#037ffc] bg-[#037ffc] text-[#ffffff]' : 'border-slate-200 bg-white text-slate-600 hover:border-[#037ffc] hover:text-[#037ffc] dark:border-slate-700 dark:bg-transparent dark:text-slate-300 dark:hover:border-sky-500/50 dark:hover:text-sky-300'}`}
+                            >
+                                <span className={`h-1.5 w-1.5 rounded-full ${issueCount ? 'bg-amber-500' : 'bg-emerald-500'}`} aria-hidden="true" />
+                                {cluster.name || clusterIdValue}
+                                {issueCount > 0 && <span className={selected ? 'text-white/75' : 'text-slate-400'}>{issueCount}</span>}
+                            </button>
+                        );
+                    })}
+                </div>
+            )}
+        </section>
+    );
 }
 
 export default function WelcomePage({
@@ -145,11 +222,37 @@ export default function WelcomePage({
 
     usePolling(() => loadIssues({ quiet: true }), { intervalMs: 15000 });
 
-    const filteredIssues = useMemo(() => {
-        const all = overview?.issues?.data || [];
-        return severity ? all.filter((issue) => issue.severity === severity) : all;
-    }, [overview, severity]);
+    const allIssues = useMemo(() => overview?.issues?.data || [], [overview]);
+    const filteredIssues = useMemo(
+        () => (severity ? allIssues.filter((issue) => issue.severity === severity) : allIssues),
+        [allIssues, severity],
+    );
+    const issueCounts = useMemo(() => ({
+        total: allIssues.length,
+        critical: allIssues.filter((issue) => issue.severity === 'critical').length,
+        warning: allIssues.filter((issue) => issue.severity === 'warning').length,
+        info: allIssues.filter((issue) => issue.severity === 'info').length,
+    }), [allIssues]);
+    const clusterIssueCounts = useMemo(() => {
+        const counts = {};
+        allIssues.forEach((issue) => {
+            if (!issue.clusterId) return;
+            counts[issue.clusterId] = (counts[issue.clusterId] || 0) + 1;
+        });
+        return counts;
+    }, [allIssues]);
+    const askAboutIssue = useCallback((issue) => {
+        const draft = `Investigate this issue and explain how to resolve it using the Lens UI. Give step-by-step page navigation and the controls or fields to use. Do not answer with API requests or shell commands.\n\n${issue.title}\n${issue.message}`;
+        setPrompt(draft.slice(0, MAX_PROMPT_LENGTH));
+        requestAnimationFrame(() => {
+            const input = document.getElementById('welcome-assistant-prompt');
+            input?.focus();
+            input?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        });
+    }, []);
     const quickActions = visibleWelcomeActions(can, canView);
+    const hasRightRail = canChat || quickActions.length > 0;
+    const rightRailCollapsed = !canChat && quickActionsCollapsed;
     const issueCount = filteredIssues.length;
     const issuesChecking = issuesLoading && !overview?.issues;
     const issuesPartial = Boolean(
@@ -216,13 +319,14 @@ export default function WelcomePage({
                     </HelpTooltip>
                 </span>
             )}
-            padding="sm"
-            className="border-0 bg-transparent shadow-none backdrop-blur-none"
+            padding="md"
+            className="flex w-full flex-col bg-transparent pb-3 shadow-none backdrop-blur-none not-dark:border-[#cbd5e1]"
         >
-            <div className="relative">
+            <div>
                 <Textarea
+                    id="welcome-assistant-prompt"
                     aria-label="Message Lens Assistant"
-                    rows={4}
+                    rows={7}
                     value={prompt}
                     maxLength={MAX_PROMPT_LENGTH}
                     onChange={(event) => setPrompt(event.target.value)}
@@ -233,31 +337,33 @@ export default function WelcomePage({
                         }
                     }}
                     placeholder="Ask anything"
-                    className="resize-none pb-11"
+                    className="resize-none rounded-none border-0 bg-transparent px-3 pb-3 pt-3 text-sm focus:bg-transparent focus:ring-0 dark:bg-transparent"
                 />
-                <div className="pointer-events-none absolute bottom-2 left-3 right-14 flex min-w-0 items-center">
-                    <ProviderSelect
-                        providers={providers}
-                        value={selectedProviderId}
-                        onChange={setSelectedProviderId}
-                        disabled={!canReadProviders || providersLoading}
-                        loading={providersLoading}
-                        emptyLabel={!canReadProviders ? 'Provider access required' : 'No compatible provider'}
-                        onAddProvider={canView('ai-providers') ? () => onNavigate('ai-providers', { action: 'add' }) : undefined}
-                    />
+                <div className="flex items-center justify-between gap-2 border-t border-[#e5e7eb] pt-2 dark:border-slate-800">
+                    <div className="min-w-0">
+                        <ProviderSelect
+                            providers={providers}
+                            value={selectedProviderId}
+                            onChange={setSelectedProviderId}
+                            disabled={!canReadProviders || providersLoading}
+                            loading={providersLoading}
+                            emptyLabel={!canReadProviders ? 'Provider access required' : 'No compatible provider'}
+                            onAddProvider={canView('ai-providers') ? () => onNavigate('ai-providers', { action: 'add' }) : undefined}
+                        />
+                    </div>
+                    <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={send}
+                        disabled={!canSend}
+                        isLoading={handoffPending}
+                        aria-label="Send message to Lens Assistant"
+                        title="Send"
+                        className="shrink-0 text-slate-500 hover:bg-slate-900/10 hover:text-emerald-600 dark:text-slate-400 dark:hover:bg-slate-800/60 dark:hover:text-emerald-300"
+                    >
+                        {!handoffPending && <Send size={15} aria-hidden="true" />}
+                    </Button>
                 </div>
-                <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={send}
-                    disabled={!canSend}
-                    isLoading={handoffPending}
-                    aria-label="Send message to Lens Assistant"
-                    title="Send"
-                    className="pointer-events-auto absolute bottom-1.5 right-2 h-8 w-8 text-slate-500 hover:bg-slate-900/10 hover:text-emerald-600 dark:text-slate-400 dark:hover:bg-slate-800/60 dark:hover:text-emerald-300"
-                >
-                    {!handoffPending && <Send size={15} aria-hidden="true" />}
-                </Button>
             </div>
             {prompt.length > MAX_PROMPT_LENGTH - 500 && (
                 <p className="mt-1.5 text-right text-[10px] text-theme-muted">
@@ -339,9 +445,17 @@ export default function WelcomePage({
                         </div>
                     )}
                 />
-                <div className={cn('mt-4 grid gap-4', quickActions.length > 0 && (quickActionsCollapsed ? 'lg:min-h-[calc(100vh-9.5rem)] lg:grid-cols-[minmax(0,1fr)_2.5rem]' : 'lg:min-h-[calc(100vh-9.5rem)] lg:grid-cols-[minmax(0,1fr)_24rem]'))}>
+                <div className={cn('mt-4 grid gap-4', hasRightRail && (rightRailCollapsed ? 'lg:min-h-[calc(100vh-9.5rem)] lg:grid-cols-[minmax(0,1fr)_2.5rem]' : 'lg:min-h-[calc(100vh-9.5rem)] lg:grid-cols-[minmax(0,1fr)_28rem]'))}>
                     <div className={cn('flex min-h-0 flex-col gap-4')}>
-                        {composer}
+                        <SystemBrief
+                            clusters={overview?.scope?.clusters || []}
+                            clusterId={clusterId}
+                            issueCounts={issueCounts}
+                            clusterIssueCounts={clusterIssueCounts}
+                            lastChecked={overview?.issues?.observedAt || overview?.issues?.generatedAt || overview?.generatedAt}
+                            loading={issuesLoading && !overview}
+                            onSelectCluster={(value) => onNavigate('welcome', { clusterId: value })}
+                        />
                         <Panel
                             title={(
                                 <span className="inline-flex items-center gap-1.5">
@@ -426,6 +540,7 @@ export default function WelcomePage({
                                     <IssueList
                                         issues={filteredIssues}
                                         onNavigate={onNavigate}
+                                        onAskAI={canChat ? askAboutIssue : undefined}
                                         limit={8}
                                         emptyTitle={severity
                                             ? `No ${severity} issues`
@@ -448,25 +563,30 @@ export default function WelcomePage({
                             </div>
                         </Panel>
                     </div>
-                    {quickActions.length > 0 && (
-                        quickActionsCollapsed ? (
-                            <div className="flex justify-end">
-                                <Button
-                                    variant="secondary"
-                                    size="icon"
-                                    onClick={() => setQuickActionsCollapsed(false)}
-                                    aria-label="Expand quick actions"
-                                    title="Expand quick actions"
-                                    className="h-10 w-10 text-sky-600 dark:text-sky-300"
-                                >
-                                    <ChevronLeft size={16} aria-hidden="true" />
-                                </Button>
-                            </div>
-                        ) : (
-                            <div className="flex min-h-0 flex-col">
-                                <QuickActions onNavigate={onNavigate} onCollapse={() => setQuickActionsCollapsed(true)} />
-                            </div>
-                        )
+                    {hasRightRail && (
+                        <div className="flex min-h-0 flex-col gap-4">
+                            {composer}
+                            {quickActions.length > 0 && (
+                                quickActionsCollapsed ? (
+                                    <div className="flex justify-end">
+                                        <Button
+                                            variant="secondary"
+                                            size="icon"
+                                            onClick={() => setQuickActionsCollapsed(false)}
+                                            aria-label="Expand quick actions"
+                                            title="Expand quick actions"
+                                            className="h-10 w-10 text-sky-600 dark:text-sky-300"
+                                        >
+                                            <ChevronLeft size={16} aria-hidden="true" />
+                                        </Button>
+                                    </div>
+                                ) : (
+                                    <div className="flex min-h-0 flex-col">
+                                        <QuickActions onNavigate={onNavigate} onCollapse={() => setQuickActionsCollapsed(true)} />
+                                    </div>
+                                )
+                            )}
+                        </div>
                     )}
                 </div>
             </div>

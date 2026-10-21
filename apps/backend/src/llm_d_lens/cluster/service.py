@@ -919,7 +919,14 @@ def update_cluster_settings(
 ) -> registry.Cluster:
     """Patch a cluster's name/description/proxy/version settings (wizard Step 2/3,
     and the Clusters overview page's "Edit cluster" action)."""
-    registry.require_cluster(cluster_id)
+    cluster = registry.require_cluster(cluster_id)
+    requested_provider = (gateway_provider or "").strip() or None
+    if requested_provider is not None and requested_provider != cluster.gateway_provider:
+        raise ClusterOverviewError(
+            "Model gateway provider is fixed when the cluster is created; recreate the cluster to change it",
+            status_code=422,
+            code="gateway_provider_immutable",
+        )
     updates: dict[str, Any] = {}
     if name is not None:
         clean_name = name.strip()
@@ -951,7 +958,6 @@ def update_cluster_settings(
     updates["gie_version"] = current.k8s_gateway_api_inference_extension
     updates["ipp_version"] = current.llm_d_inference_payload_processor
     for key, value in (
-        ("gateway_provider", gateway_provider),
         ("gateway_namespace", gateway_namespace),
         ("gateway_name", gateway_name),
         ("gateway_public_url", gateway_public_url),

@@ -111,8 +111,9 @@ export function AIProvidersPage({ onToggleMobileNav, initialAction = '' }) {
                     onRetry={load}
                     emptyContent={<EmptyState
                         icon={<Plug size={22} />}
+                        iconClassName="ai-providers-empty-icon"
                         title="No AI providers configured"
-                        message="Add an OpenAI-compatible endpoint (OpenAI, Azure OpenAI, a self-hosted vLLM/Ollama server, etc.) so Agentic components can use it."
+                        message="Add a publicly reachable OpenAI- or Anthropic-compatible endpoint over HTTPS (for example OpenAI, Azure OpenAI, or Anthropic) for Lens Assistant and Agentic deployment planning."
                         action={<Button variant="sky" size="sm" onClick={() => setDialog({ mode: 'add' })}><Plus size={14} /> Add provider</Button>}
                     />}
                 >

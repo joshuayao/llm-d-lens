@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from llm_d_lens.agentic.generator import (
     AgenticMcpClient,
@@ -13,8 +14,52 @@ from llm_d_lens.agentic.generator import (
     CandidateValidator,
 )
 from llm_d_lens.agentic.planner import OpenAIPlannerSettings, PlanningFacts, WorkloadProfile
-from llm_d_lens.ai_providers.client import AIToolCall, AIToolTurn
+from llm_d_lens.ai_providers.client import AIProviderClientError, AIToolCall, AIToolTurn
 from llm_d_lens.auth.security import verify_internal
+
+
+def test_generator_schema_excludes_direct_vllm_and_accepts_optimized_baseline():
+    proposal = {
+        "provider_ref": "optimized-baseline",
+        "replicas": 1,
+        "tensor_parallel_size": 1,
+        "rationale": "Use llm-d routing.",
+    }
+    assert CandidateProposal.model_validate(proposal).provider_ref == "optimized-baseline"
+    assert "baseline-vllm" not in CandidateProposal.model_json_schema()["properties"]["provider_ref"]["enum"]
+    with pytest.raises(ValidationError, match="provider_ref"):
+        CandidateProposal.model_validate({**proposal, "provider_ref": "baseline-vllm"})
+
+
+@pytest.mark.parametrize("operator_prompt", [None, "", "single GPU, no PD"])
+def test_generator_keeps_prompt_and_nested_preference_consistent(monkeypatch, operator_prompt):
+    captured = {}
+
+    class Client:
+        async def complete_tool_turn(self, **kwargs):
+            captured.update(kwargs)
+            raise AIProviderClientError("stop after capturing input")
+
+    class Tools:
+        async def available_tools(self):
+            return [_cluster_tool(), _aic_tool()]
+
+    monkeypatch.setattr("llm_d_lens.agentic.generator.client_for", lambda **_kwargs: Client())
+    facts = PlanningFacts(8, 32, 4, operator_preference="prefer existing cache")
+    generator = AICandidateGenerator(
+        OpenAIPlannerSettings(base_url="http://provider", model="generator"), tools=Tools()
+    )
+    with pytest.raises(CandidateGenerationError, match="stop after capturing input"):
+        asyncio.run(generator.generate("cluster-a", "model-a", facts, operator_prompt))
+    preference = facts.operator_preference if operator_prompt is None else operator_prompt
+    content = captured["messages"][0]["content"]
+    assert content.startswith("Operator preference")
+    prefix, context = content.split("\n\nPlanning context (JSON):\n", 1)
+    assert prefix.endswith(preference or "(not provided)")
+    payload = json.loads(context)
+    assert payload["operator_preference"] == preference
+    assert payload["deployment_intent"]["operator_preference"] == preference
+    assert facts.operator_preference == "prefer existing cache"
 
 
 def test_validator_keeps_valid_ai_candidates_when_other_proposals_are_invalid():
@@ -27,7 +72,7 @@ def test_validator_keeps_valid_ai_candidates_when_other_proposals_are_invalid():
     )
     proposals = [
         CandidateProposal(
-            provider_ref="baseline-vllm",
+            provider_ref="optimized-baseline",
             replicas=1,
             tensor_parallel_size=1,
             rationale="Small deployable baseline.",
@@ -45,7 +90,7 @@ def test_validator_keeps_valid_ai_candidates_when_other_proposals_are_invalid():
 
     result = CandidateValidator().validate(facts, proposals)
 
-    assert [candidate.id for candidate in result.accepted] == ["baseline-vllm-tp1-r1"]
+    assert [candidate.id for candidate in result.accepted] == ["optimized-baseline-tp1-r1"]
     assert result.accepted[0].gpu_memory_utilization == 0.6
     assert result.accepted[0].evidence_ids == ["aic:search"]
     assert [candidate.id for candidate in result.rejected] == ["pd-disaggregation-p2-tp2-d2-tp2"]
@@ -78,7 +123,7 @@ def test_validator_drops_ai_evidence_ids_not_present_in_authoritative_facts():
         evidence_ids=("cluster-overview:cluster-a",),
     )
     proposal = CandidateProposal(
-        provider_ref="baseline-vllm",
+        provider_ref="optimized-baseline",
         replicas=1,
         tensor_parallel_size=1,
         rationale="Fits.",
@@ -262,7 +307,7 @@ def test_ai_generator_gets_required_evidence_via_model_selected_mcp_call(monkeyp
                         arguments={
                             "candidates": [
                                 {
-                                    "provider_ref": "baseline-vllm",
+                                    "provider_ref": "optimized-baseline",
                                     "replicas": 1,
                                     "tensor_parallel_size": 1,
                                     "rationale": "Fits the current cluster.",
@@ -297,10 +342,14 @@ def test_ai_generator_gets_required_evidence_via_model_selected_mcp_call(monkeyp
     ]
     assert "The server will independently recompute" in captured["system_prompt"]
     assert "Do not score, select, render, approve, or deploy" in captured["system_prompt"]
-    user_context = json.loads(captured["messages"][0]["content"])
+    user_content = captured["messages"][0]["content"]
+    assert user_content.startswith("Operator preference")
+    assert user_content.index("prefer throughput") < user_content.index("Planning context (JSON):")
+    user_context = json.loads(user_content.split("Planning context (JSON):\n", 1)[1])
+    assert next(iter(user_context)) == "operator_preference"
     assert user_context["operator_preference"] == "prefer throughput"
     assert "validated_planning_facts" not in user_context
-    assert proposals.proposals.candidates[0].provider_ref == "baseline-vllm"
+    assert proposals.proposals.candidates[0].provider_ref == "optimized-baseline"
     assert proposals.resolved.facts.vram_per_gpu_gib == 32
     assert proposals.resolved.facts.free_gpu_count == 4
 
@@ -365,7 +414,7 @@ def test_ai_generator_relaxes_only_after_empty_aic_search_and_freezes_original_t
                         arguments={
                             "candidates": [
                                 {
-                                    "provider_ref": "baseline-vllm",
+                                    "provider_ref": "optimized-baseline",
                                     "replicas": 2,
                                     "tensor_parallel_size": 1,
                                     "rationale": "AIC anchor requires validation.",
@@ -410,8 +459,8 @@ def test_ai_generator_relaxes_only_after_empty_aic_search_and_freezes_original_t
         (candidate.provider_ref, candidate.tensor_parallel_size, candidate.replicas)
         for candidate in result.proposals.candidates
     ] == [
-        ("baseline-vllm", 1, 2),
-        ("baseline-vllm", 2, 1),
+        ("optimized-baseline", 1, 2),
+        ("optimized-baseline", 2, 1),
     ]
     accepted = CandidateValidator().validate(result.resolved.facts, result.proposals.candidates).accepted
     assert accepted[-1].required_gpus == 2
@@ -494,7 +543,7 @@ def test_ai_generator_relaxes_no_feasible_aic_error_with_live_gpu_budget(
                         arguments={
                             "candidates": [
                                 {
-                                    "provider_ref": "baseline-vllm",
+                                    "provider_ref": "optimized-baseline",
                                     "replicas": 1,
                                     "tensor_parallel_size": 1,
                                     "rationale": "No AIC prediction is available.",
@@ -569,7 +618,7 @@ def test_ai_generator_keeps_relaxed_tool_hidden_when_aic_returns_candidates(monk
                         arguments={
                             "candidates": [
                                 {
-                                    "provider_ref": "baseline-vllm",
+                                    "provider_ref": "optimized-baseline",
                                     "replicas": 1,
                                     "tensor_parallel_size": 1,
                                     "rationale": "Initial AIC search returned a candidate.",
@@ -627,7 +676,7 @@ def test_ai_generator_does_not_relax_unrelated_aic_error(monkeypatch):
                         arguments={
                             "candidates": [
                                 {
-                                    "provider_ref": "baseline-vllm",
+                                    "provider_ref": "optimized-baseline",
                                     "replicas": 1,
                                     "tensor_parallel_size": 1,
                                     "rationale": "No prediction available.",
@@ -711,7 +760,7 @@ def test_ai_generator_requires_relaxed_search_after_empty_aic_result(monkeypatch
                         arguments={
                             "candidates": [
                                 {
-                                    "provider_ref": "baseline-vllm",
+                                    "provider_ref": "optimized-baseline",
                                     "replicas": 1,
                                     "tensor_parallel_size": 1,
                                     "rationale": "No AIC result.",
@@ -765,7 +814,7 @@ def test_ai_generator_does_not_replay_an_empty_assistant_response(monkeypatch):
                         arguments={
                             "candidates": [
                                 {
-                                    "provider_ref": "baseline-vllm",
+                                    "provider_ref": "optimized-baseline",
                                     "replicas": 1,
                                     "tensor_parallel_size": 1,
                                     "rationale": "Fits the observed cluster.",
@@ -784,7 +833,7 @@ def test_ai_generator_does_not_replay_an_empty_assistant_response(monkeypatch):
 
     result = asyncio.run(generator.generate("cluster-a", "Qwen/Qwen3-8B", PlanningFacts(8, 32, 4), None))
 
-    assert result.proposals.candidates[0].provider_ref == "baseline-vllm"
+    assert result.proposals.candidates[0].provider_ref == "optimized-baseline"
     assert request_messages[1] == [
         request_messages[0][0],
         {
@@ -907,8 +956,8 @@ def test_ai_generator_runs_bounded_optional_mcp_calls_before_final_candidates(mo
     assert all(trace["status"] == "success" for trace in proposals.proposals.tool_trace[2:])
     assert len(proposals.proposals.tool_trace[2]["arguments_digest"]) == 64
     assert len(proposals.proposals.tool_trace[2]["result_digest"]) == 64
-    assert "arguments" not in proposals.proposals.tool_trace[2]
-    assert "result" not in proposals.proposals.tool_trace[2]
+    assert proposals.proposals.tool_trace[2]["arguments"] == {"model": "Qwen/Qwen3-8B"}
+    assert proposals.proposals.tool_trace[2]["result"] == {"items": [{"id": "simulation-1", "status": "completed"}]}
     aic_trace = proposals.proposals.tool_trace[1]
     assert aic_trace["arguments"] == _aic_arguments()
     assert aic_trace["result"] == {"candidates": []}
@@ -945,7 +994,7 @@ def test_ai_generator_retries_one_text_only_turn(monkeypatch):
                         arguments={
                             "candidates": [
                                 {
-                                    "provider_ref": "baseline-vllm",
+                                    "provider_ref": "optimized-baseline",
                                     "replicas": 1,
                                     "tensor_parallel_size": 1,
                                     "rationale": "Fits.",
@@ -979,7 +1028,7 @@ def test_ai_generator_retries_one_text_only_turn(monkeypatch):
     )
 
     assert provider.turns == 3
-    assert result.proposals.candidates[0].provider_ref == "baseline-vllm"
+    assert result.proposals.candidates[0].provider_ref == "optimized-baseline"
 
 
 def test_ai_generator_rejects_tool_outside_planning_allowlist(monkeypatch):
@@ -1030,7 +1079,7 @@ def test_ai_generator_rejects_submission_without_cluster_evidence(monkeypatch):
                         arguments={
                             "candidates": [
                                 {
-                                    "provider_ref": "baseline-vllm",
+                                    "provider_ref": "optimized-baseline",
                                     "replicas": 1,
                                     "tensor_parallel_size": 1,
                                     "rationale": "Unsupported guess.",
@@ -1202,7 +1251,7 @@ def test_ai_generator_retries_invalid_first_tool_batch_once(monkeypatch):
                         arguments={
                             "candidates": [
                                 {
-                                    "provider_ref": "baseline-vllm",
+                                    "provider_ref": "optimized-baseline",
                                     "replicas": 1,
                                     "tensor_parallel_size": 1,
                                     "rationale": "Fits the observed cluster.",
@@ -1224,7 +1273,7 @@ def test_ai_generator_retries_invalid_first_tool_batch_once(monkeypatch):
     assert len(requests) == 3
     assert "Retry once by calling exactly" in requests[1][-1]["content"]
     assert calls == ["get_cluster_overview", "search_candidates"]
-    assert result.proposals.candidates[0].provider_ref == "baseline-vllm"
+    assert result.proposals.candidates[0].provider_ref == "optimized-baseline"
 
 
 def test_ai_generator_injects_required_cluster_and_aic_arguments(monkeypatch):
@@ -1252,7 +1301,7 @@ def test_ai_generator_injects_required_cluster_and_aic_arguments(monkeypatch):
                             arguments={
                                 "candidates": [
                                     {
-                                        "provider_ref": "baseline-vllm",
+                                        "provider_ref": "optimized-baseline",
                                         "replicas": 1,
                                         "tensor_parallel_size": 1,
                                         "rationale": "Fits the observed cluster.",
@@ -1298,7 +1347,7 @@ def test_ai_generator_injects_required_cluster_and_aic_arguments(monkeypatch):
         )
     )
 
-    assert result.proposals.candidates[0].provider_ref == "baseline-vllm"
+    assert result.proposals.candidates[0].provider_ref == "optimized-baseline"
     assert calls[0] == ("get_cluster_overview", {"clusterId": "cluster-a"})
     assert calls[1][0] == "search_candidates"
     assert calls[1][1]["sourceIds"] == ["aic"]
@@ -1389,7 +1438,7 @@ def test_preference_constraints_override_form_values_for_aic_and_slo_filter(monk
                         arguments={
                             "candidates": [
                                 {
-                                    "provider_ref": "baseline-vllm",
+                                    "provider_ref": "optimized-baseline",
                                     "replicas": 1,
                                     "tensor_parallel_size": 1,
                                     "rationale": "Fits the observed cluster.",
@@ -1520,7 +1569,7 @@ def test_ai_generator_uses_aic_default_workload_when_none_is_provided(monkeypatc
                             arguments={
                                 "candidates": [
                                     {
-                                        "provider_ref": "baseline-vllm",
+                                        "provider_ref": "optimized-baseline",
                                         "replicas": 1,
                                         "tensor_parallel_size": 1,
                                         "rationale": "Fits the observed cluster.",
@@ -1604,7 +1653,7 @@ def test_ai_generator_retries_an_invalid_candidate_submission(monkeypatch):
                         arguments={
                             "candidates": [
                                 {
-                                    "provider_ref": "baseline-vllm",
+                                    "provider_ref": "optimized-baseline",
                                     "replicas": 1,
                                     "tensor_parallel_size": 1,
                                     "rationale": "Fits the observed cluster.",
@@ -1630,7 +1679,7 @@ def test_ai_generator_retries_an_invalid_candidate_submission(monkeypatch):
         )
     )
 
-    assert result.proposals.candidates[0].provider_ref == "baseline-vllm"
+    assert result.proposals.candidates[0].provider_ref == "optimized-baseline"
     correction = requests[2][-1]["results"][0]
     assert correction["tool_call_id"] == "invalid"
     assert "submission schema invalid" in correction["content"]
@@ -1670,6 +1719,10 @@ def test_ai_generator_prompt_encodes_candidate_priorities_and_tool_policy():
     assert "First request only get_cluster_overview and search_candidates" in prompt
     assert "prefer those values over the corresponding deployment_intent fields" in prompt
     assert "operator_preference as the primary recommendation criterion" in prompt
+    assert prompt.index("explicit operator requirements") < prompt.index("Provider semantics:")
+    assert "Never relax an explicit operator requirement" in prompt
+    assert "explicit operator requirement, or explicit SLO" in prompt
+    assert "Diversity never requires an operator-forbidden provider or topology" in prompt
     assert "valid AIC predictions as secondary recommendation evidence" in prompt
     assert "Only when that search returns zero AIC candidates" in prompt
     assert "scale replicas first (prefill for TTFT, decode for TPOT in PD), then supported TP" in prompt
@@ -1690,7 +1743,7 @@ def test_ai_generator_prompt_encodes_candidate_priorities_and_tool_policy():
     assert "If the initial search is empty, use the relaxed anchor" in prompt
     assert "operator_preference may select a provider but does not justify additional resources by itself" in prompt
     assert "Relaxed-anchor scaling remains unverified" in prompt
-    assert "baseline-vllm: direct standard vLLM deployment" in prompt
+    assert "baseline-vllm" not in prompt
     assert "optimized-baseline: vLLM with llm-d prefix-affinity" in prompt
     assert "pd-disaggregation: separate prefill and decode roles" in prompt
     assert "tiered-prefix-cache: vLLM with tiered prefix caching that uses available CPU buffer" in prompt

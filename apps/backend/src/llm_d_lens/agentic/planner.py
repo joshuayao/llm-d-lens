@@ -42,7 +42,6 @@ logger = logging.getLogger(__name__)
 PlannerProgressCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 _PROVIDER_GUIDANCE = (
-    "- baseline-vllm: direct standard vLLM deployment without llm-d request routing.\n"
     "- optimized-baseline: vLLM with llm-d prefix-affinity and load-aware routing; useful for repeated prefixes, "
     "multiple replicas, or uneven request load.\n"
     "- pd-disaggregation: separate prefill and decode roles; useful for prefill-heavy or long-input workloads.\n"
@@ -67,7 +66,7 @@ class PlannedCandidate(BaseModel):
         "pd-disaggregation",
         "tiered-prefix-cache",
         "precise-prefix-cache-routing",
-    ] = "baseline-vllm"
+    ] = "optimized-baseline"
     replicas: int = Field(ge=1)
     tensor_parallel_size: int = Field(ge=1)
     prefill_replicas: int | None = Field(default=None, ge=1)
@@ -424,7 +423,7 @@ class DeterministicPlanner:
         shared_prefix_guides = [("precise-prefix-cache-routing", None)]
         if facts.cpu_buffer_gib >= facts.required_cpu_buffer_gib:
             shared_prefix_guides.append(("tiered-prefix-cache", "native/cpu/base"))
-        providers = [("baseline-vllm", None), ("optimized-baseline", None), *shared_prefix_guides]
+        providers = [("optimized-baseline", None), *shared_prefix_guides]
         return [
             PlannedCandidate(
                 id=f"{provider}-tp{tensor_parallel_size}-r{replicas}",
@@ -529,13 +528,15 @@ class DeterministicPlanner:
 
     def decide(self, facts: PlanningFacts, candidates: list[PlannedCandidate]) -> PlannerDecision:
         facts = resolve_workload_signals(facts)
-        deployable = [candidate for candidate in candidates if candidate.deployable]
+        deployable = [
+            candidate for candidate in candidates if candidate.deployable and candidate.provider_ref != "baseline-vllm"
+        ]
         if not deployable:
             reasons = sorted({reason for candidate in candidates for reason in candidate.rejection_reasons})
             return PlannerDecision(
                 action="cannot_satisfy",
                 confidence=1.0,
-                rationale="No bounded Standard vLLM candidate satisfies the current resource constraints.",
+                rationale="No eligible Agentic candidate satisfies the current resource constraints.",
                 evidence_ids=list(facts.evidence_ids),
                 unmet_constraints=reasons,
             )
@@ -566,7 +567,9 @@ class DeterministicPlanner:
 
     def score(self, facts: PlanningFacts, candidates: list[PlannedCandidate]) -> list[PlannedCandidate]:
         facts = resolve_workload_signals(facts)
-        deployable = [candidate for candidate in candidates if candidate.deployable]
+        deployable = [
+            candidate for candidate in candidates if candidate.deployable and candidate.provider_ref != "baseline-vllm"
+        ]
         ranked = self._rank(facts, deployable)
         total = max(len(ranked), 1)
         return [
@@ -616,7 +619,9 @@ class DeterministicPlanner:
 
     def ranking_trace(self, facts: PlanningFacts, candidates: list[PlannedCandidate]) -> list[dict[str, Any]]:
         facts = resolve_workload_signals(facts)
-        deployable = [candidate for candidate in candidates if candidate.deployable]
+        deployable = [
+            candidate for candidate in candidates if candidate.deployable and candidate.provider_ref != "baseline-vllm"
+        ]
         if not deployable:
             return []
         balanced_candidate_ids = {candidate.id for candidate in self._balanced_candidates(facts, deployable)}
@@ -1044,6 +1049,8 @@ class OpenAICompatiblePlanner:
         operator_prompt: str | None = None,
         on_progress: PlannerProgressCallback | None = None,
     ) -> tuple[PlannerDecision, list[PlannedCandidate]]:
+        operator_prompt = facts.operator_preference if operator_prompt is None else operator_prompt
+        facts = replace(facts, operator_preference=operator_prompt)
         deterministic_planner = DeterministicPlanner()
         valid_candidates = self._diverse_candidate_catalog(facts, candidates)
         if not valid_candidates:
@@ -1069,21 +1076,24 @@ class OpenAICompatiblePlanner:
         planning_facts = asdict(facts)
         planning_facts.pop("performance_score_inputs", None)
         context = {
+            "operator_preference": operator_prompt,
             "planning_facts": planning_facts,
             "valid_candidates": [self._candidate_context(facts, candidate) for candidate in valid_candidates],
         }
-        if operator_prompt:
-            context["operator_preference"] = operator_prompt
-        user_content = json.dumps(context)
-        if operator_prompt:
-            user_content += (
-                "\n\nOperator preference (primary scoring criterion after hard constraints; "
-                "it cannot create configurations):\n" + operator_prompt
-            )
+        user_content = (
+            "Operator preference (primary scoring criterion after hard constraints; "
+            "explicit requirements constrain eligibility; it cannot create configurations):\n"
+            f"{operator_prompt or '(not provided)'}\n\nPlanning context (JSON):\n" + json.dumps(context)
+        )
         user_content += "\n\nDeployment use case (important scenario-specific planning input):\n" + facts.use_case
         expected_candidate_count = min(3, len(valid_candidates))
         system_prompt = (
             "You are Prism's configuration selector. Follow this priority order:\n"
+            "Platform validity and hardware constraints come first, then explicit operator requirements, "
+            "operator soft preferences, and finally performance evidence and candidate diversity. "
+            "Never relax an explicit operator requirement to improve SLO estimates, resource policy, or diversity. "
+            "Prefer only candidates satisfying explicit operator requirements; do not treat a forbidden "
+            "provider or topology as an acceptable tradeoff.\n"
             "Provider semantics:\n"
             f"{provider_guidance()}\n"
             "1. Choose only among valid_candidates. Never invent IDs, configurations, providers, or facts.\n"
@@ -1107,8 +1117,9 @@ class OpenAICompatiblePlanner:
             "relevance to this target; it is not a current performance guarantee. Do not alter their metrics, "
             "configurations, outcomes, or match_confidence. Historical observations are supporting evidence from "
             "similar workloads, not candidate-specific guarantees.\n"
-            f"Return exactly {expected_candidate_count} candidate ID(s): return the top three "
-            "when at least three valid candidates exist; otherwise return every valid candidate. "
+            f"Return up to {expected_candidate_count} candidate ID(s): return the top three "
+            "when at least three valid candidates satisfy explicit operator requirements; otherwise return "
+            "only the candidates satisfying those requirements. Never pad the result with a forbidden topology. "
             "Assign scores from 0 to 1. candidate_id must "
             "have the highest score. scores must contain exactly one numeric entry per selected ID. In rationale, "
             "explain why the top candidate scores highest, then name every other returned candidate ID and give its "

@@ -7,7 +7,7 @@ import { useResourceList } from '../../../../shared/lib/useResourceList';
 import { AsyncState } from '../../../../shared/ui/AsyncState';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { usePolling } from '../../../../shared/lib/usePolling';
-import { CheckCircle2, HardDrive, Info, PanelLeftClose, PanelLeftOpen, Plus, RefreshCw, Search, ServerCog, Server } from 'lucide-react';
+import { CheckCircle2, HardDrive, Info, PanelLeftClose, PanelLeftOpen, Plus, RefreshCw, RotateCcw, Search, Server, ServerCog, Tags } from 'lucide-react';
 import {
     createStorageVolume,
     acknowledgeStorageVolumeNodes,
@@ -150,6 +150,12 @@ export function StorageManagementPage({ initialClusterId = '', initialVolumeId =
     }, [knownClusters, items, clusterId]);
 
     const hasFilters = Boolean(query || kind || purpose || clusterId);
+    const clearFilters = () => {
+        setSearchInput('');
+        setKind('');
+        setPurpose('');
+        setClusterId('');
+    };
 
     useEffect(() => {
         setPage(0);
@@ -272,7 +278,7 @@ export function StorageManagementPage({ initialClusterId = '', initialVolumeId =
                 <div className="flex shrink-0 items-center gap-2">
                     {sidebarOpen && (
                         <div className="flex min-w-0 flex-1 items-center gap-2.5 rounded-2xl border border-slate-800/80 bg-slate-900/50 p-1.5 pl-3 backdrop-blur-xl transition-colors hover:border-cyan-500/40">
-                            <span className="inline-flex shrink-0 items-center gap-1.5 text-xs font-semibold tracking-wide text-[#037ffc] dark:text-cyan-400">
+                            <span className="inline-flex shrink-0 items-center gap-1.5 text-sm font-semibold text-[#037ffc] dark:text-cyan-400">
                                 <Server size={14} />
                                 <span className="hidden sm:inline">Cluster</span>
                             </span>
@@ -307,7 +313,15 @@ export function StorageManagementPage({ initialClusterId = '', initialVolumeId =
                 className="storage-card relative flex min-h-0 flex-1 flex-col rounded-2xl border border-slate-800/80 bg-gradient-to-br from-slate-900/90 via-slate-900/50 to-slate-950/90 shadow-2xl backdrop-blur-xl"
             >
               <div className="flex min-h-0 flex-1 flex-col p-4">
-                <div className="mt-3 flex shrink-0 flex-col gap-2">
+                <div className="mt-3 flex shrink-0 flex-col gap-2 pr-1">
+                    <div className="flex items-center justify-between gap-2">
+                        <SectionLabel className="mb-0 text-[#037ffc] text-sm font-semibold normal-case tracking-normal">{`Storage volumes (${items.length})`}</SectionLabel>
+                        {hasFilters && (
+                            <Button variant="ghost" size="xs" onClick={clearFilters}>
+                                <RotateCcw size={11} aria-hidden="true" /> Clear
+                            </Button>
+                        )}
+                    </div>
                     <div className="relative">
                         <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" aria-hidden="true" />
                         <Input
@@ -319,28 +333,34 @@ export function StorageManagementPage({ initialClusterId = '', initialVolumeId =
                             className="h-10 py-2 pl-9 text-xs"
                         />
                     </div>
-                    <select
-                        value={kind}
-                        onChange={(event) => setKind(event.target.value)}
-                        aria-label="Filter by type"
-                        className="h-10 w-full rounded-xl border border-slate-800/40 bg-[#0b0f17] px-3 text-xs text-slate-300 outline-none transition focus:border-cyan-400 focus:ring-2 focus:ring-cyan-500/10"
-                    >
-                        <option value="">All types</option>
-                        {STORAGE_KIND_OPTIONS.map((option) => (
-                            <option key={option} value={option}>{kindLabel(option)}</option>
-                        ))}
-                    </select>
-                    <select
-                        value={purpose}
-                        onChange={(event) => setPurpose(event.target.value)}
-                        aria-label="Filter by purpose"
-                        className="h-10 w-full rounded-xl border border-slate-800/40 bg-[#0b0f17] px-3 text-xs text-slate-300 outline-none transition focus:border-cyan-400 focus:ring-2 focus:ring-cyan-500/10"
-                    >
-                        <option value="">All purposes</option>
-                        {PURPOSE_OPTIONS.map((option) => (
-                            <option key={option} value={option}>{purposeLabel(option)}</option>
-                        ))}
-                    </select>
+                    <div className="grid grid-cols-2 gap-2">
+                        <Select
+                            variant="toolbar"
+                            icon={HardDrive}
+                            value={kind}
+                            onChange={(event) => setKind(event.target.value)}
+                            aria-label="Filter by type"
+                            className="h-9 min-w-0 text-xs"
+                        >
+                            <option value="">All types</option>
+                            {STORAGE_KIND_OPTIONS.map((option) => (
+                                <option key={option} value={option}>{kindLabel(option)}</option>
+                            ))}
+                        </Select>
+                        <Select
+                            variant="toolbar"
+                            icon={Tags}
+                            value={purpose}
+                            onChange={(event) => setPurpose(event.target.value)}
+                            aria-label="Filter by purpose"
+                            className="h-9 min-w-0 text-xs"
+                        >
+                            <option value="">All purposes</option>
+                            {PURPOSE_OPTIONS.map((option) => (
+                                <option key={option} value={option}>{purposeLabel(option)}</option>
+                            ))}
+                        </Select>
+                    </div>
                 </div>
                 <div className="mt-3 flex min-h-0 flex-1 flex-col">
                 <div className="min-h-0 flex-1 overflow-y-auto pr-1">
@@ -369,11 +389,7 @@ export function StorageManagementPage({ initialClusterId = '', initialVolumeId =
                             hasFilters ? (
                                 <Button
                                     variant="secondary"
-                                    onClick={() => {
-                                        setSearchInput('');
-                                        setKind('');
-                                        setClusterId('');
-                                    }}
+                                    onClick={clearFilters}
                                 >
                                     Clear filters
                                 </Button>
@@ -408,7 +424,7 @@ export function StorageManagementPage({ initialClusterId = '', initialVolumeId =
             </div>
 
             <section className="storage-card flex min-h-0 min-w-0 flex-1 flex-col rounded-2xl border border-slate-800/80 bg-gradient-to-br from-slate-900/90 via-slate-900/50 to-slate-950/90 p-6 shadow-2xl backdrop-blur-xl">
-                <SectionLabel className="shrink-0 text-[#037ffc]">Status</SectionLabel>
+                <SectionLabel className="shrink-0 text-[#037ffc] text-sm font-semibold normal-case tracking-normal">Storage details</SectionLabel>
                 <div className="mt-3 min-h-0 flex-1 overflow-y-auto pr-1">
                     <StorageResourceDetailPanel
                         item={selectedResourceItem}

@@ -18,6 +18,13 @@ as you type. Use **Clear filters** to reset both search and category.
 | **Manual** | You want to choose an llm-d Guide template, configure resources or review generated YAML |
 | **Agentic** (Experimental) | You want Lens to recommend a configuration for a workload and performance target |
 
+Deployment setup uses the model card's **Context** metadata as its initial maximum
+context length, including Agentic recommendations. For example, Qwen3-0.6B starts
+with `40960`, not `4096`. Only models with no listed context use the `4096`
+default. Standard and Agentic requests accept `256` through `1048576` tokens
+without silently shortening the card value; resource and model compatibility
+checks still apply. Existing plans and deployments are not rewritten.
+
 ## Create a manual deployment
 
 1. Open **Model Market**, use **Model categories** to narrow the list, and click a model card.
@@ -64,6 +71,11 @@ again. A resource or network error during generation must be resolved before dep
 Optionally, expand **Pod placement** before generating a recommendation to choose
 where the deployment runs.
 
+Agentic generation and selection offer `optimized-baseline` instead of direct
+`baseline-vllm`, including built-in fallback and AIC recommendations. Historical
+direct-vLLM configurations are not reintroduced as candidates. Existing plans
+and manual Standard vLLM deployments are unchanged.
+
 For load-based sizing, enter either **Concurrent requests** or **Request rate (QPS)**,
 not both. These are optional and have no prefilled target. A provided target selects
 native AIC recommendation mode; leaving both blank keeps the fixed-GPU search.
@@ -74,6 +86,17 @@ next action, rather than silently falling back to predictions without a load tar
 
 To change the recommendation, enter your revised preference below the alternatives
 and click **Recalculate selection**. This also works without an external AI provider.
+
+With an external AI provider, both generation and selection prompts put your full
+preference before the planning context. Explicit requirements such as one GPU or no
+P/D separation take precedence over candidate diversity and performance suggestions,
+subject to platform and hardware validity. This is AI guidance, not a guarantee that
+arbitrary natural-language requirements are mechanically enforced.
+
+New planning audits retain the full preference and each actual AI request/response,
+including tools and retries. They exclude provider authentication headers and API keys.
+Treat these audit files as private data; old decisions cannot recover previously
+unrecorded exchanges.
 
 **AI score** ranks the alternatives; it is not a measured performance result or
 a probability of success. Treat **SLO not met** as a reason to revise the target

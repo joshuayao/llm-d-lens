@@ -1128,6 +1128,30 @@ html:not(.dark) .model-services-page .model-services-card {
   background: #ffffff !important;
 }
 
+/* Light mode: Storage volume rows use light gray separators. */
+html:not(.dark) .storage-page .storage-volume-rows > tr {
+  border-color: #e5e7eb !important;
+}
+
+/* Light mode: GPU cards stay white and their tracks use a visible gray. */
+html:not(.dark) .cluster-page .gpu-card {
+  background-color: #ffffff !important;
+  border-color: #d1d5db !important;
+}
+html:not(.dark) .cluster-page .gpu-card .utilization-track {
+  background-color: #e5e7eb !important;
+}
+
+/* Light mode: utilization tracks use a very light neutral surface. */
+html:not(.dark) .cluster-page .utilization-track {
+  background-color: #f8fafc !important;
+}
+
+/* Light mode: Workers table row separators use a light gray line. */
+html:not(.dark) .cluster-page .workers-table-body > tr {
+  border-color: #e5e7eb !important;
+}
+
 /* Light mode: model-service topology boxes use white surfaces and gray borders. */
 html:not(.dark) .model-services-page .model-service-node {
   background: #ffffff !important;
@@ -2062,4 +2086,16 @@ html:not(.dark) .assistant-chat-scroll::-webkit-scrollbar-thumb {
 }
 html:not(.dark) .assistant-chat-scroll::-webkit-scrollbar-thumb:hover {
   background: #94a3b8;
+}
+
+/* Light mode: external-providers empty-state icon uses brand blue and white ink. */
+html:not(.dark) .ai-providers-empty-icon {
+  background-color: #037ffc !important;
+  border-color: #037ffc !important;
+  color: #ffffff !important;
+}
+
+/* Light mode: selected cluster scope chips keep white ink on Intel blue. */
+html:not(.dark) .welcome-page .cluster-scope-chip[aria-pressed="true"] {
+  color: #ffffff !important;
 }
