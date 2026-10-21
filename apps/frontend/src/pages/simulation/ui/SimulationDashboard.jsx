@@ -1290,6 +1290,7 @@ export default function SimulationDashboard({ onNavigate, onToggleMobileNav, emb
                         <div className="rounded-2xl border border-slate-800 bg-slate-900/80">
                             <EmptyState
                                 icon={<Activity className="h-8 w-8" />}
+                                iconClassName="simulation-empty-icon"
                                 title="No simulation tasks found"
                                 message={statusFilter || search || activeAdvancedFilterCount > 0 ? 'Adjust the filters or create a new task.' : 'Create a task to replay a production trace.'}
                                 action={<Button variant="sky" onClick={openNewTask}><Plus className="h-3.5 w-3.5" /> New Task</Button>}

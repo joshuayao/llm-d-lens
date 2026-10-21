@@ -2079,6 +2079,13 @@ html:not(.dark) .ai-providers-empty-icon {
   color: #ffffff !important;
 }
 
+/* Light mode: Simulation empty-state icon uses brand blue and white ink. */
+html:not(.dark) .simulation-empty-icon {
+  background-color: #037ffc !important;
+  border-color: #037ffc !important;
+  color: #ffffff !important;
+}
+
 /* Light mode: selected cluster scope chips keep white ink on Intel blue. */
 html:not(.dark) .welcome-page .cluster-scope-chip[aria-pressed="true"] {
   color: #ffffff !important;
