@@ -921,7 +921,15 @@ def update_cluster_settings(
     and the Clusters overview page's "Edit cluster" action)."""
     cluster = registry.require_cluster(cluster_id)
     requested_provider = (gateway_provider or "").strip() or None
-    if requested_provider is not None and requested_provider != cluster.gateway_provider:
+    # A cluster may be created as a draft before the wizard's Gateway step, so
+    # the first provider assignment is allowed. Once set, the provider stays
+    # immutable because changing it requires tearing down the installed data
+    # plane and its routes.
+    if (
+        requested_provider is not None
+        and cluster.gateway_provider is not None
+        and requested_provider != cluster.gateway_provider
+    ):
         raise ClusterOverviewError(
             "Model gateway provider is fixed when the cluster is created; recreate the cluster to change it",
             status_code=422,
@@ -957,6 +965,8 @@ def update_cluster_settings(
     updates["router_version"] = current.llm_d_router
     updates["gie_version"] = current.k8s_gateway_api_inference_extension
     updates["ipp_version"] = current.llm_d_inference_payload_processor
+    if requested_provider is not None:
+        updates["gateway_provider"] = requested_provider
     for key, value in (
         ("gateway_namespace", gateway_namespace),
         ("gateway_name", gateway_name),

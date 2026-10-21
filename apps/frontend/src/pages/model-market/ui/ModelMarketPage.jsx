@@ -14,7 +14,12 @@ import { consumePendingModelMarketCluster } from '../model/transfer';
 import { useAuth } from '../../auth';
 import { recommendationBudget } from '../../evaluation';
 
-const formatDefaultName = (model) => `${model.id}-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '')}`;
+function formatDefaultName(model) {
+    const suffix = (globalThis.crypto?.randomUUID?.()
+        ?? `${Math.random().toString(16).slice(2)}${Math.random().toString(16).slice(2)}`).slice(0, 8);
+    const base = String(model.id || 'model').slice(0, Math.max(1, 63 - suffix.length - 1));
+    return `${base}-${suffix}`;
+}
 const GiB = 1024 ** 3;
 const VLLM_ARGUMENT_NAME = /^[a-z][a-z0-9-]*$/;
 
