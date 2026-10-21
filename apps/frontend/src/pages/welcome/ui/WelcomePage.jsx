@@ -242,7 +242,7 @@ export default function WelcomePage({
         return counts;
     }, [allIssues]);
     const askAboutIssue = useCallback((issue) => {
-        const draft = `Investigate this issue and tell me what to do next.\n\n${issue.title}\n${issue.message}`;
+        const draft = `Investigate this issue and explain how to resolve it using the Lens UI. Give step-by-step page navigation and the controls or fields to use. Do not answer with API requests or shell commands.\n\n${issue.title}\n${issue.message}`;
         setPrompt(draft.slice(0, MAX_PROMPT_LENGTH));
         requestAnimationFrame(() => {
             const input = document.getElementById('welcome-assistant-prompt');
