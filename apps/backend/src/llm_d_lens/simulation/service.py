@@ -68,7 +68,7 @@ save_jobs: dict[str, set[asyncio.Task[None]]] = {}
 pending_creates = 0
 create_lock: asyncio.Lock | None = None
 persist_lock: asyncio.Lock | None = None
-run_semaphore: asyncio.Semaphore | None = None
+target_locks: dict[str, asyncio.Lock] = {}
 service_instance_id = str(uuid.uuid4())
 _dao: SimulationTaskDao | None = None
 _repository_thread_lock = threading.Lock()
@@ -113,11 +113,22 @@ def _get_persist_lock() -> asyncio.Lock:
     return persist_lock
 
 
-def _get_run_semaphore() -> asyncio.Semaphore:
-    global run_semaphore
-    if run_semaphore is None:
-        run_semaphore = asyncio.Semaphore(_positive_environment("SIMULATION_MAX_CONCURRENT_TASKS", 1))
-    return run_semaphore
+def _task_target_key(task: SimulationTask) -> str:
+    """Identify the endpoint a task exercises so only that target is serialized."""
+    if task.endpoint_deployment_execution_id:
+        return f"deployment:{task.endpoint_cluster_id or ''}:{task.endpoint_deployment_execution_id}"
+    if task.model_service_group_id:
+        return f"model-service:{task.model_service_group_id}"
+    if task.endpoint_namespace and task.endpoint_service:
+        return (
+            f"service:{task.endpoint_cluster_id or ''}:"
+            f"{task.endpoint_namespace}/{task.endpoint_service}:{task.model_name}"
+        )
+    return f"url:{task.endpoint_url.rstrip('/')}:{task.model_name}"
+
+
+def _get_target_lock(target: str) -> asyncio.Lock:
+    return target_locks.setdefault(target, asyncio.Lock())
 
 
 def _schedule_task(task: SimulationTask) -> None:
@@ -127,7 +138,7 @@ def _schedule_task(task: SimulationTask) -> None:
 
     async def runner() -> None:
         await asyncio.sleep(0)
-        async with _get_run_semaphore():
+        async with _get_target_lock(_task_target_key(task)):
             if task.status == "queued":
                 await _run_task(task)
 
@@ -947,6 +958,31 @@ async def rerun_task(
     return rerun
 
 
+async def _ensure_model_service_gateway(task: SimulationTask) -> None:
+    """Repair a Model Service route/rewrite before the benchmark starts."""
+    from llm_d_lens.model_service.gateway_ops import GatewayOpsService  # noqa: PLC0415
+    from llm_d_lens.model_service.service import default_service  # noqa: PLC0415
+
+    model_services = default_service()
+    group = model_services.groups.get(task.model_service_group_id) if task.model_service_group_id else None
+    if group is None and task.endpoint_mode == "deployment" and task.endpoint_cluster_id and task.model_name:
+        # Older tasks did not persist model_service_group_id. Resolve the public
+        # name in the cluster so reruns still repair the Gateway before starting.
+        group = next(
+            (
+                candidate
+                for candidate in model_services.groups.list()
+                if candidate.cluster_id == task.endpoint_cluster_id and candidate.name == task.model_name
+            ),
+            None,
+        )
+    if group is None:
+        return
+    operation = await GatewayOpsService().reconcile_cluster_gateway(group.cluster_id)
+    if operation.status != "succeeded":
+        raise SimulationConfigurationError(f"Model Service Gateway is not ready: {operation.message}")
+
+
 async def _run_task(task: SimulationTask) -> None:
     cancel_event = asyncio.Event()
     controllers[task.id] = cancel_event
@@ -985,6 +1021,7 @@ async def _run_task(task: SimulationTask) -> None:
     task.progress_message = "Simulation running"
     await save_task(task)
     try:
+        await _ensure_model_service_gateway(task)
         resolved_endpoint = await _resolve_task_endpoint_url(
             endpoint_mode=task.endpoint_mode,
             endpoint_url=task.endpoint_url,
@@ -1082,7 +1119,7 @@ async def shutdown_service() -> None:
 
 def reset_service_state() -> None:
     """Reset process-local state for focused tests."""
-    global pending_creates, create_lock, persist_lock, run_semaphore, _dao
+    global pending_creates, create_lock, persist_lock, _dao
     for runner in runners.values():
         runner.cancel()
     tasks.clear()
@@ -1093,7 +1130,7 @@ def reset_service_state() -> None:
     pending_creates = 0
     create_lock = None
     persist_lock = None
-    run_semaphore = None
+    target_locks.clear()
     _dao = None
 
 

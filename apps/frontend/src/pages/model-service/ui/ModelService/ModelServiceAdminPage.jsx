@@ -44,7 +44,7 @@ import {
 import { DataPlaneTopology } from './DataPlaneTopology';
 import { loadCluster, listLensHosts } from '../../../optimization';
 import { ComponentLogViewer, GatewayOperationLogDrawer } from './GatewayOperationLogDrawer';
-import { availableModelProviders, filterServiceFlow, MAX_TRAFFIC_WEIGHT, trafficDistributionError, trafficShare, trafficTotal } from '../../model/modelService';
+import { availableModelProviders, filterServiceFlow, memberIsRoutable, MAX_TRAFFIC_WEIGHT, trafficDistributionError, trafficShare, trafficTotal } from '../../model/modelService';
 import { CARD } from './modelServiceStyles';
 
 
@@ -117,9 +117,16 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
                             name: deployments.find((item) => item.executionId === member.executionId)?.name || member.executionId,
                             status: member.status,
                             weight: member.weight,
+                            endpointKind: member.endpointKind,
                             components: member.healthJson?.components || null,
                             poolName: member.poolName,
                             eppRef: member.eppRef,
+                            routable: memberIsRoutable({
+                                status: member.status,
+                                weight: member.weight,
+                                endpointKind: member.endpointKind,
+                                components: member.healthJson?.components || {},
+                            }),
                             namespace: member.targetNamespace,
                             targetService: member.targetService,
                             target: `${member.targetService}.${member.targetNamespace}:${member.targetPort}`,
@@ -216,6 +223,8 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
                 executionId: member.executionId,
                 name: deployments.find((deployment) => deployment.executionId === member.executionId)?.name || member.executionId,
                 status: member.status, weight: String(member.weight),
+                endpointKind: member.endpointKind,
+                components: member.healthJson?.components || null,
             })),
         });
     };
@@ -233,6 +242,8 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
             rows: result.items.map((member) => ({
                 executionId: member.executionId, status: member.status, weight: String(member.weight),
                 name: trafficDraft.rows.find((row) => row.executionId === member.executionId)?.name || member.executionId,
+                endpointKind: trafficDraft.rows.find((row) => row.executionId === member.executionId)?.endpointKind,
+                components: trafficDraft.rows.find((row) => row.executionId === member.executionId)?.components,
             })),
         });
         await load({ quiet: true });
@@ -1222,7 +1233,7 @@ export function AddModelForm({ form, onChange, clusters, deployments, models = [
             </div>
             <div>
                 <Label htmlFor="add-model-provider"
-                    help="The deployment that provides inference for this model. Only ready deployments in the selected cluster that have not already been added to a model are listed, regardless of existing provider status or weight.">
+                    help="The deployment that provides inference for this model. Only ready llm-d deployments with a deployment-owned InferencePool and EPP in the selected cluster that have not already been added to a model are listed; plain vLLM deployments cannot back a Model Service.">
                     Provider
                 </Label>
                 <Select id="add-model-provider" value={selectedDeployment?.executionId || ''}
@@ -1237,7 +1248,7 @@ export function AddModelForm({ form, onChange, clusters, deployments, models = [
                 </Select>
                 {form.clusterId && deployments.length === 0 && (
                     <p role="status" className="mt-1 text-xs text-theme-muted">
-                        No available ready deployments in this cluster. Deployments already added to a model are excluded.
+                        No available ready llm-d deployments in this cluster. Plain vLLM deployments and deployments already added to a model are excluded.
                     </p>
                 )}
             </div>
@@ -1324,6 +1335,11 @@ export function TrafficDistributionForm({ draft, onChange, deployments, members 
                         <output className="w-16 shrink-0 text-right text-sm font-semibold text-theme-text"
                             aria-label={`${row.name} configured traffic share`}>{trafficShare(row, total)}</output>
                     </div>
+                    {row.status !== 'disabled' && Number(row.weight) > 0 && !memberIsRoutable(row) && (
+                        <p className="mt-2 text-[11px] leading-5 text-rose-600 dark:text-rose-300">
+                            Unavailable: excluded from routing as 0% effective until it recovers. Its configured weight is retained.
+                        </p>
+                    )}
                 </Panel>
             ))}
             <div>

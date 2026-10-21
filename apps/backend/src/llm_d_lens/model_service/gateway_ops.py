@@ -127,6 +127,22 @@ def member_pool_name(member) -> str | None:
     return default_pool_name(member.epp_ref or member.target_service)
 
 
+def member_is_routable(member) -> bool:
+    """Whether a provider should currently appear in the shared HTTPRoute.
+
+    A provider with a missing model server, EPP, or InferencePool is completely
+    unavailable: keeping it in the route would send traffic to a dead pool.
+    A provider whose route is merely missing stays routable so the next
+    reconcile can recreate the route and heal its health.
+    """
+    if member.status == "disabled" or member.weight <= 0 or not member_pool_name(member):
+        return False
+    if member.endpoint_kind != "llm-d-epp":
+        return False
+    components = (member.health_json or {}).get("components") or {}
+    return not any(components.get(key) == "missing" for key in ("epp", "inferencePool", "modelServer"))
+
+
 def local_public_ip() -> str:
     """The host's outbound IP (used as the public host for exposed Gateways)."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1513,7 +1529,7 @@ class GatewayOpsService:
             # Include every published member, not only healthy ones: the health
             # probe marks a member unhealthy when its route is missing, so routing
             # only "active" members would never create the route that heals it.
-            published = [m for m in cluster_members if m.status != "disabled" and m.weight > 0 and member_pool_name(m)]
+            published = [m for m in cluster_members if member_is_routable(m)]
             if not published:
                 continue
             bindings = [
@@ -1758,14 +1774,17 @@ class GatewayOpsService:
         """
         updated = 0
         heal: set[str] = set()
+        reconcile: set[str] = set()
         for member in self.members.list_all():
             group = self.groups.get(member.group_id)
             if member.status == "disabled" or group is None or group.status == "disabled":
                 continue
+            was_routable = member_is_routable(member)
             try:
                 self._target_resolver(member.execution_id)
             except ExecutionMissingError:
                 self.members.delete(member.id)
+                reconcile.add(member.cluster_id)
                 continue
             except ExecutionTargetError:
                 pass  # not publishable yet; fall through to record health
@@ -1778,10 +1797,14 @@ class GatewayOpsService:
             member.status = "active" if healthy else "unhealthy"
             member = self.members.save_health(member)
             updated += 1
+            if was_routable != member_is_routable(member):
+                reconcile.add(member.cluster_id)
             if member.status != "disabled" and not healthy and _data_plane_degraded(detail.get("components") or {}):
                 heal.add(member.cluster_id)
         for cluster_id in heal:
             await self._heal_data_plane(cluster_id)
+        for cluster_id in reconcile:
+            await self.reconcile_cluster(cluster_id)
         return updated
 
     async def _heal_data_plane(self, cluster_id: str) -> None:

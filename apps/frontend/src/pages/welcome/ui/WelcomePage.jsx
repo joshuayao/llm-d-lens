@@ -359,7 +359,7 @@ export default function WelcomePage({
                                             <span className="block pt-1 font-semibold">Model services</span>
                                             <span className="block">Enabled services without a serving target, provider readiness, Gateway/IPP availability and sustained serving pressure.</span>
                                             <span className="block pt-1 font-semibold">Deployments and dependencies</span>
-                                            <span className="block">Deployment failures in the last 24 hours, storage provisioning/capacity and model-cache download or node-sync failures.</span>
+                                            <span className="block">Deployment failures in the last 24 hours, missing or under-replicated model-server Pods, storage provisioning/capacity and model-cache download or node-sync failures.</span>
                                             <span className="block pt-1 font-semibold">Access</span>
                                             <span className="block">Active users with no direct role and no role inherited from their groups, or groups with no role binding.</span>
                                             <span className="block pt-1 text-theme-muted">High utilization alone is not an issue. Missing telemetry is shown as unknown or stale.</span>

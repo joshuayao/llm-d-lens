@@ -4,14 +4,14 @@ import React, { createElement, Children } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { AddModelForm, ModelServiceAdminPage, TrafficDistributionForm } from './ModelServiceAdminPage.jsx';
 import { AuthContext } from '../../../auth/AuthContext.js';
-import { availableModelProviders, filterServiceFlow, parseTrafficWeight, trafficDistributionError, trafficShare, trafficTotal } from '../../model/modelService.js';
+import { availableModelProviders, effectiveTrafficShare, filterServiceFlow, memberIsRoutable, parseTrafficWeight, routedTrafficTotal, trafficDistributionError, trafficShare, trafficTotal } from '../../model/modelService.js';
 import { ComponentLogAction, DataPlaneTopology, ManageDeploymentAction, PublicationToggleAction, ProvidersToggleAction, Flow as FlowConnector } from './DataPlaneTopology.jsx';
 import { ComponentLogViewer } from './GatewayOperationLogDrawer.jsx';
 import { addModel, deleteGroup, getModelAccess, grantModelAccess, revokeModelAccess, setProvidersStatus } from './modelServiceBackend.js';
 import { DeploymentManagementPage } from '../../../deployment/ui/DeploymentManagement/DeploymentManagementPage.jsx';
 
 describe("Add model", () => {
-    const deployment = { executionId: 'exec-a', name: 'deployment-a', model: 'Qwen/Qwen3-8B' };
+    const deployment = { executionId: 'exec-a', name: 'deployment-a', model: 'Qwen/Qwen3-8B', endpointKind: 'llm-d-epp' };
     const defaults = {
         form: { clusterId: 'cluster-a', name: 'public-chat', executionId: 'exec-a' },
         clusters: [{ id: 'cluster-a', name: 'Cluster A' }, { id: 'cluster-b', name: 'Cluster B' }],
@@ -107,6 +107,7 @@ describe("Add model", () => {
             ...deployment, executionId: id, clusterId: 'cluster-a', status: id === 'not-ready' ? 'running' : 'ready',
         }));
         deployments.push({ ...deployment, executionId: 'other-cluster', clusterId: 'cluster-b', status: 'ready' });
+        deployments.push({ ...deployment, executionId: 'plain-vllm', clusterId: 'cluster-a', status: 'ready', endpointKind: 'vllm' });
         const members = ['active', 'disabled', 'staged', 'unhealthy'].map((id) => ({
             executionId: id, groupId: `group-${id}`, clusterId: 'cluster-a',
             status: id === 'staged' ? 'active' : id, weight: id === 'staged' ? 0 : 1,
@@ -120,6 +121,15 @@ describe("Add model", () => {
             ['other-cluster'],
         );
         assert.equal(availableModelProviders(deployments, members, '').length, 0);
+    });
+
+    test('plain vLLM deployments are never offered as Model Service providers', () => {
+        const plain = { ...deployment, executionId: 'plain-vllm', clusterId: 'cluster-a', status: 'ready', endpointKind: 'vllm' };
+        const epp = { ...deployment, clusterId: 'cluster-a', status: 'ready' };
+        assert.deepEqual(
+            availableModelProviders([plain, epp], [], 'cluster-a').map((item) => item.executionId),
+            ['exec-a'],
+        );
     });
 
     test('a provider added while the drawer is open becomes unselectable and returns after removal', () => {
@@ -1059,6 +1069,18 @@ describe("Model state", () => {
         assert.equal(trafficDistributionError(rows), '');
         assert.equal(trafficTotal([{ weight: '' }]), null);
         assert.equal(trafficShare({ weight: '' }, null), 'Unknown');
+    });
+
+    test('unavailable providers leave the effective route but keep their configured weight', () => {
+        const members = [
+            { executionId: 'healthy', status: 'active', weight: 1, endpointKind: 'llm-d-epp', components: { modelServer: 'ready', epp: 'ready', inferencePool: 'ready' } },
+            { executionId: 'failed', status: 'unhealthy', weight: 1, endpointKind: 'llm-d-epp', components: { modelServer: 'missing', epp: 'missing', inferencePool: 'degraded' } },
+        ];
+        assert.equal(memberIsRoutable(members[0]), true);
+        assert.equal(memberIsRoutable(members[1]), false);
+        assert.equal(routedTrafficTotal(members), 1);
+        assert.deepEqual(members.map((member) => effectiveTrafficShare(member, 1)), ['100%', '0%']);
+        assert.equal(members[1].weight, 1);
     });
 
     test('allocations reject all-zero, duplicate, empty and oversized provider lists', () => {
