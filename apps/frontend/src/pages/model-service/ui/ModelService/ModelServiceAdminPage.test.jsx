@@ -90,7 +90,7 @@ describe("Add model", () => {
         clusterControl.props.onChange({ target: { value: 'cluster-b' } });
         assert.deepEqual(next, { clusterId: 'cluster-b', name: 'public-chat', executionId: '' });
         const html = render({ form: next, deployments: [], selectedDeployment: undefined });
-        assert.match(html, /No available ready deployments in this cluster/);
+        assert.match(html, /No available ready llm-d deployments in this cluster/);
         assert.doesNotMatch(html, /Qwen\/Qwen3-8B|value="exec-a"/);
     });
 
@@ -141,7 +141,7 @@ describe("Add model", () => {
         const html = render({ deployments: available, selectedDeployment: selected });
         assert.doesNotMatch(html, /value="exec-a"|value="Qwen\/Qwen3-8B"/);
         assert.match(html, /id="add-model-provider" disabled=""/);
-        assert.match(html, /Deployments already added to a model are excluded/);
+        assert.match(html, /deployments already added to a model are excluded/);
         assert.deepEqual(availableModelProviders(deployments, [], defaults.form.clusterId), deployments);
     });
 
@@ -263,7 +263,7 @@ describe("Service flow", () => {
                             name: `deployment-${service.id}-${index}`, poolName: `pool-${service.id}-${index}`,
                             eppRef: `epp-${service.id}-${index}`, status: 'active',
                             weight: index === 0 ? 90 : 10,
-                            components: { httpRoute: 'ready', inferencePool: 'ready', epp: 'missing', modelServer: 'ready' },
+                            components: { httpRoute: 'ready', inferencePool: 'ready', epp: 'ready', modelServer: 'ready' },
                             ...memberOverrides,
                         })),
                     }],
@@ -284,7 +284,7 @@ describe("Service flow", () => {
         assert.doesNotMatch(html, />Traffic distribution<\/button>/);
         assert.match(html, /90%<\/text>/);
         assert.match(html, /10%<\/text>/);
-        assert.match(html, /Configured request share; not measured traffic/);
+        assert.match(html, /Effective request share after unavailable providers leave the route; not measured traffic/);
         assert.match(html, /aria-label="chat-0 traffic distribution"/);
         assert.match(html, /title="Configure relative traffic weights[^"]*Weight 0[^"]*offline providers receive no traffic/);
         assert.match(html, /bg-sky-500[^"]*rounded-full/);
@@ -396,7 +396,7 @@ describe("Service flow", () => {
         assert.match(html, />Stopped<\/span>/);
         assert.match(html, />Online<\/span>/);
         assert.match(html, /HTTPRoute: stopped/);
-        assert.match(html, /90%<\/text>/);
+        assert.match(html, /0%<\/text>/);
         const frame = html.split('role="group" aria-label="Model chat-0"')[1];
         assert.doesNotMatch(frame, /lens-chain-flow/);
         assert.match(frame, /stroke-slate-600/);
@@ -496,7 +496,7 @@ describe("Service flow", () => {
                 assert.ok(frame.includes(`>${component}</span>`));
             }
             assert.match(frame, /title="HTTPRoute: active"/);
-            assert.match(frame, /title="EPP: unhealthy"/);
+            assert.match(frame, /title="EPP: active"/);
             assert.match(frame, /aria-label="HTTPRoute actions"/);
             assert.match(frame, /aria-label="EPP actions"/);
             const [route, deployment] = frame.split('role="group" aria-label="Deployment ');
