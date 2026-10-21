@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { requestJson } from '../../../../shared/api/httpClient';
-import { ArrowDown, Boxes, ListFilter, Plus, Repeat, RotateCcw, Search } from 'lucide-react';
+import { ArrowDown, Boxes, ListFilter, Loader2, Plus, Repeat, RotateCcw, Search } from 'lucide-react';
 import { usePolling } from '../../../../shared/lib/usePolling';
 import { useResourceList } from '../../../../shared/lib/useResourceList';
 import { useNotice } from '../../../../shared/lib/useNotice';
@@ -687,7 +687,7 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
                             </Button>
                         </Panel>
                     </div>
-                    <div className="mt-3 flex min-h-0 flex-1 flex-col">
+                    <div className="relative mt-3 flex min-h-0 flex-1 flex-col" aria-busy={!loaded}>
                         {hasFlowFilters && filteredFlow.clusters.length === 0 ? (
                             <EmptyState title="No matching service flow"
                                 message="Try another cluster, model service status or public model name, or clear the filters." />
@@ -720,6 +720,13 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
                             publicationPending={toggleSubmission.pending || serviceToggleSubmission.pending || deleteSubmission.pending}
                             onViewDeploymentDetails={openDeploymentDetails}
                         />}
+                        {!loaded && (
+                            <div role="status" aria-live="polite"
+                                className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 rounded-xl bg-white/70 backdrop-blur-[1px] dark:bg-slate-950/55">
+                                <Loader2 className="h-5 w-5 animate-spin text-[#037ffc] dark:text-emerald-300" aria-hidden="true" />
+                                <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Loading service flow…</span>
+                            </div>
+                        )}
                     </div>
                 </section>
 
