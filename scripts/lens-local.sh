@@ -858,6 +858,17 @@ cmd_stop() {
     return 0
 }
 
+# ---- status ------------------------------------------------------------------
+cmd_status() {
+    for svc in "${SERVICES[@]}"; do
+        if is_running "$svc"; then
+            log "  $svc: running (pid $(cat "$(pid_file "$svc")"))"
+        else
+            log "  $svc: stopped"
+        fi
+    done
+}
+
 # ---- clean -------------------------------------------------------------------
 # Best-effort graceful stop of a leftover embedded PostgreSQL process for
 # <data_dir>. lens-local.sh's backend runs pgserver in-process, so killing the
@@ -893,7 +904,12 @@ remove_path() {
 }
 
 cmd_clean() {
-    local scope="${1:-default}" yes="${2:-0}"
+    local clean_option="${1:-}" yes=0 scope="default"
+    case "$clean_option" in
+        -y|--yes) yes=1; scope="${2:-default}" ;;
+        "") ;;
+        *) fail "Unknown clean option: $clean_option"; return 2 ;;
+    esac
     case "$scope" in default|cache|hard|all) ;; *) fail "Unknown clean scope: $scope"; return 2 ;; esac
 
     local db_dir bootstrap_file legacy_home
@@ -1005,7 +1021,7 @@ EOF
 }
 
 lens_local_main() {
-    local action="${1:-}" clean_scope="default" clean_yes=0 option cluster_options=0 service_target=all service_selected=0
+    local action="${1:-}" clean_scope="default" clean_yes="" option cluster_options=0 service_target=all service_selected=0
     if [[ -z "$action" ]]; then
         print_usage
         return 1
@@ -1044,7 +1060,7 @@ lens_local_main() {
                 ;;
             -y|--yes)
                 [[ "$action" == clean ]] || { fail "$option is only valid for clean."; return 2; }
-                clean_yes=1
+                clean_yes="$option"
                 shift
                 ;;
             --cache|--hard|--all)
@@ -1077,7 +1093,7 @@ lens_local_main() {
         restart) cmd_restart "$service_target" ;;
         stop) cmd_stop ;;
         status) cmd_status ;;
-        clean) cmd_clean "$clean_scope" "$clean_yes" ;;
+        clean) cmd_clean "$clean_yes" "$clean_scope" ;;
         install-node) ensure_node ;;
     esac
 }
