@@ -116,6 +116,7 @@ def workload_roles(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "kind": kind,
                         "name": name,
                         "role": _role_from(role_name, labels),
+                        "role_index": role_index,
                         "pod_labels": labels,
                         "spec": role_spec,
                         "pod": pod,

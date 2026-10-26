@@ -5,13 +5,14 @@ import { AsyncState } from '../../../../shared/ui/AsyncState';
 import { PaginationControls } from '../../../../shared/ui/PaginationControls';
 import { useClusterNames } from '../../../optimization';
 import { useResourceList } from '../../../../shared/lib/useResourceList';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, Plus, Rocket, Search, ServerCog } from 'lucide-react';
 import {
     deleteDeploymentExecution,
     connectDeploymentExecution,
     listDeploymentExecutions,
     pendingDeploymentExecutions,
+    scaleDeploymentExecution,
     searchLocalDeploymentRuns,
     updateDeploymentMetadata,
 } from '../../../optimization';
@@ -20,7 +21,10 @@ import { MultiSelectDropdown } from '../../../../shared/ui/MultiSelectDropdown';
 import { EmptyState } from '../../../../shared/ui/EmptyState';
 import { Button, RefreshButton } from '../../../../shared/ui/Button';
 import { StatCardRow } from '../../../../shared/ui/StatCard';
-import { Input, Select } from '../../../../shared/ui/FormControls';
+import { Input, Label, Select } from '../../../../shared/ui/FormControls';
+import { Modal } from '../../../../shared/ui/Modal';
+import { FormError } from '../../../../shared/ui/FormError';
+import { useSubmission } from '../../../../shared/lib/useSubmission';
 import { SectionLabel } from '../../../../shared/ui/SectionLabel';
 import { ModuleHeader } from '../../../../shared/ui/ModuleHeader';
 import { ModulePage } from '../../../../shared/ui/ModulePage';
@@ -35,6 +39,7 @@ import { usePolling } from '../../../../shared/lib/usePolling';
 import {
     STATUS_FILTER_OPTIONS,
     clusterOptions,
+    deploymentTitle,
     errorMessage,
     statusLabel,
     summarizeStatuses,
@@ -54,6 +59,116 @@ function StatCard({ label, value, tone = 'text-white' }) {
     );
 }
 
+function ScaleDeploymentModal({ deployment, onCancel, onScale }) {
+    const prefillSupported = deployment?.scale?.prefillReplicas != null;
+    const currentDecode = deployment?.scale?.decodeReplicas ?? deployment?.replicas ?? '';
+    const currentPrefill = deployment?.scale?.prefillReplicas ?? '';
+    const [decodeReplicas, setDecodeReplicas] = useState(String(currentDecode));
+    const [prefillReplicas, setPrefillReplicas] = useState(String(currentPrefill));
+    const { pending: scaling, error, run } = useSubmission('Failed to scale deployment', { keepPendingOnSuccess: true });
+    const decodeRef = useRef(null);
+
+    useEffect(() => {
+        decodeRef.current?.focus();
+    }, []);
+
+    if (!deployment) return null;
+
+    const parseReplicas = (value) => {
+        const parsed = Number(value);
+        return Number.isInteger(parsed) && parsed >= 1 && parsed <= 100 ? parsed : null;
+    };
+    const decode = parseReplicas(decodeReplicas);
+    const prefill = prefillSupported ? parseReplicas(prefillReplicas) : null;
+    const unchanged = decode === currentDecode && (!prefillSupported || prefill === currentPrefill);
+    const invalid = decode === null || (prefillSupported && prefill === null) || unchanged;
+
+    const submit = async (event) => {
+        event.preventDefault();
+        if (invalid || scaling) return;
+        await run(() => onScale({
+            decodeReplicas: decode,
+            ...(prefillSupported ? { prefillReplicas: prefill } : {}),
+        }));
+    };
+
+    return (
+        <Modal
+            isOpen
+            onClose={scaling ? undefined : onCancel}
+            title="Scale deployment"
+            subtitle={deploymentTitle(deployment)}
+            closeOnBackdrop={!scaling}
+            closeOnEscape={!scaling}
+            footer={(
+                <>
+                    <Button variant="secondary" onClick={onCancel} disabled={scaling}>Cancel</Button>
+                    <Button variant="sky" type="submit" form="scale-deployment-form" isLoading={scaling} disabled={invalid}>
+                        {scaling ? 'Scaling' : 'Scale deployment'}
+                    </Button>
+                </>
+            )}
+        >
+            <form id="scale-deployment-form" onSubmit={submit} className="flex flex-col gap-4">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    {prefillSupported && (
+                        <div>
+                            <Label htmlFor="scale-prefill-replicas">Prefill replicas</Label>
+                            <Input
+                                id="scale-prefill-replicas"
+                                type="number"
+                                min="1"
+                                max="100"
+                                step="1"
+                                value={prefillReplicas}
+                                onChange={(event) => setPrefillReplicas(event.target.value)}
+                                disabled={scaling}
+                                error={Boolean(prefillReplicas) && parseReplicas(prefillReplicas) === null}
+                            />
+                            <p className="mt-1 text-[10px] text-slate-500">Current: {currentPrefill || '—'}</p>
+                        </div>
+                    )}
+                    <div>
+                        <Label htmlFor="scale-decode-replicas">{prefillSupported ? 'Decode replicas' : 'Replicas'}</Label>
+                        <Input
+                            id="scale-decode-replicas"
+                            ref={decodeRef}
+                            type="number"
+                            min="1"
+                            max="100"
+                            step="1"
+                            value={decodeReplicas}
+                            onChange={(event) => setDecodeReplicas(event.target.value)}
+                            disabled={scaling}
+                            error={Boolean(decodeReplicas) && decode === null}
+                        />
+                        <p className="mt-1 text-[10px] text-slate-500">Current: {currentDecode || '—'}</p>
+                    </div>
+                </div>
+                <p className="rounded-lg border border-slate-800/60 bg-slate-900/40 px-3 py-2 text-[11px] text-slate-500">
+                    This changes live Kubernetes replicas only. Restarting the deployment restores its configured replica count.
+                </p>
+                {(Number(deployment.scale?.slices) || 1) > 1 && (
+                    <p className="text-[11px] text-theme-muted">
+                        Values are per slice; this deployment has {deployment.scale.slices} slices
+                        ({(Number(deployment.scale.slices) || 1) * (
+                            (Number(decode) || 0) + (Number(prefill) || 0)
+                        )} model-server Pods after scaling).
+                    </p>
+                )}
+                {prefillSupported && (
+                    <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
+                        Scaling down Prefill can interrupt in-flight KV transfers. When a{' '}
+                        <span className="font-mono">--kv-transfer-config</span> is present, Lens sets{' '}
+                        <span className="font-mono">kv_load_failure_policy=recompute</span> so Decode can recompute.
+                    </p>
+                )}
+                <FormError message={error} />
+            </form>
+        </Modal>
+    );
+}
+
 export function DeploymentManagementPage({ onNavigate, initialSearch = '', initialClusterId = '' } = {}) {
     const [searchInput, setSearchInput] = useState(initialSearch);
     const query = useDebouncedValue(searchInput, SEARCH_DEBOUNCE_MS).trim();
@@ -62,6 +177,7 @@ export function DeploymentManagementPage({ onNavigate, initialSearch = '', initi
     const [dialog, setDialog] = useState(null);
     const [selected, setSelected] = useState(null);
     const { can } = useAuth();
+    const canScale = can('deployment:execution:scale');
     const [mutatingId, setMutatingId] = useState(null);
     const [connectingEndpointId, setConnectingEndpointId] = useState('');
     const [notice, setNotice] = useNotice();
@@ -130,6 +246,22 @@ export function DeploymentManagementPage({ onNavigate, initialSearch = '', initi
             const updated = await updateDeploymentMetadata(executionId, { displayName, description });
             setItems((current) => current.map((item) => (item.execution_id === executionId ? updated : item)));
             setNotice('Deployment updated');
+            closeDialog();
+        } finally {
+            setMutatingId(null);
+        }
+    };
+
+    const handleScale = async ({ prefillReplicas, decodeReplicas }) => {
+        if (!selected?.execution_id) return;
+        const executionId = selected.execution_id;
+        setMutatingId(executionId);
+        try {
+            const updated = await scaleDeploymentExecution(executionId, { prefillReplicas, decodeReplicas });
+            setItems((current) => current.map((item) => (
+                item.execution_id === executionId ? { ...item, ...updated } : item
+            )));
+            setNotice('Deployment scaled');
             closeDialog();
         } finally {
             setMutatingId(null);
@@ -307,12 +439,14 @@ export function DeploymentManagementPage({ onNavigate, initialSearch = '', initi
                         mutatingId={mutatingId}
                         connectingEndpointId={connectingEndpointId}
                         clusterNameById={clusterNameById}
+                        canScale={canScale}
                         onInspect={openDialog('details')}
                         onViewPodsLogs={openDialog('pods-logs')}
                         onEdit={openDialog('edit')}
                         onDelete={openDialog('delete')}
                         onNavigate={onNavigate}
                         onConnectLocalEndpoint={handleConnectLocalEndpoint}
+                        onScale={openDialog('scale')}
                     />
                     <PaginationControls className="mt-2" page={currentPage} totalPages={totalPages} onPageChange={setPage}
                         total={items.length} pageStart={pageStart} pageEnd={pageEnd} itemLabel="deployments"
@@ -325,6 +459,7 @@ export function DeploymentManagementPage({ onNavigate, initialSearch = '', initi
 
             {dialog === 'details' && <DeploymentDetailsModal deployment={selected} clusterNameById={clusterNameById} onClose={closeDialog} onViewPodsLogs={openDialog('pods-logs')} />}
             {dialog === 'edit' && <EditDeploymentModal deployment={selected} onCancel={closeDialog} onSave={handleSave} />}
+            {dialog === 'scale' && <ScaleDeploymentModal deployment={selected} onCancel={closeDialog} onScale={handleScale} />}
             {dialog === 'delete' && <DeleteDeploymentModal deployment={selected} clusterNameById={clusterNameById} onCancel={closeDialog} onDelete={handleDelete} />}
             {dialog === 'pods-logs' && <DeploymentPodsLogsModal deployment={selected} onClose={closeDialog} />}
             <Toast
