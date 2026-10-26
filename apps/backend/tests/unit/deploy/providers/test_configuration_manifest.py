@@ -1145,10 +1145,7 @@ def test_graceful_shutdown_sets_kv_load_failure_policy_in_shell_args():
             _vllm_deployment(
                 "prefill",
                 shell_style=True,
-                args=[
-                    "vllm serve model --kv-transfer-config "
-                    '\'{"kv_connector":"NixlConnector","kv_role":"kv_both"}\''
-                ],
+                args=['vllm serve model --kv-transfer-config \'{"kv_connector":"NixlConnector","kv_role":"kv_both"}\''],
             )
         ],
         sort_keys=False,

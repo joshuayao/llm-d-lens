@@ -128,10 +128,7 @@ class DeploymentExecutionContext:
     def expected_model_pods(self) -> int:
         if self.scale:
             slices = int(self.scale.get("slices") or 1)
-            total = slices * (
-                int(self.scale.get("prefillReplicas") or 0)
-                + int(self.scale.get("decodeReplicas") or 0)
-            )
+            total = slices * (int(self.scale.get("prefillReplicas") or 0) + int(self.scale.get("decodeReplicas") or 0))
             if total > 0:
                 return total
         return max(int(self.replicas or 1), 1)
@@ -761,9 +758,7 @@ def _scale_workloads(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "manifestReplicas": item.get("replicas"),
                 "roleIndex": item.get("role_index"),
                 "slices": item.get("slices", 1),
-                "scalingMode": (scaling or {}).get("mode", "Static")
-                if isinstance(scaling, dict)
-                else "Static",
+                "scalingMode": (scaling or {}).get("mode", "Static") if isinstance(scaling, dict) else "Static",
             }
         )
     if unsupported:
@@ -811,17 +806,13 @@ async def _build_scale_plan(execution) -> dict[str, Any]:
     resolved: list[dict[str, Any]] = []
     for workload in workloads:
         if workload["kind"] != "DisaggregatedSet":
-            workload["currentReplicas"] = live_replicas.get(
-                str(workload["name"]), workload.get("manifestReplicas")
-            )
+            workload["currentReplicas"] = live_replicas.get(str(workload["name"]), workload.get("manifestReplicas"))
             resolved.append(workload)
     for name in disaggregated_sets:
         live_document = live_sets.get(name)
         if live_document is not None:
             resolved.extend(
-                workload
-                for workload in _scale_workloads([live_document])
-                if workload["kind"] == "DisaggregatedSet"
+                workload for workload in _scale_workloads([live_document]) if workload["kind"] == "DisaggregatedSet"
             )
         else:
             resolved.extend(
@@ -852,9 +843,7 @@ async def _build_scale_plan(execution) -> dict[str, Any]:
     slices = 1
     if kind == "DisaggregatedSet":
         slice_counts = {
-            int(workload.get("slices") or 1)
-            for workload in resolved
-            if workload["kind"] == "DisaggregatedSet"
+            int(workload.get("slices") or 1) for workload in resolved if workload["kind"] == "DisaggregatedSet"
         }
         if len(slice_counts) > 1:
             raise DeploymentScaleError(
@@ -868,11 +857,7 @@ async def _build_scale_plan(execution) -> dict[str, Any]:
         "slices": slices,
         "disaggregatedSet": disaggregated_sets[0] if disaggregated_sets else None,
         "externalRoles": sorted(
-            {
-                workload["role"]
-                for workload in resolved
-                if workload.get("scalingMode") == "External"
-            }
+            {workload["role"] for workload in resolved if workload.get("scalingMode") == "External"}
         ),
         "prefillReplicas": _role_replicas(prefill),
         "decodeReplicas": _role_replicas(decode),
@@ -890,9 +875,7 @@ async def deployment_scale_plan(execution_id: str) -> dict[str, Any]:
 
 
 def _scale_order(changes: dict[str, int], plan: dict[str, Any]) -> list[str]:
-    decreasing = any(
-        target < (plan.get(f"{role}Replicas") or 0) for role, target in changes.items()
-    )
+    decreasing = any(target < (plan.get(f"{role}Replicas") or 0) for role, target in changes.items())
     return ["decode", "prefill"] if decreasing else ["prefill", "decode"]
 
 
@@ -976,8 +959,7 @@ async def scale_deployment_execution(
             else:
                 if result.returncode != 0:
                     failures.append(
-                        f"DisaggregatedSet/{name}: "
-                        f"{(result.stderr or result.stdout or 'scale failed').strip()}"
+                        f"DisaggregatedSet/{name}: {(result.stderr or result.stdout or 'scale failed').strip()}"
                     )
                 else:
                     successes.update(changes)
@@ -1008,8 +990,7 @@ async def scale_deployment_execution(
                         continue
                     if result.returncode != 0:
                         failures.append(
-                            f"{role} {workload['name']}: "
-                            f"{(result.stderr or result.stdout or 'scale failed').strip()}"
+                            f"{role} {workload['name']}: {(result.stderr or result.stdout or 'scale failed').strip()}"
                         )
                         role_failed = True
                 if not role_failed:

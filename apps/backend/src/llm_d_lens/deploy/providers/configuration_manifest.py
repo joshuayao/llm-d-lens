@@ -63,10 +63,7 @@ def _as_items(value: Any) -> list[Any]:
 
 
 def _container_invocation(container: dict[str, Any]) -> str:
-    return " ".join(
-        str(item)
-        for item in [*_as_items(container.get("command")), *_as_items(container.get("args"))]
-    )
+    return " ".join(str(item) for item in [*_as_items(container.get("command")), *_as_items(container.get("args"))])
 
 
 def _is_model_container(container: dict[str, Any]) -> bool:
@@ -133,9 +130,7 @@ def _ensure_prestop(container: dict[str, Any]) -> str:
         }
         return "added"
     if isinstance(lifecycle, dict) and "preStop" not in lifecycle:
-        lifecycle["preStop"] = {
-            "exec": {"command": ["/bin/sh", "-c", f"sleep {MODEL_PRESTOP_SLEEP_SECONDS}"]}
-        }
+        lifecycle["preStop"] = {"exec": {"command": ["/bin/sh", "-c", f"sleep {MODEL_PRESTOP_SLEEP_SECONDS}"]}}
         return "added"
     return "preserved"
 
@@ -223,7 +218,7 @@ def _graceful_shutdown_pod_specs(document: dict[str, Any]) -> list[dict[str, Any
     if document.get("kind") != "DisaggregatedSet":
         return pods
     for role in (document.get("spec") or {}).get("roles") or []:
-        template = ((role.get("spec") or {}).get("leaderWorkerTemplate") or {})
+        template = (role.get("spec") or {}).get("leaderWorkerTemplate") or {}
         for key in ("leaderTemplate", "workerTemplate"):
             spec = (template.get(key) or {}).get("spec")
             if isinstance(spec, dict):
@@ -282,9 +277,7 @@ def prepare_graceful_shutdown_manifest(manifest: str) -> tuple[str, dict[str, An
                 pod_entries.append(entry)
             required_grace = max(
                 MODEL_TERMINATION_GRACE_PERIOD_SECONDS,
-                longest_shutdown_timeout + MODEL_PRESTOP_SLEEP_SECONDS + 10
-                if longest_shutdown_timeout
-                else 0,
+                longest_shutdown_timeout + MODEL_PRESTOP_SLEEP_SECONDS + 10 if longest_shutdown_timeout else 0,
             )
             _ensure_termination_grace_period(pod, required_grace)
             for entry in pod_entries:
@@ -389,9 +382,7 @@ def prepare_single_slice_disaggregated_set(
     )
 
 
-def prepare_graceful_shutdown(
-    artifact: GuideDeploymentArtifact, output_root: Path
-) -> GuideDeploymentArtifact:
+def prepare_graceful_shutdown(artifact: GuideDeploymentArtifact, output_root: Path) -> GuideDeploymentArtifact:
     if not artifact.manifest_ref:
         return artifact
     reference = Path(artifact.manifest_ref)

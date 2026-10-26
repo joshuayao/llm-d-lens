@@ -705,11 +705,7 @@ def _deployment(name, role, replicas):
             "replicas": replicas,
             "template": {
                 "metadata": {"labels": {"llm-d.ai/role": role}},
-                "spec": {
-                    "containers": [
-                        {"name": "modelserver", "command": ["vllm", "serve"], "args": ["model"]}
-                    ]
-                },
+                "spec": {"containers": [{"name": "modelserver", "command": ["vllm", "serve"], "args": ["model"]}]},
             },
         },
     }
@@ -765,9 +761,7 @@ async def test_deployment_scale_plan_reads_live_replica_counts(deployment_store,
 
 
 @pytest.mark.asyncio
-async def test_scale_deployment_uses_safe_order_and_persists_desired_replicas(
-    deployment_store, monkeypatch, tmp_path
-):
+async def test_scale_deployment_uses_safe_order_and_persists_desired_replicas(deployment_store, monkeypatch, tmp_path):
     _bind_scale_manifest(
         deployment_store,
         tmp_path,
@@ -835,9 +829,7 @@ async def test_scale_rejects_unsupported_workloads(deployment_store, monkeypatch
                 "metadata": {"name": "lws"},
                 "spec": {
                     "replicas": 1,
-                    "leaderWorkerTemplate": {
-                        "workerTemplate": {"spec": {"containers": [{"name": "modelserver"}]}}
-                    },
+                    "leaderWorkerTemplate": {"workerTemplate": {"spec": {"containers": [{"name": "modelserver"}]}}},
                 },
             }
         ],
@@ -864,9 +856,7 @@ async def test_scale_rejects_prefill_for_aggregated_deployment(deployment_store,
     monkeypatch.setattr(executions, "run_kubectl", fake_run_kubectl)
 
     with pytest.raises(executions.DeploymentScaleError) as failure:
-        await executions.scale_deployment_execution(
-            "execution-ready", DeploymentScaleRequest(prefill_replicas=2)
-        )
+        await executions.scale_deployment_execution("execution-ready", DeploymentScaleRequest(prefill_replicas=2))
     assert failure.value.code == "deployment_scale_unsupported"
 
 
@@ -885,9 +875,7 @@ async def test_scale_route_returns_updated_execution(deployment_store, monkeypat
 
     monkeypatch.setattr(executions, "run_kubectl", fake_run_kubectl)
 
-    response = await router.scale_execution(
-        "execution-ready", DeploymentScaleRequest(decode_replicas=2)
-    )
+    response = await router.scale_execution("execution-ready", DeploymentScaleRequest(decode_replicas=2))
 
     assert response["scale"]["decodeReplicas"] == 2
     assert response["replicas"] == 2
@@ -901,11 +889,7 @@ def _disaggregated_set_document(*, slices=2, prefill=4, decode=1, external_prefi
                 "replicas": replicas,
                 "leaderWorkerTemplate": {
                     "workerTemplate": {
-                        "spec": {
-                            "containers": [
-                                {"name": "modelserver", "image": "vllm/vllm-openai:v1"}
-                            ]
-                        }
+                        "spec": {"containers": [{"name": "modelserver", "image": "vllm/vllm-openai:v1"}]}
                     }
                 },
             },
@@ -948,9 +932,7 @@ async def test_scale_plan_supports_disaggregated_set(deployment_store, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_scale_disaggregated_set_patches_role_replicas_without_slices(
-    deployment_store, monkeypatch, tmp_path
-):
+async def test_scale_disaggregated_set_patches_role_replicas_without_slices(deployment_store, monkeypatch, tmp_path):
     document = _disaggregated_set_document(slices=2, prefill=4, decode=1)
     _bind_scale_manifest(deployment_store, tmp_path, [document])
     commands = []
@@ -974,10 +956,7 @@ async def test_scale_disaggregated_set_patches_role_replicas_without_slices(
 
     patch_command = next(command for command in commands if command[0] == "patch")
     operations = json.loads(patch_command[patch_command.index("--patch") + 1])
-    assert not any(
-        operation["op"] == "replace" and operation["path"] == "/spec/slices"
-        for operation in operations
-    )
+    assert not any(operation["op"] == "replace" and operation["path"] == "/spec/slices" for operation in operations)
     assert {"op": "replace", "path": "/spec/roles/0/spec/replicas", "value": 6} in operations
     assert {"op": "replace", "path": "/spec/roles/1/spec/replicas", "value": 2} in operations
 
@@ -997,9 +976,7 @@ async def test_scale_disaggregated_set_patches_role_replicas_without_slices(
 
 
 @pytest.mark.asyncio
-async def test_scale_disaggregated_set_rejects_external_role(
-    deployment_store, monkeypatch, tmp_path
-):
+async def test_scale_disaggregated_set_rejects_external_role(deployment_store, monkeypatch, tmp_path):
     document = _disaggregated_set_document(external_prefill=True)
     _bind_scale_manifest(deployment_store, tmp_path, [document])
 
@@ -1013,9 +990,7 @@ async def test_scale_disaggregated_set_rejects_external_role(
     monkeypatch.setattr(executions, "run_kubectl", fake_run_kubectl)
 
     with pytest.raises(executions.DeploymentScaleError) as failure:
-        await executions.scale_deployment_execution(
-            "execution-ready", DeploymentScaleRequest(prefill_replicas=6)
-        )
+        await executions.scale_deployment_execution("execution-ready", DeploymentScaleRequest(prefill_replicas=6))
 
     assert failure.value.code == "deployment_scale_unsupported"
     assert "Externally managed roles" in str(failure.value)
