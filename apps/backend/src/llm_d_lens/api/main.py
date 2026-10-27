@@ -15,6 +15,7 @@ import os
 from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from starlette.middleware.gzip import GZipMiddleware
 
@@ -26,7 +27,7 @@ from llm_d_lens.api.speech_models import router as speech_models_router
 from llm_d_lens.api.web import WebEntryMiddleware
 from llm_d_lens.api.web import router as web_router
 from llm_d_lens.auth.bootstrap import ensure_initial_admin, format_initial_admin_banner
-from llm_d_lens.auth.context import AuthContextMiddleware, require_route_permission
+from llm_d_lens.auth.context import AuthContextMiddleware, require_route_permission, with_principal_context
 from llm_d_lens.auth.maintenance import run_maintenance
 from llm_d_lens.auth.master_key import ensure_master_key
 from llm_d_lens.auth.router import router as auth_router
@@ -73,12 +74,34 @@ app = FastAPI(
     title="Lens API",
     description="Model, inference, evaluation and cluster management backend for Lens",
     version="1.0.0",
-    docs_url="/api/simulation/docs" if auth_settings.expose_api_docs else None,
-    redoc_url="/api/simulation/redoc" if auth_settings.expose_api_docs else None,
-    openapi_url="/api/simulation/openapi.json" if auth_settings.expose_api_docs else None,
-    dependencies=[Depends(require_route_permission)],
+    docs_url="/api/v1/simulation/docs" if auth_settings.expose_api_docs else None,
+    redoc_url="/api/v1/simulation/redoc" if auth_settings.expose_api_docs else None,
+    openapi_url="/api/v1/simulation/openapi.json" if auth_settings.expose_api_docs else None,
+    dependencies=[Depends(require_route_permission), Depends(with_principal_context)],
 )
 install_problem_handlers(app)
+
+
+def _custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    components = schema.setdefault("components", {}).setdefault("securitySchemes", {})
+    components.setdefault(
+        "BearerAuth",
+        {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"},
+    )
+    schema["security"] = [{"BearerAuth": []}]
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _custom_openapi
 app.add_middleware(AuthContextMiddleware)
 app.add_middleware(WebEntryMiddleware)
 app.add_middleware(GZipMiddleware, minimum_size=500)
@@ -359,7 +382,7 @@ app.include_router(versions_router)
 
 
 @app.get("/api/health", tags=["system"])
-@app.get("/api/simulation/health", include_in_schema=False)
+@app.get("/api/v1/simulation/health", include_in_schema=False)
 @app.get("/healthz", include_in_schema=False)
 async def health() -> dict[str, str]:
     return {

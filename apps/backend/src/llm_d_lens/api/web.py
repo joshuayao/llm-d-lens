@@ -21,7 +21,7 @@ router = APIRouter(include_in_schema=False)
 MAX_JSON_BYTES = 50 * 1024 * 1024
 
 
-@router.get("/api/config")
+@router.get("/api/v1/config")
 async def config():
     return {
         "deploymentDefaults": {
@@ -53,12 +53,6 @@ class WebEntryMiddleware:
             await self.app(scope, receive, send)
             return
         path = scope["path"]
-        for alias, canonical in (("/api/v1/cluster", "/api/cluster"), ("/api/v1/simulation", "/api/simulation")):
-            if path == alias or path.startswith(alias + "/"):
-                scope = dict(scope, path=canonical + path[len(alias) :])
-                scope["raw_path"] = scope["path"].encode()
-                path = scope["path"]
-                break
         request = Request(scope)
         api = (
             path in {"/api", "/v1", "/healthz", "/docs/oauth2-redirect"}

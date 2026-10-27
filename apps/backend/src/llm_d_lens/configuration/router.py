@@ -24,11 +24,11 @@ from fastapi.routing import APIRoute
 
 from llm_d_lens.auth.access import current_principal, filter_by_cluster, require_cluster_access
 from llm_d_lens.core.exceptions import DomainError
-from llm_d_lens.deploy.capabilities import deployment_capabilities
 
 from .errors import ConfigurationError
 from .models import (
     ConfigurationArtifactRecord,
+    ConfigurationCapabilitiesResponse,
     RenderRequest,
     RenderResponse,
     ResolveRequest,
@@ -37,6 +37,7 @@ from .models import (
     SaveResponse,
 )
 from .service import (
+    configuration_capabilities,
     delete_configuration_artifact,
     get_configuration_artifact,
     list_configuration_artifacts,
@@ -75,7 +76,7 @@ class LegacyConfigurationRoute(APIRoute):
 
 
 legacy_router = APIRouter(
-    prefix="/api/configurations",
+    prefix="/api/v1/configurations",
     route_class=LegacyConfigurationRoute,
     include_in_schema=False,
 )
@@ -97,6 +98,7 @@ def _configuration_errors(failure_message: str, client_errors: tuple[type[Except
 
 @router.get(
     "/capabilities",
+    response_model=ConfigurationCapabilitiesResponse,
     summary="Get Lens Configuration capability metadata and provider catalog information.",
     description=(
         "Get Lens Configuration capability metadata and provider catalog information. "
@@ -104,8 +106,8 @@ def _configuration_errors(failure_message: str, client_errors: tuple[type[Except
     ),
     operation_id="get_configuration_capabilities",
 )
-async def capabilities() -> dict:
-    return {"schema_version": "deployment-capabilities.v1", "providers": deployment_capabilities()}
+async def capabilities() -> ConfigurationCapabilitiesResponse:
+    return configuration_capabilities()
 
 
 @router.post(

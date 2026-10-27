@@ -30,15 +30,64 @@ function readCookie(name) {
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
-export async function requestJson(url, options = {}, { fallback = {}, errorFactory = problemError, strictJson = false, expectedStatus } = {}) {
+let accessToken = '';
+let unauthorizedHandler = null;
+
+/** Keep the short-lived Bearer token in memory; never persist it in storage. */
+export function setAuthToken(token) {
+    accessToken = token || '';
+}
+
+export function getAuthToken() {
+    return accessToken;
+}
+
+/** Register one refresh callback used to recover from a 401. */
+export function setUnauthorizedHandler(handler) {
+    unauthorizedHandler = handler;
+}
+
+export async function requestJson(
+    url,
+    options = {},
+    {
+        fallback = {},
+        errorFactory = problemError,
+        strictJson = false,
+        expectedStatus,
+        auth = 'auto',
+        retryOnUnauthorized = true,
+    } = {},
+) {
     const headers = new Headers(options.headers);
     if (!headers.has('Accept')) headers.set('Accept', 'application/json');
     const method = (options.method || 'GET').toUpperCase();
-    if (!SAFE_METHODS.has(method) && !headers.has('X-Prism-CSRF')) {
+    const useBearer = auth !== 'none' && Boolean(accessToken);
+    if (useBearer) headers.set('Authorization', `Bearer ${accessToken}`);
+    if (!SAFE_METHODS.has(method) && !useBearer && !headers.has('X-Prism-CSRF')) {
         const csrf = readCookie('prism_csrf');
         if (csrf) headers.set('X-Prism-CSRF', csrf);
     }
-    const response = await fetch(url, { credentials: 'include', ...options, headers });
+    const credentials = options.credentials || (useBearer ? 'omit' : 'include');
+    const response = await fetch(url, { ...options, credentials, headers });
+    if (
+        response.status === 401
+        && useBearer
+        && retryOnUnauthorized
+        && typeof unauthorizedHandler === 'function'
+    ) {
+        const refreshed = await unauthorizedHandler();
+        if (refreshed) {
+            return requestJson(url, options, {
+                fallback,
+                errorFactory,
+                strictJson,
+                expectedStatus,
+                auth,
+                retryOnUnauthorized: false,
+            });
+        }
+    }
     const payload = strictJson && response.ok ? await response.json() : await readJson(response, fallback);
     if (!response.ok || (expectedStatus !== undefined && response.status !== expectedStatus)) {
         if (response.status === 401 && typeof window !== 'undefined') {
@@ -49,8 +98,8 @@ export async function requestJson(url, options = {}, { fallback = {}, errorFacto
     return payload;
 }
 
-export function postJson(url, body, options = {}) {
+export function postJson(url, body, options = {}, requestOptions = {}) {
     const headers = new Headers(options.headers);
     if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
-    return requestJson(url, { ...options, method: 'POST', headers, body: JSON.stringify(body) });
+    return requestJson(url, { ...options, method: 'POST', headers, body: JSON.stringify(body) }, requestOptions);
 }

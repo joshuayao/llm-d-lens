@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { getAuthToken } from '../api/httpClient';
+
 function filenameFromContentDisposition(disposition) {
     if (!disposition) return null;
     const star = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
@@ -39,7 +41,11 @@ function filenameFromContentDisposition(disposition) {
  * @returns {Promise<string>} the filename the file was saved as
  */
 export async function downloadFile(url, { fallbackName } = {}) {
-    const response = await fetch(url, { credentials: 'include' });
+    const token = getAuthToken();
+    const response = await fetch(url, {
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        credentials: token ? 'omit' : 'include',
+    });
     if (!response.ok) {
         let payload = null;
         try {

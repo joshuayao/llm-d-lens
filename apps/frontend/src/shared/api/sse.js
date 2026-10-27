@@ -2,7 +2,7 @@
  * Native EventSource only supports GET without custom headers, but our SSE
  * endpoints take a JSON body and need the CSRF header, so we parse the
  * `event:`/`data:` frames out of a streamed fetch response instead. */
-import { problemError, readJson } from './httpClient.js';
+import { getAuthToken, problemError, readJson } from './httpClient.js';
 
 function csrfToken() {
     if (typeof document === 'undefined') return '';
@@ -16,12 +16,18 @@ function csrfToken() {
  */
 export async function streamSseRequest(path, payload, onEvent, signal) {
     const headers = { 'Content-Type': 'application/json', Accept: 'text/event-stream' };
-    const csrf = csrfToken();
-    if (csrf) headers['X-Prism-CSRF'] = csrf;
+    const token = getAuthToken();
+    if (token) {
+        headers.Authorization = `Bearer ${token}`;
+    } else {
+        const csrf = csrfToken();
+        if (csrf) headers['X-Prism-CSRF'] = csrf;
+    }
     const response = await fetch(path, {
         method: 'POST',
         headers,
         body: JSON.stringify(payload),
+        credentials: token ? 'omit' : 'include',
         signal,
     });
     if (!response.ok || !response.body) {

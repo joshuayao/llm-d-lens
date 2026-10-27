@@ -35,7 +35,7 @@ def test_configuration_router_owns_domain_prefix():
 def test_legacy_configuration_validation_preserves_error_field(operation):
     client = TestClient(app)
     canonical = client.post(f"/api/v1/configurations/{operation}", json={})
-    legacy = client.post(f"/api/configurations/{operation}", json={})
+    legacy = client.post(f"/api/v1/configurations/{operation}", json={})
     assert legacy.status_code == canonical.status_code == 422
     assert legacy.json() == {**canonical.json(), "error": canonical.json()["detail"]}
 
@@ -49,7 +49,7 @@ def test_legacy_configuration_resolve_reuses_service(monkeypatch):
         "configurations": [{"configuration_id": "candidate-1", "payload": {"model": "example/model"}}],
     }
     client = TestClient(app)
-    response = client.post("/api/configurations/resolve", json=payload)
+    response = client.post("/api/v1/configurations/resolve", json=payload)
     assert response.status_code == 200
     assert response.json()["results"] == []
     service.assert_awaited_once()
@@ -62,6 +62,6 @@ def test_legacy_configuration_service_failure_preserves_error_field(monkeypatch)
         "candidate_source": {"name": "baseline_search"},
         "configurations": [{"configuration_id": "candidate-1", "payload": {"model": "example/model"}}],
     }
-    response = TestClient(app).post("/api/configurations/resolve", json=payload)
+    response = TestClient(app).post("/api/v1/configurations/resolve", json=payload)
     assert response.status_code == 400
     assert response.json()["error"] == response.json()["detail"] == "invalid"

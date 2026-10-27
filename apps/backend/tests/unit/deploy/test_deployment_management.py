@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 
 from llm_d_lens.auth.records import GroupRecord, GroupRoleBindingRecord, RoleRecord, UserRecord, UserRoleBindingRecord
 from llm_d_lens.auth.service import default_service
+from llm_d_lens.auth.settings import AuthSettings, set_settings_for_testing
+from llm_d_lens.core.exceptions import ForbiddenError, UnauthenticatedError
 from llm_d_lens.db.dao.base import ConcurrentUpdateError
 from llm_d_lens.db.dao.cluster import ClusterDao
 from llm_d_lens.db.dao.deployment_batch import DeploymentBatchDao
@@ -33,7 +35,14 @@ from llm_d_lens.deploy.contracts import (
     DeploymentStatus,
     VersionedPayload,
 )
+from llm_d_lens.deploy.models import (
+    DeploymentCaseResponse,
+    DeploymentCaseSummary,
+    DeploymentExecutionListResponse,
+    DeploymentExecutionResponse,
+)
 from llm_d_lens.deploy.run_store import JsonDeploymentRunStore
+from llm_d_lens.sdk import LensLocal
 
 router = importlib.import_module("llm_d_lens.deploy.router")
 executions = importlib.import_module("llm_d_lens.deploy.executions")
@@ -275,13 +284,15 @@ def _payload(response):
 async def test_list_returns_all_deployments_with_metadata_fields(deployment_store):
     response = await router.list_executions()
 
-    identifiers = [item["execution_id"] for item in response["items"]]
+    assert isinstance(response, DeploymentExecutionListResponse)
+    identifiers = [item.execution_id for item in response.items]
     assert sorted(identifiers) == ["execution-cleaned", "execution-ready"]
-    for item in response["items"]:
-        assert item["display_name"] == ""
-        assert item["description"] == ""
-        assert "run_id" not in item
-        assert "case_id" not in item
+    for item in response.items:
+        assert isinstance(item, DeploymentExecutionResponse)
+        assert item.display_name == ""
+        assert item.description == ""
+        assert "run_id" not in item.model_dump()
+        assert "case_id" not in item.model_dump()
 
 
 @pytest.mark.asyncio
@@ -294,9 +305,23 @@ async def test_list_filters_by_query_across_metadata_and_serving_facts(deploymen
     by_namespace = await router.list_executions(query="qwen-cleaned")
     by_model = await router.list_executions(query="qwen3-0.6b")
 
-    assert [item["execution_id"] for item in by_display_name["items"]] == ["execution-ready"]
-    assert [item["execution_id"] for item in by_namespace["items"]] == ["execution-cleaned"]
-    assert len(by_model["items"]) == 2
+    assert [item.execution_id for item in by_display_name.items] == ["execution-ready"]
+    assert [item.execution_id for item in by_namespace.items] == ["execution-cleaned"]
+    assert len(by_model.items) == 2
+
+
+@pytest.mark.asyncio
+async def test_case_and_cluster_routes_return_shared_models(deployment_store):
+    case = await router.get_case("run-1", "case-0")
+    assert isinstance(case, DeploymentCaseResponse)
+    assert case.case.id == "case-0"
+    assert case.execution.execution_id == "execution-ready"
+    assert case.deployment.name == "qwen-0"
+
+    cluster_cases = await router.list_cluster_deployments("cluster-1")
+    assert cluster_cases
+    assert all(isinstance(item, DeploymentCaseSummary) for item in cluster_cases)
+    assert {item.case_id for item in cluster_cases} == {"case-0", "case-1"}
 
 
 @pytest.mark.asyncio
@@ -305,9 +330,9 @@ async def test_list_filters_by_multiple_statuses_and_limit(deployment_store):
     ready_only = await router.list_executions(statuses=[DeploymentStatus.READY])
     limited = await router.list_executions(limit=1)
 
-    assert len(both["items"]) == 2
-    assert [item["execution_id"] for item in ready_only["items"]] == ["execution-ready"]
-    assert len(limited["items"]) == 1
+    assert len(both.items) == 2
+    assert [item.execution_id for item in ready_only.items] == ["execution-ready"]
+    assert len(limited.items) == 1
 
 
 @pytest.mark.asyncio
@@ -318,8 +343,9 @@ async def test_patch_updates_only_supplied_fields(deployment_store):
     )
     response = await router.patch_execution("execution-ready", DeploymentMetadataUpdateRequest(description="Second"))
 
-    assert response["display_name"] == "Qwen production"
-    assert response["description"] == "Second"
+    assert isinstance(response, DeploymentExecutionResponse)
+    assert response.display_name == "Qwen production"
+    assert response.description == "Second"
     assert deployment_store.get_execution("execution-ready").metadata.display_name == "Qwen production"
 
 
@@ -328,7 +354,7 @@ async def test_patch_can_clear_a_field(deployment_store):
     await router.patch_execution("execution-ready", DeploymentMetadataUpdateRequest(description="temporary"))
     response = await router.patch_execution("execution-ready", DeploymentMetadataUpdateRequest(description=""))
 
-    assert response["description"] == ""
+    assert response.description == ""
 
 
 @pytest.mark.asyncio
@@ -338,9 +364,9 @@ async def test_patch_never_changes_runtime_facts(deployment_store):
     response = await router.patch_execution("execution-ready", DeploymentMetadataUpdateRequest(display_name="renamed"))
     after = deployment_store.get_execution("execution-ready")
 
-    assert response["name"] == "qwen-0"
-    assert response["namespace"] == "qwen-ready"
-    assert response["status"] == "ready"
+    assert response.name == "qwen-0"
+    assert response.namespace == "qwen-ready"
+    assert response.status == "ready"
     assert after.namespace == before.namespace
     assert after.status == before.status
     assert after.endpoint == before.endpoint
@@ -676,3 +702,90 @@ async def test_cancel_evaluation_retains_records_on_cleanup_failure(deployment_s
 
     assert deployment_store.get_run("run-1") is not None
     assert deployment_store.get_execution("execution-ready") is not None
+
+
+STRONG_LOCAL_PASSWORD = "Correct-Horse-9!"  # noqa: S105 - test fixture
+
+
+@pytest.mark.asyncio
+async def test_local_sdk_uses_user_id_context_and_enforces_permissions(deployment_store):
+    set_settings_for_testing(
+        AuthSettings(
+            auth_mode="local",
+            auto_seed_admin=False,
+            session_ttl_seconds=3600,
+            session_idle_seconds=3600,
+        )
+    )
+    service = default_service()
+    service.ensure_builtin_roles()
+    admin = service.bootstrap_admin("root", STRONG_LOCAL_PASSWORD)
+
+    lens = LensLocal(admin.username)
+    with LensLocal(admin.username) as entered:
+        assert entered.user_id == admin.id
+    contexts = lens.deployments.list_executions()
+    assert {context.execution_id for context in contexts} == {"execution-ready", "execution-cleaned"}
+    assert lens.deployments.get_execution("execution-ready").execution_id == "execution-ready"
+
+    run = await lens.deployments.wait_run("run-1")
+    assert run.id == "run-1"
+
+    with pytest.raises(UnauthenticatedError):
+        LensLocal("missing-user")
+
+    limited = service.create_user(username="limited", password=STRONG_LOCAL_PASSWORD)
+    with pytest.raises(ForbiddenError):
+        LensLocal(limited.username).deployments.list_executions()
+
+
+@pytest.mark.asyncio
+async def test_local_sdk_evaluation_uses_in_process_principal(deployment_store):
+    set_settings_for_testing(
+        AuthSettings(
+            auth_mode="local",
+            auto_seed_admin=False,
+            session_ttl_seconds=3600,
+            session_idle_seconds=3600,
+        )
+    )
+    service = default_service()
+    service.ensure_builtin_roles()
+    admin = service.bootstrap_admin("root", STRONG_LOCAL_PASSWORD)
+
+    lens = LensLocal(admin.username)
+    defaults = await lens.evaluation.benchmark_defaults()
+    assert {"mode", "repository", "revision"} <= set(defaults.model_dump())
+
+    limited = service.create_user(username="limited-eval", password=STRONG_LOCAL_PASSWORD)
+    with pytest.raises(ForbiddenError):
+        await LensLocal(limited.username).evaluation.benchmark_defaults()
+
+
+@pytest.mark.asyncio
+async def test_local_sdk_module_facade_uses_route_permissions(deployment_store):
+    set_settings_for_testing(
+        AuthSettings(
+            auth_mode="local",
+            auto_seed_admin=False,
+            session_ttl_seconds=3600,
+            session_idle_seconds=3600,
+        )
+    )
+    service = default_service()
+    service.ensure_builtin_roles()
+    admin = service.bootstrap_admin("root", STRONG_LOCAL_PASSWORD)
+
+    lens = LensLocal(admin.username)
+    payload = await lens.clusters.list_lens_hosts()
+    assert isinstance(payload.items, list)
+    clusters = await lens.clusters.list_clusters(include_drafts=True)
+    assert isinstance(clusters.items, list)
+    volumes = await lens.storage.list_volumes()
+    assert isinstance(volumes.items, list)
+    with pytest.raises(AttributeError):
+        _ = lens.clusters.Request
+
+    limited = service.create_user(username="limited-cluster", password=STRONG_LOCAL_PASSWORD)
+    with pytest.raises(ForbiddenError):
+        await LensLocal(limited.username).clusters.list_lens_hosts()
