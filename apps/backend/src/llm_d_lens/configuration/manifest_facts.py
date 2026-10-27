@@ -165,6 +165,13 @@ def _shell_tokens(script: str, deployment_name: str) -> list[str]:
         raise ValueError(f"model server {deployment_name} uses a compound shell invocation")
     if tokens and tokens[0] == "exec":
         tokens = tokens[1:]
+    if (
+        len(tokens) >= 3
+        and PurePosixPath(tokens[0]).name in {"python", "python3"}
+        and tokens[1] == "-m"
+        and tokens[2].startswith("vllm.entrypoints.")
+    ):
+        return tokens[3:]
     if len(tokens) < 2 or PurePosixPath(tokens[0]).name != "vllm" or tokens[1] != "serve":
         raise ValueError(f"model server {deployment_name} does not use a recognizable vllm serve invocation")
     return tokens[2:]
@@ -186,6 +193,13 @@ def _invocation_tokens(container: dict[str, Any], deployment_name: str) -> list[
         return _shell_tokens(combined[2], deployment_name)
 
     if command:
+        if (
+            len(command) >= 3
+            and PurePosixPath(command[0]).name in {"python", "python3"}
+            and command[1] == "-m"
+            and command[2].startswith("vllm.entrypoints.")
+        ):
+            return [*command[3:], *args]
         if PurePosixPath(command[0]).name != "vllm":
             raise ValueError(f"model server {deployment_name} does not use a recognizable vllm serve invocation")
         if len(command) >= 2 and command[1] == "serve":
@@ -193,6 +207,13 @@ def _invocation_tokens(container: dict[str, Any], deployment_name: str) -> list[
         if len(command) == 1 and args and args[0] == "serve":
             return list(args[1:])
         raise ValueError(f"model server {deployment_name} does not use a recognizable vllm serve invocation")
+    if (
+        len(args) >= 3
+        and PurePosixPath(args[0]).name in {"python", "python3"}
+        and args[1] == "-m"
+        and args[2].startswith("vllm.entrypoints.")
+    ):
+        return list(args[3:])
     if len(args) >= 2 and PurePosixPath(args[0]).name == "vllm" and args[1] == "serve":
         return list(args[2:])
     if args:
@@ -233,6 +254,12 @@ def _argument_value(tokens: list[str], names: set[str], deployment_name: str) ->
     if len(set(values)) > 1:
         raise ValueError(f"model server {deployment_name} has conflicting {'/'.join(sorted(names))} options")
     return values[-1] if values else _MISSING
+
+
+def vllm_argument_value(container: dict[str, Any], names: set[str], deployment_name: str) -> str | None:
+    """Return one vLLM option from a recognizable invocation; raise ValueError when ambiguous."""
+    value = _argument_value(_invocation_tokens(container, deployment_name), names, deployment_name)
+    return None if value is _MISSING else str(value)
 
 
 def _model_argument(tokens: list[str], deployment_name: str) -> str:

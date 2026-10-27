@@ -897,6 +897,100 @@ def test_graceful_shutdown_manifest_applies_vllm_settings():
     assert report["warnings"] == []
 
 
+def test_graceful_shutdown_manifest_patches_shell_command_script():
+    from llm_d_lens.configuration.manifest_facts import _invocation_tokens
+
+    document = _vllm_deployment("command-shell")
+    container = document["spec"]["template"]["spec"]["containers"][0]
+    container["command"] = ["/bin/sh", "-c", "vllm serve model --max-model-len=4096"]
+    container.pop("args")
+
+    rendered, report = configuration_manifest.prepare_graceful_shutdown_manifest(
+        yaml.safe_dump_all([document], sort_keys=False)
+    )
+
+    rendered_container = yaml.safe_load(rendered)["spec"]["template"]["spec"]["containers"][0]
+    assert rendered_container["command"][2].endswith("--shutdown-timeout=90")
+    assert not rendered_container.get("args")
+    assert report["containers"][0]["shutdownTimeoutSeconds"] == 90
+    assert "--shutdown-timeout=90" in _invocation_tokens(rendered_container, "command-shell")
+
+
+def test_graceful_shutdown_manifest_patches_python_module_invocation():
+    from llm_d_lens.configuration.manifest_facts import _invocation_tokens
+
+    document = _vllm_deployment("python-module")
+    container = document["spec"]["template"]["spec"]["containers"][0]
+    container["command"] = ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+    container["args"] = ["--model", "model"]
+
+    rendered, report = configuration_manifest.prepare_graceful_shutdown_manifest(
+        yaml.safe_dump_all([document], sort_keys=False)
+    )
+
+    rendered_container = yaml.safe_load(rendered)["spec"]["template"]["spec"]["containers"][0]
+    assert "--shutdown-timeout=90" in rendered_container["args"]
+    assert report["containers"][0]["shutdownTimeoutSeconds"] == 90
+    assert "--shutdown-timeout=90" in _invocation_tokens(rendered_container, "python-module")
+
+
+@pytest.mark.parametrize(
+    ("command", "args"),
+    [
+        (["/bin/sh", "-c"], ["exec vllm serve model \\\n  --tensor-parallel-size=4\n"]),
+        (["/bin/sh", "-c"], ['vllm serve model --host "$HOST_IP" --shutdown-timeout 30']),
+        (["vllm"], ["serve", "model"]),
+    ],
+)
+def test_graceful_shutdown_manifest_patches_recognizable_invocations(command, args):
+    from llm_d_lens.configuration.manifest_facts import vllm_argument_value
+
+    document = _vllm_deployment("recognizable")
+    container = document["spec"]["template"]["spec"]["containers"][0]
+    container["command"] = command
+    container["args"] = args
+
+    rendered, report = configuration_manifest.prepare_graceful_shutdown_manifest(
+        yaml.safe_dump_all([document], sort_keys=False)
+    )
+
+    rendered_container = yaml.safe_load(rendered)["spec"]["template"]["spec"]["containers"][0]
+    assert vllm_argument_value(rendered_container, {"--shutdown-timeout"}, "recognizable") == "90"
+    assert report["containers"][0]["shutdownTimeoutSeconds"] == 90
+    assert report["warnings"] == []
+
+
+def test_graceful_shutdown_manifest_keeps_non_literal_shutdown_timeout():
+    document = _vllm_deployment("variable-timeout")
+    container = document["spec"]["template"]["spec"]["containers"][0]
+    container["command"] = ["/bin/sh", "-c", "vllm serve model --shutdown-timeout=$TIMEOUT"]
+    container.pop("args")
+
+    rendered, report = configuration_manifest.prepare_graceful_shutdown_manifest(
+        yaml.safe_dump_all([document], sort_keys=False)
+    )
+
+    rendered_container = yaml.safe_load(rendered)["spec"]["template"]["spec"]["containers"][0]
+    assert rendered_container["command"][2] == "vllm serve model --shutdown-timeout=$TIMEOUT"
+    assert report["containers"][0]["shutdownTimeoutSeconds"] is None
+
+
+def test_graceful_shutdown_manifest_skips_unsafe_shell_command_with_warning():
+    document = _vllm_deployment("unsafe-shell")
+    container = document["spec"]["template"]["spec"]["containers"][0]
+    container["command"] = ["/bin/sh", "-c", "vllm serve model && echo done"]
+    container.pop("args")
+
+    rendered, report = configuration_manifest.prepare_graceful_shutdown_manifest(
+        yaml.safe_dump_all([document], sort_keys=False)
+    )
+
+    rendered_container = yaml.safe_load(rendered)["spec"]["template"]["spec"]["containers"][0]
+    assert rendered_container["command"] == ["/bin/sh", "-c", "vllm serve model && echo done"]
+    assert report["containers"][0]["shutdownTimeoutSeconds"] is None
+    assert any("could not safely apply" in warning for warning in report["warnings"])
+
+
 def test_graceful_shutdown_manifest_preserves_existing_values_and_handles_sglang():
     manifest = yaml.safe_dump_all(
         [

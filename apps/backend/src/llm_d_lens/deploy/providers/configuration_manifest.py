@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import re
@@ -10,11 +11,12 @@ import shlex
 import shutil
 import tempfile
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
 
+from llm_d_lens.configuration.manifest_facts import vllm_argument_value
 from llm_d_lens.core.hashing import stable_hash
 from llm_d_lens.deploy.providers.deployment_bundle import validate_deployment_bundle
 from llm_d_lens.deploy.providers.guide_adapter import (
@@ -100,26 +102,63 @@ def _existing_shutdown_timeout(container: dict[str, Any]) -> int | None:
     return max(int(item) for item in matches) if matches else None
 
 
-def _apply_shutdown_timeout(container: dict[str, Any]) -> int:
-    value = max(_existing_shutdown_timeout(container) or 0, MODEL_SHUTDOWN_TIMEOUT_SECONDS)
-    command = container.get("command")
-    if isinstance(command, str) and "vllm serve" in command:
-        container["command"] = [set_vllm_shell_argument(command, "shutdown-timeout", value)]
-        return value
-    args = container.get("args")
-    if isinstance(args, str):
-        container["args"] = [set_vllm_shell_argument(args, "shutdown-timeout", value)]
-        return value
-    if isinstance(args, list):
-        for index, item in enumerate(args):
-            if isinstance(item, str) and "vllm serve" in item:
-                args[index] = set_vllm_shell_argument(item, "shutdown-timeout", value)
-                container["args"] = args
-                return value
-        container["args"] = set_vllm_argument([str(item) for item in args], "shutdown-timeout", value)
-        return value
-    container["args"] = set_vllm_argument([], "shutdown-timeout", value)
-    return value
+_SHUTDOWN_FLAG = "--shutdown-timeout"
+_SHELLS = {"sh", "bash"}
+
+
+def _shell_script_slot(container: dict[str, Any]) -> tuple[str, int] | None:
+    """Locate the script of a validated `sh -c` invocation split across command and args."""
+    command = container.get("command") or []
+    if not command or PurePosixPath(command[0]).name not in _SHELLS:
+        return None
+    return ("command", 2) if len(command) >= 3 else ("args", 2 - len(command))
+
+
+def _has_shutdown_flag(tokens: list[Any]) -> bool:
+    return any(str(item) == _SHUTDOWN_FLAG or str(item).startswith(f"{_SHUTDOWN_FLAG}=") for item in tokens)
+
+
+def _apply_shutdown_timeout(container: dict[str, Any]) -> int | None:
+    """Add --shutdown-timeout only where the shared vLLM invocation parser will see it."""
+    existing = _existing_shutdown_timeout(container)
+    timeout = max(existing or 0, MODEL_SHUTDOWN_TIMEOUT_SECONDS)
+    label = str(container.get("name") or "<unnamed>")
+    try:
+        current = vllm_argument_value(container, {_SHUTDOWN_FLAG}, label)
+    except ValueError as error:
+        logger.warning("Cannot safely apply %s to %s: %s", _SHUTDOWN_FLAG, label, error)
+        return existing
+    if current is not None and not current.isdigit():
+        logger.warning("Keeping non-literal %s=%s for %s", _SHUTDOWN_FLAG, current, label)
+        return None
+
+    original = {key: copy.deepcopy(container[key]) for key in ("command", "args") if key in container}
+    slot = _shell_script_slot(container)
+    if slot is not None:
+        field, index = slot
+        values = list(container[field])
+        values[index] = set_vllm_shell_argument(str(values[index]), "shutdown-timeout", timeout)
+        container[field] = values
+    else:
+        command = list(container.get("command") or [])
+        args = list(container.get("args") or [])
+        command_has_flag = _has_shutdown_flag(command)
+        if command_has_flag:
+            container["command"] = set_vllm_argument(command, "shutdown-timeout", timeout)
+        if not command_has_flag or _has_shutdown_flag(args):
+            container["args"] = set_vllm_argument(args, "shutdown-timeout", timeout)
+
+    try:
+        applied = vllm_argument_value(container, {_SHUTDOWN_FLAG}, label)
+    except ValueError:
+        applied = None
+    if applied == str(timeout):
+        return timeout
+    for key in ("command", "args"):
+        container.pop(key, None)
+    container.update(original)
+    logger.warning("Cannot verify %s=%s for %s; leaving the invocation unchanged", _SHUTDOWN_FLAG, timeout, label)
+    return existing
 
 
 def _ensure_prestop(container: dict[str, Any]) -> str:
@@ -266,8 +305,11 @@ def prepare_graceful_shutdown_manifest(manifest: str) -> tuple[str, dict[str, An
                 }
                 if runtime == "vllm":
                     shutdown_timeout = _apply_shutdown_timeout(container)
-                    longest_shutdown_timeout = max(longest_shutdown_timeout, shutdown_timeout)
+                    if shutdown_timeout is not None:
+                        longest_shutdown_timeout = max(longest_shutdown_timeout, shutdown_timeout)
                     entry["shutdownTimeoutSeconds"] = shutdown_timeout
+                    if shutdown_timeout is None:
+                        warnings.append(f"{label}: could not safely apply vLLM --shutdown-timeout")
                 elif runtime == "sglang":
                     warnings.append(
                         f"{label}: SGLang does not expose vLLM --shutdown-timeout; "

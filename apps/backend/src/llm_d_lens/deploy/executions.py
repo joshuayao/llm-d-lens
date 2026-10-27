@@ -907,6 +907,9 @@ async def scale_deployment_execution(
                     code="deployment_scale_unsupported",
                 )
             changes["decode"] = request.decode_replicas
+        changes = {role: target for role, target in changes.items() if target != plan.get(f"{role}Replicas")}
+        if not changes:
+            return get_execution_context(execution_id)
         external_roles = set(plan.get("externalRoles") or [])
         blocked = sorted(set(changes) & external_roles)
         if blocked:
@@ -934,7 +937,7 @@ async def scale_deployment_execution(
                 for workload in role_workloads:
                     operations.append(
                         {
-                            "op": "replace",
+                            "op": "add",
                             "path": f"/spec/roles/{workload['roleIndex']}/spec/replicas",
                             "value": target,
                         }
@@ -1011,13 +1014,7 @@ async def scale_deployment_execution(
         manual["updatedAt"] = utcnow().isoformat()
         manual["updatedBy"] = actor or ""
         provenance["manual_scale"] = manual
-        _store.save_execution(
-            execution.model_copy(
-                update={"provenance": provenance, "updated_at": utcnow()},
-                deep=True,
-            ),
-            preserve_metadata=True,
-        )
+        _store.update_execution_provenance(execution_id, provenance)
         if failures:
             raise DeploymentScaleError(
                 "Deployment scale was partially applied: " + "; ".join(failures),

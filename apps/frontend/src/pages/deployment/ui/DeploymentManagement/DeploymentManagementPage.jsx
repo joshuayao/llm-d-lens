@@ -87,8 +87,8 @@ function ScaleDeploymentModal({ deployment, onCancel, onScale }) {
         event.preventDefault();
         if (invalid || scaling) return;
         await run(() => onScale({
-            decodeReplicas: decode,
-            ...(prefillSupported ? { prefillReplicas: prefill } : {}),
+            ...(decode !== currentDecode ? { decodeReplicas: decode } : {}),
+            ...(prefillSupported && prefill !== currentPrefill ? { prefillReplicas: prefill } : {}),
         }));
     };
 

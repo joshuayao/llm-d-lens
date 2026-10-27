@@ -881,7 +881,7 @@ async def test_scale_route_returns_updated_execution(deployment_store, monkeypat
     assert response["replicas"] == 2
 
 
-def _disaggregated_set_document(*, slices=2, prefill=4, decode=1, external_prefill=False):
+def _disaggregated_set_document(*, slices=2, prefill=4, decode=1, external_prefill=False, external_decode=False):
     def role(name, replicas):
         value = {
             "name": name,
@@ -894,7 +894,7 @@ def _disaggregated_set_document(*, slices=2, prefill=4, decode=1, external_prefi
                 },
             },
         }
-        if name == "prefill" and external_prefill:
+        if (name == "prefill" and external_prefill) or (name == "decode" and external_decode):
             value["scaling"] = {"mode": "External"}
         return value
 
@@ -956,9 +956,9 @@ async def test_scale_disaggregated_set_patches_role_replicas_without_slices(depl
 
     patch_command = next(command for command in commands if command[0] == "patch")
     operations = json.loads(patch_command[patch_command.index("--patch") + 1])
-    assert not any(operation["op"] == "replace" and operation["path"] == "/spec/slices" for operation in operations)
-    assert {"op": "replace", "path": "/spec/roles/0/spec/replicas", "value": 6} in operations
-    assert {"op": "replace", "path": "/spec/roles/1/spec/replicas", "value": 2} in operations
+    assert not any(operation["path"] == "/spec/slices" for operation in operations)
+    assert {"op": "add", "path": "/spec/roles/0/spec/replicas", "value": 6} in operations
+    assert {"op": "add", "path": "/spec/roles/1/spec/replicas", "value": 2} in operations
 
     persisted = deployment_store.get_execution("execution-ready")
     manual = persisted.provenance["manual_scale"]
@@ -973,6 +973,62 @@ async def test_scale_disaggregated_set_patches_role_replicas_without_slices(depl
         "manual": True,
     }
     assert context.expected_model_pods == 16
+
+
+@pytest.mark.asyncio
+async def test_scale_disaggregated_set_allows_unchanged_external_role(deployment_store, monkeypatch, tmp_path):
+    document = _disaggregated_set_document(slices=2, prefill=4, decode=1, external_decode=True)
+    _bind_scale_manifest(deployment_store, tmp_path, [document])
+    commands = []
+
+    async def fake_run_kubectl(command, timeout=10, cluster_id=None):
+        commands.append(command)
+        if command[:2] == ["get", "deployments"]:
+            return _live_get([])
+        if command[:2] == ["get", "disaggregatedset"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps(document), stderr="")
+        if command[0] == "patch":
+            return SimpleNamespace(returncode=0, stdout="patched", stderr="")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(executions, "run_kubectl", fake_run_kubectl)
+
+    await executions.scale_deployment_execution(
+        "execution-ready",
+        DeploymentScaleRequest(prefill_replicas=6, decode_replicas=1),
+    )
+
+    patch_command = next(command for command in commands if command[0] == "patch")
+    operations = json.loads(patch_command[patch_command.index("--patch") + 1])
+    assert operations == [{"op": "add", "path": "/spec/roles/0/spec/replicas", "value": 6}]
+
+
+@pytest.mark.asyncio
+async def test_scale_preserves_concurrent_status_change(deployment_store, monkeypatch, tmp_path):
+    document = _disaggregated_set_document(slices=2, prefill=4, decode=1)
+    _bind_scale_manifest(deployment_store, tmp_path, [document])
+
+    async def fake_run_kubectl(command, timeout=10, cluster_id=None):
+        if command[:2] == ["get", "deployments"]:
+            return _live_get([])
+        if command[:2] == ["get", "disaggregatedset"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps(document), stderr="")
+        if command[0] == "patch":
+            current = deployment_store.get_execution("execution-ready")
+            deployment_store.save_execution(current.model_copy(update={"status": DeploymentStatus.CLEANED}))
+            return SimpleNamespace(returncode=0, stdout="patched", stderr="")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(executions, "run_kubectl", fake_run_kubectl)
+
+    await executions.scale_deployment_execution(
+        "execution-ready",
+        DeploymentScaleRequest(prefill_replicas=6),
+    )
+
+    persisted = deployment_store.get_execution("execution-ready")
+    assert persisted.status == DeploymentStatus.CLEANED
+    assert persisted.provenance["manual_scale"]["prefillReplicas"] == 6
 
 
 @pytest.mark.asyncio
