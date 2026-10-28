@@ -341,6 +341,46 @@ with LensLocal("<username>") as lens:
   </TabItem>
 </Tabs>
 
+### Scale a deployment execution
+
+Change the live Prefill and Decode model-server replicas for a ready or failed execution. This changes Kubernetes replicas only; the saved configuration is unchanged. Deployments and DisaggregatedSets are supported. DisaggregatedSet scaling changes role replicas and never changes `spec.slices`.
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+
+**`POST /api/v1/deployments/executions/{execution_id}/scale`**
+
+```json
+{"prefill_replicas": 1, "decode_replicas": 2}
+```
+
+Only supplied roles are changed. Aggregated deployments use `decode_replicas`. Returns the updated execution with `scale`.
+
+  </TabItem>
+  <TabItem value="python-api" label="In-process Python SDK">
+
+```python
+import asyncio
+
+from llm_d_lens.deploy.contracts import DeploymentScaleRequest
+from llm_d_lens.sdk import LensLocal
+
+
+async def main() -> None:
+    with LensLocal("<username>") as lens:
+        context = await lens.deploy.scale_execution(
+            "<execution-id>",
+            DeploymentScaleRequest(decode_replicas=2),
+        )
+        print(context.scale)
+
+
+asyncio.run(main())
+```
+
+  </TabItem>
+</Tabs>
+
 ## Endpoints
 
 ### Deployment lifecycle

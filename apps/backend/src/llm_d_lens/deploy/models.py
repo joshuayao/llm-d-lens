@@ -86,6 +86,7 @@ class DeploymentExecutionResponse(BaseModel):
     custom_parameters: list[dict[str, Any]] = Field(default_factory=list)
     baseline_endpoint: str | None = None
     service_ref: str | None = None
+    scale: dict[str, Any] | None = None
 
     @classmethod
     def from_context(cls, context: Any) -> DeploymentExecutionResponse:
@@ -123,6 +124,7 @@ class DeploymentExecutionResponse(BaseModel):
             custom_parameters=context.custom_parameters or [],
             baseline_endpoint=context.baseline_endpoint,
             service_ref=context.service_ref,
+            scale=context.scale,
         )
 
 

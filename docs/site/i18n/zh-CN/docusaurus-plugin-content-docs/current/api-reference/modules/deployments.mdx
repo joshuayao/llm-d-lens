@@ -341,6 +341,46 @@ with LensLocal("<username>") as lens:
   </TabItem>
 </Tabs>
 
+### 扩缩容部署执行
+
+为 ready 或 failed 状态的执行调整 Prefill 和 Decode model-server 副本数。只修改 Kubernetes 副本，不改变已保存的配置。支持 Deployment 和 DisaggregatedSet；DisaggregatedSet 只改 role 副本，不修改 `spec.slices`。
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+
+**`POST /api/v1/deployments/executions/{execution_id}/scale`**
+
+```json
+{"prefill_replicas": 1, "decode_replicas": 2}
+```
+
+只修改传入的 role；聚合部署使用 `decode_replicas`。返回带 `scale` 的更新后执行。
+
+  </TabItem>
+  <TabItem value="python-api" label="In-process Python SDK">
+
+```python
+import asyncio
+
+from llm_d_lens.deploy.contracts import DeploymentScaleRequest
+from llm_d_lens.sdk import LensLocal
+
+
+async def main() -> None:
+    with LensLocal("<username>") as lens:
+        context = await lens.deploy.scale_execution(
+            "<execution-id>",
+            DeploymentScaleRequest(decode_replicas=2),
+        )
+        print(context.scale)
+
+
+asyncio.run(main())
+```
+
+  </TabItem>
+</Tabs>
+
 ## 端点
 
 ### 部署生命周期

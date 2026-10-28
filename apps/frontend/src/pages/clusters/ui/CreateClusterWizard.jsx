@@ -5,11 +5,11 @@ import { requestJson } from '../../../shared/api/httpClient';
 // See docs/design/cluster-design.md#cluster-creation-wizard for the full design.
 // Step 1 creates the cluster immediately (so Step 2-4 have a real
 // `cluster_id` to attach kubeconfig-backed operations to); Step 2/3 PATCH
-// the cluster's proxy/version-pin settings; Step 4 (optional) prewarms a
-// Model Cache entry by: creating a standalone HF_TOKEN secret, creating or
-// selecting a Storage volume, then creating a Model Cache entry that
-// references that secret via the existing `existing-secret` token source
-// (no new token source mode -- see section 4.4 of the design doc).
+// the cluster's proxy/version-pin settings; Step 4 creates a standalone
+// HF_TOKEN secret and a required Storage volume, then optionally prewarms a
+// Model Cache entry that references that secret via the existing
+// `existing-secret` token source (no new token source mode -- see section 4.4
+// of the design doc).
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
     AlertTriangle,
@@ -325,8 +325,7 @@ export function CreateClusterWizard({ onClose, onCreated }) {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [stepIndex, cluster, acceleratorPairs]);
 
-    // Step 5: model cache (optional)
-    const [modelCacheEnabled, setModelCacheEnabled] = useState(false);
+    // Step 5: model cache storage (required) and prewarm (optional)
     const [prewarmEnabled, setPrewarmEnabled] = useState(false);
     const [secretNamespace, setSecretNamespace] = useState('llm-d-bench-storage');
     const [secretNamespaceTouched, setSecretNamespaceTouched] = useState(false);
@@ -397,7 +396,7 @@ export function CreateClusterWizard({ onClose, onCreated }) {
     }, [cluster?.id, secretNamespaceTouched]);
 
     useEffect(() => {
-        if (stepIndex !== 4 || !modelCacheEnabled || !cluster || storageKind !== 'local-disk') return undefined;
+        if (stepIndex !== 4 || !cluster || storageKind !== 'local-disk') return undefined;
         const controller = new AbortController();
         (async () => {
             try {
@@ -408,7 +407,7 @@ export function CreateClusterWizard({ onClose, onCreated }) {
             }
         })();
         return () => controller.abort();
-    }, [stepIndex, modelCacheEnabled, storageKind, cluster]);
+    }, [stepIndex, storageKind, cluster]);
 
     const basicsValid = name.trim().length > 0 && !!file;
     const proxyValid = proxyMode === 'auto' || Boolean(httpProxy.trim() || httpsProxy.trim() || noProxy.trim());
@@ -423,12 +422,11 @@ export function CreateClusterWizard({ onClose, onCreated }) {
     // gated models without the user re-entering a token every time.
     const hfTokenSecretValid = Boolean(secretNamespace.trim() && secretName.trim() && hfToken.trim());
     const modelCacheValid =
-        !modelCacheEnabled ||
-        (modelCacheStorageSpecValid &&
-            CAPACITY_PATTERN.test(storageCapacity.trim()) &&
-            (!prewarmEnabled ||
-                (REPO_ID_PATTERN.test(repoId.trim()) &&
-                    revision.trim())));
+        modelCacheStorageSpecValid &&
+        CAPACITY_PATTERN.test(storageCapacity.trim()) &&
+        (!prewarmEnabled ||
+            (REPO_ID_PATTERN.test(repoId.trim()) &&
+                revision.trim()));
 
     const goNext = async () => {
         setError('');
@@ -612,34 +610,14 @@ export function CreateClusterWizard({ onClose, onCreated }) {
         if (finishing || finished) return;
         setFinishing(true);
         setError('');
-        if (!modelCacheEnabled) {
-            const finalCluster = await finalizeDraftCluster();
-            setFinishStatus([]);
-            setFinished(true);
-            setFinishing(false);
-            onCreated?.(finalCluster);
-            return;
-        }
         const steps = [
-            ...(modelCacheEnabled
-                ? [
-                    { key: 'storage', label: 'Create storage volume', state: 'pending' },
-                    ...(prewarmEnabled ? [{ key: 'model-cache', label: 'Start model cache download', state: 'pending' }] : []),
-                ]
-                : []),
+            { key: 'storage', label: 'Create storage volume', state: 'pending' },
+            ...(prewarmEnabled ? [{ key: 'model-cache', label: 'Start model cache download', state: 'pending' }] : []),
         ];
         setFinishStatus(steps);
         const setStepState = (key, state, detail) =>
             setFinishStatus((current) => current.map((item) => (item.key === key ? { ...item, state, detail } : item)));
         try {
-            if (!modelCacheEnabled) {
-                const finalCluster = await finalizeDraftCluster();
-                setFinished(true);
-                setFinishing(false);
-                onCreated?.(finalCluster);
-                return;
-            }
-
             let volumeId;
             {
                 setStepState('storage', 'running');
@@ -1226,9 +1204,9 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                     <div className="rounded-lg border border-slate-700/70 bg-slate-800/40 px-4 py-4">
                         <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-400">HF_TOKEN secret</p>
                         <p className="mb-3 text-[11px] leading-relaxed text-slate-400">
-                            Always required, independent of Model Cache below -- Deploy/Evaluate default to reusing
-                            this secret on this cluster so gated models can be pulled without asking for a token again.
-                            Created as soon as you click Next.
+                            Required for every cluster -- Deploy/Evaluate default to reusing this secret on this
+                            cluster so gated models can be pulled without asking for a token again. Created as soon
+                            as you click Next.
                         </p>
                         <div className="space-y-4">
                             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
@@ -1252,21 +1230,15 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                             )}
                         </div>
                     </div>
-                    <Checkbox
-                        id="wizard-model-cache-enabled"
-                        checked={modelCacheEnabled}
-                        onChange={(event) => setModelCacheEnabled(event.target.checked)}
-                        label="Create a storage volume for model-cache on this cluster"
-                    />
-                    {modelCacheEnabled && (
-                        <div className="space-y-4 rounded-lg border border-slate-700/70 bg-slate-800/40 px-4 py-4">
-                            <div className="space-y-3">
-                                <Label>Storage volume</Label>
-                                <p className="text-[11px] leading-relaxed text-slate-400">
-                                    Same fields as the Storage page's manual "New storage volume" form -- there are
-                                    no default values, fill in everything below yourself.
-                                </p>
-                                <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                    <div className="space-y-4 rounded-lg border border-slate-700/70 bg-slate-800/40 px-4 py-4">
+                        <div className="space-y-3">
+                            <Label>Storage volume (required)</Label>
+                            <p className="text-[11px] leading-relaxed text-slate-400">
+                                A storage volume is created for every cluster using the same fields as the Storage
+                                page's manual "New storage volume" form -- there are no default values, fill in
+                                everything below yourself.
+                            </p>
+                            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                                     <div>
                                         <Label htmlFor="wizard-storage-kind">Type</Label>
                                         <Select id="wizard-storage-kind" value={storageKind} onChange={(event) => setStorageKind(event.target.value)}>
@@ -1333,8 +1305,7 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                                 )}
                             </div>
                         </div>
-                    )}
-                </div>
+                    </div>
                 </section>
             )}
 
@@ -1494,29 +1465,21 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                             padding="sm"
                             className="h-full shadow-none"
                             title={<PanelHeading icon={<Database size={14} />}>Model cache</PanelHeading>}
-                            actions={(
-                                <Badge tone={modelCacheEnabled ? 'info' : 'neutral'} size="xs">
-                                    {modelCacheEnabled ? 'Enabled' : 'Skipped'}
-                                </Badge>
-                            )}
+                            actions={<Badge tone="info" size="xs">Required</Badge>}
                         >
-                            {modelCacheEnabled ? (
-                                <dl className="divide-y divide-theme-border">
-                                    <ReviewRow label="Type">{STORAGE_KIND_LABEL[storageKind] || storageKind}</ReviewRow>
-                                    <ReviewRow label="Capacity" mono>{storageCapacity.trim() || '—'}</ReviewRow>
-                                    <ReviewRow label="Volume name" mono>{storageName.trim() || 'Auto-named'}</ReviewRow>
-                                    <ReviewRow label="Location" mono>
-                                        {storageKind === 'local-disk'
-                                            ? hostPath.trim() || '—'
-                                            : `${nfsServer.trim() || '—'}:${nfsPath.trim() || '—'}`}
-                                    </ReviewRow>
-                                    <ReviewRow label="Prewarm" mono>
-                                        {prewarmEnabled ? `${repoId.trim()}@${revision.trim()}` : 'No prewarm'}
-                                    </ReviewRow>
-                                </dl>
-                            ) : (
-                                <p className="text-xs text-theme-muted">No model cache storage will be created.</p>
-                            )}
+                            <dl className="divide-y divide-theme-border">
+                                <ReviewRow label="Type">{STORAGE_KIND_LABEL[storageKind] || storageKind}</ReviewRow>
+                                <ReviewRow label="Capacity" mono>{storageCapacity.trim() || '—'}</ReviewRow>
+                                <ReviewRow label="Volume name" mono>{storageName.trim() || 'Auto-named'}</ReviewRow>
+                                <ReviewRow label="Location" mono>
+                                    {storageKind === 'local-disk'
+                                        ? hostPath.trim() || '—'
+                                        : `${nfsServer.trim() || '—'}:${nfsPath.trim() || '—'}`}
+                                </ReviewRow>
+                                <ReviewRow label="Prewarm" mono>
+                                    {prewarmEnabled ? `${repoId.trim()}@${revision.trim()}` : 'No prewarm'}
+                                </ReviewRow>
+                            </dl>
                         </Panel>
                     </div>
 

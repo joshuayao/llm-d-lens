@@ -235,6 +235,7 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     RoutePermission("DELETE", "/api/v1/deployments/executions/{execution_id}", "deployment:execution:delete"),
     RoutePermission("GET", "/api/v1/deployments/executions/{execution_id}", "deployment:run:read"),
     RoutePermission("PATCH", "/api/v1/deployments/executions/{execution_id}", "deployment:execution:update"),
+    RoutePermission("POST", "/api/v1/deployments/executions/{execution_id}/scale", "deployment:execution:scale"),
     RoutePermission("POST", "/api/v1/deployments/executions/{execution_id}/endpoint", "deployment:execution:connect"),
     RoutePermission("GET", "/api/v1/deployments/executions/{execution_id}/pods", "deployment:run:read"),
     RoutePermission("GET", "/api/v1/deployments/executions/{execution_id}/pods/{pod_name}/logs", "deployment:run:read"),
