@@ -19,7 +19,7 @@ export function refreshSession() {
 }
 
 export function logout() {
-    return postJson('/api/v1/auth/logout', {});
+    return postJson('/api/v1/auth/logout', {}, { credentials: 'include' });
 }
 
 export function changePassword(oldPassword, newPassword) {

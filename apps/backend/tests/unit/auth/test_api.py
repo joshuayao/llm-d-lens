@@ -854,6 +854,26 @@ def test_refresh_exchanges_http_only_cookie_for_new_access_token():
         assert old.status_code == 200
 
 
+def test_refresh_uses_cookie_when_cookie_fallback_is_disabled():
+    set_settings_for_testing(
+        AuthSettings(
+            auth_mode="local",
+            session_ttl_seconds=3600,
+            session_idle_seconds=3600,
+            auto_seed_admin=False,
+            cookie_fallback=False,
+        )
+    )
+    with _client() as client:
+        _bootstrap_and_login(client)
+        assert client.get("/api/v1/auth/session").status_code == 401
+        refresh = client.post("/api/v1/auth/refresh", headers=_csrf_headers(client))
+        assert refresh.status_code == 200, refresh.text
+        token = refresh.json()["accessToken"]
+        session = client.get("/api/v1/auth/session", headers={"Authorization": f"Bearer {token}"})
+        assert session.status_code == 200
+
+
 def test_refresh_requires_csrf_for_cookie_based_exchange():
     with _client() as client:
         _login_with_access_token(client)

@@ -330,7 +330,7 @@ with LensLocal("<username>") as lens:
 | 方法 | 路径 | 权限 | 用途 |
 | --- | --- | --- | --- |
 | POST | `/api/v1/auth/login` | 公开 | 登录；返回访问令牌并设置刷新 Cookie。 |
-| POST | `/api/v1/auth/refresh` | 已认证 | 使用刷新 Cookie 和 CSRF 请求头获取新的访问令牌。 |
+| POST | `/api/v1/auth/refresh` | 公开，需刷新 Cookie 和 CSRF | 使用刷新 Cookie 和 CSRF 请求头获取新的访问令牌。 |
 | POST | `/api/v1/auth/logout` | 已认证 | 撤销当前会话（`204`）。 |
 | GET | `/api/v1/auth/session` | 已认证 | 读取当前 principal 和权限。 |
 | POST | `/api/v1/auth/password` | 已认证 | 修改自己的密码（`204`）。 |

@@ -5,9 +5,11 @@ from __future__ import annotations
 import importlib
 import inspect
 from types import SimpleNamespace
+from typing import Annotated
 from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
+from fastapi import Form, Header, Query
 from starlette.background import BackgroundTasks
 from starlette.requests import Request
 
@@ -218,8 +220,12 @@ def test_every_public_route_has_an_sdk_namespace(local_users):
     facades = [getattr(lens, name) for name in namespaces]
     for module_path in module_paths:
         module = importlib.import_module(module_path)
-        routers = [getattr(module, "router", None), getattr(module, "admin_router", None),
-                   getattr(module, "internal_router", None), getattr(module, "public_router", None)]
+        routers = [
+            getattr(module, "router", None),
+            getattr(module, "admin_router", None),
+            getattr(module, "internal_router", None),
+            getattr(module, "public_router", None),
+        ]
         for router in [r for r in routers if r is not None]:
             for route in router.routes:
                 endpoint = getattr(route, "endpoint", None)
@@ -271,7 +277,11 @@ def test_every_namespace_route_endpoint_is_exposed_and_checked(local_users):
                     assert callable(wrapper)
                     assert inspect.iscoroutinefunction(wrapper) == inspect.iscoroutinefunction(endpoint)
 
-                    injected = facade._with_http_context(endpoint, {})
+                    try:
+                        injected = facade._with_http_context(endpoint, {})
+                    except TypeError as error:
+                        assert "is required" in str(error)
+                        continue
                     for name, parameter in inspect.signature(endpoint).parameters.items():
                         if parameter.default is not inspect._empty:
                             continue
@@ -350,6 +360,40 @@ async def test_module_facade_exposes_only_route_endpoints(local_users):
         _ = lens.clusters.Query
 
 
+def test_http_context_resolves_field_info_defaults():
+    async def endpoint(
+        include_drafts: bool = Query(default=False),
+        limit: int = Query(default=20, ge=1),
+        token: str = Header(default=""),
+        name: str = Form(default=""),
+        volume_ids: Annotated[list[str], Query(default_factory=list)] = None,
+    ):
+        return include_drafts, limit, token, name, volume_ids
+
+    class FakeOwner:
+        def _context(self):
+            return context_manager()
+
+        def _require(self, permission):
+            return None
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def context_manager():
+        yield
+
+    module = local_sdk.LocalModule(FakeOwner(), "llm_d_lens.cluster.router")
+    injected = module._with_http_context(endpoint, {})
+    assert injected == {"include_drafts": False, "limit": 20, "token": "", "name": "", "volume_ids": []}
+
+    async def required(limit: int = Query(...)):
+        return limit
+
+    with pytest.raises(TypeError, match="limit is required"):
+        module._with_http_context(required, {})
+
+
 def test_http_context_injection():
     async def endpoint(request: Request, background: BackgroundTasks):
         return request, background
@@ -384,3 +428,5 @@ async def test_limited_user_is_forbidden(local_users):
         await lens.evaluation.benchmark_defaults()
     with pytest.raises(ForbiddenError):
         lens.deployments.list_executions()
+    with pytest.raises(ForbiddenError):
+        await lens.remote_request("/start", {})

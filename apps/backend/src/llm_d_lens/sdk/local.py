@@ -6,9 +6,11 @@ import importlib
 import inspect
 import os
 from functools import wraps
-from typing import Any
+from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
+from fastapi.params import FieldInfo
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic_core import PydanticUndefined
 from starlette.background import BackgroundTasks
 from starlette.requests import Request
 from starlette.responses import Response
@@ -188,13 +190,37 @@ class LocalModule:
 
     def _with_http_context(self, func, kwargs: dict[str, Any]) -> dict[str, Any]:
         injected = dict(kwargs)
+        try:
+            hints = get_type_hints(func, include_extras=True)
+        except Exception:  # pragma: no cover - defensive for unusual forward refs
+            hints = {}
         for name, parameter in inspect.signature(func).parameters.items():
-            if name in injected or parameter.default is not inspect._empty:
+            if name in injected:
                 continue
-            annotation = str(parameter.annotation)
-            if annotation in {"Request", "starlette.requests.Request", "fastapi.Request"}:
+            annotation = hints.get(name, parameter.annotation)
+            field_info = parameter.default if isinstance(parameter.default, FieldInfo) else None
+            if get_origin(annotation) is Annotated:
+                field_info = next(
+                    (item for item in get_args(annotation)[1:] if isinstance(item, FieldInfo)),
+                    field_info,
+                )
+            if field_info is not None:
+                if field_info.default is not PydanticUndefined:
+                    injected[name] = field_info.default
+                elif field_info.default_factory is not None:
+                    injected[name] = field_info.default_factory()
+                else:
+                    raise TypeError(f"{name} is required for {getattr(func, '__name__', 'SDK call')}")
+                continue
+            if parameter.default is not inspect._empty:
+                continue
+            annotation_name = getattr(annotation, "__name__", "") or str(annotation)
+            if annotation is Request or annotation_name in {"Request", "starlette.requests.Request", "fastapi.Request"}:
                 injected[name] = self._request()
-            elif annotation in {"BackgroundTasks", "starlette.background.BackgroundTasks"}:
+            elif annotation is BackgroundTasks or annotation_name in {
+                "BackgroundTasks",
+                "starlette.background.BackgroundTasks",
+            }:
                 injected[name] = BackgroundTasks()
         return injected
 
@@ -450,8 +476,15 @@ class LensLocal:
             "server": ("local", 0),
         }
         request = Request(scope, receive)
+        route_path = path if path.startswith("/api/") else f"/api/v1/remote-deploy{path}"
+        found, permission = resolve_route_permission("POST", route_path)
+        if not found:
+            raise ForbiddenError(f"{route_path} is not registered for authorization")
         with self._context():
-            self._require_authenticated()
+            if permission:
+                self._require(permission)
+            else:
+                self._require_authenticated()
             result = await remote_operation(request)
         if isinstance(result, JSONResponse):
             return LocalModule._normalize(json.loads(result.body), None)

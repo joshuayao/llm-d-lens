@@ -75,11 +75,18 @@ class LegacyConfigurationRoute(APIRoute):
         return legacy_handler
 
 
-legacy_router = APIRouter(
-    prefix="/api/v1/configurations",
-    route_class=LegacyConfigurationRoute,
-    include_in_schema=False,
-)
+def _legacy_post(path: str, **kwargs):
+    def decorator(func):
+        router.add_api_route(
+            path,
+            func,
+            methods=["POST"],
+            route_class_override=LegacyConfigurationRoute,
+            **kwargs,
+        )
+        return func
+
+    return decorator
 
 
 @contextmanager
@@ -110,7 +117,7 @@ async def capabilities() -> ConfigurationCapabilitiesResponse:
     return configuration_capabilities()
 
 
-@router.post(
+@_legacy_post(
     "/resolve",
     response_model=ResolveResponse,
     summary="Resolve source configurations into validated candidates.",
@@ -127,7 +134,7 @@ async def resolve(request: ResolveRequest) -> ResolveResponse:
         return await resolve_configurations(request)
 
 
-@router.post(
+@_legacy_post(
     "/render",
     response_model=RenderResponse,
     summary="Render a candidate into a deployable configuration.",
@@ -144,7 +151,7 @@ async def render(request: RenderRequest) -> RenderResponse:
         return render_configuration(request)
 
 
-@router.post(
+@_legacy_post(
     "/save",
     response_model=SaveResponse,
     summary="Publish a deployable configuration as a saved artifact.",
@@ -159,11 +166,6 @@ async def render(request: RenderRequest) -> RenderResponse:
 async def save(request: SaveRequest) -> SaveResponse:
     with _configuration_errors("Unable to save configuration", (ConfigurationError, OSError, ValueError)):
         return save_configuration(request)
-
-
-legacy_router.add_api_route("/resolve", resolve, methods=["POST"], response_model=ResolveResponse)
-legacy_router.add_api_route("/render", render, methods=["POST"], response_model=RenderResponse)
-legacy_router.add_api_route("/save", save, methods=["POST"], response_model=SaveResponse)
 
 
 def _artifact_cluster_id(artifact: ConfigurationArtifactRecord) -> str | None:

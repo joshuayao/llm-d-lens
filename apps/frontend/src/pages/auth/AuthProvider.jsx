@@ -32,14 +32,15 @@ export function AuthProvider({ children }) {
             applyAccessToken(data.accessToken);
             setPrincipal(data.principal);
             setStatus('authenticated');
-            return true;
+            return data;
         } catch {
-            return false;
+            return null;
         }
     }, [applyAccessToken]);
 
     const refresh = useCallback(async () => {
-        if (await refreshAccessToken()) return true;
+        const refreshed = await refreshAccessToken();
+        if (refreshed) return refreshed.principal;
         try {
             const data = await fetchSession();
             applyAccessToken('');

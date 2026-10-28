@@ -330,7 +330,7 @@ with LensLocal("<username>") as lens:
 | Method | Path | Permission | Purpose |
 | --- | --- | --- | --- |
 | POST | `/api/v1/auth/login` | Public | Sign in; returns an access token and sets the refresh cookie. |
-| POST | `/api/v1/auth/refresh` | Authenticated | Get a new access token using the refresh cookie and CSRF header. |
+| POST | `/api/v1/auth/refresh` | Public + refresh cookie + CSRF | Get a new access token using the refresh cookie and CSRF header. |
 | POST | `/api/v1/auth/logout` | Authenticated | Revoke the current session (`204`). |
 | GET | `/api/v1/auth/session` | Authenticated | Read the current principal and permissions. |
 | POST | `/api/v1/auth/password` | Authenticated | Change your own password (`204`). |

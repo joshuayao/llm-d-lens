@@ -15,7 +15,7 @@ from fastapi import APIRouter, Query, Request, Response
 
 from llm_d_lens.auth import master_key
 from llm_d_lens.auth.bootstrap import clear_initial_admin_credentials
-from llm_d_lens.auth.context import CSRF_COOKIE, SESSION_COOKIE, cookie_token_from_request
+from llm_d_lens.auth.context import CSRF_COOKIE, SESSION_COOKIE, _verify_csrf, cookie_token_from_request
 from llm_d_lens.auth.contracts import Principal
 from llm_d_lens.auth.models import (
     AccessGroupRoleBindingResponse,
@@ -194,6 +194,7 @@ async def login(body: LoginRequest, request: Request, response: Response) -> Log
 
 @router.post("/auth/refresh", response_model=RefreshResponse)
 async def refresh(request: Request) -> RefreshResponse:
+    _verify_csrf(request)
     token = cookie_token_from_request(request)
     result = default_service().refresh_access_token(token or "")
     return RefreshResponse(
@@ -722,6 +723,9 @@ async def rotate_secret_key(body: RotateSecretKeyRequest, request: Request) -> S
     service = default_service()
     actor = _principal(request)
     result = master_key.rotate_master_key(get_settings(), body.new_key, provider_dao=service.identity_provider_dao)
+    from llm_d_lens.auth.service import invalidate_access_token_keys_cache
+
+    invalidate_access_token_keys_cache()
     service.audit(
         "secret_key_rotated",
         actor=actor,
@@ -738,6 +742,9 @@ async def clear_old_secret_keys(request: Request) -> SecretKeyStatusResponse:
     service = default_service()
     actor = _principal(request)
     result = master_key.clear_old_keys(get_settings())
+    from llm_d_lens.auth.service import invalidate_access_token_keys_cache
+
+    invalidate_access_token_keys_cache()
     service.audit("secret_key_old_cleared", actor=actor, target_type="system", target_id="secret-key")
     result["providerSecretCount"] = _provider_secret_count(service)
     return SecretKeyStatusResponse.model_validate(result)

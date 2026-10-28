@@ -78,6 +78,12 @@ Start with the module that matches your task:
 - Field names in HTTP payloads are camelCase. Python models expose snake_case
   attributes and accept both names where aliases are defined.
 
+## Deprecated paths
+
+Old `/api/...` paths such as `/api/cluster`, `/api/simulation` and `/api/mcp`
+remain temporary aliases to `/api/v1/...` while clients migrate. `/healthz`
+remains available for process probes.
+
 ## Full schema
 
 The generated OpenAPI schema is the source of truth for every request and

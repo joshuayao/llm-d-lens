@@ -758,6 +758,9 @@ Two credentials are used:
 1. **Access token**
    - Short-lived signed JWT: default 30 minutes.
    - Claims: `iss`, `sub`, `sid`, `aud`, `authzVersion`, `iat`, `exp`.
+   - The JWT is a short-lived bearer pointer, not a stateless session: every
+     request also validates the server-side session and compares `authzVersion`
+     with the current principal version.
    - Sent as `Authorization: Bearer <access-token>`.
    - Stored by the Web UI in memory only; never in `localStorage`.
    - The Python API validates signature, issuer, audience, expiry and that the

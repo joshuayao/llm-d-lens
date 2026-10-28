@@ -239,7 +239,6 @@ class RefreshResponse(AuthModel):
 
 class SessionResponse(AuthModel):
     user_id: str
-    token_hash: str
     id: str
     created_at: IsoDatetime
     expires_at: IsoDatetime | None = None
@@ -253,7 +252,9 @@ class SessionResponse(AuthModel):
 
     @classmethod
     def from_record(cls, record: SessionRecord, *, username: str | None = None) -> SessionResponse:
-        return cls(username=username, **asdict(record))
+        data = asdict(record)
+        data.pop("token_hash", None)
+        return cls(username=username, **data)
 
 
 class UserGroupResponse(AuthModel):

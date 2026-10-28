@@ -32,6 +32,7 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 let accessToken = '';
 let unauthorizedHandler = null;
+let refreshPromise = null;
 
 /** Keep the short-lived Bearer token in memory; never persist it in storage. */
 export function setAuthToken(token) {
@@ -45,6 +46,46 @@ export function getAuthToken() {
 /** Register one refresh callback used to recover from a 401. */
 export function setUnauthorizedHandler(handler) {
     unauthorizedHandler = handler;
+}
+
+/** Share one refresh across all concurrent 401 responses. */
+export async function refreshAccessTokenOnce() {
+    if (typeof unauthorizedHandler !== 'function') return false;
+    if (!refreshPromise) {
+        refreshPromise = Promise.resolve()
+            .then(() => unauthorizedHandler())
+            .then((value) => Boolean(value))
+            .catch(() => false)
+            .finally(() => {
+                refreshPromise = null;
+            });
+    }
+    return refreshPromise;
+}
+
+/** Fetch a raw response (download/SSE) with one shared 401 refresh-and-retry. */
+export async function fetchWithAuthRetry(url, options = {}, { retryOnUnauthorized = true } = {}) {
+    const token = getAuthToken();
+    let headers = options.headers;
+    if (token) {
+        headers = new Headers(options.headers);
+        headers.set('Authorization', `Bearer ${token}`);
+    }
+    const response = await fetch(url, {
+        ...options,
+        headers,
+        credentials: options.credentials || (token ? 'omit' : 'include'),
+    });
+    if (response.status === 401 && token && retryOnUnauthorized) {
+        const refreshed = await refreshAccessTokenOnce();
+        if (refreshed) {
+            return fetchWithAuthRetry(url, options, { retryOnUnauthorized: false });
+        }
+        if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('prism:auth-expired'));
+        }
+    }
+    return response;
 }
 
 export async function requestJson(
@@ -76,7 +117,7 @@ export async function requestJson(
         && retryOnUnauthorized
         && typeof unauthorizedHandler === 'function'
     ) {
-        const refreshed = await unauthorizedHandler();
+        const refreshed = await refreshAccessTokenOnce();
         if (refreshed) {
             return requestJson(url, options, {
                 fallback,

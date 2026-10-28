@@ -63,6 +63,28 @@ def test_login_issues_short_lived_access_token_and_refresh_roundtrip():
     assert service.validate_access_token(refreshed.access_token) is not None
 
 
+def test_access_token_keys_are_cached_across_services(monkeypatch):
+    from llm_d_lens.auth import service as auth_service
+    from llm_d_lens.auth.master_key import MasterKey
+
+    auth_service.invalidate_access_token_keys_cache()
+    calls = 0
+
+    def fake_resolve(_settings):
+        nonlocal calls
+        calls += 1
+        return MasterKey(primary="cached-master", old=(), source="test")
+
+    monkeypatch.setattr(auth_service, "resolve_master_key", fake_resolve)
+    settings = AuthSettings(auth_mode="local", session_ttl_seconds=3600, session_idle_seconds=3600)
+    first = AuthService(settings)._access_token_keys()
+    second = AuthService(settings)._access_token_keys()
+    auth_service.invalidate_access_token_keys_cache()
+
+    assert first == second
+    assert calls == 1
+
+
 def test_access_token_is_rejected_after_session_revocation():
     service = _service()
     service.bootstrap_admin("root", STRONG)

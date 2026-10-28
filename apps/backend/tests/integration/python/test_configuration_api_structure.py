@@ -26,18 +26,23 @@ def test_shared_api_registers_configuration_router():
     assert client.post("/api/v1/configurations/save", json={}).status_code == 422
 
 
+def test_configuration_artifact_errors_keep_problem_json():
+    response = TestClient(app).get("/api/v1/configurations/artifacts/missing")
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("application/problem+json")
+    assert "error" not in response.json()
+
+
 def test_configuration_router_owns_domain_prefix():
     assert router.prefix == "/api/v1/configurations"
     assert compatibility_app is app
 
 
 @pytest.mark.parametrize("operation", ["resolve", "render", "save"])
-def test_legacy_configuration_validation_preserves_error_field(operation):
-    client = TestClient(app)
-    canonical = client.post(f"/api/v1/configurations/{operation}", json={})
-    legacy = client.post(f"/api/v1/configurations/{operation}", json={})
-    assert legacy.status_code == canonical.status_code == 422
-    assert legacy.json() == {**canonical.json(), "error": canonical.json()["detail"]}
+def test_configuration_validation_preserves_error_field(operation):
+    response = TestClient(app).post(f"/api/v1/configurations/{operation}", json={})
+    assert response.status_code == 422
+    assert response.json()["error"] == response.json()["detail"]
 
 
 def test_legacy_configuration_resolve_reuses_service(monkeypatch):

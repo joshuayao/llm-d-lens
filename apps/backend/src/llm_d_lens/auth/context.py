@@ -211,6 +211,7 @@ _PASSWORD_CHANGE_ALLOWED = {
     "/api/v1/auth/password",
     "/api/v1/auth/session",
     "/api/v1/auth/logout",
+    "/api/v1/auth/refresh",
 }
 
 

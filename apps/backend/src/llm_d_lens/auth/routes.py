@@ -48,6 +48,7 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     RoutePermission("GET", "/api/v1/mcp", ("mcp:tool:invoke", "playground:chat:use")),
     RoutePermission("DELETE", "/api/v1/mcp", ("mcp:tool:invoke", "playground:chat:use")),
     # --- public ---
+    RoutePermission("GET", "/api/v1/health", PUBLIC),
     RoutePermission("GET", "/api/health", PUBLIC),
     RoutePermission("GET", "/healthz", PUBLIC),
     RoutePermission("GET", "/api/v1/simulation/health", PUBLIC),
@@ -59,7 +60,7 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     RoutePermission("POST", "/api/v1/auth/login", PUBLIC),
     RoutePermission("POST", "/api/v1/auth/bootstrap", PUBLIC),
     # --- auth session ---
-    RoutePermission("POST", "/api/v1/auth/refresh", AUTHENTICATED),
+    RoutePermission("POST", "/api/v1/auth/refresh", PUBLIC),
     RoutePermission("POST", "/api/v1/auth/logout", AUTHENTICATED),
     RoutePermission("GET", "/api/v1/auth/session", AUTHENTICATED),
     RoutePermission("POST", "/api/v1/auth/password", AUTHENTICATED),

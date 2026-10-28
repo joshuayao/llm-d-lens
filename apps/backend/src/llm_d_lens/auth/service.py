@@ -8,6 +8,7 @@ Session directly. Design references: sections 5, 7 and 8.
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -73,6 +74,13 @@ SHARE_RESOURCE_TYPES = frozenset({"model_service_group"})
 
 
 _EPHEMERAL_ACCESS_SECRET = generate_session_token()
+_ACCESS_TOKEN_KEY_CACHE: tuple[tuple[object, ...], tuple[str, ...]] | None = None
+logger = logging.getLogger(__name__)
+
+
+def invalidate_access_token_keys_cache() -> None:
+    global _ACCESS_TOKEN_KEY_CACHE
+    _ACCESS_TOKEN_KEY_CACHE = None
 
 
 @dataclass(frozen=True)
@@ -485,15 +493,32 @@ class AuthService:
         self.user_dao.save(user)
 
     def _access_token_keys(self) -> tuple[str, ...]:
+        global _ACCESS_TOKEN_KEY_CACHE
+        signature = (
+            self.settings.access_token_secret,
+            self.settings.old_access_token_secrets,
+            self.settings.secret_key,
+            self.settings.old_secret_keys,
+        )
+        if _ACCESS_TOKEN_KEY_CACHE is not None and _ACCESS_TOKEN_KEY_CACHE[0] == signature:
+            return _ACCESS_TOKEN_KEY_CACHE[1]
         configured = (self.settings.access_token_secret or "").strip()
         if configured:
-            return (configured, *self.settings.old_access_token_secrets)
-        master = resolve_master_key(self.settings)
-        if master.primary:
-            current = hashlib.sha256(f"lens-access-token:{master.primary}".encode()).hexdigest()
-            old = tuple(hashlib.sha256(f"lens-access-token:{key}".encode()).hexdigest() for key in master.old)
-            return (current, *old)
-        return (_EPHEMERAL_ACCESS_SECRET,)
+            keys = (configured, *self.settings.old_access_token_secrets)
+        else:
+            master = resolve_master_key(self.settings)
+            if master.primary:
+                current = hashlib.sha256(f"lens-access-token:{master.primary}".encode()).hexdigest()
+                old = tuple(hashlib.sha256(f"lens-access-token:{key}".encode()).hexdigest() for key in master.old)
+                keys = (current, *old)
+            else:
+                logger.warning(
+                    "Using a process-local ephemeral access-token key. Configure "
+                    "LENS_AUTH_JWT_SECRET or LENS_SECRET_KEY so tokens work across workers."
+                )
+                keys = (_EPHEMERAL_ACCESS_SECRET,)
+        _ACCESS_TOKEN_KEY_CACHE = (signature, keys)
+        return keys
 
     def _issue_access_token(self, principal: Principal, session_id: str) -> tuple[str, int]:
         return encode_access_token(
@@ -526,6 +551,7 @@ class AuthService:
             )
         )
         self._enforce_session_limit(user, token=token, ip=ip)
+        user = self.user_dao.get(user.id) or user
         self.audit("login", actor=user, ip=ip)
         principal = self.principal_for(user)
         access_token, expires_in = self._issue_access_token(principal, session.id)
@@ -551,8 +577,8 @@ class AuthService:
         if current is None:
             return
         superseded = self.session_dao.revoke_user_sessions(user.id, keep_session_id=current.id)
-        self.user_dao.bump_principal_version(user.id)
         if superseded:
+            self.user_dao.bump_principal_version(user.id)
             self.audit(
                 "session_revoked",
                 actor=user,
@@ -614,7 +640,10 @@ class AuthService:
         user = self._valid_session_user(session)
         if user is None or user.id != claims["sub"]:
             return None
-        return self.principal_for(user), session.id
+        principal = self.principal_for(user)
+        if int(claims.get("authzVersion", -1)) != principal.authz_version:
+            return None
+        return principal, session.id
 
     def refresh_access_token(self, raw_refresh_token: str) -> AccessTokenResult:
         if not raw_refresh_token:

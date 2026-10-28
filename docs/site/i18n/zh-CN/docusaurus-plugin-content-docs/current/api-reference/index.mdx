@@ -77,6 +77,11 @@ SDK 只用于运行在 Lens 主机上的代码。调用方在远程主机，或�
 - HTTP 字段使用 camelCase；Python 模型使用 snake_case 属性，并在定义了别名时
   同时接受两种写法。
 
+## 已弃用路径
+
+旧的 `/api/...` 路径，例如 `/api/cluster`、`/api/simulation` 和 `/api/mcp`，
+在客户端迁移期间仍作为 `/api/v1/...` 的临时别名保留。`/healthz` 继续用于进程探针。
+
 ## 完整 schema
 
 生成的 OpenAPI schema 是请求/响应字段的最终来源：

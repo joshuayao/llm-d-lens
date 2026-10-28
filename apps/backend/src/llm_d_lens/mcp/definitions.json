@@ -1906,6 +1906,7 @@
     "GET /api/v1/cluster-overview/sessions/{session_id}",
     "GET /api/v1/cluster/sessions/{session_id}",
     "GET /api/health",
+    "GET /api/v1/health",
     "GET /api/v1/audit-logs",
     "GET /api/v1/auth/permissions",
     "GET /api/v1/auth/providers",
