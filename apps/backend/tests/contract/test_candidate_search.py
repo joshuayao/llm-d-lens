@@ -96,7 +96,9 @@ def test_manual_yaml_preserves_chosen_and_replica_inference(monkeypatch):
 
 
 def test_unknown_sources_are_ignored():
-    assert TestClient(app).post("/api/v1/candidate-search", json={"sourceIds": ["unknown"]}).json() == {"candidates": []}
+    assert TestClient(app).post("/api/v1/candidate-search", json={"sourceIds": ["unknown"]}).json() == {
+        "candidates": []
+    }
 
 
 @pytest.mark.parametrize("field", ["concurrency", "request_rate"])
