@@ -15,7 +15,7 @@ import pytest
 import llm_d_lens.infrastructure.hostos as hostos
 from llm_d_lens.infrastructure.hostos import Host, SupportStatus
 from llm_d_lens.infrastructure.hostos import __main__ as cli
-from llm_d_lens.infrastructure.hostos.facts import HostFacts
+from llm_d_lens.infrastructure.hostos.facts import HostFacts, detect_facts
 from llm_d_lens.infrastructure.hostos.systems import UBUNTU
 
 FACTS = HostFacts(
@@ -29,6 +29,16 @@ FACTS = HostFacts(
     in_wsl=False,
 )
 HOST = Host(FACTS, UBUNTU)
+WINDOWS_FACTS = HostFacts(
+    family="windows",
+    arch="amd64",
+    machine="AMD64",
+    distro_id="windows",
+    version="22631",
+    pretty_name="Windows",
+    in_container=False,
+    in_wsl=False,
+)
 
 
 def _use(monkeypatch, host):
@@ -75,6 +85,48 @@ def test_info_text(monkeypatch, capsys):
     assert "installer: LensInstaller-Ubuntu-x86_64-online.sh" in output
     assert "supported: True" in output
     assert "capability.cluster-bootstrap: True" in output
+
+
+def test_info_succeeds_when_container_marker_is_inaccessible(monkeypatch, capsys, tmp_path):
+    release = tmp_path / "etc" / "os-release"
+    release.parent.mkdir(parents=True)
+    release.write_text('ID=ubuntu\nVERSION_ID="22.04"\n', encoding="utf-8")
+    blocked = tmp_path / ".dockerenv"
+    original_exists = Path.exists
+
+    def exists(path):
+        if path == blocked:
+            raise PermissionError(path)
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", exists)
+    monkeypatch.setattr(
+        cli,
+        "current_host",
+        lambda: Host(detect_facts(sys_platform="linux", machine="x86_64", root=tmp_path), None),
+    )
+    assert cli.main(["info"]) == 0
+    assert "distro_id: ubuntu" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["port-in-use", "1"],
+        ["free-port", "3000"],
+        ["port-owner", "22"],
+        ["lan-ip"],
+        ["tool-platform", "--style", "go"],
+        ["packages", "missing"],
+    ],
+)
+def test_unsupported_operation_returns_one(monkeypatch, capsys, arguments):
+    monkeypatch.setattr(hostos.os, "name", "nt")
+    _use(monkeypatch, Host(WINDOWS_FACTS, None))
+    assert cli.main(arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "is not supported" in captured.err
 
 
 def test_packages_missing(monkeypatch, capsys):

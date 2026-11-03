@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import platform
 from pathlib import Path
 
@@ -110,6 +111,40 @@ def test_detect_container_containerenv(tmp_path):
     (tmp_path / "run").mkdir()
     (tmp_path / "run" / ".containerenv").touch()
     assert detect_facts(sys_platform="linux", machine="x86_64", root=tmp_path).in_container
+
+
+@pytest.mark.parametrize("marker", [".dockerenv", "run/.containerenv"])
+def test_detect_inaccessible_container_marker_is_absent(monkeypatch, tmp_path, marker):
+    _release(tmp_path, 'ID=ubuntu\nVERSION_ID="22.04"\nPRETTY_NAME="Ubuntu 22.04.4 LTS"\n')
+    blocked = tmp_path / marker
+    original_exists = Path.exists
+
+    def exists(path):
+        if path == blocked:
+            raise PermissionError(path)
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", exists)
+    facts = detect_facts(sys_platform="linux", machine="x86_64", root=tmp_path)
+    assert facts.distro_id == "ubuntu"
+    assert facts.version == "22.04"
+    assert facts.in_container is False
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="needs a non-root POSIX user")
+def test_detect_unsearchable_run_directory_is_absent(tmp_path):
+    _release(tmp_path, 'ID=ubuntu\nVERSION_ID="22.04"\nPRETTY_NAME="Ubuntu 22.04.4 LTS"\n')
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / ".containerenv").touch()
+    run.chmod(0o000)
+    try:
+        facts = detect_facts(sys_platform="linux", machine="x86_64", root=tmp_path)
+    finally:
+        run.chmod(0o700)
+    assert facts.distro_id == "ubuntu"
+    assert facts.version == "22.04"
+    assert facts.in_container is False
 
 
 def test_detect_container_cgroup(tmp_path):

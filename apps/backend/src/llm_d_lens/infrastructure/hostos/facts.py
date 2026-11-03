@@ -76,6 +76,13 @@ def _read_text(path: Path) -> str:
         return ""
 
 
+def _path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
 def _read_os_release(root: Path) -> dict[str, str]:
     for relative in ("etc/os-release", "usr/lib/os-release"):
         text = _read_text(root / relative)
@@ -85,7 +92,7 @@ def _read_os_release(root: Path) -> dict[str, str]:
 
 
 def _container_markers(root: Path) -> bool:
-    if (root / ".dockerenv").exists() or (root / "run" / ".containerenv").exists():
+    if _path_exists(root / ".dockerenv") or _path_exists(root / "run" / ".containerenv"):
         return True
     cgroup = _read_text(root / "proc" / "1" / "cgroup").lower()
     return any(marker in cgroup for marker in _CONTAINER_CGROUP_MARKERS)

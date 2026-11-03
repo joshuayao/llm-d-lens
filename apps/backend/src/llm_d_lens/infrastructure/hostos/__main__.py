@@ -1,4 +1,10 @@
-"""Command line for shell callers: ``python -m llm_d_lens.infrastructure.hostos``."""
+"""Command line for shell callers: ``python -m llm_d_lens.infrastructure.hostos``.
+
+Exit codes: ``0`` success or true; ``1`` false, failed, or unsupported on this
+host (stderr explains an unsupported operation); ``2`` usage or internal error.
+Predicate commands such as ``port-in-use`` and ``check`` use ``1`` for both
+false and unsupported, so shell callers must gate on ``check`` first.
+"""
 
 from __future__ import annotations
 
@@ -97,26 +103,22 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command == "packages":
-        try:
-            if args.packages_command == "missing":
-                for package in host.missing_packages():
-                    print(package)
-                return 0
-            if args.packages_command == "show":
-                problem = host.package_install_problem(args.packages)
-                if problem is not None:
-                    print(problem, file=sys.stderr)
-                    return 1
-                commands = host.package_commands(args.packages)
-                print(" && ".join(shlex.join(command) for command in commands))
-                return 0
-            if args.packages_command == "install":
-                return host.install_packages(args.packages)
-            print(host.install_hint(args.packages))
+        if args.packages_command == "missing":
+            for package in host.missing_packages():
+                print(package)
             return 0
-        except UnsupportedHostOperation as error:
-            print(error, file=sys.stderr)
-            return 1
+        if args.packages_command == "show":
+            problem = host.package_install_problem(args.packages)
+            if problem is not None:
+                print(problem, file=sys.stderr)
+                return 1
+            commands = host.package_commands(args.packages)
+            print(" && ".join(shlex.join(command) for command in commands))
+            return 0
+        if args.packages_command == "install":
+            return host.install_packages(args.packages)
+        print(host.install_hint(args.packages))
+        return 0
 
     if args.command == "port-in-use":
         return 0 if host.port_in_use(args.port) else 1
@@ -148,6 +150,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         return _run(args)
+    except UnsupportedHostOperation as error:
+        print(error, file=sys.stderr)
+        return 1
     except Exception as error:  # noqa: BLE001 - CLI boundary maps unexpected errors to exit 2
         print(error, file=sys.stderr)
         return 2
