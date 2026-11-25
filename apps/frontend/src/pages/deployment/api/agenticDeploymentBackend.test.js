@@ -219,6 +219,7 @@ test('deploymentPermissionPayload builds expected preflight and verify request f
         manifest: 'apiVersion: apps/v1\nkind: Deployment',
         namespaceLabels: { 'aibom.k8saibom.dev/enabled': 'true' },
         agenticDeploymentRunId: 'run-42',
+        preparedPlanId: 'plan-99',
         deploymentName: 'qwen-prod',
         providerRef: 'optimized-baseline',
         storageVolumeId: 'vol-1',
@@ -231,6 +232,7 @@ test('deploymentPermissionPayload builds expected preflight and verify request f
         manifest: 'apiVersion: apps/v1\nkind: Deployment',
         namespace_labels: { 'aibom.k8saibom.dev/enabled': 'true' },
         agentic_deployment_run_id: 'run-42',
+        prepared_plan_id: 'plan-99',
         deployment_name: 'qwen-prod',
         provider_ref: 'optimized-baseline',
         storage_volume_id: 'vol-1',
@@ -238,6 +240,7 @@ test('deploymentPermissionPayload builds expected preflight and verify request f
         subject_override: { kind: 'ServiceAccount', name: 'lens-edit', namespace: 'lens-edit' },
         expected_digest: 'abc123',
     });
+    assert.equal('prepared_plan_id' in deploymentPermissionPayload({ clusterId: 'cluster-1' }), false);
 });
 
 test('deployment permission and cleanup endpoints POST with CSRF and JSON bodies', async (t) => {
@@ -310,5 +313,6 @@ test('parseDeploymentCleanupHandoff and setup error helpers match exact 403/409 
     assert.equal(parseDeploymentCleanupHandoff({ status: 500, code: 'deployment_cleanup_permission_denied' }), null);
     assert.equal(isDeploymentAdminSetupError({ status: 403, code: 'deployment_admin_setup_required' }), true);
     assert.equal(isDeploymentAdminSetupError({ status: 409, body: { code: 'deployment_admin_setup_required' } }), true);
+    assert.equal(isDeploymentAdminSetupError({ status: 403, body: { detail: { code: 'deployment_admin_setup_required' } } }), true);
     assert.equal(isDeploymentAdminSetupError({ status: 403, code: 'forbidden' }), false);
 });

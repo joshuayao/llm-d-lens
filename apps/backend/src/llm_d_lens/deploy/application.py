@@ -79,6 +79,79 @@ def _deploy_accelerator(run) -> str | None:
     return None
 
 
+def single_case_namespace_lookup(request, case) -> tuple[str | None, str | None]:
+    """Return (agentic_deployment_run_id, deployment_name) for a single-case run."""
+    case_prov = case.create_request.provenance or {}
+    agentic_run_id = request.provenance.get("agentic_deployment_run_id") or case_prov.get("agentic_deployment_run_id")
+    deployment_name = (
+        request.provenance.get("deployment_name")
+        or case_prov.get("deployment_name")
+        or (case.create_request.deployment_policy.value or {}).get("deployment_name")
+    )
+    return (
+        str(agentic_run_id) if agentic_run_id else None,
+        str(deployment_name) if deployment_name else None,
+    )
+
+
+async def resolve_bootstrapped_target_namespace(cluster_id: str, request, case) -> str | None:
+    """Validate an explicit target_namespace and confirm its cluster bootstrap marker."""
+    from llm_d_lens.deploy import capabilities
+
+    case_prov = case.create_request.provenance or {}
+    requested_ns = request.provenance.get("target_namespace") or case_prov.get("target_namespace")
+    if isinstance(requested_ns, str) and requested_ns.strip():
+        validated_ns = capabilities.validate_deployment_namespace(requested_ns.strip(), cluster_id=cluster_id)
+        if await capabilities.is_bootstrap_marker_present(cluster_id, validated_ns):
+            return validated_ns
+    return None
+
+
+def ensure_namespace_not_used_by_active_execution(store, namespace: str) -> None:
+    """Reject reusing a verified namespace that already belongs to an active execution."""
+    list_executions = getattr(store, "list_executions", None)
+    if not callable(list_executions):
+        return
+    active_owner = next(
+        (
+            execution
+            for execution in list_executions()
+            if execution.namespace == namespace
+            and execution.status not in {DeploymentStatus.CLEANED, DeploymentStatus.CLEANED_UP}
+        ),
+        None,
+    )
+    if active_owner is not None:
+        raise ValueError(
+            f"target namespace '{namespace}' is already used by an active deployment ({active_owner.execution_id})"
+        )
+
+
+def bind_single_case_target_namespace(run, case, verified_ns: str | None) -> None:
+    """Bind a verified target namespace onto a single-case run, or strip unverified ones."""
+    if verified_ns:
+        run.provenance["target_namespace"] = verified_ns
+        policy_value = dict(case.create_request.deployment_policy.value or {})
+        policy_value["namespace_policy"] = {"exact": verified_ns}
+        case.create_request.deployment_policy.value = policy_value
+        if case.create_request.provenance is None:
+            case.create_request.provenance = {}
+        case.create_request.provenance["target_namespace"] = verified_ns
+    else:
+        run.provenance.pop("target_namespace", None)
+        if case.create_request.provenance is not None:
+            case.create_request.provenance.pop("target_namespace", None)
+        policy_value = dict(case.create_request.deployment_policy.value or {})
+        ns_policy = policy_value.get("namespace_policy")
+        if isinstance(ns_policy, dict) and "exact" in ns_policy:
+            sanitized = {key: value for key, value in ns_policy.items() if key != "exact"}
+            if sanitized:
+                policy_value["namespace_policy"] = sanitized
+            else:
+                policy_value.pop("namespace_policy", None)
+            case.create_request.deployment_policy.value = policy_value
+
+
 class DeploymentRunManager:
     """Compose Deploy storage, runtime selection, and background scheduling."""
 
@@ -159,26 +232,11 @@ class DeploymentRunManager:
         agentic_run_id_str: str | None = None
         deployment_name_str: str | None = None
         if len(run.cases) == 1:
-            from llm_d_lens.deploy.capabilities import (
-                consume_verified_namespace,
-                is_bootstrap_marker_present,
-                record_verified_namespace,
-                validate_deployment_namespace,
-            )
+            from llm_d_lens.deploy import capabilities
 
             case = run.cases[0]
-            case_prov = case.create_request.provenance or {}
-            agentic_run_id = request.provenance.get("agentic_deployment_run_id") or case_prov.get(
-                "agentic_deployment_run_id"
-            )
-            deployment_name = (
-                request.provenance.get("deployment_name")
-                or case_prov.get("deployment_name")
-                or (case.create_request.deployment_policy.value or {}).get("deployment_name")
-            )
-            agentic_run_id_str = str(agentic_run_id) if agentic_run_id else None
-            deployment_name_str = str(deployment_name) if deployment_name else None
-            consumed_ns = consume_verified_namespace(
+            agentic_run_id_str, deployment_name_str = single_case_namespace_lookup(request, case)
+            consumed_ns = capabilities.consume_verified_namespace(
                 session.server_id,
                 owner_user_id=owner_user_id,
                 agentic_deployment_run_id=agentic_run_id_str,
@@ -189,37 +247,10 @@ class DeploymentRunManager:
             if len(run.cases) == 1:
                 verified_ns = consumed_ns
                 if verified_ns is None:
-                    requested_ns = request.provenance.get("target_namespace") or case_prov.get("target_namespace")
-                    if isinstance(requested_ns, str) and requested_ns.strip():
-                        validated_ns = validate_deployment_namespace(
-                            requested_ns.strip(), cluster_id=session.server_id
-                        )
-                        if await is_bootstrap_marker_present(session.server_id, validated_ns):
-                            verified_ns = validated_ns
+                    verified_ns = await resolve_bootstrapped_target_namespace(session.server_id, request, case)
                 if verified_ns:
-                    active_owner = next(
-                        (
-                            execution
-                            for execution in self.store.list_executions()
-                            if execution.namespace == verified_ns
-                            and execution.status not in {DeploymentStatus.CLEANED, DeploymentStatus.CLEANED_UP}
-                        ),
-                        None,
-                    )
-                    if active_owner is not None:
-                        raise ValueError(
-                            f"target namespace '{verified_ns}' is already used by an active deployment "
-                            f"({active_owner.execution_id})"
-                        )
-                    run.provenance["target_namespace"] = verified_ns
-                    policy_value = dict(case.create_request.deployment_policy.value or {})
-                    policy_value["namespace_policy"] = {"exact": verified_ns}
-                    case.create_request.deployment_policy.value = policy_value
-                    case.create_request.provenance["target_namespace"] = verified_ns
-                else:
-                    run.provenance.pop("target_namespace", None)
-                    if case.create_request.provenance is not None:
-                        case.create_request.provenance.pop("target_namespace", None)
+                    ensure_namespace_not_used_by_active_execution(self.store, verified_ns)
+                bind_single_case_target_namespace(run, case, verified_ns)
             run = self.store.create_run(run)
             if owner_user_id:
                 from llm_d_lens.db.dao.deployment_batch import DeploymentBatchDao
@@ -229,7 +260,7 @@ class DeploymentRunManager:
             self._run_workers[run.id] = worker
         except BaseException:
             if consumed_ns:
-                record_verified_namespace(
+                capabilities.record_verified_namespace(
                     session.server_id,
                     consumed_ns,
                     owner_user_id=owner_user_id,

@@ -42,9 +42,15 @@ from llm_d_lens.configuration.manifest_facts import validate_manifest_facts
 from llm_d_lens.configuration.models import ModelSecretConfiguration
 from llm_d_lens.configuration.plan_models import DeploymentRequirements, OptimizationDecision
 from llm_d_lens.deploy.application import deployment_run_manager
+from llm_d_lens.deploy.capabilities import (
+    DeploymentAdminSetupRequiredError,
+    DeploymentCapabilityUnavailableError,
+    DeploymentClusterAuthError,
+)
 from llm_d_lens.deploy.contracts import DeployableConfiguration, DeploymentRunCreateRequest, RuntimeBinding
 from llm_d_lens.deploy.providers.hardware_profile import cluster_accelerator, resolve_cluster_vllm_image
 from llm_d_lens.deploy.providers.target_node import validate_placement
+from llm_d_lens.deploy.slice_capacity import ClusterInventoryAuthError
 from llm_d_lens.estimate_tools.aic.models import DEFAULT_INPUT_TOKENS, DEFAULT_OUTPUT_TOKENS, AICEstimateRequest
 from llm_d_lens.estimate_tools.aic.service import AICError, estimate
 from llm_d_lens.infrastructure.artifacts.manifests import configuration_checksum, text_checksum
@@ -2040,7 +2046,6 @@ class AgenticDeploymentService:
             node_inventory_restricted = False
             if not nodes:
                 from llm_d_lens.deploy.slice_capacity import (
-                    ClusterInventoryAuthError,
                     ClusterInventoryForbiddenError,
                     fetch_cluster_nodes_and_pods,
                 )
@@ -2177,6 +2182,13 @@ class AgenticDeploymentService:
             )
             if review is not None:
                 return review
+        except (
+            DeploymentAdminSetupRequiredError,
+            DeploymentCapabilityUnavailableError,
+            DeploymentClusterAuthError,
+            ClusterInventoryAuthError,
+        ):
+            raise
         except (Exception, asyncio.CancelledError):
             run.status = AgenticDeploymentStatus.FAILED
             run.error = "Deployment submission did not complete; verify deployment runs before creating a new plan."

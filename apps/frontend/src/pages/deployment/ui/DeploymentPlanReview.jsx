@@ -353,6 +353,7 @@ export function DeploymentPermissionHandoff({
     onCopyScript,
     onPrimaryAction,
     primaryActionLabel,
+    onDismiss,
     confirmed = false,
     onConfirmChange,
     onConfirmDelete,
@@ -690,6 +691,16 @@ export function DeploymentPermissionHandoff({
                     >
                         <RefreshCw size={13} aria-hidden="true" /> {primaryLabel}
                     </Button>
+                    {onDismiss && (
+                        <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={onDismiss}
+                            disabled={activeBusy}
+                        >
+                            Dismiss
+                        </Button>
+                    )}
                 </div>
 
                 <FormError message={error || localError} />

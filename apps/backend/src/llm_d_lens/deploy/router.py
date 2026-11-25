@@ -8,7 +8,7 @@ import logging
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from llm_d_lens.api.problems import problem
@@ -23,6 +23,7 @@ from llm_d_lens.auth.access import (
 from llm_d_lens.db.dao.deployment_batch import DeploymentBatchDao
 from llm_d_lens.deploy.application import deployment_run_manager
 from llm_d_lens.deploy.capabilities import (
+    DeploymentAdminSetupRequiredError,
     DeploymentBootstrapVerifyRequest,
     DeploymentCapabilityUnavailableError,
     DeploymentCapabilityValidationError,
@@ -408,6 +409,27 @@ async def _validate_cluster_placement(placement: dict | None, cluster_id: str | 
             raise ValueError("selected node label is not present in the cluster")
 
 
+def _create_run_target_cluster_ids(request: DeploymentRunCreateRequest, owner_user_id: str | None) -> list[str]:
+    cluster_ids: list[str] = []
+    if request.prepared_plan_id:
+        from llm_d_lens.db.dao.deployment_plan import DeploymentPlanDao
+
+        plan = DeploymentPlanDao().get(request.prepared_plan_id)
+        if plan is not None and plan.owner_user_id == owner_user_id and plan.cluster_id:
+            cluster_ids.append(plan.cluster_id)
+    session_id = request.provenance.get("cluster_session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        from llm_d_lens.cluster.sessions import get_session
+
+        session = get_session(session_id)
+        if session is not None and session.server_id and session.server_id not in cluster_ids:
+            cluster_ids.append(session.server_id)
+    raw_server_id = request.provenance.get("cluster_server_id")
+    if isinstance(raw_server_id, str) and raw_server_id.strip() and raw_server_id.strip() not in cluster_ids:
+        cluster_ids.append(raw_server_id.strip())
+    return cluster_ids
+
+
 @router.post(
     "/runs",
     summary="Start a deployment run from one or more already-rendered deployable configurations.",
@@ -424,11 +446,17 @@ async def _validate_cluster_placement(placement: dict | None, cluster_id: str | 
 )
 async def create_run(request: DeploymentRunCreateRequest, http_request: Request = None):
     try:
+        principal = current_principal(http_request)
+        owner_user_id = owner_for_create(principal)
+        for target_cluster_id in _create_run_target_cluster_ids(request, owner_user_id):
+            require_cluster_access(principal, target_cluster_id)
         placement = request.runtime_binding.placement if request.runtime_binding else None
         await _validate_cluster_placement(placement, request.provenance.get("cluster_server_id"), http_request)
-        return await deployment_run_manager.start_run(
-            request, owner_user_id=owner_for_create(current_principal(http_request))
-        )
+        return await deployment_run_manager.start_run(request, owner_user_id=owner_user_id)
+    except DeploymentAdminSetupRequiredError as error:
+        return JSONResponse(status_code=403, content=error.to_response_payload())
+    except DeploymentCapabilityUnavailableError as error:
+        return problem(503, "Cluster permission check unavailable", str(error), error.code)
     except Exception as error:
         if _is_cluster_auth_error(error):
             return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
@@ -1634,9 +1662,10 @@ async def generate_deployment_permission_remediation(
     http_request: Request = None,
 ):
     """Render an idempotent Orchestration administrator bash script for the deployment namespace."""
-    require_cluster_access(current_principal(http_request), body.cluster_id)
+    principal = current_principal(http_request)
+    require_cluster_access(principal, body.cluster_id)
     try:
-        return await generate_deployment_bootstrap_script(body)
+        return await generate_deployment_bootstrap_script(body, owner_user_id=owner_for_create(principal))
     except DeploymentClusterAuthError as error:
         return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
     except DeploymentCapabilityValidationError as error:

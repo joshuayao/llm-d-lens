@@ -188,6 +188,7 @@ export function deploymentPermissionPayload({
     manifest = '',
     namespaceLabels = null,
     agenticDeploymentRunId = null,
+    preparedPlanId = null,
     deploymentName = null,
     providerRef = null,
     storageVolumeId = null,
@@ -205,6 +206,7 @@ export function deploymentPermissionPayload({
         ...(manifest ? { manifest } : {}),
         ...(hasLabels ? { namespace_labels: namespaceLabels } : {}),
         ...(agenticDeploymentRunId ? { agentic_deployment_run_id: agenticDeploymentRunId } : {}),
+        ...(preparedPlanId ? { prepared_plan_id: preparedPlanId } : {}),
         ...(deploymentName ? { deployment_name: deploymentName } : {}),
         ...(providerRef ? { provider_ref: providerRef } : {}),
         ...(storageVolumeId ? { storage_volume_id: storageVolumeId } : {}),
@@ -234,7 +236,7 @@ export function verifyDeploymentCleanup(executionId, payload = {}) {
 }
 
 export function isDeploymentAdminSetupError(error) {
-    const code = error?.code || error?.body?.code || '';
+    const code = error?.code || error?.body?.code || error?.body?.detail?.code || '';
     return (error?.status === 403 || error?.status === 409) && code === 'deployment_admin_setup_required';
 }
 

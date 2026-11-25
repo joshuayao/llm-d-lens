@@ -25,6 +25,13 @@ import { listModelCacheEntries } from "../../model-cache";
 import { loadCluster, loadClusterOverview, loadClusters, selectCluster } from "../../optimization";
 import { deleteConfigurationArtifact, loadConfigurationArtifacts, loadConfigurationCapabilities, saveConfiguration } from "../../optimization";
 import { startLocalDeployment, prepareLocalDeployment, executePreparedDeployment, deploymentRequiresReview } from "../../optimization";
+import { DeploymentPermissionHandoff } from "../../deployment/ui/DeploymentPlanReview";
+import {
+    deploymentPermissionPayload,
+    generateDeploymentBootstrapScript,
+    isDeploymentAdminSetupError,
+    verifyDeploymentBootstrap,
+} from "../../deployment/api/agenticDeploymentBackend";
 import { listModelNames } from "../../model-service";
 import { loadGuideCatalog } from "../../optimization";
 import { createBenchmarkRun, createEvaluation, confirmEvaluationPlans, evaluationPlanReview } from "../model/client";
@@ -283,7 +290,20 @@ export function SliceDeploymentPreview({ preview, preflight }) {
     </section>;
 }
 
-export function DeploymentPlanReview({ preparedReview, busy, error, acknowledgeUnknown, setAcknowledgeUnknown, onClose, onConfirm }) {
+export function DeploymentPlanReview({
+    preparedReview,
+    busy,
+    error,
+    acknowledgeUnknown,
+    setAcknowledgeUnknown,
+    onClose,
+    onConfirm,
+    adminHandoff = null,
+    onVerifyBootstrap,
+    onRegenerateBootstrap,
+    onSubjectOverrideChange,
+    onDismissAdminHandoff,
+}) {
     const plan = preparedReview?.plan;
     const checksRef = useRef(null);
     useEffect(() => {
@@ -311,9 +331,32 @@ export function DeploymentPlanReview({ preparedReview, busy, error, acknowledgeU
                 <code className="block break-all text-xs">{item.manifestChecksum}</code><code className="block break-all text-xs">{item.chartChecksum}</code>
             </section>)}
             </details>
-            {plan.preflight.status === 'unknown' && <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={acknowledgeUnknown} onChange={event => setAcknowledgeUnknown(event.target.checked)} />I accept the listed unverified constraints and the absence of a resource reservation.</label>}
+            {adminHandoff && (
+                <DeploymentPermissionHandoff
+                    mode="bootstrap"
+                    report={adminHandoff.report}
+                    handoff={adminHandoff.verifyResult}
+                    namespace={adminHandoff.namespace}
+                    script={adminHandoff.script}
+                    filename={adminHandoff.filename}
+                    instructions={adminHandoff.instructions}
+                    warnings={adminHandoff.warnings}
+                    error={adminHandoff.error}
+                    busy={busy}
+                    verifying={Boolean(adminHandoff.verifying)}
+                    generating={Boolean(adminHandoff.generating)}
+                    identity={adminHandoff.identity}
+                    subjectOverride={adminHandoff.subjectOverride}
+                    onSubjectOverrideChange={onSubjectOverrideChange}
+                    onGenerateScript={onRegenerateBootstrap}
+                    onPrimaryAction={onVerifyBootstrap}
+                    primaryActionLabel="Re-check & Deploy"
+                    onDismiss={onDismissAdminHandoff}
+                />
+            )}
+            {plan.preflight.status === 'unknown' && <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={acknowledgeUnknown} disabled={busy || Boolean(adminHandoff)} onChange={event => setAcknowledgeUnknown(event.target.checked)} />I accept the listed unverified constraints and the absence of a resource reservation.</label>}
             {error && <p role="alert" className="text-sm">{error}</p>}
-            <div className="flex justify-end gap-2"><Button variant="secondary" disabled={busy} onClick={onClose}>Cancel</Button><Button isLoading={busy} disabled={busy || plan.preflight.status === 'fail' || (plan.preflight.status === 'unknown' && !acknowledgeUnknown)} onClick={onConfirm}><Play className="h-4 w-4" />Deploy</Button></div>
+            <div className="flex justify-end gap-2"><Button variant="secondary" disabled={busy || Boolean(adminHandoff?.verifying) || Boolean(adminHandoff?.generating)} onClick={onClose}>Cancel</Button><Button isLoading={busy} disabled={busy || Boolean(adminHandoff) || plan.preflight.status === 'fail' || (plan.preflight.status === 'unknown' && !acknowledgeUnknown)} onClick={onConfirm}><Play className="h-4 w-4" />Deploy</Button></div>
     </section>;
 }
 
@@ -399,8 +442,22 @@ export default function EvaluationTaskWizard({ onNavigate }) {
     const [loading, setLoading] = useState(true);
     const [busy, setBusy] = useState(false);
     const [preparedReview, setPreparedReview] = useState(null);
+    const [adminHandoff, setAdminHandoff] = useState(null);
     const [acknowledgeUnknown, setAcknowledgeUnknown] = useState(false);
     const [error, setError] = useState("");
+    const mountedRef = useRef(true);
+    const handoffVersionRef = useRef(0);
+    const resetAdminHandoff = useCallback(() => {
+        handoffVersionRef.current += 1;
+        setAdminHandoff(null);
+    }, []);
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+            handoffVersionRef.current += 1;
+        };
+    }, []);
 
     const [hardwareRequest] = useState(createLatestResourceRequest);
     const refreshClusterHardware = useCallback(async ({ quiet = false } = {}) => {
@@ -550,6 +607,7 @@ export default function EvaluationTaskWizard({ onNavigate }) {
     }, []);
 
     useEffect(() => {
+        resetAdminHandoff();
         if (!selectedClusterId) {
             setConnectedCluster(null);
             setClusterHardware(null);
@@ -720,9 +778,199 @@ export default function EvaluationTaskWizard({ onNavigate }) {
         setConfigurationEditor({ guideId, mode, artifact: mode === "clone" ? selectedArtifacts.at(-1) : null, key: `${guideId}-${Date.now()}` });
     };
 
+    function buildWizardPermissionPayload(handoffSeed = null, extra = {}) {
+        const activePlan = handoffSeed?.plan || preparedReview?.plan || null;
+        const activeRequest = handoffSeed?.request || preparedReview?.request || null;
+        const firstConfig = activeRequest?.configurations?.[0] || handoffSeed?.configurations?.[0] || null;
+        const activeProvenance = activeRequest?.provenance || handoffSeed?.provenance || {};
+        const manifest = activePlan?.cases?.[0]?.manifest
+            || firstConfig?.content?.officialGuide?.renderedManifest
+            || '';
+        const storageId = firstConfig?.content?.runtime?.storageVolumeId || storageVolumeId || null;
+        const resolvedClusterId = activeProvenance?.cluster_server_id || selectedClusterId || cluster.id || '';
+        const resolvedDeploymentName = activeProvenance?.deployment_name || deploymentName.trim() || null;
+        return deploymentPermissionPayload({
+            clusterId: resolvedClusterId,
+            namespace: handoffSeed?.namespace || activePlan?.cases?.[0]?.namespace || null,
+            manifest,
+            preparedPlanId: activePlan?.id || null,
+            deploymentName: resolvedDeploymentName,
+            providerRef: firstConfig?.provider_ref || null,
+            storageVolumeId: storageId,
+            usesStorage: Boolean(storageId),
+            ...extra,
+        });
+    }
+
+    async function generateWizardBootstrapScript(overrideArg = null, seed = null, expectedVersion = handoffVersionRef.current) {
+        const current = seed || adminHandoff;
+        const override = overrideArg || current?.subjectOverride || null;
+        const validOverride = override?.name?.trim()
+            ? {
+                kind: override.kind || 'ServiceAccount',
+                name: override.name.trim(),
+                ...(override.kind === 'ServiceAccount' && override.namespace?.trim()
+                    ? { namespace: override.namespace.trim() }
+                    : {}),
+            }
+            : null;
+        setAdminHandoff(prev => (prev ? { ...prev, generating: true, error: '', ...(validOverride ? { subjectOverride: validOverride } : {}) } : prev));
+        try {
+            const remediation = await generateDeploymentBootstrapScript(buildWizardPermissionPayload(current, {
+                subjectOverride: validOverride,
+            }));
+            if (!mountedRef.current || expectedVersion !== handoffVersionRef.current) return;
+            setAdminHandoff(prev => (prev ? {
+                ...prev,
+                generating: false,
+                script: remediation.script || '',
+                filename: remediation.scriptFilename || remediation.filename || 'lens-deployment-bootstrap.sh',
+                instructions: remediation.instructions || '',
+                bootstrapDigest: remediation.bootstrapDigest || remediation.digest || null,
+                namespace: remediation.namespace || prev.namespace,
+                identity: remediation.identity || prev.identity,
+                warnings: Array.isArray(remediation.warnings) ? remediation.warnings : prev.warnings,
+            } : prev));
+        } catch (failure) {
+            if (!mountedRef.current || expectedVersion !== handoffVersionRef.current) return;
+            setAdminHandoff(prev => (prev ? { ...prev, generating: false, error: failure.message || 'Could not generate Orchestration administrator script.' } : prev));
+        }
+    }
+
+    async function openWizardAdminSetupFromError(failure, context = {}) {
+        const version = context.handoffVersion ?? ++handoffVersionRef.current;
+        if (!mountedRef.current || version !== handoffVersionRef.current) return null;
+        const rawBody = failure?.body && typeof failure.body === 'object' ? failure.body : {};
+        const body = rawBody.detail && typeof rawBody.detail === 'object' && !Array.isArray(rawBody.detail)
+            ? { ...rawBody.detail, ...rawBody }
+            : rawBody;
+        const fallbackNamespace = context.plan?.cases?.[0]?.namespace || preparedReview?.plan?.cases?.[0]?.namespace || '';
+        const seed = {
+            mode: context.mode || (context.plan || preparedReview?.plan ? 'prepared' : 'direct'),
+            request: context.request || preparedReview?.request || null,
+            plan: context.plan || preparedReview?.plan || null,
+            configurations: context.configurations || context.request?.configurations || preparedReview?.request?.configurations || null,
+            provenance: context.provenance || context.request?.provenance || preparedReview?.request?.provenance || null,
+            placement: context.placement || context.request?.runtime_binding?.placement || preparedReview?.request?.runtime_binding?.placement || null,
+            report: body,
+            verifyResult: null,
+            namespace: body.namespace || fallbackNamespace || '',
+            identity: body.identity || null,
+            subjectOverride: context.subjectOverride !== undefined
+                ? context.subjectOverride
+                : (context.preserveOverride ? (adminHandoff?.subjectOverride || null) : null),
+            script: typeof body.script === 'string' ? body.script : '',
+            filename: body.scriptFilename || 'lens-deployment-bootstrap.sh',
+            instructions: body.instructions || '',
+            bootstrapDigest: body.bootstrapDigest || body.digest || null,
+            warnings: Array.isArray(body.warnings) ? body.warnings : [],
+            generating: false,
+            verifying: false,
+            error: context.showFailureError ? (failure.message || (typeof body.detail === 'string' ? body.detail : '') || '') : '',
+        };
+        setError('');
+        setAdminHandoff(seed);
+        if (!seed.script && (seed.subjectOverride?.name || (!seed.identity?.overrideRequired && seed.identity?.kind !== 'unknown'))) {
+            await generateWizardBootstrapScript(seed.subjectOverride || null, seed, version);
+        }
+        return seed;
+    }
+
+    async function verifyWizardBootstrapAndDeploy() {
+        if (!adminHandoff || adminHandoff.verifying) return;
+        const version = ++handoffVersionRef.current;
+        const expectedClusterId = selectedClusterId;
+        const handoffSnapshot = adminHandoff;
+        const override = handoffSnapshot.subjectOverride?.name?.trim()
+            ? {
+                kind: handoffSnapshot.subjectOverride.kind || 'ServiceAccount',
+                name: handoffSnapshot.subjectOverride.name.trim(),
+                ...(handoffSnapshot.subjectOverride.kind === 'ServiceAccount' && handoffSnapshot.subjectOverride.namespace?.trim()
+                    ? { namespace: handoffSnapshot.subjectOverride.namespace.trim() }
+                    : {}),
+            }
+            : null;
+        setBusy(true);
+        setError('');
+        setAdminHandoff(prev => (prev ? { ...prev, verifying: true, error: '' } : prev));
+        let verifyResult = null;
+        try {
+            verifyResult = await verifyDeploymentBootstrap(buildWizardPermissionPayload(handoffSnapshot, {
+                ...(handoffSnapshot.namespace ? { namespace: handoffSnapshot.namespace } : {}),
+                subjectOverride: override,
+                expectedDigest: handoffSnapshot.bootstrapDigest || undefined,
+            }));
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
+            if (verifyResult?.verified) {
+                setAdminHandoff(null);
+                const activeRequest = preparedReview?.request || handoffSnapshot.request;
+                const activePlan = preparedReview?.plan || handoffSnapshot.plan;
+                if (activeRequest && activePlan && !preparedReview?.workflow) {
+                    if (activeRequest.provenance?.cluster_server_id !== expectedClusterId) {
+                        throw new Error('Selected cluster changed; prepare a new plan.');
+                    }
+                    if (activePlan.preflight?.status === 'unknown' && !acknowledgeUnknown) {
+                        throw new Error('Acknowledge the unverified constraints before deploying.');
+                    }
+                    await executePreparedDeployment(activeRequest, activePlan, acknowledgeUnknown);
+                    if (!mountedRef.current || version !== handoffVersionRef.current) return;
+                    setPreparedReview(null);
+                    clearEvaluationIntent();
+                    onNavigate('optimization-deployments');
+                    return;
+                }
+                if (handoffSnapshot.mode === 'direct' && handoffSnapshot.configurations) {
+                    if (handoffSnapshot.provenance?.cluster_server_id !== expectedClusterId) {
+                        throw new Error('Selected cluster changed; prepare a new deployment.');
+                    }
+                    const directProvenance = verifyResult?.namespace
+                        ? { ...handoffSnapshot.provenance, target_namespace: verifyResult.namespace }
+                        : handoffSnapshot.provenance;
+                    await startLocalDeployment(handoffSnapshot.configurations, directProvenance, handoffSnapshot.placement);
+                    if (!mountedRef.current || version !== handoffVersionRef.current) return;
+                    clearEvaluationIntent();
+                    onNavigate('optimization-deployments');
+                    return;
+                }
+                return;
+            }
+            setAdminHandoff(prev => (prev ? {
+                ...prev,
+                verifying: false,
+                verifyResult,
+                namespace: verifyResult?.namespace || prev.namespace,
+                identity: verifyResult?.identity || prev.identity,
+                warnings: Array.isArray(verifyResult?.warnings) ? verifyResult.warnings : prev.warnings,
+                error: verifyResult?.message || 'Orchestration administrator namespace setup is not yet verified. Run the script and try again.',
+            } : prev));
+        } catch (nextError) {
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
+            if (isDeploymentAdminSetupError(nextError)) {
+                await openWizardAdminSetupFromError(nextError, {
+                    ...handoffSnapshot,
+                    handoffVersion: version,
+                    subjectOverride: handoffSnapshot.subjectOverride || null,
+                    preserveOverride: true,
+                    showFailureError: true,
+                });
+                return;
+            }
+            if (verifyResult?.verified) {
+                setAdminHandoff(null);
+                setError(nextError.message || 'Deployment could not be started');
+                return;
+            }
+            setAdminHandoff(prev => (prev ? { ...prev, verifying: false, error: nextError.message || 'Verification failed.' } : prev));
+        } finally {
+            if (mountedRef.current) setBusy(false);
+        }
+    }
+
     async function deployPublishedConfiguration(publishedArtifacts) {
+        const version = ++handoffVersionRef.current;
         setBusy(true);
         setError("");
+        let deploymentInputs = null;
         try {
             const configurations = (publishedArtifacts || [])
                 .map((artifact) => artifact.deployable_configuration)
@@ -737,6 +985,7 @@ export default function EvaluationTaskWizard({ onNavigate }) {
             // reconstruct ~/.cache paths in the browser: the API returns the
             // resolved absolute path for the version downloaded for this cluster.
             const latestCluster = await loadCluster(clusterId);
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
             const provenance = {
                 cluster_session_id: cluster.session_id || sessionStorage.getItem("prism_cluster_session_id") || undefined,
                 cluster_server_id: clusterId,
@@ -750,46 +999,76 @@ export default function EvaluationTaskWizard({ onNavigate }) {
                 model_market: { deployment_name: deploymentName.trim() },
             };
             const placement = configurations[0].provenance?.placement || { replicas: 'prefer-same-node' };
+            deploymentInputs = { configurations, provenance, placement };
             if (deploymentRequiresReview(configurations)) {
                 const request = { configurations, provenance, runtime_binding: { placement } };
                 const plan = await prepareLocalDeployment(request);
+                if (!mountedRef.current || version !== handoffVersionRef.current) return;
+                deploymentInputs = { ...deploymentInputs, mode: 'prepared', request, plan };
                 setAcknowledgeUnknown(false);
+                setAdminHandoff(null);
                 setPreparedReview({ request, plan });
                 if (plan.preflight.status !== 'pass') return;
                 await executePreparedDeployment(request, plan, false);
+                if (!mountedRef.current || version !== handoffVersionRef.current) return;
                 setPreparedReview(null);
             } else {
+                deploymentInputs = { ...deploymentInputs, mode: 'direct' };
                 await startLocalDeployment(configurations, provenance, placement);
+                if (!mountedRef.current || version !== handoffVersionRef.current) return;
             }
             clearEvaluationIntent();
             onNavigate("optimization-deployments");
         } catch (nextError) {
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
+            if (isDeploymentAdminSetupError(nextError)) {
+                await openWizardAdminSetupFromError(nextError, { ...(deploymentInputs || {}), handoffVersion: version });
+                return;
+            }
             await refreshClusterHardware().catch(() => null);
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
             setError(nextError.message || "Deployment could not be created");
             window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "smooth" }));
         } finally {
-            setBusy(false);
+            if (mountedRef.current) setBusy(false);
         }
     }
 
     async function confirmPreparedDeployment() {
         if (busy || !preparedReview) return;
+        const version = ++handoffVersionRef.current;
         setBusy(true);
         setError('');
         try {
             if (preparedReview.workflow) {
                 if (preparedReview.workflow.cluster_id !== selectedClusterId) throw new Error('Selected cluster changed; prepare a new Evaluation.');
                 await confirmEvaluationPlans(preparedReview.workflow, acknowledgeUnknown);
+                if (!mountedRef.current || version !== handoffVersionRef.current) return;
+                setPreparedReview(null);
+                setAdminHandoff(null);
                 onNavigate('optimization-evaluate');
                 return;
             }
             if (preparedReview.request.provenance.cluster_server_id !== selectedClusterId) throw new Error('Selected cluster changed; prepare a new plan.');
             await executePreparedDeployment(preparedReview.request, preparedReview.plan, acknowledgeUnknown);
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
+            setPreparedReview(null);
+            setAdminHandoff(null);
             clearEvaluationIntent();
             onNavigate('optimization-deployments');
         } catch (nextError) {
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
+            if (!preparedReview.workflow && isDeploymentAdminSetupError(nextError)) {
+                await openWizardAdminSetupFromError(nextError, {
+                    mode: 'prepared',
+                    handoffVersion: version,
+                    request: preparedReview.request,
+                    plan: preparedReview.plan,
+                });
+                return;
+            }
             setError(nextError.message || 'Prepared deployment could not be started');
-        } finally { setBusy(false); }
+        } finally { if (mountedRef.current) setBusy(false); }
     }
 
     const acceptPublishedConfiguration = ({ artifacts: publishedArtifacts, advance = false, optimizationSelection }) => {
@@ -1051,6 +1330,7 @@ export default function EvaluationTaskWizard({ onNavigate }) {
             });
             if (createdWorkflow.status === 'awaiting_review') {
                 setAcknowledgeUnknown(false);
+                resetAdminHandoff();
                 const review = evaluationPlanReview(createdWorkflow);
                 setPreparedReview(review);
                 if (review.plan.preflight.status !== 'pass') return;
@@ -1102,7 +1382,7 @@ export default function EvaluationTaskWizard({ onNavigate }) {
                 </Button>
             )}
         </div></div>}
-        <fieldset disabled={Boolean(preparedReview)} className="min-w-0 space-y-5">
+        <fieldset disabled={Boolean(preparedReview || adminHandoff)} className="min-w-0 space-y-5">
         {!deployOnly && <ol className="grid grid-cols-4 gap-2 rounded-2xl border border-slate-800/60 bg-white p-2 shadow-inner dark:bg-slate-950/30" aria-label="Task creation progress">{STEPS.map((label, index) => <li key={label}><button disabled={editorBusy || index > step || (targetMode === "existing" && index === 1)} onClick={() => setStep(index)} className={`flex w-full items-center gap-2 rounded-xl px-2.5 py-2 text-left transition disabled:cursor-not-allowed ${index === step ? "bg-[#037ffc] shadow-sm ring-0 dark:bg-cyan-500/10 dark:ring-1 dark:ring-cyan-400/25" : index < step ? "hover:bg-slate-800/50" : "opacity-55"}`}><span className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[9px] font-bold ${index < step ? "bg-emerald-400/15 text-emerald-300" : index === step ? "bg-white text-[#037ffc] shadow-none dark:bg-cyan-400 dark:text-slate-950 dark:shadow-[0_0_14px_rgba(34,211,238,.35)]" : "bg-slate-800 text-slate-500"}`}>{index < step ? <Check className="h-3.5 w-3.5" /> : index + 1}</span><span className={`hidden truncate text-[9px] font-bold uppercase tracking-wide sm:block lg:text-[10px] ${index === step ? "not-dark:text-white dark:text-cyan-200" : index < step ? "text-slate-300" : "text-slate-500"}`}>{label}</span></button></li>)}</ol>}
         {loading ? <div className="flex min-h-80 items-center justify-center"><RefreshCw className="h-6 w-6 animate-spin text-cyan-400" /></div> : <div>
             <main className="rounded-3xl border border-slate-800/70 bg-white p-5 dark:bg-[#080d17]/95 shadow-[0_24px_80px_rgba(2,6,23,.32)] backdrop-blur-sm lg:p-6">
@@ -1223,7 +1503,43 @@ export default function EvaluationTaskWizard({ onNavigate }) {
             </main>
         </div>}
         </fieldset>
-        <DeploymentPlanReview preparedReview={preparedReview} busy={busy} error={error} acknowledgeUnknown={acknowledgeUnknown} setAcknowledgeUnknown={setAcknowledgeUnknown} onClose={() => setPreparedReview(null)} onConfirm={confirmPreparedDeployment} />
+        <DeploymentPlanReview
+            preparedReview={preparedReview}
+            busy={busy}
+            error={error}
+            acknowledgeUnknown={acknowledgeUnknown}
+            setAcknowledgeUnknown={setAcknowledgeUnknown}
+            onClose={() => { setPreparedReview(null); resetAdminHandoff(); }}
+            onConfirm={confirmPreparedDeployment}
+            adminHandoff={adminHandoff}
+            onVerifyBootstrap={verifyWizardBootstrapAndDeploy}
+            onRegenerateBootstrap={(overrideArg) => generateWizardBootstrapScript(overrideArg)}
+            onSubjectOverrideChange={(next) => setAdminHandoff(prev => (prev ? { ...prev, subjectOverride: next } : prev))}
+            onDismissAdminHandoff={resetAdminHandoff}
+        />
+        {!preparedReview?.plan && adminHandoff && (
+            <DeploymentPermissionHandoff
+                mode="bootstrap"
+                report={adminHandoff.report}
+                handoff={adminHandoff.verifyResult}
+                namespace={adminHandoff.namespace}
+                script={adminHandoff.script}
+                filename={adminHandoff.filename}
+                instructions={adminHandoff.instructions}
+                warnings={adminHandoff.warnings}
+                error={adminHandoff.error}
+                busy={busy}
+                verifying={Boolean(adminHandoff.verifying)}
+                generating={Boolean(adminHandoff.generating)}
+                identity={adminHandoff.identity}
+                subjectOverride={adminHandoff.subjectOverride}
+                onSubjectOverrideChange={(next) => setAdminHandoff(prev => (prev ? { ...prev, subjectOverride: next } : prev))}
+                onGenerateScript={(overrideArg) => generateWizardBootstrapScript(overrideArg)}
+                onPrimaryAction={verifyWizardBootstrapAndDeploy}
+                primaryActionLabel="Re-check & Deploy"
+                onDismiss={resetAdminHandoff}
+            />
+        )}
         <Modal isOpen={Boolean(yamlArtifact)} onClose={() => setYamlArtifact(null)} title="Deployment Configuration YAML" subtitle="YAML editing supports annotations and formatting. Use Edit configuration for model, topology, runtime or storage changes." size="xl" footer={<>{yamlArtifact?.deployable_configuration?.content?.officialGuide?.deploymentBundle && <a className="mr-auto text-xs text-cyan-300 hover:underline" href={`/api/v1/configurations/artifacts/${encodeURIComponent(yamlArtifact.artifact_id)}/bundle`}>Download deployment bundle</a>}<Button variant="secondary" onClick={() => setYamlArtifact(null)}>Cancel</Button><Button disabled={yamlLoading || yamlSaving || !yamlText.trim()} onClick={saveEditedYaml}>{yamlSaving ? "Saving…" : "Save YAML"}</Button></>}>
             {yamlLoading ? <div className="flex h-72 items-center justify-center"><RefreshCw className="h-5 w-5 animate-spin text-cyan-300" /></div> : <textarea aria-label="Editable deployment YAML" value={yamlText} onChange={(event) => setYamlText(event.target.value)} spellCheck={false} className="h-[60vh] w-full resize-none rounded-xl border border-slate-700 bg-black/35 p-4 font-mono text-[10px] leading-5 text-slate-300 outline-none focus:border-cyan-500" />}
         </Modal>
