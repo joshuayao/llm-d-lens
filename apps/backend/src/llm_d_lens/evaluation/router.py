@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -12,10 +15,12 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 import yaml
@@ -30,6 +35,7 @@ from llm_d_lens.auth.access import (
 from llm_d_lens.cluster import deployment_runtime_overrides, require_active_session, sessions
 from llm_d_lens.cluster import registry as cluster_registry
 from llm_d_lens.cluster.deployment_source import resolve_cluster_benchmark_source
+from llm_d_lens.configuration.manifest_facts import _invocation_tokens, _option, workload_roles
 from llm_d_lens.configuration.service import get_configuration_artifact
 from llm_d_lens.db.dao.evaluate_run import EvaluateRunDao
 from llm_d_lens.db.dao.evaluate_workflow import EvaluateWorkflowDao
@@ -85,17 +91,24 @@ from llm_d_lens.evaluation.ownership import evaluation_lock, owned_control, owne
 from llm_d_lens.evaluation.request_evidence import apply_request_evidence, enable_request_reports
 from llm_d_lens.evaluation.timing import benchmark_timing
 from llm_d_lens.evaluation.workflow_state import TERMINAL_EVALUATION_STATUSES as _TERMINAL_EVALUATE_STATUSES
+from llm_d_lens.hardware.registry import all_profiles
 from llm_d_lens.hardware.resolver import (
+    configuration_resource_request,
+    deployment_mode,
     resolve_by_accelerator_key,
+    resolve_by_device_class,
     resolve_by_node_label,
     resolve_by_resource,
     resolve_configuration_profile,
 )
-from llm_d_lens.hardware.telemetry import parse_device_metrics
+from llm_d_lens.hardware.telemetry import _selector, parse_device_metrics
 from llm_d_lens.infrastructure.artifacts.manifests import configuration_checksum
 from llm_d_lens.infrastructure.artifacts.store import register_artifacts
 from llm_d_lens.infrastructure.hostos import current_host
+from llm_d_lens.infrastructure.kubernetes import validate_namespace
 from llm_d_lens.infrastructure.kubernetes.proxy import api_server_host
+from llm_d_lens.infrastructure.process import CommandNotFoundError
+from llm_d_lens.infrastructure.process import spawn as _process_spawn
 from llm_d_lens.infrastructure.storage.paths import storage_path
 from llm_d_lens.model_service.resolution import resolve_model_service_target
 from llm_d_lens.monitoring.deployment import service as deployment_monitoring
@@ -104,8 +117,15 @@ from llm_d_lens.monitoring.profiling.service import (
     collect_benchmark_observability,
     wait_for_deployment_metrics,
 )
+from llm_d_lens.monitoring.prometheus import (
+    create_prometheus_client,
+    query_vector,
+    resolve_prometheus_endpoint,
+)
+from llm_d_lens.monitoring.service_links import is_forbidden_error, redact_monitoring_error
 from llm_d_lens.versions import router_chart_version, stack
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/evaluate", tags=["evaluate"])
 _store = deployment_run_manager.store
 _application_root = Path(__file__).resolve().parents[2]
@@ -1473,11 +1493,48 @@ def _benchmark_response(run: dict) -> dict:
     return response
 
 
+def _resolve_run_cluster_id(run: dict, execution_id: str) -> str | None:
+    if run.get("cluster_id"):
+        return str(run["cluster_id"])
+    execution = _store.get_execution(execution_id) if execution_id else None
+    if execution is not None:
+        provenance = getattr(execution, "provenance", None) or {}
+        if provenance.get("cluster_server_id"):
+            return str(provenance["cluster_server_id"])
+        if provenance.get("cluster_session_id"):
+            with contextlib.suppress(Exception):
+                sess = sessions.get_session(provenance["cluster_session_id"])
+                if sess is not None and getattr(sess, "server_id", None):
+                    return str(sess.server_id)
+    if run.get("cluster_session_id"):
+        with contextlib.suppress(Exception):
+            sess = sessions.get_session(run["cluster_session_id"])
+            if sess is not None and getattr(sess, "server_id", None):
+                return str(sess.server_id)
+    if execution_id:
+        with contextlib.suppress(Exception):
+            return deployment_monitoring.resolve_execution_cluster_id(execution_id)
+    return None
+
+
+def _wait_metrics_accepts_optional_epp(fn: Any) -> bool:
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.name == "allow_optional_epp" or p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in params
+    )
+
+
 async def _prepare_benchmark_monitoring(run: dict) -> None:
     """Require serving scrapes before starting traffic, including borrowed endpoints."""
     timeout = float(run.get("wait_timeout_seconds") or _MONITORING_PREPARE_TIMEOUT)
     run["monitoring"] = {"status": "preparing", "enabled": False}
     _save(run)
+    skipped_k8s_error: Exception | None = None
+    prom_endpoint = None
     try:
         async with asyncio.timeout(timeout):
             execution_id = run["deployment_execution_id"]
@@ -1486,16 +1543,55 @@ async def _prepare_benchmark_monitoring(run: dict) -> None:
                     status="ready", enabled=True, source="existing", message="Using existing Prometheus targets"
                 )
             else:
-                status = await deployment_monitoring.enable(execution_id)
-                run["monitoring"].update(
-                    resources={
-                        "servicemonitors": status.get("servicemonitors", []),
-                        "podmonitors": status.get("podmonitors", []),
-                    },
-                    message="Waiting for Prometheus to load deployment targets and collect serving samples",
-                )
+                try:
+                    status = await deployment_monitoring.enable(execution_id, for_benchmark=True)
+                except deployment_monitoring.DeploymentMonitoringError as mon_err:
+                    is_k8s_perm_error = (
+                        mon_err.status_code == 403
+                        or mon_err.code == "admin_handoff_required"
+                        or is_forbidden_error(str(mon_err))
+                    )
+                    if not is_k8s_perm_error:
+                        raise
+                    cluster_id = _resolve_run_cluster_id(run, execution_id)
+                    prom_endpoint = await resolve_prometheus_endpoint(cluster_id, allow_port_forward=False)
+                    if prom_endpoint is None:
+                        raise
+                    skipped_k8s_error = mon_err
+                    logger.warning(
+                        "Benchmark %s skipped Kubernetes monitoring mutation on cluster %s (%s); "
+                        "polling Prometheus HTTP API (%s)",
+                        run.get("id") or execution_id,
+                        cluster_id,
+                        mon_err.code,
+                        prom_endpoint.base_url,
+                    )
+                    run["monitoring"].update(
+                        source="prometheus_http",
+                        permission_note=redact_monitoring_error(str(mon_err)),
+                        message=(
+                            "Kubernetes monitoring mutation skipped on non-admin cluster; "
+                            "polling Prometheus HTTP API for serving samples"
+                        ),
+                    )
+                else:
+                    run["monitoring"].update(
+                        resources={
+                            "servicemonitors": status.get("servicemonitors", []),
+                            "podmonitors": status.get("podmonitors", []),
+                        },
+                        message="Waiting for Prometheus to load deployment targets and collect serving samples",
+                    )
                 _save(run)
-                pending = asyncio.create_task(wait_for_deployment_metrics(execution_id, timeout_seconds=timeout))
+                if skipped_k8s_error is not None and _wait_metrics_accepts_optional_epp(wait_for_deployment_metrics):
+                    wait_coro = wait_for_deployment_metrics(
+                        execution_id,
+                        timeout_seconds=timeout,
+                        allow_optional_epp=True,
+                    )
+                else:
+                    wait_coro = wait_for_deployment_metrics(execution_id, timeout_seconds=timeout)
+                pending = asyncio.create_task(wait_coro)
                 try:
                     while not pending.done():
                         run["heartbeat_at"] = _now()
@@ -1508,14 +1604,26 @@ async def _prepare_benchmark_monitoring(run: dict) -> None:
                     await asyncio.gather(pending, return_exceptions=True)
                 run["monitoring"].update(status="ready", enabled=True, message="Serving metrics are ready")
     except TimeoutError as error:
-        message = (
-            f"Monitoring preparation exceeded {timeout:g}s. Benchmark traffic was not started. "
-            "Check Prometheus configuration reloads, serving targets and Monitor selectors, then retry."
-        )
+        if skipped_k8s_error is not None and prom_endpoint is not None:
+            message = (
+                f"Monitoring preparation exceeded {timeout:g}s waiting for serving metrics from Prometheus HTTP API "
+                f"({prom_endpoint.base_url}); benchmark traffic was not started. "
+                f"Check Prometheus targets in namespace '{run.get('namespace') or 'deployment'}' or complete "
+                f"deployment monitoring setup as an Orchestration administrator: "
+                f"{redact_monitoring_error(str(skipped_k8s_error))}"
+            )
+        else:
+            message = (
+                f"Monitoring preparation exceeded {timeout:g}s. Benchmark traffic was not started. "
+                "Check Prometheus configuration reloads, serving targets and Monitor selectors, then retry."
+            )
         run["monitoring"].update(status="unavailable", message=message)
         raise RuntimeError(message) from error
     except Exception as error:
-        message = f"Monitoring preparation failed; benchmark traffic was not started: {error}"
+        message = (
+            "Monitoring preparation failed; benchmark traffic was not started: "
+            f"{redact_monitoring_error(str(error))}"
+        )
         run["monitoring"].update(status="unavailable", message=message)
         raise RuntimeError(message) from error
     finally:
@@ -2548,19 +2656,178 @@ def _parse_xpumd_metrics(payload: str | None, profile=None) -> dict | None:
     return parse_device_metrics(payload, profile)
 
 
-async def _kubernetes_resource_snapshot(
-    session_id: str | None, namespace: str | None, hardware_profile: str | None = None
-) -> dict | None:
-    """Return configured allocation/capacity, not runtime utilization."""
-    if not session_id:
+def _normalize_ksm_resource_name(raw_name: str, profiles_list: list) -> str:
+    cleaned = str(raw_name or "").strip()
+    if not cleaned:
+        return ""
+    if resolve_by_resource(cleaned) is not None:
+        return cleaned
+    sanitized = re.sub(r"[^A-Za-z0-9]", "_", cleaned).lower()
+    for profile in profiles_list:
+        candidates: list[str] = []
+        if profile.deployment.resource_name:
+            candidates.append(profile.deployment.resource_name)
+        for mode in (profile.deployment.modes or {}).values():
+            candidates.extend(mode.get("resource_names") or [])
+        for prefix in profile.resource_prefixes or []:
+            if not prefix.endswith("/"):
+                candidates.append(prefix)
+        for candidate in candidates:
+            if re.sub(r"[^A-Za-z0-9]", "_", candidate).lower() == sanitized:
+                return candidate
+        for prefix in profile.resource_prefixes or []:
+            norm_prefix = re.sub(r"[^A-Za-z0-9]", "_", prefix).lower()
+            if norm_prefix and sanitized.startswith(norm_prefix):
+                suffix = cleaned[len(norm_prefix) :].lstrip("_")
+                if prefix.endswith("/"):
+                    return f"{prefix}{suffix}" if suffix else prefix.rstrip("/")
+                return f"{prefix}/{suffix}" if suffix else prefix
+    return cleaned
+
+
+def _prom_sample_float(entry: dict) -> float | None:
+    value = entry.get("value")
+    if not isinstance(value, list | tuple) or len(value) < 2:
         return None
     try:
-        environment = deployment_runtime_overrides(session_id)
-    except ValueError:
+        parsed = float(value[1])
+    except (TypeError, ValueError):
         return None
-    pods = await _kubectl_json(["get", "pods", "-n", namespace], environment) if namespace else None
-    nodes = await _kubectl_json(["get", "nodes"], environment)
-    profiles = {}
+    return parsed if math.isfinite(parsed) else None
+
+
+async def _prometheus_profile_device_snapshot(client: Any, profile: Any) -> dict | None:
+    telemetry = getattr(profile, "telemetry", None)
+    if telemetry is None or not telemetry.device_metric_sources:
+        return None
+    sources = [
+        (semantic, source)
+        for semantic, source in telemetry.device_metric_sources.items()
+        if source.metric
+    ]
+    if not sources:
+        return None
+    query_results = await asyncio.gather(
+        *(query_vector(client, source.metric + _selector(source.match)) for _, source in sources)
+    )
+    labels_schema = telemetry.label_schema or {}
+    node_label_keys = telemetry.allocation.get("node_labels") or [labels_schema.get("node", "")]
+    devices: dict[tuple[str, str], dict[str, Any]] = {}
+    for (semantic, source), rows in zip(sources, query_results, strict=True):
+        for entry in rows:
+            val = _prom_sample_float(entry)
+            if val is None:
+                continue
+            labels = entry.get("metric") or {}
+            identity = next(
+                (
+                    str(labels.get(labels_schema.get(key, "")))
+                    for key in ("pci", "uuid", "fallback_device", "device")
+                    if labels.get(labels_schema.get(key, ""))
+                ),
+                None,
+            )
+            if not identity:
+                continue
+            node = next(
+                (str(labels.get(k)) for k in node_label_keys if k and labels.get(k)),
+                str(labels.get(labels_schema.get("node", ""), "") or ""),
+            )
+            dev_obj = devices.setdefault(
+                (node, identity),
+                {
+                    "id": identity,
+                    "node": node,
+                    "name": labels.get(labels_schema.get("name", "")),
+                    "metrics": {},
+                },
+            )
+            tile = str(labels.get(labels_schema.get("device", ""), "") or "")
+            dev_obj["metrics"].setdefault(semantic, {})[tile] = val * source.scale
+
+    if not devices:
+        return None
+
+    fields = {
+        "framebuffer_used": "memory_used_bytes",
+        "vram": "memory_total_bytes",
+        "power": "power_watts",
+        "temperature": "temperature_celsius",
+    }
+    results = []
+    for device in devices.values():
+        for semantic, tiles in device.pop("metrics").items():
+            source = telemetry.device_metric_sources[semantic]
+            values = [tiles[""]] if "" in tiles else list(tiles.values())
+            agg_val = (
+                sum(values)
+                if source.tile_aggregation == "sum"
+                else max(values)
+                if source.tile_aggregation == "max"
+                else sum(values) / len(values)
+            )
+            if semantic in {"utilization", "memory_utilization", "memory_bandwidth_utilization"}:
+                device[semantic + "_ratio"] = agg_val / 100 if source.output_unit == "percent" else agg_val
+            else:
+                device[fields.get(semantic, semantic)] = agg_val
+        results.append(device)
+
+    utilization = [item["utilization_ratio"] for item in results if "utilization_ratio" in item]
+    return {
+        "source": telemetry.provider_id,
+        "hardware_profile": profile.id,
+        "captured_at": _now(),
+        "scope": "cluster-device",
+        "device_count": len(results),
+        "devices": results,
+        "average_utilization_ratio": sum(utilization) / len(utilization) if utilization else None,
+        "maximum_utilization_ratio": max(utilization) if utilization else None,
+    }
+
+
+def _profile_primary_resource_key(profile: Any) -> str:
+    if profile.deployment.resource_name:
+        return profile.deployment.resource_name
+    for mode in (profile.deployment.modes or {}).values():
+        names = mode.get("resource_names") or []
+        if names:
+            return str(names[0])
+    for prefix in profile.resource_prefixes or []:
+        return str(prefix).rstrip("/") or profile.id
+    return profile.id
+
+
+async def _kubernetes_resource_snapshot(
+    session_id: str | None,
+    namespace: str | None,
+    hardware_profile: str | None = None,
+    *,
+    cluster_id: str | None = None,
+) -> dict | None:
+    """Return configured allocation/capacity, falling back to Prometheus HTTP API on non-admin 403."""
+    if not session_id and not cluster_id:
+        return None
+    environment: dict[str, str] | None = None
+    if session_id:
+        try:
+            environment = deployment_runtime_overrides(session_id)
+        except ValueError:
+            if not cluster_id:
+                return None
+    resolved_cluster_id = cluster_id
+    if not resolved_cluster_id and session_id:
+        with contextlib.suppress(Exception):
+            sess = sessions.get_session(session_id)
+            if sess is not None and getattr(sess, "server_id", None):
+                resolved_cluster_id = str(sess.server_id)
+
+    pods = (
+        await _kubectl_json(["get", "pods", "-n", namespace], environment)
+        if (namespace and environment is not None)
+        else None
+    )
+    nodes = await _kubectl_json(["get", "nodes"], environment) if environment is not None else None
+    profiles: dict[str, Any] = {}
     for node in (nodes or {}).get("items", []):
         for key in node.get("status", {}).get("allocatable") or {}:
             profile = resolve_by_resource(key)
@@ -2569,18 +2836,33 @@ async def _kubernetes_resource_snapshot(
         profile = resolve_by_node_label(node.get("metadata", {}).get("labels") or {})
         if profile:
             profiles[profile.id] = profile
+    for pod in (pods or {}).get("items", []):
+        for container in pod.get("spec", {}).get("containers", []):
+            resources = container.get("resources") or {}
+            for key in {**(resources.get("requests") or {}), **(resources.get("limits") or {})}:
+                profile = resolve_by_resource(key)
+                if profile:
+                    profiles[profile.id] = profile
+        node_sel = pod.get("spec", {}).get("nodeSelector") or {}
+        if node_sel:
+            profile = resolve_by_node_label(node_sel)
+            if profile:
+                profiles[profile.id] = profile
     if hardware_profile:
         selected = resolve_by_accelerator_key(hardware_profile)
         profiles = {selected.id: selected} if selected else {}
+
     snapshots = []
-    for profile in profiles.values():
-        if profile.telemetry and profile.telemetry.scrape_path:
-            snapshot = parse_device_metrics(await _kubectl_raw(profile.telemetry.scrape_path, environment), profile)
-            if snapshot:
-                snapshots.append(snapshot)
-    gpu_telemetry = snapshots[0] if len(snapshots) == 1 else None
-    if pods is None and nodes is None:
-        return None
+    if environment is not None:
+        for profile in profiles.values():
+            if profile.telemetry and profile.telemetry.scrape_path:
+                snapshot = parse_device_metrics(
+                    await _kubectl_raw(profile.telemetry.scrape_path, environment),
+                    profile,
+                )
+                if snapshot:
+                    snapshots.append(snapshot)
+
     pod_allocations = []
     requested_gpus = 0
     for pod in (pods or {}).get("items", []):
@@ -2605,6 +2887,7 @@ async def _kubernetes_resource_snapshot(
                 "containers": containers,
             }
         )
+
     node_capacity = []
     allocatable_gpus = 0
     for node in (nodes or {}).get("items", []):
@@ -2624,8 +2907,159 @@ async def _kubernetes_resource_snapshot(
                 "gpus": gpu_resources,
             }
         )
+
+    need_prom_fallback = resolved_cluster_id and (nodes is None or not snapshots or (namespace and pods is None))
+    if need_prom_fallback:
+        prom_endpoint = await resolve_prometheus_endpoint(resolved_cluster_id, allow_port_forward=False)
+        if prom_endpoint is not None:
+            registered_profiles = list(all_profiles())
+            try:
+                async with create_prometheus_client(prom_endpoint, timeout=5.0) as client:
+                    if pods is None and namespace:
+                        try:
+                            safe_ns = validate_namespace(namespace)
+                        except ValueError:
+                            safe_ns = None
+                        if safe_ns:
+                            info_rows, phase_rows, req_rows, lim_rows = await asyncio.gather(
+                                query_vector(client, f'kube_pod_info{{namespace="{safe_ns}"}}'),
+                                query_vector(client, f'kube_pod_status_phase{{namespace="{safe_ns}"}} == 1'),
+                                query_vector(client, f'kube_pod_container_resource_requests{{namespace="{safe_ns}"}}'),
+                                query_vector(client, f'kube_pod_container_resource_limits{{namespace="{safe_ns}"}}'),
+                            )
+                            pod_nodes = {
+                                str((e.get("metric") or {}).get("pod")): (e.get("metric") or {}).get("node")
+                                for e in info_rows
+                                if (e.get("metric") or {}).get("pod")
+                            }
+                            pod_phases = {
+                                str((e.get("metric") or {}).get("pod")): (e.get("metric") or {}).get("phase")
+                                for e in phase_rows
+                                if (e.get("metric") or {}).get("pod") and (_prom_sample_float(e) or 0) > 0
+                            }
+                            containers_map: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+                            for kind_key, rows in (("requests", req_rows), ("limits", lim_rows)):
+                                for entry in rows:
+                                    val = _prom_sample_float(entry)
+                                    if val is None:
+                                        continue
+                                    labels = entry.get("metric") or {}
+                                    pod_name = str(labels.get("pod") or "").strip()
+                                    raw_res = str(labels.get("resource") or "").strip()
+                                    if not pod_name or not raw_res:
+                                        continue
+                                    cname = str(labels.get("container") or "modelserver")
+                                    norm_res = _normalize_ksm_resource_name(raw_res, registered_profiles)
+                                    c_dict = containers_map.setdefault(pod_name, {}).setdefault(
+                                        cname, {"requests": {}, "limits": {}}
+                                    )
+                                    c_dict[kind_key][norm_res] = (
+                                        str(int(val)) if float(val).is_integer() else str(val)
+                                    )
+                            all_pod_names = sorted(set(pod_nodes) | set(pod_phases) | set(containers_map))
+                            for pod_name in all_pod_names:
+                                c_list = []
+                                for cname, res_pair in sorted((containers_map.get(pod_name) or {}).items()):
+                                    reqs = res_pair["requests"]
+                                    lims = res_pair["limits"]
+                                    for key, value in {**reqs, **lims}.items():
+                                        prof = resolve_by_resource(key)
+                                        if prof:
+                                            if not hardware_profile:
+                                                profiles[prof.id] = prof
+                                            if (
+                                                not any(key.endswith(s) for s in prof.monitor_resource_suffixes)
+                                                and str(value).isdigit()
+                                            ):
+                                                requested_gpus += int(value)
+                                    c_list.append({"name": cname, "requests": reqs, "limits": lims})
+                                pod_allocations.append(
+                                    {
+                                        "name": pod_name,
+                                        "phase": pod_phases.get(pod_name),
+                                        "node": pod_nodes.get(pod_name),
+                                        "containers": c_list,
+                                    }
+                                )
+
+                    if nodes is None:
+                        alloc_rows = await query_vector(client, "kube_node_status_allocatable")
+                        by_node: dict[str, dict[str, str]] = {}
+                        for entry in alloc_rows:
+                            val = _prom_sample_float(entry)
+                            if val is None:
+                                continue
+                            labels = entry.get("metric") or {}
+                            node_name = str(labels.get("node") or "").strip()
+                            raw_res = str(labels.get("resource") or "").strip()
+                            if not node_name or not raw_res:
+                                continue
+                            norm_res = _normalize_ksm_resource_name(raw_res, registered_profiles)
+                            formatted = str(int(val)) if float(val).is_integer() else str(val)
+                            by_node.setdefault(node_name, {})[norm_res] = formatted
+                        for node_name, allocatable in sorted(by_node.items()):
+                            gpu_resources = {}
+                            for key, value in allocatable.items():
+                                prof = resolve_by_resource(key)
+                                if prof:
+                                    if not hardware_profile:
+                                        profiles[prof.id] = prof
+                                    if not any(key.endswith(s) for s in prof.monitor_resource_suffixes):
+                                        gpu_resources[key] = value
+                            allocatable_gpus += sum(
+                                int(value) for value in gpu_resources.values() if str(value).isdigit()
+                            )
+                            node_capacity.append(
+                                {
+                                    "name": node_name,
+                                    "cpu": allocatable.get("cpu"),
+                                    "memory": allocatable.get("memory"),
+                                    "gpus": gpu_resources,
+                                }
+                            )
+
+                    if not snapshots:
+                        candidates = list(profiles.values()) if profiles else registered_profiles
+                        prom_snaps = await asyncio.gather(
+                            *(_prometheus_profile_device_snapshot(client, prof) for prof in candidates)
+                        )
+                        for prof, snap in zip(candidates, prom_snaps, strict=True):
+                            if snap:
+                                snapshots.append(snap)
+                                if not hardware_profile:
+                                    profiles[prof.id] = prof
+
+                    if not node_capacity and snapshots:
+                        inferred_nodes: dict[str, dict[str, int]] = {}
+                        for snap in snapshots:
+                            prof = profiles.get(snap["hardware_profile"]) or resolve_by_accelerator_key(
+                                snap["hardware_profile"]
+                            )
+                            res_key = _profile_primary_resource_key(prof) if prof else snap["hardware_profile"]
+                            for dev in snap.get("devices") or []:
+                                node_name = str(dev.get("node") or "").strip()
+                                if node_name:
+                                    node_gpus = inferred_nodes.setdefault(node_name, {})
+                                    node_gpus[res_key] = node_gpus.get(res_key, 0) + 1
+                        for node_name, gpus_counts in sorted(inferred_nodes.items()):
+                            gpu_str_map = {k: str(v) for k, v in gpus_counts.items()}
+                            allocatable_gpus += sum(gpus_counts.values())
+                            node_capacity.append(
+                                {
+                                    "name": node_name,
+                                    "cpu": None,
+                                    "memory": None,
+                                    "gpus": gpu_str_map,
+                                }
+                            )
+            except Exception:
+                logger.debug("Prometheus resource snapshot fallback failed", exc_info=True)
+
+    gpu_telemetry = snapshots[0] if len(snapshots) == 1 else None
+    if pods is None and nodes is None and not pod_allocations and not node_capacity and not snapshots:
+        return None
     return {
-        "source": "kubernetes-api",
+        "source": "kubernetes-api" if (pods is not None or nodes is not None) else "prometheus",
         "captured_at": _now(),
         "namespace": namespace,
         "requested_gpus": requested_gpus,
@@ -2936,13 +3370,165 @@ def _install_helm_proxy_wrapper(output: Path, environment: dict[str, str], proxy
 
 
 def _harness_proxy_override(proxy_environment: dict[str, str]) -> str | None:
-    """Build the legacy-compatible proxy override for benchmark harnesses."""
+    """Build the legacy-compatible proxy and harness env override for benchmark harnesses."""
     items = [
         {"name": name, "value": proxy_environment[name]}
-        for name in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "OPENAI_API_KEY")
+        for name in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "OPENAI_API_KEY",
+            "LLMDBENCH_VLLM_MODELSERVICE_GAIE_PRESETS_CONFIG",
+        )
         if name in proxy_environment
     ]
     return f"harness.extraEnvVars={json.dumps(items, separators=(',', ':'))}" if items else None
+
+
+_STORAGE_CLASS_NAME_RE = re.compile(r"^[a-z0-9]([-.a-z0-9]*[a-z0-9])?\Z")
+_EXTENDED_RESOURCE_NAME_RE = re.compile(
+    r"^(?:[a-z0-9]([-.a-z0-9]*[a-z0-9])?/)?[A-Za-z0-9]([-_.A-Za-z0-9]*[A-Za-z0-9])?\Z"
+)
+_INTERNAL_BENCHMARK_STORAGE_CLASSES = frozenset({"prism-benchmark-local", "lens-model-cache-static"})
+_BENCHMARK_TOKEN_KV_RE = re.compile(r"(?i)\b(HF_TOKEN|OPENAI_API_KEY)\b(\s*[:=]\s*)\S+")
+_HF_TOKEN_RE = re.compile(r"\bhf_[A-Za-z0-9]{16,}\b")
+
+
+def _is_valid_k8s_subdomain(value: str) -> bool:
+    return bool(value and len(value) <= 253 and _STORAGE_CLASS_NAME_RE.fullmatch(value))
+
+
+def _is_valid_extended_resource_name(value: str) -> bool:
+    return bool(value and len(value) <= 253 and _EXTENDED_RESOURCE_NAME_RE.fullmatch(value))
+
+
+def _redact_benchmark_error(text: str) -> str:
+    cleaned = redact_monitoring_error(text, max_len=0)
+    cleaned = _BENCHMARK_TOKEN_KV_RE.sub(r"\1\2[REDACTED]", cleaned)
+    return _HF_TOKEN_RE.sub("[REDACTED]", cleaned)
+
+
+def _file_contains_token(path: Path, token: str) -> bool:
+    try:
+        return path.is_file() and token in path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+
+def _benchmark_supports_no_pvc(benchmark_root: Path) -> bool:
+    return _file_contains_token(benchmark_root / "llmdbenchmark/cli.py", "--no-pvc") and _file_contains_token(
+        benchmark_root / "config/templates/jinja/20_harness_pod.yaml.j2", "no_pvc"
+    )
+
+
+def _benchmark_supports_no_prism(benchmark_root: Path) -> bool:
+    return (benchmark_root / "llmdbenchmark/run/steps/step_02b_deploy_prism.py").is_file() and _file_contains_token(
+        benchmark_root / "llmdbenchmark/cli.py", "--no-prism"
+    )
+
+
+def _benchmark_supports_non_admin(benchmark_root: Path) -> bool:
+    return _file_contains_token(benchmark_root / "llmdbenchmark/cli.py", "--non-admin")
+
+
+def _benchmark_supports_step_filter(benchmark_root: Path) -> bool:
+    return _file_contains_token(benchmark_root / "llmdbenchmark/interface/run.py", "--step")
+
+
+def _is_valid_resource_request(req: dict, selected_hardware: Any | None) -> bool:
+    device_class = req.get("device_class")
+    if device_class is not None and str(device_class):
+        dc = str(device_class)
+        if not _is_valid_k8s_subdomain(dc):
+            return False
+        allowed_classes = getattr(selected_hardware, "device_classes", ()) or ()
+        if allowed_classes and dc not in allowed_classes:
+            return False
+    resource_name = req.get("resource_name")
+    if resource_name is not None and str(resource_name) and not _is_valid_extended_resource_name(str(resource_name)):
+        return False
+    for name in req.get("resource_names") or ():
+        if name and not _is_valid_extended_resource_name(str(name)):
+            return False
+    return True
+
+
+def _execution_resource_request(execution, selected_hardware: Any | None) -> dict | None:
+    if selected_hardware is None:
+        return None
+    for artifact in getattr(execution, "configuration_artifacts", None) or ():
+        try:
+            content = json.loads(artifact.content or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(content, dict):
+            continue
+        try:
+            req = configuration_resource_request(content, selected_hardware)
+        except ValueError:
+            continue
+        if _is_valid_resource_request(req, selected_hardware):
+            return req
+    try:
+        return deployment_mode(selected_hardware)
+    except ValueError:
+        return None
+
+
+def _cluster_resource_overrides(
+    accelerator_profile: str | None,
+    selected_hardware: Any | None,
+    resource_request: dict | None = None,
+) -> list[str]:
+    """Resolve all ClusterResourceResolver.has_unresolved() fields without nodes:list."""
+    if accelerator_profile and not _is_valid_k8s_subdomain(accelerator_profile):
+        raise ValueError("Invalid accelerator_profile")
+    req = resource_request
+    if req is None and selected_hardware is not None:
+        try:
+            req = deployment_mode(selected_hardware)
+        except (AttributeError, ValueError):
+            req = None
+
+    overrides = [f"accelerator.profile={accelerator_profile or ''}"]
+    deployment = getattr(selected_hardware, "deployment", None)
+    if req and req.get("request_model") == "dra" and req.get("device_class"):
+        device_class = str(req["device_class"])
+        if not _is_valid_k8s_subdomain(device_class):
+            raise ValueError("Invalid DRA device_class")
+        allowed_classes = getattr(selected_hardware, "device_classes", ()) or ()
+        if allowed_classes and device_class not in allowed_classes:
+            raise ValueError("DRA device_class does not match selected hardware profile")
+        overrides.append("accelerator.resource=")
+        overrides.append(f"accelerator.draDriver={device_class}")
+    elif req and req.get("request_model") == "extended-resource":
+        resource_name = str(
+            req.get("resource_name")
+            or next(iter(req.get("resource_names") or ()), "")
+            or (getattr(deployment, "resource_name", None) or "")
+        )
+        if resource_name and not _is_valid_extended_resource_name(resource_name):
+            raise ValueError("Invalid accelerator resource name")
+        overrides.append(f"accelerator.resource={resource_name}")
+    elif req is None and deployment is not None:
+        resource_name = str(getattr(deployment, "resource_name", None) or "")
+        if resource_name and not _is_valid_extended_resource_name(resource_name):
+            raise ValueError("Invalid accelerator resource name")
+        overrides.append(f"accelerator.resource={resource_name}")
+    else:
+        overrides.append("accelerator.resource=")
+
+    overrides.extend(
+        [
+            "vllmCommon.networkResource=",
+            "vllmCommon.networkNr=",
+            "affinity.nodeSelector={}",
+            "decode.acceleratorType.labelValue=",
+            "prefill.acceleratorType.labelValue=",
+            "standalone.acceleratorType.labelValue=",
+        ]
+    )
+    return overrides
 
 
 def _harness_resource_overrides(run: dict, benchmark_root: Path) -> list[str]:
@@ -3036,15 +3622,117 @@ async def _benchmark_kubectl_json(environment: dict[str, str], *arguments: str, 
     return json.loads(stdout or b"{}") if stdout.strip() else {}
 
 
+def _is_valid_storage_class_name(value: str) -> bool:
+    return _is_valid_k8s_subdomain(value) and value not in _INTERNAL_BENCHMARK_STORAGE_CLASSES
+
+
+async def _discover_storage_class_via_prometheus(
+    cluster_id: str | None,
+    namespace: str,
+) -> str | None:
+    if not cluster_id:
+        return None
+    endpoint = await resolve_prometheus_endpoint(cluster_id, allow_port_forward=False)
+    if endpoint is None:
+        return None
+    try:
+        safe_ns = validate_namespace(namespace)
+    except ValueError:
+        safe_ns = None
+    try:
+        async with create_prometheus_client(endpoint, timeout=5.0) as client:
+            queries = [
+                'kube_storageclass_annotations{annotation_storageclass_kubernetes_io_is_default_class="true"}',
+                'kube_storageclass_annotations{annotation_storageclass_beta_kubernetes_io_is_default_class="true"}',
+            ]
+            if safe_ns:
+                queries.append(f'kube_persistentvolumeclaim_info{{namespace="{safe_ns}"}}')
+            queries.append("kube_storageclass_info")
+            results = await asyncio.gather(*(query_vector(client, q) for q in queries))
+    except Exception:
+        logger.debug("Prometheus storageclass discovery failed for cluster %s", cluster_id, exc_info=True)
+        return None
+
+    sc_metadata: dict[str, tuple[str, str]] = {}
+    info_candidates: list[tuple[str, str]] = []
+    for entry in results[-1]:
+        if (_prom_sample_float(entry) or 0) <= 0:
+            continue
+        metric = entry.get("metric") or {}
+        sc_name = str(metric.get("storageclass") or "").strip()
+        if not _is_valid_storage_class_name(sc_name):
+            continue
+        provisioner = str(metric.get("provisioner") or "").strip()
+        binding_mode = str(metric.get("volume_binding_mode") or "").strip()
+        sc_metadata[sc_name] = (provisioner, binding_mode)
+        if provisioner == "kubernetes.io/no-provisioner":
+            continue
+        info_candidates.append((sc_name, binding_mode))
+
+    for rows in results[:-1]:
+        for entry in rows:
+            if (_prom_sample_float(entry) or 0) <= 0:
+                continue
+            sc_name = str((entry.get("metric") or {}).get("storageclass") or "").strip()
+            if not _is_valid_storage_class_name(sc_name):
+                continue
+            provisioner, _ = sc_metadata.get(sc_name, ("", ""))
+            if provisioner == "kubernetes.io/no-provisioner":
+                continue
+            return sc_name
+
+    for sc_name, binding_mode in info_candidates:
+        if binding_mode != "WaitForFirstConsumer":
+            return sc_name
+    return info_candidates[0][0] if info_candidates else None
+
+
+async def _discover_storage_class_from_namespace_pvcs(
+    namespace: str,
+    environment: dict[str, str],
+) -> str | None:
+    try:
+        pvcs = await _benchmark_kubectl_json(environment, "get", "pvc", "-n", namespace, "-o", "json")
+    except (OSError, RuntimeError, ValueError):
+        return None
+    for item in (pvcs or {}).get("items", []):
+        sc_name = str((item.get("spec") or {}).get("storageClassName") or "").strip()
+        if _is_valid_storage_class_name(sc_name):
+            return sc_name
+    return None
+
+
 async def _prepare_benchmark_storage(
     run_id: str,
     namespace: str,
     environment: dict[str, str],
     configured_storage_class: str | None,
+    *,
+    cluster_id: str | None = None,
 ) -> tuple[str, str | None]:
     if configured_storage_class:
+        if not _is_valid_k8s_subdomain(configured_storage_class):
+            raise ValueError("Invalid configured storage class name")
         return configured_storage_class, None
-    storage_classes = await _benchmark_kubectl_json(environment, "get", "storageclass", "-o", "json")
+    try:
+        storage_classes = await _benchmark_kubectl_json(environment, "get", "storageclass", "-o", "json")
+    except RuntimeError as error:
+        if not is_forbidden_error(str(error)):
+            raise
+        prom_sc = await _discover_storage_class_via_prometheus(cluster_id, namespace)
+        if prom_sc:
+            return prom_sc, None
+        ns_sc = await _discover_storage_class_from_namespace_pvcs(namespace, environment)
+        if ns_sc:
+            return ns_sc, None
+        logger.warning(
+            "Benchmark %s skipped cluster-scoped StorageClass query on non-admin cluster; "
+            "relying on cluster DefaultStorageClass admission in namespace %s",
+            run_id,
+            namespace,
+        )
+        return "", None
+
     for item in storage_classes.get("items", []):
         annotations = (item.get("metadata") or {}).get("annotations") or {}
         if (
@@ -3107,31 +3795,292 @@ async def _prepare_benchmark_storage(
             },
         ],
     }
-    await _benchmark_kubectl_json(
-        environment,
-        "apply",
-        "--filename=-",
-        "--output=json",
-        stdin=json.dumps(manifest).encode(),
-    )
+    try:
+        await _benchmark_kubectl_json(
+            environment,
+            "apply",
+            "--filename=-",
+            "--output=json",
+            stdin=json.dumps(manifest).encode(),
+        )
+    except RuntimeError as error:
+        if not is_forbidden_error(str(error)):
+            raise
+        prom_sc = await _discover_storage_class_via_prometheus(cluster_id, namespace)
+        if prom_sc:
+            return prom_sc, None
+        ns_sc = await _discover_storage_class_from_namespace_pvcs(namespace, environment)
+        if ns_sc:
+            return ns_sc, None
+        return "", None
     return storage_class, volume_name
 
 
-async def _cleanup_benchmark_storage(namespace: str, volume_name: str | None, environment: dict[str, str]) -> None:
-    if not volume_name:
-        return
-    with contextlib.suppress(json.JSONDecodeError, RuntimeError):
+async def _can_get_namespace(namespace: str, environment: dict[str, str]) -> bool:
+    try:
+        await _benchmark_kubectl_json(environment, "get", "namespace", namespace, "-o", "json")
+    except RuntimeError as error:
+        return not is_forbidden_error(str(error))
+    return True
+
+
+def _deep_merge_dicts(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def _load_benchmark_values(benchmark_root: Path, accelerator_profile: str | None = None) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    defaults_path = benchmark_root / "config/templates/values/defaults.yaml"
+    if defaults_path.is_file():
+        try:
+            loaded = yaml.safe_load(defaults_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                values = loaded
+        except (OSError, yaml.YAMLError):
+            values = {}
+    if accelerator_profile and "/" not in accelerator_profile and "\\" not in accelerator_profile:
+        overlays_dir = (benchmark_root / "config/templates/values/overlays").resolve()
+        overlay_path = (overlays_dir / f"{accelerator_profile}.yaml").resolve()
+        if overlay_path.parent == overlays_dir and overlay_path.is_file():
+            try:
+                overlay = yaml.safe_load(overlay_path.read_text(encoding="utf-8"))
+                if isinstance(overlay, dict):
+                    values = _deep_merge_dicts(values, overlay)
+            except (OSError, yaml.YAMLError):
+                pass
+    return values
+
+
+async def _prepare_non_admin_harness_pvc(
+    namespace: str,
+    storage_class: str,
+    benchmark_root: Path,
+    environment: dict[str, str],
+    *,
+    accelerator_profile: str | None = None,
+    wait_timeout: int | float = 300,
+) -> None:
+    namespace = validate_namespace(namespace)
+    values = _load_benchmark_values(benchmark_root, accelerator_profile)
+    storage_cfg = (values.get("storage") or {}).get("workloadPvc") or {}
+    pvc_name = str(storage_cfg.get("name") or "workload-pvc")
+    if not _is_valid_k8s_subdomain(pvc_name):
+        raise ValueError("Invalid workload PVC name")
+    pvc_size = str(storage_cfg.get("size") or "20Gi")
+    access_modes = list(storage_cfg.get("accessModes") or ["ReadWriteMany"])
+    if storage_class == "local-path":
+        access_modes = ["ReadWriteOnce"]
+
+    images_cfg = (values.get("images") or {}).get("benchmark") or {}
+    image_repo = str(images_cfg.get("repository") or "ghcr.io/llm-d/llm-d-benchmark")
+    image_tag = str(images_cfg.get("tag") or "v1.0.0")
+    pull_policy = str(images_cfg.get("pullPolicy") or "IfNotPresent")
+
+    data_access_cfg = values.get("dataAccess") or {}
+    labels_cfg = values.get("labels") or {}
+    vllm_common_cfg = values.get("vllmCommon") or {}
+    rsync_port = int(data_access_cfg.get("rsyncPort") or 20873)
+    app_label = str(labels_cfg.get("app") or "llm-d-benchmark-harness")
+
+    existing_pvc: dict | None = None
+    try:
+        existing_pvc = await _benchmark_kubectl_json(environment, "get", "pvc", pvc_name, "-n", namespace, "-o", "json")
+    except RuntimeError as error:
+        error_lower = str(error).lower()
+        if "notfound" not in error_lower and "not found" not in error_lower:
+            raise
+
+    if not (existing_pvc and (existing_pvc.get("status") or {}).get("phase") == "Bound"):
+        pvc_spec: dict[str, Any] = {
+            "accessModes": access_modes,
+            "resources": {"requests": {"storage": pvc_size}},
+        }
+        if storage_class and storage_class not in {"auto", "default"}:
+            pvc_spec["storageClassName"] = storage_class
+        pvc_manifest = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {"name": pvc_name, "namespace": namespace},
+            "spec": pvc_spec,
+        }
+        try:
+            await _benchmark_kubectl_json(
+                environment,
+                "apply",
+                "--filename=-",
+                "--output=json",
+                stdin=json.dumps(pvc_manifest).encode(),
+            )
+        except RuntimeError as error:
+            if not (existing_pvc is not None and "immutable" in str(error).lower()):
+                raise
+
+    pod_name = "access-to-harness-data-workload-pvc"
+    container_spec: dict[str, Any] = {
+        "name": "rsync",
+        "image": f"{image_repo}:{image_tag}",
+        "imagePullPolicy": pull_policy,
+        "command": [
+            "sh",
+            "-c",
+            (
+                f"command -v rsync >/dev/null 2>&1 && exec rsync --daemon --no-detach "
+                f"--port={rsync_port} --log-file=/dev/stdout || exec sleep infinity"
+            ),
+        ],
+        "volumeMounts": [{"name": "requests", "mountPath": "/requests"}],
+    }
+    run_as_user = data_access_cfg.get("runAsUser")
+    if run_as_user is not None:
+        container_spec["securityContext"] = {"runAsUser": int(run_as_user)}
+    resources_cfg = data_access_cfg.get("resources")
+    if isinstance(resources_cfg, dict) and resources_cfg:
+        limits = {
+            k: str(v)
+            for k, v in (("cpu", resources_cfg.get("limitsCpu")), ("memory", resources_cfg.get("limitsMemory")))
+            if v is not None
+        }
+        requests = {
+            k: str(v)
+            for k, v in (("cpu", resources_cfg.get("requestsCpu")), ("memory", resources_cfg.get("requestsMemory")))
+            if v is not None
+        }
+        if limits or requests:
+            container_spec["resources"] = {
+                **({"limits": limits} if limits else {}),
+                **({"requests": requests} if requests else {}),
+            }
+
+    pod_spec: dict[str, Any] = {
+        "containers": [container_spec],
+        "volumes": [{"name": "requests", "persistentVolumeClaim": {"claimName": pvc_name}}],
+    }
+    if data_access_cfg.get("serviceAccount"):
+        pod_spec["serviceAccountName"] = str(data_access_cfg["serviceAccount"])
+    if isinstance(data_access_cfg.get("nodeSelector"), dict) and data_access_cfg["nodeSelector"]:
+        pod_spec["nodeSelector"] = {str(k): str(v) for k, v in data_access_cfg["nodeSelector"].items()}
+    if isinstance(data_access_cfg.get("tolerations"), list) and data_access_cfg["tolerations"]:
+        pod_spec["tolerations"] = data_access_cfg["tolerations"]
+    if vllm_common_cfg.get("pullSecret"):
+        pod_spec["imagePullSecrets"] = [{"name": str(vllm_common_cfg["pullSecret"])}]
+
+    pod_manifest = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+            "namespace": namespace,
+            "labels": {"app": app_label, "role": "llm-d-benchmark-data-access"},
+        },
+        "spec": pod_spec,
+    }
+    try:
+        await _benchmark_kubectl_json(
+            environment,
+            "apply",
+            "--filename=-",
+            "--output=json",
+            stdin=json.dumps(pod_manifest).encode(),
+        )
+    except RuntimeError as error:
+        error_lower = str(error).lower()
+        if not any(marker in error_lower for marker in ("immutable", "pod updates may not change", "invalid")):
+            raise
         await _benchmark_kubectl_json(
             environment,
             "delete",
-            "pvc",
-            "workload-pvc",
+            "pod",
+            pod_name,
             "--namespace",
             namespace,
             "--ignore-not-found=true",
-            "--wait=false",
+            "--wait=true",
             "--output=json",
         )
+        await _benchmark_kubectl_json(
+            environment,
+            "apply",
+            "--filename=-",
+            "--output=json",
+            stdin=json.dumps(pod_manifest).encode(),
+        )
+
+    deadline = asyncio.get_running_loop().time() + max(1.0, float(wait_timeout))
+    poll_interval = min(2.0, max(0.05, float(wait_timeout) / 10.0))
+    while True:
+        pod = await _benchmark_kubectl_json(environment, "get", "pod", pod_name, "-n", namespace, "-o", "json")
+        status = pod.get("status") or {}
+        conditions = status.get("conditions") or []
+        if status.get("phase") == "Running" and any(
+            isinstance(cond, dict) and cond.get("type") == "Ready" and cond.get("status") == "True"
+            for cond in conditions
+        ):
+            return
+        if status.get("phase") == "Failed":
+            raise RuntimeError(f"Pod {pod_name} in namespace {namespace} entered Failed phase")
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError(f"Timed out waiting for Pod {pod_name} in namespace {namespace} to become Ready")
+        await asyncio.sleep(poll_interval)
+
+
+async def _cleanup_benchmark_storage(
+    namespace: str,
+    volume_name: str | None,
+    environment: dict[str, str],
+    *,
+    cleanup_pvc_resources: bool = False,
+) -> None:
+    if cleanup_pvc_resources:
+        try:
+            safe_namespace = validate_namespace(namespace)
+        except ValueError:
+            safe_namespace = None
+        if safe_namespace:
+            with contextlib.suppress(json.JSONDecodeError, RuntimeError):
+                await _benchmark_kubectl_json(
+                    environment,
+                    "delete",
+                    "pod",
+                    "access-to-harness-data-workload-pvc",
+                    "--namespace",
+                    safe_namespace,
+                    "--ignore-not-found=true",
+                    "--wait=false",
+                    "--output=json",
+                )
+            with contextlib.suppress(json.JSONDecodeError, RuntimeError):
+                await _benchmark_kubectl_json(
+                    environment,
+                    "delete",
+                    "pvc",
+                    "workload-pvc",
+                    "--namespace",
+                    safe_namespace,
+                    "--ignore-not-found=true",
+                    "--wait=false",
+                    "--output=json",
+                )
+    if not volume_name:
+        return
+    if not cleanup_pvc_resources:
+        with contextlib.suppress(json.JSONDecodeError, RuntimeError):
+            await _benchmark_kubectl_json(
+                environment,
+                "delete",
+                "pvc",
+                "workload-pvc",
+                "--namespace",
+                namespace,
+                "--ignore-not-found=true",
+                "--wait=false",
+                "--output=json",
+            )
     with contextlib.suppress(json.JSONDecodeError, RuntimeError):
         await _benchmark_kubectl_json(
             environment,
@@ -3205,6 +4154,1241 @@ async def _stream_benchmark_process(
     return tails["stdout"], tails["stderr"]
 
 
+_EPP_INTERNAL_PORTS = frozenset({9002, 9090})
+_DEFAULT_GAIE_PRESETS_CONFIG_YAML = "plugins: []\n"
+_DEFAULT_GAIE_PRESETS_CONFIG_B64 = base64.b64encode(_DEFAULT_GAIE_PRESETS_CONFIG_YAML.encode("utf-8")).decode("ascii")
+_STANDUP_CM_NAME = "llm-d-benchmark-standup-parameters"
+_STANDUP_CM_MANAGED_LABEL = "lens.llm-d.ai/managed-standup-parameters"
+_standup_configmap_refs: dict[tuple[str, str], int] = {}
+_standup_configmap_lock = asyncio.Lock()
+
+
+def _eval_k8s_env(environment: Mapping[str, str]) -> dict[str, str]:
+    """Merge os.environ with caller environment without re-injecting stripped external proxies."""
+    base = {k: v for k, v in os.environ.items() if k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}}
+    return {**base, **environment}
+
+
+def _standup_ref_key(environment: Mapping[str, str], namespace: str) -> tuple[str, str]:
+    target = (environment.get("KUBECONFIG") or environment.get("KUBERNETES_SERVICE_HOST") or "").strip()
+    return target, namespace
+
+
+def _has_k8s_cluster_target(environment: Mapping[str, str]) -> bool:
+    """True only when an explicit kubeconfig file exists on disk or running in-cluster."""
+    kc = (environment.get("KUBECONFIG") or "").strip()
+    if kc and any(Path(part.strip()).is_file() for part in kc.split(os.pathsep) if part.strip()):
+        return True
+    return bool((environment.get("KUBERNETES_SERVICE_HOST") or "").strip())
+
+
+async def _eval_k8s_json(arguments: list[str], environment: dict[str, str]) -> dict[str, Any] | None:
+    """Execute a read-only kubectl JSON query via SDK with process.spawn fallback."""
+    if not _has_k8s_cluster_target(environment):
+        return None
+    from llm_d_lens.infrastructure.kubernetes.commands import execute_sdk_command, sdk_enabled
+
+    if sdk_enabled():
+        try:
+            result = await execute_sdk_command(
+                ["kubectl", *arguments, "-o", "json"],
+                kubeconfig=environment.get("KUBECONFIG") or None,
+                timeout=5,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("SDK k8s query failed for %s", arguments, exc_info=True)
+            return None
+        if result is not None:
+            if result.returncode != 0:
+                return None
+            try:
+                parsed = json.loads(result.stdout)
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                return None
+    try:
+        proc = await _process_spawn(
+            ["kubectl", *arguments, "-o", "json"],
+            env=_eval_k8s_env(environment),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except (CommandNotFoundError, OSError):
+        return None
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(OSError):
+            await proc.wait()
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        parsed = json.loads(stdout)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+async def _eval_k8s_apply(manifest: dict[str, Any], environment: dict[str, str]) -> bool:
+    """Apply a namespace-scoped manifest via SDK/client-side apply."""
+    if not _has_k8s_cluster_target(environment):
+        return False
+    payload = json.dumps(manifest).encode("utf-8")
+    from llm_d_lens.infrastructure.kubernetes.commands import execute_sdk_command, sdk_enabled, sdk_writes_enabled
+
+    if sdk_enabled():
+        try:
+            result = await execute_sdk_command(
+                ["kubectl", "apply", "--filename=-", "--output=json"],
+                kubeconfig=environment.get("KUBECONFIG") or None,
+                timeout=10,
+                stdin_data=payload,
+                allow_writes=sdk_writes_enabled(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("SDK k8s apply failed", exc_info=True)
+            return False
+        if result is not None:
+            return result.returncode == 0
+    try:
+        proc = await _process_spawn(
+            ["kubectl", "apply", "--filename=-", "--output=json"],
+            env=_eval_k8s_env(environment),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except (CommandNotFoundError, OSError):
+        return False
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(payload), timeout=10)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(OSError):
+            await proc.wait()
+        return False
+    if proc.returncode != 0:
+        logger.debug("kubectl apply failed: %s", _redact_benchmark_error(stderr.decode(errors="replace").strip()))
+        return False
+    return True
+
+
+async def _eval_k8s_delete(resource: str, name: str, namespace: str, environment: dict[str, str]) -> bool:
+    """Delete a namespace-scoped resource safely via SDK with process.spawn fallback."""
+    if not _has_k8s_cluster_target(environment):
+        return False
+    try:
+        safe_ns = validate_namespace(namespace)
+    except ValueError:
+        return False
+    if not _is_valid_k8s_subdomain(name):
+        return False
+    argv = ["kubectl", "delete", resource, name, "-n", safe_ns, "--ignore-not-found=true"]
+    from llm_d_lens.infrastructure.kubernetes.commands import execute_sdk_command, sdk_enabled, sdk_writes_enabled
+
+    if sdk_enabled():
+        try:
+            result = await execute_sdk_command(
+                argv,
+                kubeconfig=environment.get("KUBECONFIG") or None,
+                timeout=10,
+                allow_writes=sdk_writes_enabled(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("SDK k8s delete failed for %s/%s", resource, name, exc_info=True)
+            return False
+        if result is not None:
+            return result.returncode == 0
+    try:
+        proc = await _process_spawn(
+            argv,
+            env=_eval_k8s_env(environment),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except (CommandNotFoundError, OSError):
+        return False
+    try:
+        await asyncio.wait_for(proc.communicate(), timeout=10)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(OSError):
+            await proc.wait()
+        return False
+    return proc.returncode == 0
+
+
+def _parse_in_cluster_service_url(url: str, default_ns: str) -> tuple[str, str, int] | None:
+    """Extract (service_name, namespace, port) from *.svc / *.svc.cluster.local URLs."""
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    parts = parsed.hostname.rstrip(".").lower().split(".")
+    if (len(parts) == 5 and parts[2:] == ["svc", "cluster", "local"]) or (len(parts) == 3 and parts[2] == "svc"):
+        svc_name, ns = parts[0], parts[1]
+    else:
+        return None
+    resolved_ns = ns or default_ns
+    try:
+        safe_ns = validate_namespace(resolved_ns)
+    except ValueError:
+        return None
+    if not _is_valid_k8s_subdomain(svc_name):
+        return None
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return svc_name, safe_ns, port
+
+
+def _is_loopback_url(url: str) -> bool:
+    parsed = urlparse(str(url or "").strip())
+    host = (parsed.hostname or "").rstrip(".").lower()
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def _selector_matches(selector: Mapping[str, Any], labels: Mapping[str, Any]) -> bool:
+    return bool(selector) and all(labels.get(k) == v for k, v in selector.items())
+
+
+def _is_pod_ready_and_running(pod: Mapping[str, Any]) -> bool:
+    metadata = pod.get("metadata") or {}
+    if metadata.get("deletionTimestamp"):
+        return False
+    status = pod.get("status") or {}
+    if status.get("phase") != "Running":
+        return False
+    conditions = status.get("conditions")
+    if isinstance(conditions, list):
+        ready_conds = [c for c in conditions if isinstance(c, dict) and c.get("type") == "Ready"]
+        if ready_conds:
+            return any(c.get("status") == "True" for c in ready_conds)
+    container_statuses = status.get("containerStatuses")
+    if isinstance(container_statuses, list) and container_statuses:
+        return any(isinstance(cs, dict) and cs.get("ready") is True for cs in container_statuses)
+    return True
+
+
+def _deployment_available(dep: Mapping[str, Any]) -> bool:
+    status = dep.get("status")
+    if isinstance(status, Mapping):
+        if "availableReplicas" in status:
+            return int(status.get("availableReplicas") or 0) > 0
+        if "readyReplicas" in status:
+            return int(status.get("readyReplicas") or 0) > 0
+    replicas = (dep.get("spec") or {}).get("replicas")
+    return replicas is None or int(replicas) > 0
+
+
+def _workload_pod_spec(workload: Mapping[str, Any]) -> dict[str, Any]:
+    spec = workload.get("spec") or {}
+    template = spec.get("template")
+    if isinstance(template, Mapping):
+        pod_spec = template.get("spec")
+        return dict(pod_spec) if isinstance(pod_spec, Mapping) else {}
+    return dict(spec) if isinstance(spec, Mapping) else {}
+
+
+def _workload_name(workload: Mapping[str, Any]) -> str:
+    return str(((workload.get("metadata") or {}).get("name")) or "")
+
+
+def _is_epp_container(container: Mapping[str, Any]) -> bool:
+    if container.get("name") == "epp":
+        return True
+    tokens = [str(x) for x in [*(container.get("command") or []), *(container.get("args") or [])]]
+    return any(tok.startswith(("--pool-name", "--grpc-health-port")) for tok in tokens)
+
+
+def _is_envoy_proxy_container(container: Mapping[str, Any]) -> bool:
+    name = str(container.get("name") or "").lower()
+    image = str(container.get("image") or "").lower()
+    return (
+        name in {"envoy-proxy", "envoy", "agentgateway"}
+        or "envoy" in name
+        or "agentgateway" in name
+        or "envoy" in image
+    )
+
+
+def _infer_modelserver_port(container: Mapping[str, Any], workload_name: str) -> int:
+    """Infer modelserver serving port from --port (via manifest_facts) or raw tokens, defaulting to 8000."""
+    try:
+        tokens = _invocation_tokens(dict(container), workload_name)
+        port_raw = _option(tokens, {"--port"}, workload_name)
+        if port_raw is not None:
+            return int(port_raw)
+    except (ValueError, TypeError):
+        raw_tokens = [str(x) for x in [*(container.get("command") or []), *(container.get("args") or [])]]
+        for idx, tok in enumerate(raw_tokens):
+            name, sep, attached = tok.partition("=")
+            if name == "--port":
+                candidate = attached if sep else (raw_tokens[idx + 1] if idx + 1 < len(raw_tokens) else "")
+                if candidate.isdigit():
+                    return int(candidate)
+    return 8000
+
+
+def _container_tcp_ports(container: Mapping[str, Any], workload_name: str) -> tuple[set[int], dict[str, int]]:
+    numeric: set[int] = set()
+    named: dict[str, int] = {}
+    ports = container.get("ports")
+    if isinstance(ports, list) and ports:
+        for entry in ports:
+            if not isinstance(entry, Mapping):
+                continue
+            if str(entry.get("protocol") or "TCP").upper() != "TCP":
+                continue
+            cport = entry.get("containerPort")
+            if cport is None:
+                continue
+            port_num = int(cport)
+            numeric.add(port_num)
+            if entry.get("name"):
+                named[str(entry["name"])] = port_num
+        return numeric, named
+    if container.get("name") in {"modelserver", "model-server"}:
+        inferred = _infer_modelserver_port(container, workload_name)
+        numeric.add(inferred)
+    return numeric, named
+
+
+def _resolve_service_port_target(
+    svc_port: Mapping[str, Any],
+    containers: list[dict[str, Any]],
+    workload_name: str,
+) -> int | None:
+    """Match ServicePort.targetPort (defaulting to port, supporting named targetPort) against containers."""
+    if str(svc_port.get("protocol") or "TCP").upper() != "TCP":
+        return None
+    raw_port = svc_port.get("port")
+    if raw_port is None:
+        return None
+    port_num = int(raw_port)
+    target = svc_port.get("targetPort")
+    if target is None:
+        target = port_num
+    for container in containers:
+        if not isinstance(container, Mapping):
+            continue
+        numeric, named = _container_tcp_ports(container, workload_name)
+        if isinstance(target, int) or (isinstance(target, str) and target.isdigit()):
+            tp_num = int(target)
+            if tp_num in _EPP_INTERNAL_PORTS:
+                continue
+            if tp_num in numeric:
+                return tp_num
+        elif isinstance(target, str) and target in named:
+            tp_num = named[target]
+            if tp_num not in _EPP_INTERNAL_PORTS:
+                return tp_num
+    return None
+
+
+def _detect_envoy_epp_mismatch(deployment: Mapping[str, Any], envoy_yaml: str) -> str | None:
+    """Detect TLS vs plaintext mismatches between Envoy's ext_proc cluster and the EPP container."""
+    pod_spec = _workload_pod_spec(deployment)
+    containers = [c for c in (pod_spec.get("containers") or []) if isinstance(c, Mapping)]
+    epp_container = next((c for c in containers if _is_epp_container(c)), None)
+    if epp_container is None:
+        return None
+    tokens = [str(x) for x in [*(epp_container.get("command") or []), *(epp_container.get("args") or [])]]
+    secure_serving: bool | None = None
+    for idx, token in enumerate(tokens):
+        lower = token.lower()
+        if lower in {"--secure-serving=false", "--secure-serving=0"}:
+            secure_serving = False
+        elif lower in {"--secure-serving=true", "--secure-serving=1"}:
+            secure_serving = True
+        elif lower == "--secure-serving" and idx + 1 < len(tokens):
+            val = tokens[idx + 1].lower()
+            if val in {"false", "0"}:
+                secure_serving = False
+            elif val in {"true", "1"}:
+                secure_serving = True
+    epp_plaintext = secure_serving is False
+
+    try:
+        envoy_doc = yaml.safe_load(envoy_yaml)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(envoy_doc, Mapping):
+        return None
+    clusters = (envoy_doc.get("static_resources") or {}).get("clusters") or []
+    ext_proc = next((c for c in clusters if isinstance(c, Mapping) and c.get("name") == "ext_proc"), None)
+    if ext_proc is None:
+        return None
+    transport_socket = ext_proc.get("transport_socket")
+    health_checks = ext_proc.get("health_checks") or []
+    envoy_uses_tls = (
+        isinstance(transport_socket, Mapping) and transport_socket.get("name") == "envoy.transport_sockets.tls"
+    ) or any(isinstance(hc, Mapping) and "tls_options" in hc for hc in health_checks)
+    if epp_plaintext and envoy_uses_tls:
+        return "envoy_ext_proc_tls_mismatch_epp_plaintext"
+    if not epp_plaintext and not envoy_uses_tls:
+        return "envoy_ext_proc_plaintext_mismatch_epp_tls"
+    return None
+
+
+def _envoy_configmap_names(workload: Mapping[str, Any]) -> list[str]:
+    pod_spec = _workload_pod_spec(workload)
+    cm_by_vol = {
+        str(v["name"]): str(v["configMap"]["name"])
+        for v in (pod_spec.get("volumes") or [])
+        if isinstance(v, Mapping)
+        and v.get("name")
+        and isinstance(v.get("configMap"), Mapping)
+        and v["configMap"].get("name")
+    }
+    names: list[str] = []
+    for container in pod_spec.get("containers") or []:
+        if not isinstance(container, Mapping) or not _is_envoy_proxy_container(container):
+            continue
+        for vm in container.get("volumeMounts") or []:
+            if isinstance(vm, Mapping) and vm.get("name") in cm_by_vol:
+                cm_name = cm_by_vol[str(vm["name"])]
+                if _is_valid_k8s_subdomain(cm_name) and cm_name not in names:
+                    names.append(cm_name)
+    return names
+
+
+async def _check_target_service_health(
+    target_svc_name: str,
+    target_port: int,
+    services: list[dict[str, Any]],
+    deployments: list[dict[str, Any]],
+    get_cm_fn: Callable[[str], Any] | None = None,
+    *,
+    pods: list[dict[str, Any]] | None = None,
+) -> str | None:
+    """Verify Service existence, port mapping, backing readiness, listening targetPort, and Envoy/EPP TLS parity."""
+    target_svc = next((s for s in services if _workload_name(s) == target_svc_name), None)
+    if target_svc is None:
+        return "service_not_found"
+    svc_spec = target_svc.get("spec") or {}
+    svc_ports = [p for p in (svc_spec.get("ports") or []) if isinstance(p, Mapping)]
+    matching_port = next(
+        (
+            p
+            for p in svc_ports
+            if p.get("port") is not None
+            and int(p["port"]) == target_port
+            and str(p.get("protocol") or "TCP").upper() == "TCP"
+        ),
+        None,
+    )
+    if matching_port is None:
+        return "service_port_not_found"
+
+    selector = svc_spec.get("selector") or {}
+    if not isinstance(selector, Mapping) or not selector:
+        return None
+
+    matching_deps = [
+        dep
+        for dep in deployments
+        if _selector_matches(
+            selector, ((dep.get("spec") or {}).get("template") or {}).get("metadata", {}).get("labels") or {}
+        )
+    ]
+    matching_pods = [
+        pod for pod in (pods or []) if _selector_matches(selector, (pod.get("metadata") or {}).get("labels") or {})
+    ]
+    ready_pods = [pod for pod in matching_pods if _is_pod_ready_and_running(pod)]
+
+    if matching_deps:
+        if not any(_deployment_available(dep) for dep in matching_deps):
+            return "backing_deployment_unavailable"
+        active_workloads: list[dict[str, Any]] = [dep for dep in matching_deps if _deployment_available(dep)]
+    else:
+        if not ready_pods:
+            return "backing_deployment_unavailable"
+        active_workloads = ready_pods
+
+    port_listening = any(
+        _resolve_service_port_target(
+            matching_port,
+            _workload_pod_spec(w).get("containers") or [],
+            _workload_name(w),
+        )
+        is not None
+        for w in active_workloads
+    )
+    if not port_listening:
+        return "proxy_target_port_not_listening"
+
+    if get_cm_fn is not None:
+        for workload in active_workloads:
+            containers = [c for c in (_workload_pod_spec(workload).get("containers") or []) if isinstance(c, Mapping)]
+            if not any(_is_epp_container(c) for c in containers):
+                continue
+            for cm_name in _envoy_configmap_names(workload):
+                cm = get_cm_fn(cm_name)
+                if inspect.isawaitable(cm):
+                    cm = await cm
+                if not isinstance(cm, Mapping):
+                    continue
+                data = cm.get("data") or {}
+                envoy_yaml = data.get("envoy.yaml")
+                if not isinstance(envoy_yaml, str):
+                    envoy_yaml = next(
+                        (v for v in data.values() if isinstance(v, str) and "ext_proc" in v),
+                        None,
+                    )
+                if isinstance(envoy_yaml, str):
+                    mismatch = _detect_envoy_epp_mismatch(workload, envoy_yaml)
+                    if mismatch:
+                        return mismatch
+    return None
+
+
+def _discover_namespace_inference_endpoints(
+    services: list[dict[str, Any]],
+    deployments: list[dict[str, Any]],
+    namespace: str,
+    *,
+    pods: list[dict[str, Any]] | None = None,
+) -> tuple[str | None, str | None]:
+    """Discover (router_url, direct_modelserver_url) in namespace from Services/Deployments/Pods."""
+    try:
+        safe_ns = validate_namespace(namespace)
+    except ValueError:
+        return None, None
+    router_candidates: list[tuple[tuple[int, int, str], str]] = []
+    direct_candidates: list[tuple[tuple[int, int, int, str], str]] = []
+
+    for svc in services:
+        svc_name = _workload_name(svc)
+        if not svc_name or not _is_valid_k8s_subdomain(svc_name):
+            continue
+        svc_spec = svc.get("spec") or {}
+        selector = svc_spec.get("selector") or {}
+        if not isinstance(selector, Mapping) or not selector:
+            continue
+        matching_deps = [
+            dep
+            for dep in deployments
+            if _selector_matches(
+                selector, ((dep.get("spec") or {}).get("template") or {}).get("metadata", {}).get("labels") or {}
+            )
+        ]
+        if matching_deps:
+            available_workloads: list[dict[str, Any]] = [d for d in matching_deps if _deployment_available(d)]
+        else:
+            available_workloads = [
+                p
+                for p in (pods or [])
+                if _selector_matches(selector, (p.get("metadata") or {}).get("labels") or {})
+                and _is_pod_ready_and_running(p)
+            ]
+        if not available_workloads:
+            continue
+
+        is_headless = svc_spec.get("clusterIP") == "None"
+        svc_ports = [p for p in (svc_spec.get("ports") or []) if isinstance(p, Mapping)]
+
+        for workload in available_workloads:
+            w_name = _workload_name(workload)
+            containers = [c for c in (_workload_pod_spec(workload).get("containers") or []) if isinstance(c, Mapping)]
+            proxy_containers = [c for c in containers if _is_envoy_proxy_container(c)]
+            model_containers = [c for c in containers if c.get("name") in {"modelserver", "model-server"}]
+
+            for sp in svc_ports:
+                if sp.get("port") is None:
+                    continue
+                port_num = int(sp["port"])
+                if port_num in _EPP_INTERNAL_PORTS:
+                    continue
+                protocol = "https" if port_num == 443 or str(sp.get("name") or "").lower() == "https" else "http"
+                url = f"{protocol}://{svc_name}.{safe_ns}.svc.cluster.local:{port_num}"
+                if proxy_containers and _resolve_service_port_target(sp, proxy_containers, w_name) is not None:
+                    port_rank = 0 if port_num in {80, 8080} else 1
+                    router_candidates.append(((1 if is_headless else 0, port_rank, svc_name), url))
+                if model_containers and _resolve_service_port_target(sp, model_containers, w_name) is not None:
+                    name_lower = svc_name.lower()
+                    name_rank = (
+                        0
+                        if name_lower.endswith(("-baseline", "-model-servers", "-modelserver"))
+                        else 1
+                        if ("modelserver" in name_lower or "model-server" in name_lower)
+                        else 2
+                    )
+                    port_rank = 0 if port_num == 8000 else 1
+                    direct_candidates.append(((1 if is_headless else 0, name_rank, port_rank, svc_name), url))
+
+    router_candidates.sort(key=lambda item: item[0])
+    direct_candidates.sort(key=lambda item: item[0])
+    return (
+        router_candidates[0][1] if router_candidates else None,
+        direct_candidates[0][1] if direct_candidates else None,
+    )
+
+
+async def _fetch_namespace_resources(
+    namespace: str,
+    environment: dict[str, str],
+    cache: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """Fetch services, deployments, and pods once per namespace, caching on the shared dict."""
+    try:
+        safe_ns = validate_namespace(namespace)
+    except ValueError:
+        return [], [], [], False
+    if cache is not None and safe_ns in cache:
+        entry = cache[safe_ns]
+        return entry["services"], entry["deployments"], entry["pods"], entry["ok"]
+    services_doc, deployments_doc, pods_doc = await asyncio.gather(
+        _eval_k8s_json(["get", "services", "-n", safe_ns], environment),
+        _eval_k8s_json(["get", "deployments", "-n", safe_ns], environment),
+        _eval_k8s_json(["get", "pods", "-n", safe_ns], environment),
+    )
+    ok = services_doc is not None and (deployments_doc is not None or pods_doc is not None)
+    services = list((services_doc or {}).get("items") or [])
+    deployments = list((deployments_doc or {}).get("items") or [])
+    pods = list((pods_doc or {}).get("items") or [])
+    if cache is not None:
+        cache[safe_ns] = {"services": services, "deployments": deployments, "pods": pods, "ok": ok}
+    return services, deployments, pods, ok
+
+
+async def _resolve_benchmark_endpoint(
+    run: dict[str, Any],
+    execution: Any,
+    environment: dict[str, str],
+    *,
+    namespace_cache: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    """Resolve the in-cluster benchmark endpoint with proxy preflight and fallback."""
+    endpoint_url = execution.endpoint.url
+    baseline_url = getattr(execution.endpoint, "baseline_url", None)
+    namespace = execution.namespace or "default"
+
+    if run.get("use_baseline_endpoint"):
+        if not baseline_url:
+            raise ValueError(
+                "this Guide deployment does not expose a kubernetes-service baseline endpoint for comparison"
+            )
+        return baseline_url
+
+    if run.get("model_service_group_id") or deployment_uses_shared_gateway(execution):
+        # An "existing endpoint" run always targets a published Model Service:
+        # its HTTPRoute reaches the InferencePool directly, regardless of what
+        # data plane the underlying deployment happened to resolve at deploy
+        # time. Design Configuration runs (no model_service_group_id) fall back
+        # to the deployment's recorded data plane.
+        gateway_endpoint = await _cluster_gateway_endpoint((execution.provenance or {}).get("cluster_server_id"))
+        if gateway_endpoint:
+            return gateway_endpoint
+        return endpoint_url
+
+    is_loopback = bool(endpoint_url and _is_loopback_url(endpoint_url))
+    parsed_svc = _parse_in_cluster_service_url(endpoint_url, namespace) if endpoint_url and not is_loopback else None
+    if not is_loopback and parsed_svc is None:
+        return endpoint_url
+
+    target_ns = parsed_svc[1] if parsed_svc is not None else namespace
+    services, deployments, pods, k8s_ok = await _fetch_namespace_resources(target_ns, environment, namespace_cache)
+
+    if not k8s_ok:
+        if is_loopback:
+            return baseline_url or f"http://optimized-baseline-epp.{namespace}.svc:80"
+        return endpoint_url
+
+    cm_cache: dict[str, dict[str, Any] | None] = {}
+
+    async def get_cm(cm_name: str) -> dict[str, Any] | None:
+        if not _is_valid_k8s_subdomain(cm_name):
+            return None
+        if cm_name not in cm_cache:
+            cm_cache[cm_name] = await _eval_k8s_json(["get", "configmap", cm_name, "-n", target_ns], environment)
+        return cm_cache[cm_name]
+
+    async def _healthy_baseline() -> str | None:
+        if not baseline_url:
+            return None
+        parsed_base = _parse_in_cluster_service_url(baseline_url, target_ns)
+        if parsed_base is None:
+            return baseline_url
+        b_svc, b_ns, b_port = parsed_base
+        if b_ns != target_ns:
+            return baseline_url
+        reason = await _check_target_service_health(b_svc, b_port, services, deployments, get_cm, pods=pods)
+        return baseline_url if reason is None else None
+
+    router_url, direct_url = _discover_namespace_inference_endpoints(services, deployments, target_ns, pods=pods)
+
+    if is_loopback:
+        router_reason = "no_healthy_router_service"
+        if router_url:
+            parsed_router = _parse_in_cluster_service_url(router_url, target_ns)
+            if parsed_router is not None:
+                router_reason = (
+                    await _check_target_service_health(
+                        parsed_router[0], parsed_router[2], services, deployments, get_cm, pods=pods
+                    )
+                    or ""
+                )
+                if not router_reason:
+                    return router_url
+        fallback = await _healthy_baseline() or direct_url
+        if fallback:
+            logger.warning(
+                "Loopback endpoint %s fell back to %s (reason=%s)",
+                endpoint_url,
+                fallback,
+                router_reason or "router_unhealthy",
+            )
+            run["endpoint_fallback"] = {
+                "original_endpoint": endpoint_url,
+                "resolved_endpoint": fallback,
+                "reason": router_reason or "router_unhealthy",
+            }
+            return fallback
+        return baseline_url or f"http://optimized-baseline-epp.{namespace}.svc:80"
+
+    assert parsed_svc is not None
+    target_svc, _, target_port = parsed_svc
+    reason = await _check_target_service_health(target_svc, target_port, services, deployments, get_cm, pods=pods)
+    if reason is None:
+        return endpoint_url
+
+    fallback = await _healthy_baseline() or direct_url
+    if fallback and fallback != endpoint_url:
+        logger.warning(
+            "Target service %s:%s failed preflight (%s); falling back to %s",
+            target_svc,
+            target_port,
+            reason,
+            fallback,
+        )
+        run["endpoint_fallback"] = {
+            "original_endpoint": endpoint_url,
+            "resolved_endpoint": fallback,
+            "reason": reason,
+        }
+        return fallback
+    logger.warning(
+        "Target service %s:%s failed preflight (%s) with no healthy direct fallback; keeping %s",
+        target_svc,
+        target_port,
+        reason,
+        endpoint_url,
+    )
+    return endpoint_url
+
+
+def _profile_from_namespace_workloads(
+    deployments: list[dict[str, Any]],
+    pods: list[dict[str, Any]],
+    claim_templates: list[dict[str, Any]] | None = None,
+) -> Any | None:
+    """Resolve HardwareProfile from namespace workloads/claims without node access."""
+    profiles = list(all_profiles())
+    for item in [*(pods or []), *(deployments or [])]:
+        pod_spec = _workload_pod_spec(item)
+        for claim in pod_spec.get("resourceClaims") or []:
+            if not isinstance(claim, Mapping):
+                continue
+            dc = str(claim.get("deviceClassName") or "")
+            if dc and (profile := resolve_by_device_class(dc)):
+                return profile
+        for container in pod_spec.get("containers") or []:
+            if not isinstance(container, Mapping):
+                continue
+            resources = container.get("resources") or {}
+            for section in ("limits", "requests"):
+                for res_key in resources.get(section) or {}:
+                    profile = resolve_by_resource(str(res_key))
+                    if profile and not any(str(res_key).endswith(s) for s in profile.monitor_resource_suffixes):
+                        return profile
+    for tmpl in claim_templates or []:
+        devices = ((tmpl.get("spec") or {}).get("spec") or {}).get("devices") or {}
+        for req in devices.get("requests") or []:
+            if not isinstance(req, Mapping):
+                continue
+            dc = str(req.get("deviceClassName") or ((req.get("exactly") or {}).get("deviceClassName")) or "")
+            if dc and (profile := resolve_by_device_class(dc)):
+                return profile
+    for item in [*(pods or []), *(deployments or [])]:
+        pod_spec = _workload_pod_spec(item)
+        for container in pod_spec.get("containers") or []:
+            if not isinstance(container, Mapping):
+                continue
+            image = str(container.get("image") or "")
+            if not image:
+                continue
+            no_digest = image.split("@", 1)[0]
+            repo = no_digest.rsplit(":", 1)[0] if ":" in no_digest.rsplit("/", 1)[-1] else no_digest
+            for profile in profiles:
+                if repo in profile.deployment.managed_image_repositories:
+                    return profile
+    return None
+
+
+async def _resolve_standup_accelerator_model(
+    selected_hardware: Any | None,
+    *,
+    cluster_id: str | None,
+    namespace: str,
+    environment: dict[str, str],
+    deployments: list[dict[str, Any]],
+    pods: list[dict[str, Any]],
+) -> str:
+    """Resolve concrete accelerator_model purely from hardware profile telemetry/metadata (zero list_node)."""
+    profile = selected_hardware
+    if profile is None:
+        profile = _profile_from_namespace_workloads(deployments, pods)
+        if profile is None and _has_k8s_cluster_target(environment):
+            try:
+                safe_ns = validate_namespace(namespace)
+            except ValueError:
+                safe_ns = ""
+            if safe_ns:
+                rcts = await _eval_k8s_json(["get", "resourceclaimtemplates", "-n", safe_ns], environment)
+                profile = _profile_from_namespace_workloads(deployments, pods, list((rcts or {}).get("items") or []))
+
+    telemetry = getattr(profile, "telemetry", None) if profile is not None else None
+    if profile is not None and telemetry is not None and cluster_id:
+        model_label_keys = list(
+            dict.fromkeys(
+                key
+                for key in (
+                    (telemetry.label_schema or {}).get("model"),
+                    (telemetry.label_schema or {}).get("name"),
+                )
+                if key
+            )
+        )
+        node_label_keys = list(
+            dict.fromkeys(
+                str(key)
+                for key in [
+                    *((telemetry.allocation or {}).get("node_labels") or ()),
+                    (telemetry.label_schema or {}).get("node") or "",
+                ]
+                if key
+            )
+        )
+        expr: str | None = (telemetry.device_metrics or {}).get("device_info") or (telemetry.device_metrics or {}).get(
+            "gpu_info"
+        )
+        if not expr:
+            for source in (telemetry.device_metric_sources or {}).values():
+                if getattr(source, "metric", ""):
+                    expr = f"{source.metric}{_selector(source.match)}"
+                    break
+
+        if expr and model_label_keys:
+            model_nodes = {
+                str((pod.get("spec") or {}).get("nodeName") or "").strip()
+                for pod in pods
+                if (pod.get("spec") or {}).get("nodeName")
+                and any(
+                    isinstance(c, Mapping) and c.get("name") == "modelserver"
+                    for c in ((pod.get("spec") or {}).get("containers") or [])
+                )
+            }
+            if not model_nodes:
+                model_nodes = {
+                    str((pod.get("spec") or {}).get("nodeName") or "").strip()
+                    for pod in pods
+                    if (pod.get("spec") or {}).get("nodeName")
+                }
+            try:
+                endpoint = await resolve_prometheus_endpoint(cluster_id, allow_port_forward=False)
+                if endpoint is not None:
+                    async with create_prometheus_client(endpoint, timeout=5.0) as client:
+                        rows = await query_vector(client, expr)
+                    fallback_model: str | None = None
+                    for entry in rows:
+                        if _prom_sample_float(entry) is None:
+                            continue
+                        metric = entry.get("metric") or {}
+                        model_val = next(
+                            (str(metric.get(k)).strip() for k in model_label_keys if metric.get(k)),
+                            "",
+                        )
+                        if not model_val:
+                            continue
+                        if model_nodes and any(
+                            str(metric.get(nk) or "").strip() in model_nodes for nk in node_label_keys
+                        ):
+                            return model_val
+                        if fallback_model is None:
+                            fallback_model = model_val
+                    if fallback_model:
+                        return fallback_model
+            except Exception:  # noqa: BLE001
+                logger.debug("Prometheus accelerator model lookup failed for %s", profile.id, exc_info=True)
+
+    if profile is not None:
+        return str(profile.display_name or profile.id or "unknown")
+    return "unknown"
+
+
+def _extract_parallelism_from_container(
+    container: Mapping[str, Any],
+    workload_name: str,
+) -> tuple[int | None, int | None, int | None]:
+    tp: int | None = None
+    dp: int | None = None
+    dp_local: int | None = None
+    try:
+        tokens = _invocation_tokens(dict(container), workload_name)
+    except ValueError:
+        tokens = [str(x) for x in [*(container.get("command") or []), *(container.get("args") or [])]]
+    for names, target in (
+        ({"--tensor-parallel-size", "-tp"}, "tp"),
+        ({"--data-parallel-size", "-dp"}, "dp"),
+        ({"--data-parallel-size-local"}, "dp_local"),
+    ):
+        try:
+            raw = _option(tokens, names, workload_name)
+        except ValueError:
+            raw = None
+        if raw is not None and str(raw).isdigit():
+            val = int(raw)
+            if target == "tp":
+                tp = val
+            elif target == "dp":
+                dp = val
+            else:
+                dp_local = val
+    return tp, dp, dp_local
+
+
+def _build_standup_parameters_data(
+    execution: Any,
+    *,
+    model_name: str,
+    namespace: str,
+    accelerator_model: str,
+    deployments: list[dict[str, Any]],
+    gateway_class: str = "",
+) -> dict[str, str]:
+    """Build strictly stringified ConfigMap data keys consumed by native_to_br0_2._ev_dict_from_params."""
+    counts = {
+        "decode": {"replicas": 1, "tensor": 1, "data": 1, "data_local": 1, "workers": 1},
+        "prefill": {"replicas": 0, "tensor": 1, "data": 1, "data_local": 1, "workers": 1},
+    }
+    multinode_enabled = False
+    found_structured = False
+    found_manifest = False
+
+    for artifact in getattr(execution, "configuration_artifacts", None) or ():
+        try:
+            content = json.loads(artifact.content or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(content, Mapping):
+            continue
+        for role_key, cfg in (
+            ("decode", content.get("decode") or content.get("serving")),
+            ("prefill", content.get("prefill")),
+        ):
+            if not isinstance(cfg, Mapping) or not cfg:
+                continue
+            found_structured = True
+            if cfg.get("replicaCount") is not None:
+                counts[role_key]["replicas"] = int(cfg["replicaCount"])
+            if cfg.get("tensorParallelSize") is not None:
+                counts[role_key]["tensor"] = int(cfg["tensorParallelSize"])
+            if cfg.get("dataParallelSize") is not None:
+                counts[role_key]["data"] = int(cfg["dataParallelSize"])
+            if cfg.get("dataLocalParallelSize") is not None:
+                counts[role_key]["data_local"] = int(cfg["dataLocalParallelSize"])
+            workers = cfg.get("workerCount") or cfg.get("workers")
+            if workers is not None:
+                counts[role_key]["workers"] = int(workers)
+            if cfg.get("multinode"):
+                multinode_enabled = True
+        if content.get("multinodeEnabled") or content.get("multinode"):
+            multinode_enabled = True
+
+        manifest_text = ((content.get("officialGuide") or {}).get("renderedManifest")) or ""
+        if isinstance(manifest_text, str) and manifest_text.strip():
+            try:
+                docs = [d for d in yaml.safe_load_all(manifest_text) if isinstance(d, dict)]
+            except yaml.YAMLError:
+                docs = []
+            for workload in workload_roles(docs):
+                containers = workload["pod"].get("containers") or []
+                ms = next((c for c in containers if isinstance(c, Mapping) and c.get("name") == "modelserver"), None)
+                if ms is None:
+                    continue
+                found_manifest = True
+                role_key = "prefill" if workload.get("role") == "prefill" else "decode"
+                if not found_structured and workload.get("replicas") is not None:
+                    counts[role_key]["replicas"] = int(workload["replicas"])
+                tp, dp, dp_local = _extract_parallelism_from_container(ms, str(workload.get("name") or role_key))
+                if tp is not None and not found_structured:
+                    counts[role_key]["tensor"] = tp
+                if dp is not None and not found_structured:
+                    counts[role_key]["data"] = dp
+                if dp_local is not None and not found_structured:
+                    counts[role_key]["data_local"] = dp_local
+                slices = int(workload.get("slices") or 1)
+                lws_size = int(((workload.get("spec") or {}).get("leaderWorkerTemplate") or {}).get("size") or 1)
+                if workload.get("kind") in {"LeaderWorkerSet", "DisaggregatedSet"} and (slices > 1 or lws_size > 1):
+                    multinode_enabled = True
+                    counts[role_key]["workers"] = max(counts[role_key]["workers"], lws_size)
+
+    if not found_structured and not found_manifest:
+        for dep in deployments:
+            pod_spec = _workload_pod_spec(dep)
+            containers = pod_spec.get("containers") or []
+            ms = next((c for c in containers if isinstance(c, Mapping) and c.get("name") == "modelserver"), None)
+            if ms is None:
+                continue
+            labels = (dep.get("metadata") or {}).get("labels") or {}
+            dep_name = _workload_name(dep)
+            role_key = (
+                "prefill" if labels.get("llm-d.ai/role") == "prefill" or "prefill" in dep_name.lower() else "decode"
+            )
+            replicas = (dep.get("spec") or {}).get("replicas")
+            if replicas is not None:
+                counts[role_key]["replicas"] = int(replicas)
+            tp, dp, dp_local = _extract_parallelism_from_container(ms, dep_name or role_key)
+            if tp is not None:
+                counts[role_key]["tensor"] = tp
+            if dp is not None:
+                counts[role_key]["data"] = dp
+            if dp_local is not None:
+                counts[role_key]["data_local"] = dp_local
+
+    return {
+        "model_name": str(model_name or ""),
+        "namespace": str(namespace or "default"),
+        "accelerator_model": str(accelerator_model or "unknown"),
+        "decode_replicas": str(counts["decode"]["replicas"]),
+        "prefill_replicas": str(counts["prefill"]["replicas"]),
+        "decode_tensor_parallelism": str(counts["decode"]["tensor"]),
+        "decode_data_parallelism": str(counts["decode"]["data"]),
+        "decode_data_local_parallelism": str(counts["decode"]["data_local"]),
+        "decode_workers_parallelism": str(counts["decode"]["workers"]),
+        "prefill_tensor_parallelism": str(counts["prefill"]["tensor"]),
+        "prefill_data_parallelism": str(counts["prefill"]["data"]),
+        "prefill_data_local_parallelism": str(counts["prefill"]["data_local"]),
+        "prefill_workers_parallelism": str(counts["prefill"]["workers"]),
+        "gateway_class": str(gateway_class or ""),
+        "multinode_enabled": "true" if multinode_enabled else "false",
+    }
+
+
+async def _prepare_standup_parameters_configmap(
+    run: dict[str, Any],
+    execution: Any,
+    *,
+    model_name: str,
+    namespace: str,
+    environment: dict[str, str],
+    selected_hardware: Any | None,
+    cluster_id: str | None,
+    deployments: list[dict[str, Any]],
+    pods: list[dict[str, Any]],
+) -> bool:
+    """Create or refcount managed ConfigMap/llm-d-benchmark-standup-parameters, preserving user ConfigMaps."""
+    del run
+    if not _has_k8s_cluster_target(environment):
+        return False
+    try:
+        safe_ns = validate_namespace(namespace)
+    except ValueError:
+        return False
+    ref_key = _standup_ref_key(environment, safe_ns)
+    try:
+        async with _standup_configmap_lock:
+            existing = await _eval_k8s_json(["get", "configmap", _STANDUP_CM_NAME, "-n", safe_ns], environment)
+            if existing is not None:
+                labels = (existing.get("metadata") or {}).get("labels") or {}
+                if labels.get(_STANDUP_CM_MANAGED_LABEL) != "true":
+                    return False
+                if _standup_configmap_refs.get(ref_key, 0) > 0:
+                    _standup_configmap_refs[ref_key] += 1
+                    return True
+
+            accelerator_model = await _resolve_standup_accelerator_model(
+                selected_hardware,
+                cluster_id=cluster_id,
+                namespace=safe_ns,
+                environment=environment,
+                deployments=deployments,
+                pods=pods,
+            )
+            data = _build_standup_parameters_data(
+                execution,
+                model_name=model_name,
+                namespace=safe_ns,
+                accelerator_model=accelerator_model,
+                deployments=deployments,
+            )
+            manifest = {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": _STANDUP_CM_NAME,
+                    "namespace": safe_ns,
+                    "labels": {_STANDUP_CM_MANAGED_LABEL: "true"},
+                },
+                "data": {str(k): str(v) for k, v in data.items() if v is not None},
+            }
+            if not await _eval_k8s_apply(manifest, environment):
+                return False
+            _standup_configmap_refs[ref_key] = _standup_configmap_refs.get(ref_key, 0) + 1
+            return True
+    except Exception:  # noqa: BLE001
+        logger.warning("Best-effort standup-parameters ConfigMap preparation failed in %s", namespace, exc_info=True)
+        return False
+
+
+async def _cleanup_standup_parameters_configmap(namespace: str, environment: dict[str, str]) -> None:
+    """Decrement refcount and delete managed ConfigMap/llm-d-benchmark-standup-parameters when count hits 0."""
+    try:
+        safe_ns = validate_namespace(namespace)
+    except ValueError:
+        return
+    ref_key = _standup_ref_key(environment, safe_ns)
+    try:
+        async with _standup_configmap_lock:
+            current = _standup_configmap_refs.get(ref_key, 0)
+            if current > 1:
+                _standup_configmap_refs[ref_key] = current - 1
+                return
+            _standup_configmap_refs.pop(ref_key, None)
+            existing = await _eval_k8s_json(["get", "configmap", _STANDUP_CM_NAME, "-n", safe_ns], environment)
+            if existing is not None:
+                labels = (existing.get("metadata") or {}).get("labels") or {}
+                if labels.get(_STANDUP_CM_MANAGED_LABEL) != "true":
+                    return
+            await _eval_k8s_delete("configmap", _STANDUP_CM_NAME, safe_ns, environment)
+    except Exception:  # noqa: BLE001
+        logger.warning("Best-effort standup-parameters ConfigMap cleanup failed in %s", namespace, exc_info=True)
+
+
+def _is_valid_epp_config_yaml(text: str, *, require_kind: bool = False) -> bool:
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return False
+    if not isinstance(doc, Mapping) or not isinstance(doc.get("plugins"), list):
+        return False
+    return not (require_kind and doc.get("kind") != "EndpointPickerConfig")
+
+
+def _extract_epp_config_yaml_from_configmap(cm: Mapping[str, Any], preferred_key: str | None = None) -> str | None:
+    data = cm.get("data") or {}
+    if not isinstance(data, Mapping):
+        return None
+    if preferred_key and isinstance(data.get(preferred_key), str) and _is_valid_epp_config_yaml(data[preferred_key]):
+        return str(data[preferred_key])
+    for value in data.values():
+        if isinstance(value, str) and _is_valid_epp_config_yaml(value, require_kind=True):
+            return value
+    return None
+
+
+def _epp_config_file_hints(workloads: list[Mapping[str, Any]]) -> tuple[str | None, list[str]]:
+    """Find the active EPP --config-file basename and mounted ConfigMap names."""
+    preferred_key: str | None = None
+    cm_names: list[str] = []
+    for workload in workloads:
+        pod_spec = _workload_pod_spec(workload)
+        cm_by_vol = {
+            str(v["name"]): str(v["configMap"]["name"])
+            for v in (pod_spec.get("volumes") or [])
+            if isinstance(v, Mapping)
+            and v.get("name")
+            and isinstance(v.get("configMap"), Mapping)
+            and v["configMap"].get("name")
+        }
+        for container in pod_spec.get("containers") or []:
+            if not isinstance(container, Mapping) or not _is_epp_container(container):
+                continue
+            tokens = [str(x) for x in [*(container.get("command") or []), *(container.get("args") or [])]]
+            for idx, tok in enumerate(tokens):
+                name, sep, attached = tok.partition("=")
+                if name in {"--config-file", "--configFile"}:
+                    cfg_path = attached if sep else (tokens[idx + 1] if idx + 1 < len(tokens) else "")
+                    if cfg_path:
+                        preferred_key = Path(cfg_path).name
+            for vm in container.get("volumeMounts") or []:
+                if isinstance(vm, Mapping) and vm.get("name") in cm_by_vol:
+                    cm_name = cm_by_vol[str(vm["name"])]
+                    if _is_valid_k8s_subdomain(cm_name) and cm_name not in cm_names:
+                        cm_names.append(cm_name)
+    return preferred_key, cm_names
+
+
+async def _resolve_gaie_presets_config_b64(
+    execution: Any,
+    namespace: str,
+    environment: dict[str, str],
+    *,
+    deployments: list[dict[str, Any]] | None = None,
+    get_cm_fn: Callable[[str], Any] | None = None,
+) -> str:
+    """Resolve base64 EndpointPickerConfig YAML (containing plugins list) for harness extraEnvVars."""
+    artifact_docs: list[dict[str, Any]] = []
+    for artifact in getattr(execution, "configuration_artifacts", None) or ():
+        try:
+            content = json.loads(artifact.content or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        manifest_text = ((content.get("officialGuide") or {}).get("renderedManifest")) or ""
+        if isinstance(manifest_text, str) and manifest_text.strip():
+            try:
+                artifact_docs.extend(d for d in yaml.safe_load_all(manifest_text) if isinstance(d, dict))
+            except yaml.YAMLError:
+                continue
+
+    artifact_deployments = [d for d in artifact_docs if d.get("kind") == "Deployment"]
+    preferred_key, cm_names = _epp_config_file_hints([*(deployments or []), *artifact_deployments])
+
+    for doc in artifact_docs:
+        if doc.get("kind") == "EndpointPickerConfig" and isinstance(doc.get("plugins"), list):
+            return base64.b64encode(yaml.safe_dump(doc, sort_keys=False).encode("utf-8")).decode("ascii")
+        if doc.get("kind") == "ConfigMap":
+            found = _extract_epp_config_yaml_from_configmap(doc, preferred_key)
+            if found:
+                return base64.b64encode(found.encode("utf-8")).decode("ascii")
+
+    try:
+        safe_ns: str | None = validate_namespace(namespace)
+    except ValueError:
+        safe_ns = None
+
+    async def _fetch_cm(name: str) -> Mapping[str, Any] | None:
+        if not _is_valid_k8s_subdomain(name):
+            return None
+        if get_cm_fn is not None:
+            res = get_cm_fn(name)
+            return await res if inspect.isawaitable(res) else res
+        if not safe_ns:
+            return None
+        return await _eval_k8s_json(["get", "configmap", name, "-n", safe_ns], environment)
+
+    if cm_names and (get_cm_fn is not None or (safe_ns and _has_k8s_cluster_target(environment))):
+        for cm_name in cm_names:
+            cm = await _fetch_cm(cm_name)
+            if isinstance(cm, Mapping):
+                found = _extract_epp_config_yaml_from_configmap(cm, preferred_key)
+                if found:
+                    return base64.b64encode(found.encode("utf-8")).decode("ascii")
+
+    if safe_ns and _has_k8s_cluster_target(environment):
+        cms = await _eval_k8s_json(["get", "configmaps", "-n", safe_ns], environment)
+        for cm in (cms or {}).get("items") or []:
+            if isinstance(cm, Mapping):
+                found = _extract_epp_config_yaml_from_configmap(cm, preferred_key)
+                if found:
+                    return base64.b64encode(found.encode("utf-8")).decode("ascii")
+
+    return _DEFAULT_GAIE_PRESETS_CONFIG_B64
+
+
 async def _cluster_gateway_endpoint(cluster_id: str | None) -> str | None:
     """The cluster's shared-Gateway base URL (no ``/v1``) for benchmark traffic.
 
@@ -3246,6 +5430,8 @@ async def _execute_owned(run_id: str) -> None:
     _save(run)
     process: asyncio.subprocess.Process | None = None
     benchmark_volume: str | None = None
+    cleanup_pvc_resources = False
+    managed_standup_cm = False
     benchmark_namespace = ""
     environment: dict[str, str] = {}
     observability_started_at: str | None = None
@@ -3262,36 +5448,6 @@ async def _execute_owned(run_id: str) -> None:
             raise ValueError("deployment execution is not ready for evaluation")
         run.update(phase="preparing-monitoring", phase_started_at=_now())
         await _prepare_benchmark_monitoring(run)
-        endpoint_url = execution.endpoint.url
-        # All runs execute in an in-cluster harness. Never pass a
-        # backend-local port-forward address (127.0.0.1) to that pod; resolve
-        # the llm-d router Service in the deployment namespace instead.
-        if endpoint_url and "127.0.0.1" in endpoint_url:
-            endpoint_url = f"http://optimized-baseline-epp.{execution.namespace}.svc:80"
-        if run.get("use_baseline_endpoint"):
-            if not execution.endpoint.baseline_url:
-                raise ValueError(
-                    "this Guide deployment does not expose a kubernetes-service baseline endpoint for comparison"
-                )
-            endpoint_url = execution.endpoint.baseline_url
-        elif run.get("model_service_group_id") or deployment_uses_shared_gateway(execution):
-            # An "existing endpoint" run always targets a published Model
-            # Service: its HTTPRoute reaches the InferencePool directly,
-            # regardless of what data plane the underlying deployment
-            # happened to resolve at deploy time (it may even still be
-            # rendering its own, unrelated proxy). Design Configuration runs
-            # (no model_service_group_id) fall back to the deployment's
-            # recorded data plane: route through the Gateway only when the
-            # provider declared it as this deployment's data plane.
-            gateway_endpoint = await _cluster_gateway_endpoint(execution.provenance.get("cluster_server_id"))
-            if gateway_endpoint:
-                endpoint_url = gateway_endpoint
-        # A Model Service run must request the group's published name, not the
-        # execution's underlying model_ref: the Gateway's HTTPRoute only matches
-        # the BASE_MODEL_HEADER that ext_authz injects after validating that name.
-        model_name = run.get("model_service_published_name") or _execution_model(execution)
-        tokenizer_model = _execution_model(execution) or model_name
-        run.update(endpoint_used=endpoint_url, namespace=execution.namespace, model=model_name)
         session_id = execution.provenance.get("cluster_session_id")
         environment = {**os.environ, **deployment_runtime_overrides(session_id)} if session_id else dict(os.environ)
         harness_environment = _harness_proxy_environment(run, kubeconfig_path=environment.get("KUBECONFIG"))
@@ -3308,6 +5464,16 @@ async def _execute_owned(run_id: str) -> None:
             for name, value in environment.items()
             if name.lower() not in {"http_proxy", "https_proxy", "all_proxy"}
         }
+        namespace_k8s_cache: dict[str, dict[str, Any]] = {}
+        endpoint_url = await _resolve_benchmark_endpoint(
+            run, execution, environment, namespace_cache=namespace_k8s_cache
+        )
+        # A Model Service run must request the group's published name, not the
+        # execution's underlying model_ref: the Gateway's HTTPRoute only matches
+        # the BASE_MODEL_HEADER that ext_authz injects after validating that name.
+        model_name = run.get("model_service_published_name") or _execution_model(execution)
+        tokenizer_model = _execution_model(execution) or model_name
+        run.update(endpoint_used=endpoint_url, namespace=execution.namespace, model=model_name)
         run.update(phase="preparing-runtime", phase_started_at=_now())
         _save(run)
         cli, benchmark_root = await _prepare_benchmark_runtime(run.get("benchmark_runtime"))
@@ -3326,19 +5492,65 @@ async def _execute_owned(run_id: str) -> None:
             pass  # Explicit unknown versions cover non-Git installs.
         _install_helm_proxy_wrapper(output, environment, harness_environment)
         benchmark_namespace = execution.namespace or "default"
-        run.update(phase="preparing-storage", phase_started_at=_now())
-        _save(run)
-        storage_class, benchmark_volume = await _prepare_benchmark_storage(
-            run_id,
-            benchmark_namespace,
-            environment,
-            run.get("storage_class_name"),
-        )
         accelerator_profile = _execution_accelerator_profile(execution, run.get("accelerator_profile"))
         selected_hardware = resolve_by_accelerator_key(accelerator_profile) if accelerator_profile else None
+        resource_request = _execution_resource_request(execution, selected_hardware)
         if selected_hardware:
             run["hardware_profile"] = selected_hardware.to_dict()
+        run.update(phase="preparing-storage", phase_started_at=_now())
+        _save(run)
+        supports_no_pvc = _benchmark_supports_no_pvc(benchmark_root)
+        supports_no_prism = _benchmark_supports_no_prism(benchmark_root)
+        supports_non_admin = _benchmark_supports_non_admin(benchmark_root)
+        supports_step_filter = _benchmark_supports_step_filter(benchmark_root)
+        use_no_pvc = not run.get("storage_class_name") and run.get("harness") != "eval-containers" and supports_no_pvc
+        skip_step_02 = False
+        if use_no_pvc:
+            storage_class, benchmark_volume = "", None
+            skip_step_02 = supports_step_filter
+        else:
+            storage_class, benchmark_volume = await _prepare_benchmark_storage(
+                run_id,
+                benchmark_namespace,
+                environment,
+                run.get("storage_class_name"),
+                cluster_id=_resolve_run_cluster_id(run, run["deployment_execution_id"]),
+            )
+            if supports_step_filter and not await _can_get_namespace(benchmark_namespace, environment):
+                cleanup_pvc_resources = True
+                await _prepare_non_admin_harness_pvc(
+                    benchmark_namespace,
+                    storage_class,
+                    benchmark_root,
+                    environment,
+                    accelerator_profile=accelerator_profile,
+                    wait_timeout=min(int(run.get("wait_timeout_seconds", 300) or 300), 300),
+                )
+                skip_step_02 = True
         await capture_benchmark_context(run)
+        if _has_k8s_cluster_target(environment):
+            _, ns_deployments, ns_pods, _ = await _fetch_namespace_resources(
+                benchmark_namespace, environment, namespace_k8s_cache
+            )
+        else:
+            ns_deployments, ns_pods = [], []
+        managed_standup_cm = await _prepare_standup_parameters_configmap(
+            run,
+            execution,
+            model_name=model_name,
+            namespace=benchmark_namespace,
+            environment=environment,
+            selected_hardware=selected_hardware,
+            cluster_id=_resolve_run_cluster_id(run, run["deployment_execution_id"]),
+            deployments=ns_deployments,
+            pods=ns_pods,
+        )
+        harness_environment["LLMDBENCH_VLLM_MODELSERVICE_GAIE_PRESETS_CONFIG"] = await _resolve_gaie_presets_config_b64(
+            execution,
+            benchmark_namespace,
+            environment,
+            deployments=ns_deployments,
+        )
         _save(run)
         observability_started_at = _now()
 
@@ -3372,32 +5584,43 @@ async def _execute_owned(run_id: str) -> None:
                 "--output",
                 "local",
             ]
+            if supports_non_admin:
+                command.append("--non-admin")
+            if use_no_pvc:
+                command.append("--no-pvc")
+            if supports_no_prism:
+                command.append("--no-prism")
+            if skip_step_02:
+                command.extend(["--step", "0,1,3-20"])
             command.extend(["--set", f"harness.podLabel={run['harness_pod_label']}"])
             proxy_override = _harness_proxy_override(harness_environment)
             if proxy_override:
                 command.extend(["--set", proxy_override])
-            if accelerator_profile:
-                command.extend(["--set", f"accelerator.profile={accelerator_profile}"])
-                if selected_hardware and selected_hardware.telemetry:
-                    defaults_path = benchmark_root / "config/templates/values/defaults.yaml"
-                    defaults = (
-                        yaml.safe_load(defaults_path.read_text(encoding="utf-8")) if defaults_path.is_file() else {}
+            for cluster_override in _cluster_resource_overrides(
+                accelerator_profile,
+                selected_hardware,
+                resource_request=resource_request,
+            ):
+                command.extend(["--set", cluster_override])
+            if selected_hardware and selected_hardware.telemetry:
+                defaults_path = benchmark_root / "config/templates/values/defaults.yaml"
+                defaults = yaml.safe_load(defaults_path.read_text(encoding="utf-8")) if defaults_path.is_file() else {}
+                metrics = list((defaults or {}).get("monitoring", {}).get("timeSeriesMetrics") or [])
+                metrics = list(
+                    dict.fromkeys(
+                        [
+                            *metrics,
+                            *(
+                                source.metric
+                                for source in selected_hardware.telemetry.device_metric_sources.values()
+                                if source.metric
+                            ),
+                        ]
                     )
-                    metrics = list((defaults or {}).get("monitoring", {}).get("timeSeriesMetrics") or [])
-                    metrics = list(
-                        dict.fromkeys(
-                            [
-                                *metrics,
-                                *(
-                                    source.metric
-                                    for source in selected_hardware.telemetry.device_metric_sources.values()
-                                    if source.metric
-                                ),
-                            ]
-                        )
-                    )
-                    command.extend(["--set", "monitoring.timeSeriesMetrics=" + json.dumps(metrics)])
-            command.extend(["--set", f"storage.workloadPvc.storageClassName={storage_class}"])
+                )
+                command.extend(["--set", "monitoring.timeSeriesMetrics=" + json.dumps(metrics)])
+            if storage_class and not use_no_pvc:
+                command.extend(["--set", f"storage.workloadPvc.storageClassName={storage_class}"])
             for resource_override in _harness_resource_overrides(run, benchmark_root):
                 command.extend(["--set", resource_override])
             for version_override in _BENCHMARK_VERSION_OVERRIDES:
@@ -3405,6 +5628,38 @@ async def _execute_owned(run_id: str) -> None:
             if not environment.get("KUBECONFIG"):
                 command = [item for item in command if item != "--kubeconfig" and item != ""]
             return command
+
+        def _display_command(workload_flag: str, workload_value: str, *, include_overrides: bool = False) -> list[str]:
+            display = [
+                "llmdbenchmark",
+                "--spec",
+                run["specification_file"],
+                "run",
+                "--endpoint-url",
+                "<deployment-endpoint>",
+                "--model",
+                model_name,
+                "--namespace",
+                execution.namespace or "default",
+                "--harness",
+                run["harness"],
+                workload_flag,
+                workload_value,
+            ]
+            if supports_non_admin:
+                display.append("--non-admin")
+            if use_no_pvc:
+                display.append("--no-pvc")
+            if supports_no_prism:
+                display.append("--no-prism")
+            if skip_step_02:
+                display.extend(["--step", "0,1,3-20"])
+            if include_overrides:
+                if accelerator_profile:
+                    display.extend(["--set", f"accelerator.profile={accelerator_profile}"])
+                if storage_class and not use_no_pvc:
+                    display.extend(["--set", f"storage.workloadPvc.storageClassName={storage_class}"])
+            return display
 
         kv_capture = KVTraceCollector(
             benchmark_namespace,
@@ -3550,22 +5805,7 @@ async def _execute_owned(run_id: str) -> None:
                 matrix_results.append(point_result)
                 run["matrix_results"] = matrix_results
                 _save(run)
-            run["command"] = [
-                "llmdbenchmark",
-                "--spec",
-                run["specification_file"],
-                "run",
-                "--endpoint-url",
-                "<deployment-endpoint>",
-                "--model",
-                model_name,
-                "--namespace",
-                execution.namespace or "default",
-                "--harness",
-                run["harness"],
-                "--workload-file-path",
-                "<generated-per-matrix-point>",
-            ]
+            run["command"] = _display_command("--workload-file-path", "<generated-per-matrix-point>")
             run["output"] = str(output)
             run.update(status="succeeded", finished_at=_now())
         elif run.get("shared_prefix"):
@@ -3599,22 +5839,7 @@ async def _execute_owned(run_id: str) -> None:
             stdout, stderr = await _stream_benchmark_process(
                 process, run, namespace=benchmark_namespace, environment=environment
             )
-            run["command"] = [
-                "llmdbenchmark",
-                "--spec",
-                run["specification_file"],
-                "run",
-                "--endpoint-url",
-                "<deployment-endpoint>",
-                "--model",
-                model_name,
-                "--namespace",
-                execution.namespace or "default",
-                "--harness",
-                run["harness"],
-                "--workload-file-path",
-                "<generated-shared-prefix-workload>",
-            ]
+            run["command"] = _display_command("--workload-file-path", "<generated-shared-prefix-workload>")
             run["output"] = str(output)
             for name, value in (("stdout", stdout), ("stderr", stderr)):
                 run[f"{name}_truncated"] = (
@@ -3657,22 +5882,7 @@ async def _execute_owned(run_id: str) -> None:
             stdout, stderr = await _stream_benchmark_process(
                 process, run, namespace=benchmark_namespace, environment=environment
             )
-            run["command"] = [
-                "llmdbenchmark",
-                "--spec",
-                run["specification_file"],
-                "run",
-                "--endpoint-url",
-                "<deployment-endpoint>",
-                "--model",
-                model_name,
-                "--namespace",
-                execution.namespace or "default",
-                "--harness",
-                run["harness"],
-                "--workload-file-path",
-                "<inline-workload.yaml>",
-            ]
+            run["command"] = _display_command("--workload-file-path", "<inline-workload.yaml>")
             run["output"] = str(output)
             for name, value in (("stdout", stdout), ("stderr", stderr)):
                 run[f"{name}_truncated"] = (
@@ -3696,25 +5906,7 @@ async def _execute_owned(run_id: str) -> None:
             stdout, stderr = await _stream_benchmark_process(
                 process, run, namespace=benchmark_namespace, environment=environment
             )
-            run["command"] = [
-                "llmdbenchmark",
-                "--spec",
-                run["specification_file"],
-                "run",
-                "--endpoint-url",
-                "<deployment-endpoint>",
-                "--model",
-                model_name,
-                "--namespace",
-                execution.namespace or "default",
-                "--harness",
-                run["harness"],
-                "--workload",
-                run["workload"],
-            ]
-            if accelerator_profile:
-                run["command"].extend(["--set", f"accelerator.profile={accelerator_profile}"])
-            run["command"].extend(["--set", f"storage.workloadPvc.storageClassName={storage_class}"])
+            run["command"] = _display_command("--workload", run["workload"], include_overrides=True)
             run["output"] = str(output)
             for name, value in (("stdout", stdout), ("stderr", stderr)):
                 run[f"{name}_truncated"] = (
@@ -3731,7 +5923,11 @@ async def _execute_owned(run_id: str) -> None:
         run.update(status="cancelled", finished_at=_now())
         raise
     except Exception as error:
-        run.update(status="failed", error=_benchmark_failure_message(str(error), run), finished_at=_now())
+        run.update(
+            status="failed",
+            error=_redact_benchmark_error(_benchmark_failure_message(str(error), run)),
+            finished_at=_now(),
+        )
         _save(run)
     finally:
         if kv_capture is not None and kv_capture.session is not None and kv_workspace is not None:
@@ -3975,23 +6171,38 @@ async def _execute_owned(run_id: str) -> None:
             )
         # Persist historical evidence before releasing any benchmark storage.
         # Deployment/PVC cleanup failures must not discard collected monitoring.
-        if observability_started_at and run.get("cluster_session_id"):
-            try:
-                run["resource_snapshot"] = await asyncio.wait_for(
-                    _kubernetes_resource_snapshot(
-                        run["cluster_session_id"],
-                        benchmark_namespace,
-                        (run.get("hardware_profile") or {}).get("id"),
-                    ),
-                    timeout=30.0,
-                )
-            except Exception as snapshot_error:
-                run["resource_snapshot_error"] = str(snapshot_error) or "Resource snapshot timed out"
+        if observability_started_at:
+            snapshot_cluster_id = _resolve_run_cluster_id(run, run.get("deployment_execution_id") or "")
+            if run.get("cluster_session_id") or snapshot_cluster_id:
+                try:
+                    run["resource_snapshot"] = await asyncio.wait_for(
+                        _kubernetes_resource_snapshot(
+                            run.get("cluster_session_id"),
+                            benchmark_namespace,
+                            (run.get("hardware_profile") or {}).get("id"),
+                            cluster_id=snapshot_cluster_id,
+                        ),
+                        timeout=30.0,
+                    )
+                except Exception as snapshot_error:
+                    run["resource_snapshot_error"] = (
+                        _redact_benchmark_error(str(snapshot_error)) or "Resource snapshot timed out"
+                    )
         _enrich_benchmark_result(run)
         await verify_benchmark_context(run)
         _save(run)
+        if managed_standup_cm and benchmark_namespace and environment:
+            await _cleanup_standup_parameters_configmap(benchmark_namespace, environment)
         if benchmark_namespace and environment:
-            await _cleanup_benchmark_storage(benchmark_namespace, benchmark_volume, environment)
+            if cleanup_pvc_resources:
+                await _cleanup_benchmark_storage(
+                    benchmark_namespace,
+                    benchmark_volume,
+                    environment,
+                    cleanup_pvc_resources=True,
+                )
+            else:
+                await _cleanup_benchmark_storage(benchmark_namespace, benchmark_volume, environment)
         _tasks.pop(run_id, None)
 
 
@@ -5032,6 +7243,7 @@ async def get_workflow_run_details(workflow_id: str, request: Request = None) ->
                     resource_snapshot = await _kubernetes_resource_snapshot(
                         workflow.get("cluster_session_id"),
                         execution.namespace if execution else None,
+                        cluster_id=_resolve_run_cluster_id(workflow, case.execution_id or ""),
                     )
                     resource_snapshot = resource_snapshot or evaluation_case.get("resource_snapshot")
                     deployment_cases.append(
@@ -5075,6 +7287,7 @@ async def get_workflow_run_details(workflow_id: str, request: Request = None) ->
             resource_snapshot = await _kubernetes_resource_snapshot(
                 workflow.get("cluster_session_id"),
                 execution.namespace if execution else None,
+                cluster_id=_resolve_run_cluster_id(workflow, case.execution_id or ""),
             )
             resource_snapshot = resource_snapshot or workflow.get("resource_snapshot")
             deployment_cases.append(

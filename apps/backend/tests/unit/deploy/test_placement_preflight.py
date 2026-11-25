@@ -132,3 +132,18 @@ def test_runtime_class_constraints_and_overhead_are_included():
     assert "RuntimeClass scheduling and overhead" not in report["unmodeled"]
     report = placement_preflight([workload], [node("a", "a", 20)], [], runtime_classes=[])
     assert any(item["code"] == "RUNTIMECLASS_UNAVAILABLE" for item in report["errors"])
+
+
+def test_placement_preflight_records_prometheus_inventory_source_as_unmodeled():
+    report = placement_preflight(
+        [document(1)],
+        [node("a", "a", 6)],
+        [],
+        inventory_source="prometheus",
+    )
+    assert report["modeledConstraints"] == "pass"
+    assert report["status"] == "pass"
+    assert (
+        "Node inventory synthesized from Prometheus; node taints and custom labels may be incomplete"
+        in report["unmodeled"]
+    )

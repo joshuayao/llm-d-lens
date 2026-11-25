@@ -3169,3 +3169,129 @@ def test_shared_planning_preserves_percentiles_end_to_end_target_and_preference(
     assert run.request.planner_prompt == "Prefer simpler operations."
     unknown = asyncio.run(service.create(_shared_request(workload={"inputTokens": 1024})))
     assert unknown.request.planning_facts.workload_profile.p95_input_tokens is None
+
+
+def test_approve_threads_target_namespace_and_non_admin_node_label_fallback(monkeypatch):
+    from llm_d_lens.agentic import router
+    from llm_d_lens.agentic.models import AgenticApprovalRequest
+    from llm_d_lens.deploy import slice_capacity
+
+    service = AgenticDeploymentService()
+    session = SimpleNamespace(id="a" * 36, server_id="cluster-a")
+    monkeypatch.setattr("llm_d_lens.agentic.service.require_active_session", lambda _sid: session)
+    monkeypatch.setattr("llm_d_lens.agentic.service.resolve_planning_facts", _resolve_facts)
+    monkeypatch.setattr(router, "service", service)
+    monkeypatch.setattr(router, "current_principal", lambda _req: None)
+    monkeypatch.setattr(router, "owner_for_create", lambda _p: "owner-1")
+
+    # list_resources("nodes") returns [] on Non-Admin 403
+    async def empty_nodes(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr("llm_d_lens.agentic.service.list_resources", empty_nodes)
+
+    captured = {}
+
+    async def fake_start_run(deploy_req, *, owner_user_id=None):
+        captured["request"] = deploy_req
+        captured["owner_user_id"] = owner_user_id
+        return SimpleNamespace(id="deploy-run-nonadmin")
+
+    monkeypatch.setattr("llm_d_lens.agentic.service.deployment_run_manager.start_run", fake_start_run)
+
+    # 1. Prometheus fallback confirms hostname label -> succeeds and threads target_namespace
+    async def prom_nodes(_cid):
+        return ([{"metadata": {"name": "worker-1", "labels": {"kubernetes.io/hostname": "worker-1"}}}], [], "prometheus")
+
+    monkeypatch.setattr(slice_capacity, "fetch_cluster_nodes_and_pods", prom_nodes)
+    run1 = asyncio.run(
+        service.create(
+            _request(
+                placement_replicas="same-node",
+                placement_node_label={"key": "kubernetes.io/hostname", "value": "worker-1"},
+            )
+        )
+    )
+    approved1 = asyncio.run(
+        router.approve_agentic_deployment(
+            run1.id,
+            request=object(),
+            approval=AgenticApprovalRequest(configuration_checksum="unused", namespace="llmd-nonadmin-1"),
+        )
+    )
+    assert approved1.status == AgenticDeploymentStatus.DEPLOYING
+    assert captured["request"].provenance["target_namespace"] == "llmd-nonadmin-1"
+    assert captured["owner_user_id"] == "owner-1"
+
+    # 2. Prometheus fallback sees hostname mismatch -> rejects with 409
+    run2 = asyncio.run(
+        service.create(
+            _request(
+                placement_replicas="same-node",
+                placement_node_label={"key": "kubernetes.io/hostname", "value": "missing-worker"},
+            )
+        )
+    )
+    with pytest.raises(ValueError, match="selected node label is not present"):
+        asyncio.run(service.approve(run2.id, target_namespace="llmd-nonadmin-2"))
+
+    # 3. 403-restricted without Prometheus node inventory -> skips client-side rejection instead of false 409
+    async def forbidden_inventory(_cid):
+        raise slice_capacity.ClusterInventoryForbiddenError("403 restricted")
+
+    monkeypatch.setattr(slice_capacity, "fetch_cluster_nodes_and_pods", forbidden_inventory)
+    run3 = asyncio.run(
+        service.create(
+            _request(
+                placement_replicas="same-node",
+                placement_node_label={"key": "team.example.io/pool", "value": "gpu-pool"},
+            )
+        )
+    )
+    approved3 = asyncio.run(service.approve(run3.id, target_namespace="llmd-nonadmin-3"))
+    assert approved3.status == AgenticDeploymentStatus.DEPLOYING
+    assert captured["request"].provenance["target_namespace"] == "llmd-nonadmin-3"
+
+    # 4. 401 ClusterInventoryAuthError and DeploymentClusterAuthError return 401 (never swallowed as 409)
+    from fastapi.responses import JSONResponse
+
+    from llm_d_lens.deploy.capabilities import DeploymentClusterAuthError
+
+    async def unauthorized_inventory(_cid):
+        raise slice_capacity.ClusterInventoryAuthError("401 unauthorized kubeconfig")
+
+    monkeypatch.setattr(slice_capacity, "fetch_cluster_nodes_and_pods", unauthorized_inventory)
+    run4 = asyncio.run(
+        service.create(
+            _request(
+                placement_replicas="same-node",
+                placement_node_label={"key": "kubernetes.io/hostname", "value": "worker-1"},
+            )
+        )
+    )
+    resp_inv_401 = asyncio.run(
+        router.approve_agentic_deployment(
+            run4.id,
+            request=object(),
+            approval=AgenticApprovalRequest(configuration_checksum="unused", namespace="llmd-auth-1"),
+        )
+    )
+    assert isinstance(resp_inv_401, JSONResponse)
+    assert resp_inv_401.status_code == 401
+    assert json.loads(resp_inv_401.body)["code"] == "kubeconfig_unauthorized"
+
+    async def start_run_401(*_args, **_kwargs):
+        raise DeploymentClusterAuthError("Kubernetes cluster rejected kubeconfig credentials (401 Unauthorized).")
+
+    monkeypatch.setattr("llm_d_lens.agentic.service.deployment_run_manager.start_run", start_run_401)
+    run5 = asyncio.run(service.create(_request()))
+    resp_cap_401 = asyncio.run(
+        router.approve_agentic_deployment(
+            run5.id,
+            request=object(),
+            approval=AgenticApprovalRequest(configuration_checksum="unused", namespace="llmd-auth-2"),
+        )
+    )
+    assert isinstance(resp_cap_401, JSONResponse)
+    assert resp_cap_401.status_code == 401
+    assert json.loads(resp_cap_401.body)["code"] == "kubeconfig_unauthorized"

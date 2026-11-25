@@ -35,675 +35,164 @@ route webhook calls through the proxy and cause TLS errors or timeouts.
 
 ### Kubeconfig permissions
 
-The simplest and most compatible option is a kubeconfig whose identity has the
-`cluster-admin` role. If your security policy requires narrower permissions, save
-the helper below to a temporary file, make it executable, and run it with an admin
-kubeconfig:
+Lens keeps the kubeconfig you register. It does not create a ServiceAccount,
+ClusterRole, ClusterRoleBinding, replacement kubeconfig, or a dedicated Lens
+identity for the cluster handoff. Orchestration administrator work is a temporary operation
+script, not a credential you install in Lens.
 
-```bash
-chmod +x lens-rbac-kubeconfig.sh
-./lens-rbac-kubeconfig.sh --kubeconfig ~/.kube/config --output lens-lens-minimal.kubeconfig
-```
+The clearest setup uses an edit kubeconfig that can run normal namespaced
+operations. Some cluster-scoped operations may need an orchestration administrator. Lens shows
+those as a separate handoff instead of asking for broader credentials. When using a namespace-scoped `edit` ServiceAccount kubeconfig, Lens automatically
+aligns default `create-secret` HF token and handoff namespaces onto the edit
+kubeconfig's writable namespace (never overwriting explicit custom namespaces or
+existing secrets), so you do not have to change namespaces manually. For cluster-scoped
+or cross-namespace storage volumes, Lens defaults new PVCs to a dedicated
+`lens-storage-<cluster-id>` namespace (in `create` mode, e.g. `lens-storage-283db094`);
+for Non-Admin users, the Orchestration administrator bootstrap script automatically
+creates a per-namespace `Role` and `RoleBinding` (`lens-storage-operator`) so the
+kubeconfig can manage PVCs and model-cache Jobs in that namespace without manual
+RBAC setup.
 
-Upload the generated `lens-lens-minimal.kubeconfig`. The helper creates the
-`lens-access/lens-minimal` ServiceAccount and ClusterRole, runs a live smoke test,
-and prints the output path. Use `--skip-self-test` only when the target cluster
-does not allow the test workloads.
+### Configure the plan
 
-<details>
-<summary>Show the RBAC helper script</summary>
+The 9-step Create Cluster wizard saves a provisioning plan without installing
+anything on the target cluster. **Review** shows the saved plan preview
+(including the Monitoring summary) and does not run a permission check.
 
-```bash
-#!/usr/bin/env bash
-# Generate the least-privilege Kubernetes identity Lens needs and a kubeconfig
-# for it.
-#
-# The role is deliberately NOT cluster-admin. It is an operator role:
-#   * read-only discovery across every resource/API group (Lens renders arbitrary
-#     CRDs and its namespace cleanup enumerates every listable namespaced kind);
-#   * workload, storage, networking, batch, RBAC and CRD writes needed to
-#     deploy/evaluate models, provision model-cache volumes, install the
-#     monitoring stack and install/upgrade Gateway/GPU controllers;
-#   * no impersonation, no service-account token minting, no
-#     authentication/authorization review endpoints and no CSR approval.
-#
-# Installing arbitrary third-party Helm charts (monitoring, Gateway, GPU
-# operator) inherently requires creating ClusterRoles/ClusterRoleBindings, so
-# the role includes bind/escalate on those two resources. Everything else is
-# scoped to the resources Lens actually uses.
-#
-# Usage:
-#   lens-rbac-kubeconfig.sh [options]
-#
-# Options:
-#   --kubeconfig PATH        Admin kubeconfig used to create the RBAC
-#                            (default: $KUBECONFIG, else ~/.kube/config)
-#   --context NAME           Admin context (default: current-context)
-#   --namespace NAME         Namespace for the ServiceAccount/token
-#                            (default: lens-access)
-#   --service-account NAME   ServiceAccount name (default: lens-minimal)
-#   --cluster-role NAME      ClusterRole name (default: lens-minimal)
-#   --output PATH            kubeconfig destination
-#                            (default: ./lens-<service-account>.kubeconfig)
-#   --skip-self-test         Do not create/delete a throwaway namespace
-#   --delete                 Remove the generated RBAC identity and token secret
-#   -h, --help               Show this help
-#
-# The generated kubeconfig uses a long-lived ServiceAccount token. Pass
-# --delete first if you want to rotate the token.
+Inside the **llm-d stack** step, you can optionally override the **vLLM image** (`vllmImage`) with a custom OCI container image reference (requiring a `:tag` or `@sha256:` digest). When left empty, the default comes from the selected hardware profile (`runtime_image`). Image pre-pull (both direct admin execution and Orchestration administrator scripts) and model deployments use this cluster image, with per-deployment explicit overrides taking highest precedence, followed by the cluster `vllmImage`, and then the hardware profile default.
 
-set -euo pipefail
-umask 077
+Also inside the **llm-d stack** step, **Monitoring** is mandatory and supports two modes:
 
-SOURCE_KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
-CONTEXT=""
-NAMESPACE="lens-access"
-SERVICE_ACCOUNT="lens-minimal"
-CLUSTER_ROLE="lens-minimal"
-OUTPUT=""
-SELF_TEST=1
-DELETE=0
+- **`managed` (default)**: Installs `kube-prometheus-stack` (Prometheus, Grafana,
+  `kube-state-metrics`, `node-exporter`, Alertmanager, and Monitoring CRDs),
+  `llm-d` Grafana dashboards, cluster-wide `llm-d-prism-metrics-reader` RBAC,
+  and co-installs the selected accelerator exporters (profile-driven, such as
+  NVIDIA DCGM Exporter or Intel XPU Manager). You can configure the Monitoring
+  namespace (default `lens-monitoring-<cluster-id>`, e.g. `lens-monitoring-283db094`), optional Prometheus and Grafana
+  NodePorts (`30000`–`32767`), and an optional Monitoring host/IP.
+- **`existing`**: Connects to an existing Prometheus instance (`prometheusUrl`
+  required, `grafanaUrl` optional, Monitoring namespace, and a toggle to install
+  missing accelerator exporters and `llm-d-prism-metrics-reader` RBAC).
 
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
-info() { printf '%s\n' "$*"; }
+Choose **Preflight** to open the **Execute** step
+and evaluate the plan against the edit kubeconfig, splitting it into:
 
-usage() {
-  sed -n '2,/^set -euo pipefail$/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
-  exit 0
-}
+- **User operations**: Lens runs these with your kubeconfig.
+- **Orchestration administrator operations**: Lens does not run these; you send the generated
+  script to an orchestration administrator.
+- **Lens operations**: local follow-up work such as gateway exposure or model
+  cache job fan-out. Lens runs these during **Complete**.
+- **Blocked operations**: user-owned secret work or Lens operations whose
+  required kubeconfig access is missing. Grant the required access or adjust
+  the plan, then re-check; these never go to an orchestration administrator.
 
-while (($#)); do
-  case "$1" in
-    --kubeconfig) SOURCE_KUBECONFIG="${2:?missing value}"; shift 2 ;;
-    --context) CONTEXT="${2:?missing value}"; shift 2 ;;
-    --namespace) NAMESPACE="${2:?missing value}"; shift 2 ;;
-    --service-account) SERVICE_ACCOUNT="${2:?missing value}"; shift 2 ;;
-    --cluster-role) CLUSTER_ROLE="${2:?missing value}"; shift 2 ;;
-    --output) OUTPUT="${2:?missing value}"; shift 2 ;;
-    --skip-self-test) SELF_TEST=0; shift ;;
-    --delete) DELETE=1; shift ;;
-    -h|--help) usage ;;
-    *) die "unknown option: $1 (use --help)" ;;
-  esac
-done
+When you save the **Model Cache** step with a new Hugging Face token, Lens
+encrypts and stores the token temporarily for the draft. It is never placed in
+the provisioning plan or orchestration administrator handoff script, and is never displayed
+back in plaintext. When you resume a draft later (even after closing the browser
+or switching tabs), the wizard preserves the saved state (`Saved for this
+draft`), lets you continue **Preflight** and **Execute** without re-entering the
+token, allows replacing it if needed, and automatically deletes the temporary
+draft copy once the cluster is finalized or discarded.
 
-for cmd in kubectl python3 base64; do
-  command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
-done
-if ((SELF_TEST)); then
-  command -v curl >/dev/null 2>&1 || die "required command not found: curl (or pass --skip-self-test)"
-fi
-[[ -f "$SOURCE_KUBECONFIG" ]] || die "kubeconfig not found: $SOURCE_KUBECONFIG"
+### Run Preflight
 
-KUBECTL=(kubectl --kubeconfig "$SOURCE_KUBECONFIG" --request-timeout=30s)
-if [[ -n "$CONTEXT" ]]; then
-  KUBECTL+=(--context "$CONTEXT")
-fi
+**Review** is a clean plan preview without permission checks. Preflight
+needs the saved plan and the Hugging Face token; clicking **Preflight**
+immediately opens the **Execute** step and runs the permission check there first,
+loading or generating the orchestration administrator script when needed. It does not auto-start
+any user operation. Resuming a draft to Review also waits for this explicit action.
 
-info "Using kubeconfig: $SOURCE_KUBECONFIG"
-info "Context: $("${KUBECTL[@]}" config current-context 2>/dev/null || true)"
+- **Ready**: Once the permission check passes, click **Execute** to start running
+  user operations. A kubeconfig with full cluster permissions (equivalent to
+  `cluster-admin`) passes preflight directly as **Ready** with zero
+  Orchestration administrator handoff script and no **Waiting for marker** step —
+  Lens executes all setup operations automatically on **Execute** (including
+  namespace creation, chart-sourced CRDs such as `lws.crds`, and profile-driven
+  remote Kustomize overlays such as NFD or non-DRA device plugins once the
+  cluster-wide wildcard SSAR check succeeds).
+- **Orchestration administrator operations**: Execute shows the script and
+  **Re-check**. User operations stay disabled until re-checking verifies the
+  marker, supplies a token, and leaves no admin operations remaining, after
+  which you click **Execute**.
+- **Blocked**: Execute shows the user-owned access to fix and keeps user
+  execution disabled.
 
-if ((DELETE)); then
-  info "Deleting Lens RBAC identity in namespace $NAMESPACE"
-  "${KUBECTL[@]}" delete clusterrolebinding "$CLUSTER_ROLE" --ignore-not-found
-  "${KUBECTL[@]}" delete clusterrole "$CLUSTER_ROLE" --ignore-not-found
-  "${KUBECTL[@]}" -n "$NAMESPACE" delete secret "${SERVICE_ACCOUNT}-token" --ignore-not-found
-  "${KUBECTL[@]}" -n "$NAMESPACE" delete serviceaccount "$SERVICE_ACCOUNT" --ignore-not-found
-  info "Deleted. The namespace $NAMESPACE was left in place."
-  exit 0
-fi
+### Orchestration administrator handoff
 
-[[ -n "$OUTPUT" ]] || OUTPUT="$PWD/lens-${SERVICE_ACCOUNT}.kubeconfig"
+When the split contains orchestration administrator operations, Lens shows:
 
-info "Applying namespace/ServiceAccount/ClusterRole/ClusterRoleBinding..."
+1. The orchestration administrator operation list and readiness checks (under **View operation details**).
+2. A downloadable, idempotent orchestration administrator script.
+3. A **Re-check** action that re-checks permissions and verifies orchestration administrator completion.
 
-"${KUBECTL[@]}" apply -f - <<YAML
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: ${NAMESPACE}
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: ${SERVICE_ACCOUNT}
-  namespace: ${NAMESPACE}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: ${CLUSTER_ROLE}
-  labels:
-    app.kubernetes.io/part-of: llm-d-lens
-rules:
-  # Discovery/read for dashboards, cleanup and arbitrary CRDs.
-  - apiGroups: ["*"]
-    resources: ["*"]
-    verbs: ["get", "list", "watch"]
+Send the script to an orchestration administrator. They run it once with their own
+orchestration administrator credentials. The script contains only the plan's orchestration administrator
+operations; it does not contain your kubeconfig, a Lens identity, or a secret
+value. It writes a completion marker when every orchestration administrator operation and its
+readiness check passes, including any assigned `prometheusNodePort`,
+`grafanaNodePort`, and `monitoringHost` discovered for `managed` monitoring.
 
-  # Namespaced core workloads and configuration.
-  - apiGroups: [""]
-    resources:
-      - pods
-      - pods/log
-      - pods/exec
-      - pods/attach
-      - pods/portforward
-      - pods/status
-      - services
-      - services/proxy
-      - endpoints
-      - configmaps
-      - secrets
-      - persistentvolumeclaims
-      - serviceaccounts
-      - events
-      - replicationcontrollers
-      - replicationcontrollers/scale
-      - limitranges
-      - resourcequotas
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+After the orchestration administrator finishes, choose **Re-check** in Lens. Lens re-checks
+permissions, reads the marker, records the orchestration administrator operations as done,
+auto-discovers and persists the Monitoring endpoints and probes Prometheus
+health without manual port entry, and acquires the execution token once
+complete. The user operations stay disabled until that verification succeeds.
+If the marker is missing, partial, stale, or unreadable, Lens explains which
+orchestration administrator operations remain and does not start the user run.
 
-  # Cluster lifecycle and node maintenance (cordon/uncordon).
-  - apiGroups: [""]
-    resources: ["namespaces"]
-    verbs: ["create", "update", "patch", "delete"]
-  - apiGroups: [""]
-    resources: ["nodes", "nodes/proxy"]
-    verbs: ["update", "patch"]
-  - apiGroups: [""]
-    resources: ["persistentvolumes"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+For partial-privilege kubeconfigs, when any operation lacks permissions (or
+requires the cluster-wide wildcard check), Lens automatically promotes its
+unfinished upstream dependencies (excluding user-owned secrets and Lens-side
+verification steps) into the Orchestration administrator script so prerequisites
+stay ordered cleanly.
 
-  # Workload controllers.
-  - apiGroups: ["apps"]
-    resources:
-      - deployments
-      - deployments/scale
-      - daemonsets
-      - statefulsets
-      - statefulsets/scale
-      - replicasets
-      - replicasets/scale
-      - controllerrevisions
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["batch"]
-    resources: ["jobs", "cronjobs"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["autoscaling"]
-    resources: ["horizontalpodautoscalers"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["policy"]
-    resources: ["poddisruptionbudgets"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses", "networkpolicies"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["events.k8s.io"]
-    resources: ["events"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+With a **kubeconfig with full cluster permissions**, Lens executes monitoring and accelerator exporter
+installation directly, discovers NodePort endpoints, persists derived URLs, and
+verifies Prometheus readiness during **Complete**. With a **partial-privilege (`edit`)
+kubeconfig**, self-contained monitoring and exporter installation is included in
+the single downloaded Orchestration administrator script.
 
-  # Storage and node/device APIs used by storage volumes and DRA/GPU installs.
-  - apiGroups: ["storage.k8s.io"]
-    resources:
-      - storageclasses
-      - csidrivers
-      - csinodes
-      - volumeattachments
-      - csistoragecapacities
-    verbs: ["create", "update", "patch", "delete"]
-  - apiGroups: ["node.k8s.io"]
-    resources: ["runtimeclasses"]
-    verbs: ["create", "update", "patch", "delete"]
-  - apiGroups: ["resource.k8s.io"]
-    resources:
-      - resourceclaims
-      - resourceclaimtemplates
-      - resourceslices
-      - deviceclasses
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["scheduling.k8s.io"]
-    resources: ["priorityclasses"]
-    verbs: ["create", "update", "patch", "delete"]
+### Execute user operations
 
-  # CRD/API registration and admission configuration installed by charts.
-  - apiGroups: ["apiextensions.k8s.io"]
-    resources: ["customresourcedefinitions"]
-    verbs: ["create", "update", "patch", "delete"]
-  - apiGroups: ["apiregistration.k8s.io"]
-    resources: ["apiservices"]
-    verbs: ["create", "update", "patch", "delete"]
-  - apiGroups: ["admissionregistration.k8s.io"]
-    resources: ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"]
-    verbs: ["create", "update", "patch", "delete"]
+After Preflight opens **Execute** and the permission check passes (or orchestration administrator
+handoff is verified), clicking **Execute** runs the user operations in dependency
+order, and **Setup progress** appears once execution starts. Each operation may ask for a
+readiness wait; a failed wait stops the run without marking the operation done.
+Operations already recorded as done are skipped when you resume.
 
-  # Namespaced RBAC created by Lens and by installed charts.
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["roles", "clusterroles"]
-    verbs: ["bind", "escalate"]
+The execution token is created by handoff verification or by the first user
+operation. Later operations reuse that token. If the plan changes, Lens marks the
+old run stale and asks you to review the new split.
 
-  # llm-d / Gateway / inference / monitoring / accelerator CRDs.
-  - apiGroups:
-      - gateway.networking.k8s.io
-      - gateway.envoyproxy.io
-      - aigateway.envoyproxy.io
-      - inference.networking.k8s.io
-      - llm-d.ai
-      - agentgateway.dev
-      - networking.istio.io
-      - security.istio.io
-      - telemetry.istio.io
-      - install.istio.io
-      - monitoring.coreos.com
-      - nvidia.com
-      - keda.sh
-      - leaderworkerset.x-k8s.io
-      - disaggregatedset.x-k8s.io
-    resources: ["*"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+A **403** means Kubernetes rejected the operation despite the preflight. Lens
+refreshes the split and moves that operation into the orchestration administrator handoff while
+keeping completed user operations. A **401** means the kubeconfig is invalid or
+expired. A **504** means the operation applied but did not become ready; retry
+after the cluster resources settle. Other errors identify the operation that
+failed and keep completed work.
 
-  # Prometheus scrapes and API probes.
-  - nonResourceURLs: ["/metrics", "/version", "/readyz", "/healthz", "/livez", "/apis", "/apis/*", "/api", "/api/*"]
-    verbs: ["get"]
-YAML
+### Complete
 
-"${KUBECTL[@]}" apply -f - <<YAML
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: ${CLUSTER_ROLE}
-  labels:
-    app.kubernetes.io/part-of: llm-d-lens
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: ${CLUSTER_ROLE}
-subjects:
-  - kind: ServiceAccount
-    name: ${SERVICE_ACCOUNT}
-    namespace: ${NAMESPACE}
-YAML
+**Complete** runs the remaining Lens-local operations, verifies that every
+operation is user-done, administrator-done, or Lens-done, and finalizes the
+cluster in one step. The cluster then leaves draft state. If a Lens operation
+fails—including a **403** permission denial, which also refreshes the
+permission check—the execution token is kept so you can fix access and retry
+Complete.
 
-"${KUBECTL[@]}" apply -f - <<YAML
-apiVersion: v1
-kind: Secret
-metadata:
-  name: ${SERVICE_ACCOUNT}-token
-  namespace: ${NAMESPACE}
-  annotations:
-    kubernetes.io/service-account.name: ${SERVICE_ACCOUNT}
-type: kubernetes.io/service-account-token
-YAML
+### Upgrade from the pre-M5 step flow
 
-info "Waiting for the token controller..."
-TOKEN=""
-CA_B64=""
-for _ in $(seq 1 30); do
-  TOKEN="$("${KUBECTL[@]}" -n "$NAMESPACE" get secret "${SERVICE_ACCOUNT}-token" -o jsonpath='{.data.token}' 2>/dev/null || true)"
-  CA_B64="$("${KUBECTL[@]}" -n "$NAMESPACE" get secret "${SERVICE_ACCOUNT}-token" -o jsonpath='{.data.ca\.crt}' 2>/dev/null || true)"
-  [[ -n "$TOKEN" ]] && break
-  sleep 2
-done
-[[ -n "$TOKEN" ]] || die "token was not generated; check the service-account token controller"
+Drafts created before M5 used a separate step ledger. That ledger is not
+migrated. Re-open the draft, run **Preflight**, and execute the operation list
+again. A completion timestamp alone is not sufficient: only a
+completion whose plan hash matches the current plan is treated as complete.
 
-# Connection details come from the admin kubeconfig, without its credentials.
-CLUSTER_JSON="$(mktemp)"
-trap 'rm -f "$CLUSTER_JSON" "$CLUSTER_JSON.tmp"' EXIT
-"${KUBECTL[@]}" config view --minify --flatten --raw -o json |
-  python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d["clusters"][0]["cluster"]))' >"$CLUSTER_JSON"
+### Credential rotation is separate
 
-python3 - "$CLUSTER_JSON" "$OUTPUT" "$SERVICE_ACCOUNT" "$NAMESPACE" "$TOKEN" "$CA_B64" <<'PY'
-import base64
-import json
-import os
-import sys
-
-cluster_file, output, user, namespace, token_b64, ca_b64 = sys.argv[1:]
-with open(cluster_file, encoding="utf-8") as handle:
-    cluster = json.load(handle)
-# Prefer the CA embedded in the service-account token secret when the source
-# kubeconfig did not carry certificate-authority-data.
-if not cluster.get("certificate-authority-data") and ca_b64:
-    cluster["certificate-authority-data"] = ca_b64
-cluster.pop("certificate-authority", None)
-
-config = {
-    "apiVersion": "v1",
-    "kind": "Config",
-    "clusters": [{"name": "lens", "cluster": cluster}],
-    "users": [{"name": user, "user": {"token": base64.b64decode(token_b64).decode("utf-8")}}],
-    "contexts": [
-        {
-            "name": user,
-            "context": {"cluster": "lens", "user": user, "namespace": "default"},
-        }
-    ],
-    "current-context": user,
-}
-with open(output, "w", encoding="utf-8") as handle:
-    json.dump(config, handle, indent=2)
-    handle.write("\n")
-os.chmod(output, 0o600)
-PY
-
-unset TOKEN CA_B64
-info "Wrote kubeconfig: $OUTPUT"
-
-NEW_KUBECTL=(kubectl --kubeconfig "$OUTPUT" --request-timeout=30s)
-
-info "Checking connection..."
-"${NEW_KUBECTL[@]}" cluster-info >/dev/null
-"${NEW_KUBECTL[@]}" get --raw=/readyz >/dev/null
-"${NEW_KUBECTL[@]}" get nodes -o name >/dev/null
-
-info "Checking the permission matrix..."
-FAILED=0
-SERVED_RESOURCES=" $("${NEW_KUBECTL[@]}" api-resources -o name 2>/dev/null | sort -u | tr '\n' ' ') "
-check() {
-  local verb="$1" resource="$2"
-  shift 2
-  # A CRD that is not installed cannot be authorized; skip it here and let the
-  # wildcard group rule cover it once Lens installs the CRD or the chart/installer
-  # creates it.
-  if [[ "$resource" == *.* && "$SERVED_RESOURCES" != *" $resource "* ]]; then
-    printf '  SKIP: %-18s %-50s (CRD/API not installed)\n' "$verb" "$resource"
-    return 0
-  fi
-  if ! "${NEW_KUBECTL[@]}" auth can-i "$verb" "$resource" "$@" >/dev/null 2>&1; then
-    printf '  MISSING: %-18s %-50s %s\n' "$verb" "$resource" "$*"
-    FAILED=1
-  fi
-}
-
-for resource in nodes namespaces pods services secrets configmaps \
-  persistentvolumes persistentvolumeclaims storageclasses customresourcedefinitions \
-  deployments daemonsets statefulsets replicasets jobs cronjobs \
-  resourceclaims.resource.k8s.io resourceslices.resource.k8s.io \
-  deviceclasses.resource.k8s.io runtimeclasses.node.k8s.io; do
-  check get "$resource" --all-namespaces
-  check list "$resource" --all-namespaces
-  check watch "$resource" --all-namespaces
-done
-check get nodes.metrics.k8s.io
-check get gateways.gateway.networking.k8s.io --all-namespaces
-check get httproutes.gateway.networking.k8s.io --all-namespaces
-check get inferencepools.inference.networking.k8s.io --all-namespaces
-check get inferencemodelrewrites.llm-d.ai --all-namespaces
-check get servicemonitors.monitoring.coreos.com --all-namespaces
-
-for resource in pods services secrets configmaps persistentvolumeclaims \
-  serviceaccounts endpoints deployments daemonsets statefulsets replicasets \
-  jobs cronjobs roles rolebindings \
-  gateways.gateway.networking.k8s.io httproutes.gateway.networking.k8s.io \
-  referencegrants.gateway.networking.k8s.io \
-  inferencepools.inference.networking.k8s.io inferencemodelrewrites.llm-d.ai \
-  envoyproxies.gateway.envoyproxy.io clienttrafficpolicies.gateway.envoyproxy.io \
-  securitypolicies.gateway.envoyproxy.io \
-  agentgatewaypolicies.agentgateway.dev envoyfilters.networking.istio.io \
-  destinationrules.networking.istio.io authorizationpolicies.security.istio.io \
-  prometheuses.monitoring.coreos.com servicemonitors.monitoring.coreos.com \
-  podmonitors.monitoring.coreos.com; do
-  check create "$resource" -n "$NAMESPACE"
-  check update "$resource" -n "$NAMESPACE"
-  check patch "$resource" -n "$NAMESPACE"
-  check delete "$resource" -n "$NAMESPACE"
-done
-
-check create namespaces
-check delete namespaces
-check create persistentvolumes
-check delete persistentvolumes
-check update nodes
-check patch nodes
-check create customresourcedefinitions
-check patch customresourcedefinitions
-check create clusterroles
-check create clusterrolebindings
-check delete clusterrolebindings
-check bind clusterroles
-check escalate clusterroles
-check create gatewayclasses.gateway.networking.k8s.io
-check create runtimeclasses.node.k8s.io
-check create deviceclasses.resource.k8s.io
-check create resourceslices.resource.k8s.io
-check create mutatingwebhookconfigurations.admissionregistration.k8s.io
-check create validatingwebhookconfigurations.admissionregistration.k8s.io
-check create priorityclasses.scheduling.k8s.io
-check create apiservices.apiregistration.k8s.io
-check create pods/exec -n "$NAMESPACE"
-check create pods/portforward -n "$NAMESPACE"
-check get pods/log -n "$NAMESPACE"
-check get services/proxy -n "$NAMESPACE"
-check patch deployments/scale -n "$NAMESPACE"
-check deletecollection jobs -n "$NAMESPACE"
-check deletecollection persistentvolumeclaims -n "$NAMESPACE"
-check get /metrics
-
-if ((FAILED)); then
-  die "the generated identity is missing required permissions (see above)"
-fi
-info "Permission matrix: PASS"
-
-if ((SELF_TEST)); then
-  TEST_NS="lens-rbac-selftest-$$-$(date +%s)"
-  info "Running live smoke test in namespace $TEST_NS..."
-  cleanup() {
-    "${NEW_KUBECTL[@]}" delete namespace "$TEST_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  }
-  trap cleanup EXIT
-
-  "${NEW_KUBECTL[@]}" create namespace "$TEST_NS" >/dev/null
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" apply -f - >/dev/null <<'YAML'
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: selftest
-data:
-  key: value
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: selftest
-stringData:
-  key: value
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: selftest
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: selftest
-rules:
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: selftest
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: selftest
-subjects:
-  - kind: ServiceAccount
-    name: selftest
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: selftest
-  labels:
-    app: lens-rbac-selftest
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: lens-rbac-selftest
-  template:
-    metadata:
-      labels:
-        app: lens-rbac-selftest
-    spec:
-      containers:
-        - name: nginx
-          image: docker.io/library/nginx:1.25.2-alpine
-          ports:
-            - containerPort: 80
-          resources:
-            requests:
-              cpu: 10m
-              memory: 16Mi
-            limits:
-              cpu: 100m
-              memory: 64Mi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: selftest
-spec:
-  selector:
-    app: lens-rbac-selftest
-  ports:
-    - port: 80
-      targetPort: 80
----
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: selftest
-spec:
-  template:
-    spec:
-      restartPolicy: Never
-      containers:
-        - name: busybox
-          image: docker.io/library/nginx:1.25.2-alpine
-          command: ["sh", "-c", "echo ok"]
-YAML
-
-  DEFAULT_SC="$("${NEW_KUBECTL[@]}" get storageclasses -o json | python3 -c '
-import json, sys
-items = json.load(sys.stdin).get("items") or []
-for item in items:
-    annotations = (item.get("metadata") or {}).get("annotations") or {}
-    if annotations.get("storageclass.kubernetes.io/is-default-class") == "true":
-        print(item["metadata"]["name"])
-        break
-else:
-    print("")
-')"
-  if [[ -n "$DEFAULT_SC" ]]; then
-    "${NEW_KUBECTL[@]}" -n "$TEST_NS" apply -f - >/dev/null <<YAML
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: selftest
-spec:
-  accessModes: ["ReadWriteOnce"]
-  storageClassName: ${DEFAULT_SC}
-  resources:
-    requests:
-      storage: 64Mi
-YAML
-  fi
-
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" rollout status deployment/selftest --timeout=120s >/dev/null
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" wait --for=condition=complete job/selftest --timeout=120s >/dev/null
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" logs job/selftest >/dev/null
-  POD="$("${NEW_KUBECTL[@]}" -n "$TEST_NS" get pods -l app=lens-rbac-selftest -o jsonpath='{.items[0].metadata.name}')"
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" logs "$POD" >/dev/null
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" exec "$POD" -- true >/dev/null
-
-  # Exercise pods/portforward through a Service while its pod is Ready.
-  LOCAL_PORT=18999
-  PF_PID=""
-  for attempt in 1 2 3; do
-    "${NEW_KUBECTL[@]}" -n "$TEST_NS" port-forward service/selftest "${LOCAL_PORT}:80" >/dev/null 2>&1 &
-    PF_PID=$!
-    for _ in $(seq 1 30); do
-      if curl -fsS "http://127.0.0.1:${LOCAL_PORT}" >/dev/null 2>&1; then break; fi
-      kill -0 "$PF_PID" 2>/dev/null || break
-      sleep 0.5
-    done
-    if curl -fsS "http://127.0.0.1:${LOCAL_PORT}" >/dev/null 2>&1; then
-      break
-    fi
-    kill "$PF_PID" 2>/dev/null || true
-    wait "$PF_PID" 2>/dev/null || true
-    PF_PID=""
-    sleep 1
-  done
-  [[ -n "$PF_PID" ]] || die "port-forward smoke test failed"
-  kill "$PF_PID" 2>/dev/null || true
-  wait "$PF_PID" 2>/dev/null || true
-
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" label deployment selftest selftest=ok --overwrite >/dev/null
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" scale deployment/selftest --replicas=0 >/dev/null
-  if [[ -n "$DEFAULT_SC" ]]; then
-    "${NEW_KUBECTL[@]}" -n "$TEST_NS" get pvc/selftest >/dev/null
-  fi
-
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" delete job selftest --ignore-not-found >/dev/null
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" delete pvc selftest --ignore-not-found >/dev/null
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" delete deployment selftest --ignore-not-found >/dev/null
-  "${NEW_KUBECTL[@]}" delete namespace "$TEST_NS" --ignore-not-found >/dev/null
-  trap - EXIT
-  info "Live smoke test: PASS"
-fi
-
-info ""
-info "Done."
-info "  kubeconfig: $OUTPUT"
-info "  identity:   system:serviceaccount:${NAMESPACE}:${SERVICE_ACCOUNT}"
-info "  clusterrole: ${CLUSTER_ROLE}"
-```
-
-</details>
-
-1. Open **Clusters** and click **Add**.
-2. Enter **Cluster name**. Keep **I already have a kubeconfig**, click **Browse**, and choose the file.
-3. Click **Next**. If connection or version checks fail, correct the reported problem before continuing.
-4. On **Network Proxy**, keep **Auto-detect this cluster's proxy (recommended)**. To supply a proxy, choose **Custom proxy for this cluster** and fill in the proxy fields.
-5. On **Model gateway**, keep **Provider** on **Istio** and check the addresses using the table below.
-6. On **Accelerator**, select the accelerator types installed in the cluster and their driver access modes.
-7. On **llm-d stack**, review the listed versions and click **Next**. Wait for source downloads, image preparation, Gateway and llm-d router CRDs and the LeaderWorkerSet (LWS) controller installation to finish.
-8. On **Model Cache**, keep the suggested secret namespace/name and paste a **HuggingFace token** from your [Hugging Face settings](https://huggingface.co/settings/tokens). A model-cache storage volume is required: choose **hostPath** or **NFS** and fill in its path and capacity. You can also opt to prewarm a model now.
-9. Click **Review**, check the summary, then click **Finish**.
-10. Wait for the operations to finish and click **Done**. Select the cluster in the list and check **Workers** and **Deployable GPU**.
-
-| Model gateway field | What to enter |
-| --- | --- |
-| **Gateway exposed port (NodePort)** | The port clients will use to call models |
-| **Gateway host/IP** | A host or IP reachable by clients; leave blank to let Lens derive it |
-| **Lens address** | The Lens host or IP reachable from the cluster; keep the auto-filled address if it is reachable |
-| **Node inotify limit** | Keep the initial value unless your administrator requires a different limit |
-
-The wizard installs software and prepares images on cluster nodes. Run it against
-a cluster you are authorized to manage. A failed preparation step must be corrected
-before completing the wizard.
-
-Cluster prerequisites include the pinned llm-d router CRDs
-(`inferencemodelrewrites.llm-d.ai`). Lens installs them before any new router
-deployment starts. The cluster's CRDs action also restarts Lens-managed router
-EPPs whose pod template lacks the marker for the current CRD revision, so they
-re-register the `InferenceModelRewrite` API. On first use after upgrading, this
-restarts every published EPP once.
+Do not upload a replacement kubeconfig in the permission handoff. Kubeconfig
+replacement is a separate cluster-settings action for credential rotation. It
+does not rerun the permission check or change the provisioning plan.
 
 ## Bootstrap a new cluster via Kubespray
 
@@ -713,14 +202,14 @@ restarts every published EPP once.
 4. Under **Network proxy for target nodes**, keep **Auto** to reuse each machine's settings, or choose **Custom for these nodes** and enter the proxy.
 5. Click **Run preflight**. Fix failed checks and run preflight again until every host passes.
 6. Click **Start bootstrap** and follow its progress.
-7. When the generated kubeconfig appears, continue through the registration steps above to **Finish** and **Done**.
+7. When the generated kubeconfig appears, continue through the registration steps above to **Complete** and **Done**.
 
 Bootstrap changes the target machines. Check their addresses and roles before starting.
 
 ## Edit a cluster
 
 1. Select the cluster, then click **Edit cluster**.
-2. Change its name, description, proxy, **HF_TOKEN secret** or model-gateway settings.
+2. Change its name, description, proxy, **HF_TOKEN secret**, **vLLM image** (`vllmImage`, or reset it to empty to use the selected hardware profile's `runtime_image` default), model-gateway settings, or monitoring settings (**Monitoring mode**: `Managed` vs `Existing`, and in `Existing` mode, external **Prometheus URL** and optional **Grafana URL**; in `Managed` mode, endpoints and NodePorts are discovered automatically and displayed read-only).
 3. Click **Save changes** and check that the updated values appear.
 
 Component versions are supplied by the Lens release and are not editable here.
@@ -786,6 +275,32 @@ When accelerators use DRA, Lens reads their model from ResourceSlice device attr
 even if nodes do not have GPU product labels. The reported model is used to select
 the matching AISimulate system for hardware-aware recommendations.
 
+When Monitoring is configured, Lens fetches live node, CPU, memory, disk, and
+accelerator telemetry directly from Prometheus over HTTP, supporting restricted
+namespace-scoped kubeconfigs without cluster-wide `nodes` RBAC.
+
+The **Monitoring** health card aligns with [Observability](/user-guide/observability)
+across both orchestration administrator and non-admin kubeconfigs and both `managed` and `existing`
+monitoring modes:
+
+- **Orchestration administrator + `managed` mode**: verifies the Kubernetes monitoring stack directly.
+- **Non-admin kubeconfigs and `existing` mode**: probes the configured Prometheus and
+  Grafana HTTP endpoints, counting only applicable components (optional Grafana in
+  `existing` mode and accelerator exporters on CPU-only clusters are excluded from the
+  required count).
+
+Clicking the **Monitoring** card navigates directly to
+[Observability](/user-guide/observability). When monitoring is degraded, unreachable,
+or not configured, the overview banner provides role- and mode-appropriate guidance:
+
+- **Orchestration administrator (`managed`)**: install or reinstall the monitoring stack in
+  **Observability**.
+- **Orchestration administrator (`existing`)**: configure external Prometheus and optional Grafana URLs via
+  **Edit cluster** on the **Clusters** page, then click **Re-check** in **Observability**.
+- **Non-admin**: configure external Prometheus and Grafana URLs via **Edit cluster** on the **Clusters** page,
+  or click **Install** / **Reinstall** in **Observability** to run the **Orchestration administrator** setup or
+  repair script, then click **Re-check**.
+
 ## Put worker nodes into maintenance mode
 
 1. In the cluster's **Workers** list, select the nodes.
@@ -799,11 +314,15 @@ Plan any required workload shutdown or migration separately.
 
 1. Open the cluster's **Actions → Delete cluster**.
 2. Check the cluster name and the deletion warning.
-3. Click **Delete** and confirm the registration disappears from the list.
+3. Click **Delete**.
+   - If your kubeconfig has permission to delete all Lens-owned resources, Lens removes them and deletes the registration immediately.
+   - If your namespace-scoped `edit` kubeconfig cannot delete cluster-scoped or cross-namespace resources (or the cluster is unreachable), the modal switches to **Orchestration administrator cleanup required** (or **Cluster unreachable** when offline).
+4. When **Orchestration administrator cleanup required** or **Cluster unreachable** appears:
+   - Copy or download the idempotent cleanup script and send it to an orchestration administrator to run.
+   - Once the orchestration administrator runs the script, click **Re-check & Delete** (or **Retry & Delete** when unreachable) to verify the completion marker and remove the registration.
+   - If the completion marker cannot be verified automatically (`unconfirmed`) or the cluster is unreachable, check the explicit confirmation box and click **Confirm & Delete Record** to remove the registration from Lens.
 
-Deletion also removes this registration's isolated Gateway namespace, normally `lens-gateway-<cluster-id>`, including its Gateway, IPP and authorization resources. The old shared `lens-gateway` namespace and other registrations' namespaces are left alone. If Gateway namespace deletion fails or times out, Lens reports the error and keeps the registration and credentials so you can retry.
-
-Lens also cleans up what it created on the cluster. The cluster's `HF_TOKEN` secret is deleted, and its namespace goes with it when keeping the namespace would serve no purpose: Lens created the namespace, or the secret was the only thing in it. If the namespace still holds anything else, it is kept, and the cluster's built-in namespaces are never touched. For a cluster you are still registering, any storage volume created during the wizard is removed together with its PVC and PV, while model files on NFS or hostPath are kept. A fully registered cluster that still has storage volumes cannot be deleted until you delete those volumes first.
+Lens never deletes `existing-secret:*` secrets, existing or shared namespaces (including `existing`-mode Gateway or secret namespaces), bare `lens-storage`, bare `lens-monitoring`, or legacy `llm-d-bench-storage` namespaces, or protected system namespaces (`default`, `kube-system`, `kube-public`, `kube-node-lease`, `istio-system`, `envoy-gateway-system`, `envoy-ai-gateway-system`, `agentgateway-system`). Cluster-owned `lens-storage-<cluster-id>` and `lens-monitoring-<cluster-id>` namespaces created by Lens (when not shared with another cluster) are deletable during cleanup. When deleting a cluster with `managed` monitoring, Lens cleans up managed monitoring and accelerator exporter resources (using the two-phase orchestration administrator cleanup flow if needed, while preserving resources shared with another cluster on the same Kubernetes API server). In `existing` monitoring mode, Lens never deletes monitoring resources. For a cluster you are still registering, any storage volume created during the wizard is removed together with its PVC and PV, while model files on NFS or hostPath are kept. A fully registered cluster that still has deployments or storage volumes cannot be deleted until you delete those resources first.
 
 ## Cannot see a cluster?
 

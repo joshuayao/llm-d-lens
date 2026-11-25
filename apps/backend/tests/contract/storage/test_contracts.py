@@ -131,3 +131,27 @@ def test_purposes_rejects_unknown_value():
             purposes=["bogus"],
             nfs=NfsSpec(server="nfs.example.com", path="/export/models"),
         )
+
+
+def test_local_disk_and_nfs_optional_namespace_validation():
+    assert LocalDiskSpec(hostPath="/data/models").namespace is None
+    assert LocalDiskSpec(hostPath="/data/models", namespace="").namespace is None
+    assert LocalDiskSpec(hostPath="/data/models", namespace="lens-edit").namespace == "lens-edit"
+    assert NfsSpec(server="nfs.example.com", path="/export", namespace="").namespace is None
+    assert NfsSpec(server="nfs.example.com", path="/export", namespace="a").namespace == "a"
+
+    for bad_ns in (
+        "UpperCase",
+        " lens-edit",
+        "lens-edit ",
+        "lens edit",
+        "lens\nedit",
+        "lens\x7fedit",
+        "-leading-dash",
+        "trailing-dash-",
+        "a" * 64,
+    ):
+        with pytest.raises(ValidationError, match="DNS-1123"):
+            LocalDiskSpec(hostPath="/data/models", namespace=bad_ns)
+        with pytest.raises(ValidationError, match="DNS-1123"):
+            NfsSpec(server="nfs.example.com", path="/export", namespace=bad_ns)

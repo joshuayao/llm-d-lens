@@ -10,10 +10,48 @@ import { ModuleHeader } from '../../../../shared/ui/ModuleHeader';
 import { ModulePage } from '../../../../shared/ui/ModulePage';
 import { SectionLabel } from '../../../../shared/ui/SectionLabel';
 import { Panel } from '../../../../shared/ui/Panel';
-import { Badge } from '../../../../shared/ui/Badge';
+import { Badge, StatusChip } from '../../../../shared/ui/Badge';
 import { cn } from '../../../../shared/lib/cn';
+import { buildModelCurlSamples, connectionAddressLabel, connectionEndpointUrl, sanitizeHttpUrl } from '../../model/modelService';
 import { getModelServiceConnection, listModelNames } from './modelServiceBackend';
 import { CARD } from './modelServiceStyles';
+
+export function ClusterConnectionCard({ cluster, copiedValue = '', onCopy }) {
+    const endpoint = connectionEndpointUrl(cluster);
+    const addressLabel = connectionAddressLabel(cluster);
+    const port = cluster.port ?? cluster.gatewayPort;
+    return (
+        <Panel padding="sm" tone="subtle" className="min-w-0 shadow-none">
+            <div className="mb-3 flex min-w-0 items-center gap-2">
+                <Waypoints size={18} className="shrink-0 text-sky-500" aria-hidden="true" />
+                <p className="min-w-0 flex-1 truncate text-sm font-semibold text-theme-text">{cluster.clusterName || cluster.clusterId}</p>
+                <StatusChip
+                    size="xs"
+                    status={cluster.ready ? 'ready' : 'pending'}
+                    label={cluster.ready ? 'Ready' : 'Not ready'}
+                />
+                {cluster.reconcileStatus === 'admin_handoff_required' && (
+                    <Badge tone="warning" size="xs">Route sync pending</Badge>
+                )}
+                <Badge tone="info" size="xs">{cluster.provider || 'gateway'}</Badge>
+            </div>
+            <div className="flex min-w-0 items-center gap-2 rounded-lg border border-theme-border bg-theme-bg p-2.5">
+                <p className="min-w-0 flex-1 break-all font-mono text-xs text-theme-text">
+                    {endpoint || (cluster.ready ? 'address pending' : 'Gateway not ready')}
+                </p>
+                {endpoint && (
+                    <Button variant="ghost" size="xs" onClick={() => onCopy?.(endpoint)}>
+                        {copiedValue === endpoint ? 'Copied' : 'Copy'}
+                    </Button>
+                )}
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-theme-muted">
+                {!!port && <Badge tone="neutral" size="xs">Port {port}</Badge>}
+                {addressLabel && <span className="break-all font-mono">{addressLabel}</span>}
+            </div>
+        </Panel>
+    );
+}
 
 // User-facing "My services" page: lists the model names the caller may call and
 // the shared base URL. Personal tokens live on the separate "API keys" page.
@@ -52,10 +90,11 @@ export function ModelServicePage({ onToggleMobileNav }) {
     // Each cluster runs its own Gateway, so use the base URL of the model's cluster.
     // LENS_MODEL_GATEWAY_PUBLIC_URL (when set) overrides every cluster's URL.
     const clusterBaseUrls = Object.fromEntries(
-        (connection.clusters || []).map((cluster) => [cluster.clusterId, cluster.baseUrl]),
+        (connection.clusters || []).map((cluster) => [cluster.clusterId, connectionEndpointUrl(cluster)]),
     );
-    const fallbackBase = connection.baseUrl || `http://${window.location.hostname}:8443/v1`;
-    const baseUrlFor = (clusterId) => clusterBaseUrls[clusterId] || fallbackBase;
+    const defaultBase = connectionEndpointUrl({ address: window.location.hostname, port: 8443 });
+    const fallbackBase = sanitizeHttpUrl(connection.baseUrl) || defaultBase;
+    const baseUrlFor = (clusterId) => sanitizeHttpUrl(clusterBaseUrls[clusterId]) || fallbackBase;
     const clusterNameById = Object.fromEntries(
         (connection.clusters || []).map((cluster) => [cluster.clusterId, cluster.clusterName || cluster.clusterId]),
     );
@@ -66,11 +105,6 @@ export function ModelServicePage({ onToggleMobileNav }) {
     // request body's `model` into X-Gateway-Base-Model-Name. On other providers
     // (e.g. Envoy AI Gateway) the caller must send that header themselves.
     const autoInjectsBaseModel = (clusterId) => ['istio', 'gke'].includes(clusterProviderById[clusterId]);
-    const baseModelHeaderLine = (model) => (
-        autoInjectsBaseModel(model.clusterId)
-            ? ''
-            : ` \\\n  -H "X-Gateway-Base-Model-Name: ${model.baseModel || model.modelRef || model.name}"`
-    );
 
     // Model services are cluster-scoped; group the caller's visible models by cluster.
     const modelsByCluster = models.reduce((acc, model) => {
@@ -79,20 +113,11 @@ export function ModelServicePage({ onToggleMobileNav }) {
         return acc;
     }, {});
 
-    const curlSamples = examplesFor ? [
-        {
-            label: 'OpenAI · chat completions',
-            command: `curl ${baseUrlFor(examplesFor.clusterId)}/chat/completions \\\n  -H "Authorization: Bearer lens-mk-..."${baseModelHeaderLine(examplesFor)} \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${examplesFor.name}","messages":[{"role":"user","content":"Hello"}],"stream":true,"stream_options":{"include_usage":true}}'`,
-        },
-        {
-            label: 'OpenAI · embeddings',
-            command: `curl ${baseUrlFor(examplesFor.clusterId)}/embeddings \\\n  -H "Authorization: Bearer lens-mk-..."${baseModelHeaderLine(examplesFor)} \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${examplesFor.name}","input":"Hello"}'`,
-        },
-        {
-            label: 'Anthropic · messages (requires Anthropic support)',
-            command: `curl ${baseUrlFor(examplesFor.clusterId)}/messages \\\n  -H "x-api-key: lens-mk-..." \\\n  -H "anthropic-version: 2023-06-01"${baseModelHeaderLine(examplesFor)} \\\n  -H "content-type: application/json" \\\n  -d '{"model":"${examplesFor.name}","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}'`,
-        },
-    ] : [];
+    const curlSamples = examplesFor ? buildModelCurlSamples({
+        baseUrl: baseUrlFor(examplesFor.clusterId),
+        model: examplesFor,
+        autoInjectsBaseModel: autoInjectsBaseModel(examplesFor.clusterId),
+    }) : [];
 
     return (
         <ModulePage className="my-services-page">
@@ -115,27 +140,12 @@ export function ModelServicePage({ onToggleMobileNav }) {
                         <SectionLabel className="text-[#037ffc]">Gateway connections</SectionLabel>
                         <div className="mt-3 grid max-w-4xl gap-3 md:grid-cols-2">
                             {connection.clusters.map((cluster) => (
-                                <Panel key={cluster.clusterId} padding="sm" tone="subtle" className="min-w-0 shadow-none">
-                                    <div className="mb-3 flex min-w-0 items-center gap-2">
-                                        <Waypoints size={18} className="shrink-0 text-sky-500" aria-hidden="true" />
-                                        <p className="min-w-0 flex-1 truncate text-sm font-semibold text-theme-text">{cluster.clusterName || cluster.clusterId}</p>
-                                        <Badge tone="info" size="xs">{cluster.provider || 'gateway'}</Badge>
-                                    </div>
-                                    <div className="flex min-w-0 items-center gap-2 rounded-lg border border-theme-border bg-theme-bg p-2.5">
-                                        <p className="min-w-0 flex-1 break-all font-mono text-xs text-theme-text">
-                                            {cluster.baseUrl || (cluster.ready ? 'address pending' : 'Gateway not ready')}
-                                        </p>
-                                        {cluster.baseUrl && (
-                                            <Button variant="ghost" size="xs" onClick={() => endpointClipboard.copy(cluster.baseUrl)}>
-                                                {endpointClipboard.copiedValue === cluster.baseUrl ? 'Copied' : 'Copy'}
-                                            </Button>
-                                        )}
-                                    </div>
-                                    <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-theme-muted">
-                                        {!!cluster.port && <Badge tone="neutral" size="xs">Port {cluster.port}</Badge>}
-                                        {cluster.address && <span className="break-all font-mono">{cluster.address}</span>}
-                                    </div>
-                                </Panel>
+                                <ClusterConnectionCard
+                                    key={cluster.clusterId}
+                                    cluster={cluster}
+                                    copiedValue={endpointClipboard.copiedValue}
+                                    onCopy={endpointClipboard.copy}
+                                />
                             ))}
                         </div>
                     </section>

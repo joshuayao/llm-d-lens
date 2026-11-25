@@ -3105,3 +3105,19 @@ payload = request.model_dump(mode="json")
 清理中断任务时，取消端点接受可选查询参数 `cluster_session_id`，必须指向原测试集群；其他集群会返回 HTTP 409。
 
 `guideComposition.nativeCpuCacheGiB` 支持两种角色均使用内置 NixlConnector/kv_both 的 `pd-disaggregation`。适配器生成有序 MultiConnector 子连接器及相同镜像的能力检查初始化容器，保存的清单必须保留两者。实测优化中的 `native_cpu_cache_gib` 也会添加 P/D 变体。缺少适配器、镜像不匹配、角色缺失或缓存预算被修改均会校验失败。能力检查不能替代负载正确性测试和基准测试。
+
+## 按命名空间的权限预检与编排平台管理员脚本交接
+
+非管理员（`edit`）集群 kubeconfig 在部署启动前及命名空间内资源删除后，使用按命名空间的 SSAR 预检、幂等初始化/清理脚本生成与校验端点：
+
+| 端点 | 契约 |
+| --- | --- |
+| `POST /api/v1/deployments/permission-check` | 接收 `cluster_id`（`clusterId`）、`namespace`、`deployment_name`、`provider_ref`、`storage_volume_id`、`uses_storage`，以及可选的 `manifest`、`namespace_labels`（`namespaceLabels`）、`agentic_deployment_run_id`（`agenticDeploymentRunId`）、`prepared_plan_id`（`preparedPlanId`）、`uses_lws`、`uses_router`、`epp_service_accounts` 和 `subject_override`（`subjectOverride`）。执行按命名空间的 SSAR 检查，返回 `sufficient`、`status`（`sufficient` 或 `admin_required`）、`identity`（`overrideRequired`）、`missing`、`adminOperations`、`userOperations` 和 `warnings`。真实的 `401` kubeconfig 失败会返回 `401 kubeconfig_unauthorized`。 |
+| `POST /api/v1/deployments/permission-remediation` | 接收相同的目标字段，以及在 `identity.overrideRequired` 为 `true` 时可选的 `subject_override`（`subjectOverride`，包含 `kind`、`name`、`namespace`）。返回自包含、幂等的 bash 脚本（`set -euo pipefail`、`umask 077`、无明文密钥），用于创建 `Namespace`、命名空间级 `Role`/`RoleBinding`、EPP `system:auth-delegator` `ClusterRoleBinding`、可选静态 `PersistentVolume` 与绑定的 `PersistentVolumeClaim`，以及 `lens-deployment-bootstrap` 标记 `ConfigMap`。 |
+| `POST /api/v1/deployments/admin-handoff/verify` | 接收目标字段以及可选的 `expected_digest`（`expectedDigest`）。验证 `<deployment-ns>` 中的 `lens-deployment-bootstrap` 标记 `ConfigMap` 及所需的命名空间级 SSAR 权限，返回 `verified`、`sufficient`、`status`（`verified`、`pending` 或 `stale`）、`remainingOperations`、`missing`、`marker`、`warnings` 和 `message`。 |
+| `POST /api/v1/deployments/executions/{execution_id}/cleanup-verify` | 接收 `cleanupDigest`（`cleanup_digest`）、`deleteRecordOnVerify`（`delete_record_on_verify`）和 `forceDeleteRecord`（`force_delete_record`）。在运行清理脚本后验证 `<deployment-ns>` 及其按命名空间的 `ClusterRoleBinding` 已移除（或在 `canVerifyMarker` 为 `false` 且 `forceDeleteRecord` 为 `true` 时删除记录），返回 `verified`、`deleted`、`status`（`deleted`、`verified` 或 `pending_admin_cleanup`）、`remainingOperations`、`marker`、`canVerifyMarker`、`warnings` 和 `message`。 |
+
+### 交接错误响应（`409 Conflict`）
+
+- **`409 cleanup_marker_verification_required`**：当 `canVerifyMarker` 为 `true` 且标记验证尚未通过时，若 `POST /api/v1/deployments/executions/{execution_id}/cleanup-verify` 收到 `forceDeleteRecord=true`，则返回此错误。
+- **`409 deployment_cleanup_permission_denied`**：当 `DELETE /api/v1/deployments/executions/{execution_id}` 或 `DELETE /api/v1/deployments/runs/{run_id}` 在删除命名空间内资源后，若删除 `Namespace` 或 `ClusterRoleBinding` 返回 `403 Forbidden` 时返回。RFC-7807 `extra` 载荷包含顶层字段 `executionId`、`clusterId`、`namespace`、`phase1Completed`、`deletedInNamespace` 和 `adminCleanup`（包含 `clusterId`、`namespace`、`cleanupDigest`、`operations`、`completedOperations`、`script`、`scriptFilename`、`filename`、`instructions`、`marker`、`canVerifyMarker`、`confirmRequired`、`warnings`、`detail`），用于第二阶段清理交接。

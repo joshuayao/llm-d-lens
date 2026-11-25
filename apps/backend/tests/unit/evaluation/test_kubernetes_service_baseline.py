@@ -237,3 +237,290 @@ async def test_shared_pods_baseline_raises_when_the_benchmark_fails(monkeypatch)
 
 async def _async_none():
     return None
+
+
+def _envoy_yaml(*, tls: bool) -> str:
+    return "static_resources:\n  clusters:\n" + (
+        "  - name: ext_proc\n    transport_socket:\n      name: envoy.transport_sockets.tls\n"
+        "    health_checks:\n    - tls_options: {}\n"
+        if tls
+        else "  - name: ext_proc\n"
+    )
+
+
+def _router_deployment(*, name="optimized-baseline-epp", secure_serving="false", envoy_cm="envoy", proxy_enabled=True, available_replicas=1):
+    epp_args = ["--pool-name", "optimized-baseline", "--grpc-health-port", "9003"]
+    if secure_serving is not None:
+        epp_args.append(f"--secure-serving={secure_serving}")
+    containers = [
+        {
+            "name": "epp",
+            "args": epp_args,
+            "ports": [
+                {"name": "grpc", "containerPort": 9002, "protocol": "TCP"},
+                {"name": "metrics", "containerPort": 9090, "protocol": "TCP"},
+            ],
+        }
+    ]
+    volumes = []
+    if proxy_enabled:
+        containers.append(
+            {
+                "name": "envoy-proxy",
+                "image": "envoyproxy/envoy:v1.31",
+                "ports": [{"name": "http", "containerPort": 8081, "protocol": "TCP"}],
+                "volumeMounts": [{"name": "proxy-cfg", "mountPath": "/etc/envoy"}],
+            }
+        )
+        volumes.append({"name": "proxy-cfg", "configMap": {"name": envoy_cm}})
+    return {
+        "metadata": {"name": name},
+        "spec": {
+            "replicas": 1,
+            "template": {
+                "metadata": {"labels": {"app": name}},
+                "spec": {"containers": containers, "volumes": volumes},
+            },
+        },
+        "status": {"availableReplicas": available_replicas},
+    }
+
+
+def _modelserver_deployment(*, name="optimized-baseline-epp-model-servers", ports=None, args=None, available_replicas=1):
+    container = {"name": "modelserver", "command": ["vllm", "serve"], "args": args or ["Qwen/Qwen3-0.6B"]}
+    if ports is not None:
+        container["ports"] = ports
+    return {
+        "metadata": {"name": name},
+        "spec": {
+            "replicas": 1,
+            "template": {
+                "metadata": {"labels": {"llm-d.ai/role": "decode", "app": "ms"}},
+                "spec": {"containers": [container]},
+            },
+        },
+        "status": {"availableReplicas": available_replicas},
+    }
+
+
+def test_parse_in_cluster_service_url_and_envoy_epp_mismatch():
+    assert router._parse_in_cluster_service_url("http://svc-a.ns-1.svc.cluster.local:8080", "def") == (
+        "svc-a",
+        "ns-1",
+        8080,
+    )
+    assert router._parse_in_cluster_service_url("https://svc-b.ns-2.svc", "def") == ("svc-b", "ns-2", 443)
+    assert router._parse_in_cluster_service_url("http://endpoint.local:8000", "def") is None
+    assert router._parse_in_cluster_service_url("http://svc.--kubeconfig=/etc/foo.svc:80", "def") is None
+    assert router._parse_in_cluster_service_url("http://--server=evil.ns-1.svc:80", "def") is None
+
+    dep_plaintext_epp = _router_deployment(secure_serving="false")
+    assert router._detect_envoy_epp_mismatch(dep_plaintext_epp, _envoy_yaml(tls=True)) == (
+        "envoy_ext_proc_tls_mismatch_epp_plaintext"
+    )
+    assert router._detect_envoy_epp_mismatch(dep_plaintext_epp, _envoy_yaml(tls=False)) is None
+
+    dep_tls_epp = _router_deployment(secure_serving=None)
+    assert router._detect_envoy_epp_mismatch(dep_tls_epp, _envoy_yaml(tls=False)) == (
+        "envoy_ext_proc_plaintext_mismatch_epp_tls"
+    )
+    assert router._detect_envoy_epp_mismatch(dep_tls_epp, _envoy_yaml(tls=True)) is None
+
+
+@pytest.mark.asyncio
+async def test_check_target_service_health_covers_failures_and_healthy_cases():
+    svc_router = {
+        "metadata": {"name": "optimized-baseline-epp"},
+        "spec": {"selector": {"app": "optimized-baseline-epp"}, "ports": [{"port": 80, "targetPort": "http"}]},
+    }
+    dep_mismatch = _router_deployment(secure_serving="false", envoy_cm="custom-envoy-cm")
+    assert (
+        await router._check_target_service_health(
+            "missing", 80, [svc_router], [dep_mismatch], lambda _n: {"data": {"envoy.yaml": _envoy_yaml(tls=False)}}
+        )
+        == "service_not_found"
+    )
+    assert (
+        await router._check_target_service_health(
+            "optimized-baseline-epp", 8443, [svc_router], [dep_mismatch], lambda _n: None
+        )
+        == "service_port_not_found"
+    )
+    dep_zero = _router_deployment(available_replicas=0)
+    assert (
+        await router._check_target_service_health("optimized-baseline-epp", 80, [svc_router], [dep_zero], lambda _n: None)
+        == "backing_deployment_unavailable"
+    )
+    dep_no_proxy = _router_deployment(proxy_enabled=False)
+    svc_no_proxy = {
+        "metadata": {"name": "optimized-baseline-epp"},
+        "spec": {"selector": {"app": "optimized-baseline-epp"}, "ports": [{"port": 80, "targetPort": 8081}]},
+    }
+    assert (
+        await router._check_target_service_health(
+            "optimized-baseline-epp", 80, [svc_no_proxy], [dep_no_proxy], lambda _n: None
+        )
+        == "proxy_target_port_not_listening"
+    )
+    assert (
+        await router._check_target_service_health(
+            "optimized-baseline-epp",
+            80,
+            [svc_router],
+            [dep_mismatch],
+            lambda name: {"data": {"envoy.yaml": _envoy_yaml(tls=True)}} if name == "custom-envoy-cm" else None,
+        )
+        == "envoy_ext_proc_tls_mismatch_epp_plaintext"
+    )
+    assert (
+        await router._check_target_service_health(
+            "optimized-baseline-epp",
+            80,
+            [svc_router],
+            [dep_mismatch],
+            lambda name: {"data": {"envoy.yaml": _envoy_yaml(tls=False)}} if name == "custom-envoy-cm" else None,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_discover_endpoints_excludes_epp_and_shadow_ports_and_supports_pods_and_inferred_ports():
+    services = [
+        {
+            "metadata": {"name": "optimized-baseline-ip-5790737e"},
+            "spec": {"selector": {"llm-d.ai/role": "decode"}, "ports": [{"port": 54321, "targetPort": 54321}]},
+        },
+        {
+            "metadata": {"name": "ms-headless"},
+            "spec": {"clusterIP": "None", "selector": {"llm-d.ai/role": "decode"}, "ports": [{"port": 8088}]},
+        },
+        {
+            "metadata": {"name": "ms-lws-model-servers"},
+            "spec": {"selector": {"lws": "worker"}, "ports": [{"port": 8000, "targetPort": "modelserver"}]},
+        },
+        {
+            "metadata": {"name": "epp-grpc-only"},
+            "spec": {"selector": {"app": "epp-only"}, "ports": [{"port": 9002}, {"port": 9090}]},
+        },
+    ]
+    deployments = [
+        _modelserver_deployment(args=["Qwen/Qwen3-0.6B", "--port=8088"], ports=None),
+        _router_deployment(name="epp-only", proxy_enabled=False),
+    ]
+    deployments[1]["spec"]["template"]["metadata"]["labels"] = {"app": "epp-only"}
+    pods = [
+        {
+            "metadata": {"name": "lws-pod-0", "labels": {"lws": "worker"}},
+            "spec": {"containers": [{"name": "modelserver", "ports": [{"name": "modelserver", "containerPort": 8000}]}]},
+            "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]},
+        }
+    ]
+
+    router_url, direct_url = router._discover_namespace_inference_endpoints(services, deployments, "ns-1", pods=pods)
+    assert router_url is None
+    assert direct_url == "http://ms-lws-model-servers.ns-1.svc.cluster.local:8000"
+    assert (
+        await router._check_target_service_health(
+            "ms-lws-model-servers", 8000, services, [], None, pods=pods
+        )
+        is None
+    )
+
+    unready_pods = [
+        {
+            "metadata": {"name": "lws-pod-0", "labels": {"lws": "worker"}},
+            "spec": {"containers": [{"name": "modelserver"}]},
+            "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "False"}]},
+        }
+    ]
+    assert (
+        await router._check_target_service_health(
+            "ms-lws-model-servers", 8000, services, [], None, pods=unready_pods
+        )
+        == "backing_deployment_unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_benchmark_endpoint_keeps_healthy_router_and_falls_back_on_tls_mismatch(monkeypatch):
+    ns = "ns-e20cf405"
+    services = [
+        {
+            "metadata": {"name": "optimized-baseline-epp"},
+            "spec": {"selector": {"app": "optimized-baseline-epp"}, "ports": [{"port": 80, "targetPort": 8081}]},
+        },
+        {
+            "metadata": {"name": "optimized-baseline-ip-5790737e"},
+            "spec": {"selector": {"llm-d.ai/role": "decode"}, "ports": [{"port": 54321, "targetPort": 54321}]},
+        },
+        {
+            "metadata": {"name": "optimized-baseline-epp-model-servers"},
+            "spec": {"selector": {"llm-d.ai/role": "decode"}, "ports": [{"port": 8000}]},
+        },
+    ]
+    ms_dep = _modelserver_deployment()
+
+    def setup_k8s(*, envoy_tls: bool):
+        dep = _router_deployment(secure_serving="false", envoy_cm="envoy")
+
+        async def fake_k8s_json(args, _env):
+            if args[:2] == ["get", "services"]:
+                return {"items": services}
+            if args[:2] == ["get", "deployments"]:
+                return {"items": [dep, ms_dep]}
+            if args[:2] == ["get", "pods"]:
+                return {"items": []}
+            if args[:3] == ["get", "configmap", "envoy"]:
+                return {"data": {"envoy.yaml": _envoy_yaml(tls=envoy_tls)}}
+            return None
+
+        monkeypatch.setattr(router, "_eval_k8s_json", fake_k8s_json)
+
+    execution = SimpleNamespace(
+        namespace=ns,
+        endpoint=SimpleNamespace(url=f"http://optimized-baseline-epp.{ns}.svc.cluster.local:80", baseline_url=None),
+        provenance={},
+        artifact=None,
+    )
+
+    # Healthy plaintext Envoy + EPP -> benchmarks :80 router directly (no fallback).
+    setup_k8s(envoy_tls=False)
+    run_ok: dict = {}
+    resolved_ok = await router._resolve_benchmark_endpoint(run_ok, execution, {})
+    assert resolved_ok == f"http://optimized-baseline-epp.{ns}.svc.cluster.local:80"
+    assert "endpoint_fallback" not in run_ok
+
+    # Broken e20cf405 Envoy TLS vs EPP plaintext -> cleanly falls back to *-model-servers:8000 without mutating K8s.
+    setup_k8s(envoy_tls=True)
+    run_bad: dict = {}
+    resolved_bad = await router._resolve_benchmark_endpoint(run_bad, execution, {})
+    assert resolved_bad == f"http://optimized-baseline-epp-model-servers.{ns}.svc.cluster.local:8000"
+    assert run_bad["endpoint_fallback"] == {
+        "original_endpoint": f"http://optimized-baseline-epp.{ns}.svc.cluster.local:80",
+        "resolved_endpoint": f"http://optimized-baseline-epp-model-servers.{ns}.svc.cluster.local:8000",
+        "reason": "envoy_ext_proc_tls_mismatch_epp_plaintext",
+    }
+
+    # Loopback 127.0.0.1 with healthy router -> resolves to discovered router_url; with broken router -> falls back to direct.
+    setup_k8s(envoy_tls=False)
+    exec_loopback = SimpleNamespace(
+        namespace=ns,
+        endpoint=SimpleNamespace(url="http://127.0.0.1:8080", baseline_url=None),
+        provenance={},
+        artifact=None,
+    )
+    run_lb_ok: dict = {}
+    assert (
+        await router._resolve_benchmark_endpoint(run_lb_ok, exec_loopback, {})
+        == f"http://optimized-baseline-epp.{ns}.svc.cluster.local:80"
+    )
+    assert "endpoint_fallback" not in run_lb_ok
+
+    setup_k8s(envoy_tls=True)
+    run_lb_bad: dict = {}
+    assert (
+        await router._resolve_benchmark_endpoint(run_lb_bad, exec_loopback, {})
+        == f"http://optimized-baseline-epp-model-servers.{ns}.svc.cluster.local:8000"
+    )
+    assert run_lb_bad["endpoint_fallback"]["reason"] == "envoy_ext_proc_tls_mismatch_epp_plaintext"

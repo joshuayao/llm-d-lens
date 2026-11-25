@@ -208,3 +208,112 @@ def test_cancel_is_not_overwritten_by_inflight_run_snapshot():
         assert saved[0].cases[0].status == DeploymentCaseStatus.CANCELLED
 
     asyncio.run(check())
+
+
+def test_enable_ready_monitoring_falls_back_to_namespace_scoped_monitors_on_403_or_stack_not_ready(
+    tmp_path, monkeypatch
+):
+    import asyncio
+
+    import llm_d_lens.deploy.capabilities as caps
+    from llm_d_lens.deploy.contracts import DeploymentStatus
+    from llm_d_lens.deploy.run_store import JsonDeploymentRunStore
+    from llm_d_lens.infrastructure.process import CommandResult
+    from llm_d_lens.monitoring.deployment import service as monitoring
+    from tests.unit.deploy.test_deployment_management import _execution
+
+    async def check():
+        store = JsonDeploymentRunStore(tmp_path)
+        execution = _execution("exec-mon", DeploymentStatus.READY, "llmd-mon-ns")
+        store.save_execution(execution)
+
+        async def fail_enable(_execution_id):
+            raise monitoring.DeploymentMonitoringError("apply_failed", "clusterrolebindings is forbidden", 500)
+
+        applied = []
+
+        class _Runner:
+            async def run(self, argv, *, input=None, timeout=15):  # noqa: A002
+                applied.append((argv, input))
+                return CommandResult(tuple(argv), 0, "configured", "")
+
+        monkeypatch.setattr(monitoring, "enable", fail_enable)
+        monkeypatch.setattr(
+            monitoring,
+            "_discover_epp_service",
+            lambda _ns, _cid: asyncio.sleep(0, result={"name": "svc-epp", "labels": {"app.kubernetes.io/name": "svc-epp"}}),
+        )
+        monkeypatch.setattr(caps, "is_bootstrap_marker_present", lambda _cid, _ns, runner=None: asyncio.sleep(0, result=True))
+        monkeypatch.setattr("llm_d_lens.infrastructure.kubernetes.scoped_runner", lambda _cid: _Runner())
+
+        worker = DeploymentRunWorker(store, SimpleNamespace())
+        updated = await worker._enable_ready_monitoring(execution)
+        assert updated.monitoring_setup["status"] == "ready"
+        assert updated.monitoring_setup["enabled"] is True
+        assert updated.monitoring_setup["mode"] == "namespace_scoped_fallback"
+        assert len(applied) == 1
+        assert applied[0][0] == ["kubectl", "apply", "--namespace", "llmd-mon-ns", "-f", "-"]
+        assert "ServiceMonitor" in applied[0][1]
+        assert "PodMonitor" in applied[0][1]
+        assert "ClusterRole" not in applied[0][1]
+
+        # 401 never falls back
+        exec_401 = _execution("exec-401", DeploymentStatus.READY, "llmd-mon-401")
+        store.save_execution(exec_401)
+
+        async def fail_401(_execution_id):
+            raise monitoring.DeploymentMonitoringError("apply_failed", "Unauthorized", 500)
+
+        monkeypatch.setattr(monitoring, "enable", fail_401)
+        updated_401 = await worker._enable_ready_monitoring(exec_401)
+        assert updated_401.monitoring_setup["status"] == "unavailable"
+        assert updated_401.monitoring_setup["code"] == "kubeconfig_unauthorized"
+
+        # Secret/kubeconfig leakage is redacted in monitoring_setup message
+        exec_leak = _execution("exec-leak", DeploymentStatus.READY, "llmd-mon-leak")
+        store.save_execution(exec_leak)
+
+        async def fail_leak(_execution_id):
+            raise monitoring.DeploymentMonitoringError(
+                "apply_failed",
+                "failed --kubeconfig=/tmp/secret.kubeconfig Bearer secret.tok.123",
+                500,
+            )
+
+        monkeypatch.setattr(monitoring, "enable", fail_leak)
+        updated_leak = await worker._enable_ready_monitoring(exec_leak)
+        assert updated_leak.monitoring_setup["status"] == "unavailable"
+        assert "secret.kubeconfig" not in updated_leak.monitoring_setup["message"]
+        assert "secret.tok.123" not in updated_leak.monitoring_setup["message"]
+
+    asyncio.run(check())
+
+
+def test_clean_case_propagates_cleanup_permission_denied(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    import pytest
+
+    from llm_d_lens.deploy.contracts import DeploymentCaseStatus
+    from llm_d_lens.deploy.executions import DeploymentCleanupPermissionDenied
+
+    case = SimpleNamespace(id="case-1", execution_id="exec-1", status=DeploymentCaseStatus.READY)
+    run = SimpleNamespace(id="run-1", cases=[case], provenance={})
+    store = SimpleNamespace(get_run=lambda _: run, save_run=Mock(), save_execution=Mock())
+    service = SimpleNamespace(
+        clean=AsyncMock(
+            side_effect=DeploymentCleanupPermissionDenied(
+                "admin needed",
+                payload={"executionId": "exec-1", "adminCleanup": {"script": "#!/usr/bin/env bash"}},
+            )
+        )
+    )
+    worker = DeploymentRunWorker(store, service)
+    worker._require_active_cluster_session = Mock()
+    worker._case_execution = Mock(return_value=(run, case, SimpleNamespace(execution_id="exec-1")))
+
+    with pytest.raises(DeploymentCleanupPermissionDenied) as exc:
+        asyncio.run(worker.clean_case("run-1", "case-1"))
+    assert exc.value.code == "deployment_cleanup_permission_denied"
+    assert exc.value.payload["executionId"] == "exec-1"

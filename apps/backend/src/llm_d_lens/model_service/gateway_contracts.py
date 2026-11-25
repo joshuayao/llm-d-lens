@@ -16,6 +16,9 @@ from pydantic import BaseModel, ConfigDict, Field
 GatewayOperationStatus = Literal["running", "succeeded", "failed"]
 #: Shared-Gateway presence on a cluster, read from the Gateway resource.
 GatewayRuntimeState = Literal["installed", "missing", "unknown"]
+GatewayAccessMode = Literal["admin", "non_admin"]
+GatewayReconcileStatus = Literal["synced", "admin_handoff_required", "pending", "unknown"]
+GatewayRemediationMode = Literal["routes", "gateway_repair", "ipp_config", "all"]
 
 #: Operation kinds the current code emits. ``kind`` is stored as a plain string so
 #: historical rows still deserialize instead of failing validation.
@@ -27,6 +30,7 @@ KNOWN_OPERATION_KINDS = (
     "install-ipp",
     "uninstall-ipp",
     "component-scale",
+    "route-handoff",
 )
 LEGACY_OPERATION_KINDS = (
     "install-leaf",
@@ -184,10 +188,94 @@ class GatewayStatusCluster(StrictModel):
     ipp_name: str | None = Field(default=None, alias="ippName")
     ipp_namespace: str | None = Field(default=None, alias="ippNamespace")
     last_operation: GatewayOperation | None = Field(default=None, alias="lastOperation")
+    can_manage_gateway_infra: bool = Field(default=True, alias="canManageGatewayInfra")
+    can_manage_gateway_config: bool = Field(default=True, alias="canManageGatewayConfig")
+    can_reconcile_routes: bool = Field(default=True, alias="canReconcileRoutes")
+    access_mode: GatewayAccessMode = Field(default="admin", alias="accessMode")
+    auth_error: str | None = Field(default=None, alias="authError")
+    reconcile_status: GatewayReconcileStatus = Field(default="synced", alias="reconcileStatus")
+    handoff_mode: GatewayRemediationMode | None = Field(default=None, alias="handoffMode")
+    pending_operations_count: int = Field(default=0, alias="pendingOperationsCount")
+    desired_hash: str | None = Field(default=None, alias="desiredHash")
+    handoff_namespace: str | None = Field(default=None, alias="handoffNamespace")
+    gateway_probe_source: Literal["k8s", "http", "prometheus", "none"] | None = Field(
+        default=None, alias="gatewayProbeSource"
+    )
 
 
 class GatewayStatus(StrictModel):
     clusters: list[GatewayStatusCluster] = Field(default_factory=list)
+
+    def api_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", by_alias=True)
+
+
+class PendingOperationItem(StrictModel):
+    """Summary of one pending cluster operation in an Orchestration administrator handoff script."""
+
+    id: str
+    action: Literal["apply", "delete", "patch", "helm", "repair"]
+    kind: str
+    namespace: str
+    name: str
+    summary: str
+
+
+class GatewayHandoffPayload(StrictModel):
+    """Self-contained Orchestration administrator remediation script and operation summary."""
+
+    cluster_id: str = Field(alias="clusterId")
+    access_mode: GatewayAccessMode = Field(alias="accessMode")
+    reconcile_status: GatewayReconcileStatus = Field(alias="reconcileStatus")
+    desired_hash: str = Field(alias="desiredHash")
+    marker_namespace: str = Field(alias="markerNamespace")
+    marker_name: str = Field(alias="markerName")
+    filename: str
+    admin_script: str = Field(alias="adminScript")
+    instructions: str
+    pending_operations: list[PendingOperationItem] = Field(default_factory=list, alias="pendingOperations")
+    warnings: list[str] = Field(default_factory=list)
+    mode: GatewayRemediationMode = "routes"
+
+    def api_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", by_alias=True)
+
+
+class GatewayRemediationRequest(StrictModel):
+    """Request to render/persist an Orchestration administrator remediation script."""
+
+    cluster_id: str = Field(alias="clusterId")
+    mode: GatewayRemediationMode = "routes"
+    ipp_config: str | None = Field(default=None, alias="ippConfig")
+    provider: str | None = None
+    marker_namespace: str | None = Field(default=None, max_length=63, alias="markerNamespace")
+
+
+class GatewayRemediationVerifyRequest(StrictModel):
+    """Request to verify whether an Orchestration administrator handoff script has been applied."""
+
+    cluster_id: str = Field(alias="clusterId")
+    mode: GatewayRemediationMode | None = Field(default=None)
+    expected_hash: str | None = Field(default=None, alias="expectedHash")
+    marker_namespace: str | None = Field(default=None, max_length=63, alias="markerNamespace")
+
+
+class GatewayRemediationVerifyResult(StrictModel):
+    """Outcome of verifying an Orchestration administrator handoff script on the cluster."""
+
+    cluster_id: str = Field(alias="clusterId")
+    verified: bool
+    reconcile_status: GatewayReconcileStatus = Field(alias="reconcileStatus")
+    desired_hash: str = Field(alias="desiredHash")
+    observed_hash: str | None = Field(default=None, alias="observedHash")
+    marker_status: Literal["complete", "partial", "stale", "missing", "forbidden", "not_checked"] = Field(
+        alias="markerStatus"
+    )
+    marker_namespace: str | None = Field(default=None, alias="markerNamespace")
+    marker_name: str | None = Field(default=None, alias="markerName")
+    route_checks: list[dict[str, Any]] = Field(default_factory=list, alias="routeChecks")
+    gateway_reachable: bool | None = Field(default=None, alias="gatewayReachable")
+    message: str = ""
 
     def api_payload(self) -> dict[str, Any]:
         return self.model_dump(mode="json", by_alias=True)

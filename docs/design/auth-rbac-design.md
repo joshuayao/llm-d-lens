@@ -791,7 +791,6 @@ The table below is the core of “refined permissions”. `R` = read-like, `W` =
 | `cluster:cluster:create` | Register/create a cluster (kubeconfig upload) | `POST /clusters` |
 | `cluster:cluster:update` | Edit cluster / trigger source downloads | `PATCH /clusters/{id}`, `POST /clusters/{id}/software-downloads` |
 | `cluster:cluster:delete` | Delete cluster | `DELETE /clusters/{id}` |
-| `cluster:hf-token:create` | Create HF_TOKEN Secret | `POST /clusters/{id}/hf-token-secrets` |
 | `cluster:hf-token:update` | Rotate HF_TOKEN Secret | `PUT /clusters/{id}/hf-token-secret` |
 | `cluster:node:operate` | cordon/uncordon nodes | `POST /clusters/{id}/nodes/cordon|uncordon` |
 | `cluster:session:connect` | Open cluster session | `GET /session` (write semantics), `POST /cluster-overview/sessions/{id}/disconnect` |
@@ -1129,7 +1128,6 @@ and superseded by D28, including their creator/role-picker behavior.
 | `cluster:cluster:create` | ✅ | ✅ (requires `global`) | ❌ |
 | `cluster:cluster:update` / `:delete` / `:node:operate` / `:bootstrap:execute` | ✅ | ✅ | ❌ |
 | `cluster:cluster:grant-access` | ✅ | ✅ | ❌ |
-| `cluster:hf-token:create` | ✅ | ✅ | ❌ |
 | `cluster:hf-token:update` | ✅ | ✅ | ❌ |
 | `storage:volume:create` / `:delete` / `:acknowledge` / `:scan` | ✅ | ✅ | ❌ |
 | `model-cache:entry:create` / `:retry` | ✅ | ✅ | ✅ |

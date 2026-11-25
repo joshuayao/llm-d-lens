@@ -132,6 +132,35 @@ async def test_discover_status_reports_absent(monkeypatch):
     assert status.accelerator == "nvidia_gpu"
     assert status.status == "absent"
     assert status.cluster_reachable is True
+    by_name = {c.name: c for c in status.components}
+    assert by_name["prometheus_service_monitor"].status == "missing"
+    assert (by_name["prometheus_service_monitor"].ready, by_name["prometheus_service_monitor"].desired) == (0, 1)
+    assert by_name["grafana_dashboard"].status == "missing"
+    assert (by_name["grafana_dashboard"].ready, by_name["grafana_dashboard"].desired) == (0, 1)
+
+
+@pytest.mark.asyncio
+async def test_discover_status_resolves_cluster_monitoring_namespace_when_omitted(monkeypatch):
+    from llm_d_lens.cluster import registry as cluster_registry
+
+    _patch(monkeypatch, installed=True, plugin_ready=True)
+    seen_cm_namespaces: list[str | None] = []
+    orig_list = nvidia_gpu.k8s.list_resources
+
+    async def spy_list_resources(resource, **kwargs):
+        if resource == "configmaps":
+            seen_cm_namespaces.append(kwargs.get("namespace"))
+        return await orig_list(resource, **kwargs)
+
+    monkeypatch.setattr(nvidia_gpu.k8s, "list_resources", spy_list_resources)
+    monkeypatch.setattr(
+        cluster_registry,
+        "get_cluster_monitoring_settings",
+        lambda cid: {"monitoring_namespace": "llm-d-monitoring-123454"} if cid == "2790b2ae" else None,
+    )
+    status = await nvidia_gpu.NvidiaGpuProvider().discover_status("dcgm-exporter", "2790b2ae")
+    assert status.status == "ready"
+    assert seen_cm_namespaces == ["llm-d-monitoring-123454"]
 
 
 @pytest.mark.asyncio

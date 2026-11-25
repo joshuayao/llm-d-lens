@@ -52,7 +52,7 @@ class FakeRunner:
     def executable(self, name: str) -> str | None:
         return f"/usr/bin/{name}"
 
-    async def run(self, argv: list[str], timeout: float = 10) -> CommandResult:
+    async def run(self, argv: list[str], timeout: float = 10, **_kwargs: object) -> CommandResult:
         del timeout
         command = " ".join(argv)
         if command == "kubectl cluster-info":
@@ -63,7 +63,7 @@ class FakeRunner:
             return _result(argv, json.dumps({"items": self.daemonsets}))
         if command.startswith("kubectl get nodes"):
             return _result(argv, json.dumps({"items": self.gpu_labelled_nodes}))
-        if command.startswith("kubectl apply -k"):
+        if command.startswith("kubectl apply -k") or command.startswith("helm upgrade --install"):
             self.applied.append(command)
             return _result(argv, "applied")
         return _result(argv, returncode=1, stderr=f"unexpected command: {command}")
@@ -122,7 +122,20 @@ async def test_install_dra_applies_nfd_then_dra_manifest(monkeypatch):
     assert len(runner.applied) == 3
     assert "deployments/nfd?ref=" in runner.applied[0]
     assert "node-feature-rules" in runner.applied[1]
-    assert "intel-resource-drivers-for-kubernetes/deployments/gpu" in runner.applied[2]
+    assert "helm upgrade --install intel-gpu-resource-driver" in runner.applied[2]
+    assert "--version 0.11.0" in runner.applied[2]
+
+
+@pytest.mark.asyncio
+async def test_install_dra_reuses_existing_ready_daemonset_in_custom_namespace(monkeypatch):
+    runner = FakeRunner(
+        daemonsets=[_daemonset("intel-gpu-resource-driver-kubelet-plugin", namespace="intel-gpu-resource-driver-canary")]
+    )
+    _patch_runner(monkeypatch, runner)
+    response = await gpu_driver_service.install("dra", cluster_id=None, hardware="intel-xpu")
+    assert response.applied is True
+    assert "already installed and ready" in response.message
+    assert runner.applied == []
 
 
 @pytest.mark.asyncio

@@ -1170,3 +1170,304 @@ async def test_scale_disaggregated_set_rejects_external_role(deployment_store, m
 
     assert failure.value.code == "deployment_scale_unsupported"
     assert "Externally managed roles" in str(failure.value)
+
+
+@pytest.mark.asyncio
+async def test_delete_execution_and_delete_run_return_409_cleanup_handoff(deployment_store, worker_factory, monkeypatch):
+    from llm_d_lens.deploy.executions import DeploymentCleanupPermissionDenied
+
+    handoff_payload = {
+        "executionId": "execution-ready",
+        "clusterId": "cluster-1",
+        "namespace": "llmd-qwen-ready",
+        "phase1Completed": True,
+        "deletedInNamespace": ["deployments.apps", "services"],
+        "adminCleanup": {
+            "clusterId": "cluster-1",
+            "namespace": "llmd-qwen-ready",
+            "cleanupDigest": "a" * 64,
+            "operations": [{"id": "cleanup.namespace", "title": "Delete Namespace llmd-qwen-ready", "kind": "namespace", "name": "llmd-qwen-ready", "namespace": None}],
+            "completedOperations": [],
+            "script": "#!/usr/bin/env bash\n",
+            "scriptFilename": "lens-deploy-cleanup-llmd-qwen-ready.sh",
+            "filename": "lens-deploy-cleanup-llmd-qwen-ready.sh",
+            "instructions": "Run script",
+            "marker": {"namespace": "lens-edit", "name": "lens-deploy-cleanup-1234", "status": "pending", "verified": False},
+            "canVerifyMarker": True,
+            "confirmRequired": False,
+            "warnings": [],
+            "detail": "Admin cleanup required",
+        },
+    }
+
+    class _CleanupDeniedService:
+        async def clean(self, execution, *, preserve_rendered_overlay: bool = False):
+            raise DeploymentCleanupPermissionDenied("Admin cleanup required", payload=handoff_payload)
+
+    worker_factory(_CleanupDeniedService())
+    exec_resp = await router.delete_execution("execution-ready")
+    assert isinstance(exec_resp, JSONResponse)
+    assert exec_resp.status_code == 409
+    exec_body = json.loads(exec_resp.body)
+    assert exec_body["code"] == "deployment_cleanup_permission_denied"
+    assert exec_body["executionId"] == "execution-ready"
+    assert exec_body["phase1Completed"] is True
+    assert exec_body["adminCleanup"]["cleanupDigest"] == "a" * 64
+
+    run = deployment_store.get_run("run-1")
+    run.status = DeploymentRunStatus.SUCCEEDED
+    deployment_store.save_run(run)
+    run_resp = await router.delete_run("run-1")
+    assert isinstance(run_resp, JSONResponse)
+    assert run_resp.status_code == 409
+    run_body = json.loads(run_resp.body)
+    assert run_body["code"] == "deployment_cleanup_permission_denied"
+    assert run_body["adminCleanup"]["scriptFilename"] == "lens-deploy-cleanup-llmd-qwen-ready.sh"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_verify_rejects_force_delete_when_marker_verifiable_and_deletes_on_verify(
+    deployment_store, worker_factory, monkeypatch
+):
+    import asyncio
+
+    from llm_d_lens.deploy import orphans
+
+    execution = deployment_store.get_execution("execution-ready").model_copy(
+        update={"namespace": "llmd-qwen-ready", "provenance": {"cluster_server_id": "cluster-1"}}
+    )
+    deployment_store.save_execution(execution)
+    service = FakeDeploymentService()
+    worker_factory(service)
+
+    monkeypatch.setattr(
+        orphans,
+        "verify_deployment_cleanup",
+        lambda **_kwargs: asyncio.sleep(
+            0,
+            result={
+                "verified": False,
+                "status": "pending_admin_cleanup",
+                "message": "pending",
+                "remainingOperations": [],
+                "marker": {"namespace": "lens-edit", "name": "m", "status": "missing", "verified": False},
+                "canVerifyMarker": True,
+                "warnings": [],
+            },
+        ),
+    )
+
+    resp_409 = await router.verify_deployment_execution_cleanup(
+        "execution-ready",
+        router.CleanupVerifyRequest(force_delete_record=True),
+    )
+    assert isinstance(resp_409, JSONResponse)
+    assert resp_409.status_code == 409
+    assert json.loads(resp_409.body)["code"] == "cleanup_marker_verification_required"
+
+    monkeypatch.setattr(
+        orphans,
+        "verify_deployment_cleanup",
+        lambda **_kwargs: asyncio.sleep(
+            0,
+            result={
+                "verified": True,
+                "status": "verified",
+                "message": "ok",
+                "remainingOperations": [],
+                "marker": {"namespace": "lens-edit", "name": "m", "status": "completed", "verified": True},
+                "canVerifyMarker": True,
+                "warnings": [],
+            },
+        ),
+    )
+
+    resp_ok = await router.verify_deployment_execution_cleanup(
+        "execution-ready",
+        router.CleanupVerifyRequest(cleanup_digest="a" * 64, delete_record_on_verify=True),
+    )
+    assert resp_ok["verified"] is True
+    assert resp_ok["deleted"] is True
+    assert resp_ok["status"] == "deleted"
+    assert service.cleaned == []
+    assert deployment_store.get_execution("execution-ready") is None
+
+
+@pytest.mark.asyncio
+async def test_guide_service_clean_triggers_phase1_handoff_on_403_and_raises_on_401(tmp_path, monkeypatch):
+    import asyncio
+
+    from llm_d_lens.deploy import orphans
+    from llm_d_lens.deploy.capabilities import DeploymentClusterAuthError
+    from llm_d_lens.deploy.executions import DeploymentCleanupPermissionDenied
+    from llm_d_lens.deploy.providers.guide_catalog import GuideCatalog
+    from llm_d_lens.deploy.service import GuideAdapterDeploymentService
+
+    class _Adapter:
+        async def diagnostics(self, _exec):
+            return {}
+
+        async def cleanup(self, _exec, _artifact, *, force=False):
+            return {"cleaned_up": False, "error": self._err}
+
+    adapter = _Adapter()
+    adapter._err = "namespaces \"llmd-ns\" is forbidden"
+    catalog = GuideCatalog([])
+    monkeypatch.setattr(catalog, "get_adapter", lambda _ref: adapter)
+    svc = GuideAdapterDeploymentService(catalog, lambda _req: "llmd-ns", log_archive=None)
+    monkeypatch.setattr(orphans, "is_deletable_deployment_namespace", lambda _ns, cluster_id=None: True)
+    monkeypatch.setattr(
+        orphans,
+        "prepare_deployment_cleanup_handoff",
+        lambda **_kwargs: asyncio.sleep(
+            0,
+            result={
+                "executionId": "exec-clean",
+                "clusterId": "cluster-1",
+                "namespace": "llmd-ns",
+                "phase1Completed": True,
+                "deletedInNamespace": ["deployments.apps"],
+                "adminCleanup": {"detail": "Admin cleanup needed"},
+            },
+        ),
+    )
+
+    execution = _execution("exec-clean", DeploymentStatus.READY, "llmd-ns")
+    with pytest.raises(DeploymentCleanupPermissionDenied):
+        await svc.clean(execution)
+
+    adapter._err = "You must be logged in to the server (Unauthorized)"
+    with pytest.raises(DeploymentClusterAuthError):
+        await svc.clean(execution)
+
+
+def test_standalone_deploy_executions_import_without_cycle() -> None:
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = "apps/backend/src"
+    proc = subprocess.run(
+        [sys.executable, "-c", "import llm_d_lens.deploy.executions, llm_d_lens.deploy.router"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.asyncio
+async def test_start_run_ignores_unverified_target_namespace_and_enforces_owner_and_active_check(
+    deployment_store, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from llm_d_lens.deploy import application, capabilities
+    from llm_d_lens.deploy.configuration_adapter import configuration_checksum
+    from llm_d_lens.deploy.contracts import DeployableConfiguration, DeploymentRunCreateRequest
+
+    capabilities.clear_verified_namespaces()
+    svc = application.DeploymentRunManager(deployment_store)
+    monkeypatch.setattr(application, "require_active_session", lambda _sid: SimpleNamespace(server_id="cluster-a"))
+    monkeypatch.setattr(application, "cluster_deployment_source", lambda _s, _req=None: {"kind": "upstream"})
+    monkeypatch.setattr(svc, "_worker", lambda _run=None: SimpleNamespace())
+    monkeypatch.setattr(svc, "_schedule_run", lambda _run_id, _worker: None)
+
+    cfg_content = {"model": {"name": "Qwen/Qwen3-0.6B"}}
+    cfg = DeployableConfiguration(
+        type="optimized-baseline",
+        format="helm",
+        content=cfg_content,
+        provider_ref="optimized-baseline",
+        checksum=configuration_checksum(cfg_content),
+        provenance={"guide_id": "optimized-baseline"},
+    )
+    alice = UserDao().create(UserRecord(username="alice-ns-test"))
+    bob = UserDao().create(UserRecord(username="bob-ns-test"))
+    # 1. Unverified target_namespace in provenance is stripped & ignored
+    unverified_req = DeploymentRunCreateRequest(
+        configurations=[cfg],
+        provenance={
+            "cluster_session_id": "sess-1",
+            "cluster_server_id": "cluster-a",
+            "deployment_name": "dep-1",
+            "target_namespace": "llmd-spoofed",
+        },
+    )
+    run_unverified = await svc.start_run(unverified_req, owner_user_id=alice.id)
+    assert "target_namespace" not in run_unverified.provenance
+    assert (run_unverified.cases[0].create_request.deployment_policy.value or {}).get("namespace_policy") is None
+
+    # 2. Cross-user verified namespace cannot be consumed by bob
+    capabilities.record_verified_namespace(
+        "cluster-a",
+        "llmd-alice-ns",
+        owner_user_id=alice.id,
+        deployment_name="dep-alice",
+    )
+    bob_req = DeploymentRunCreateRequest(
+        configurations=[cfg],
+        provenance={
+            "cluster_session_id": "sess-1",
+            "cluster_server_id": "cluster-a",
+            "deployment_name": "dep-alice",
+        },
+    )
+    run_bob = await svc.start_run(bob_req, owner_user_id=bob.id)
+    assert run_bob.provenance.get("target_namespace") is None
+
+    # 3. Active namespace ownership rejects start_run for alice
+    deployment_store.save_execution(_execution("exec-busy", DeploymentStatus.READY, "llmd-alice-ns"))
+    with pytest.raises(ValueError, match="already used by an active deployment"):
+        await svc.start_run(bob_req, owner_user_id=alice.id)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_verify_enforces_stored_digest_and_marker_requirement(deployment_store, monkeypatch):
+    from llm_d_lens.deploy import executions as deploy_executions
+    from llm_d_lens.deploy import orphans
+    from llm_d_lens.deploy.capabilities import DeploymentClusterAuthError
+    from llm_d_lens.deploy.executions import DeploymentExecutionConflictError
+
+    exec_rec = _execution("exec-dig", DeploymentStatus.READY, "llmd-dig-ns").model_copy(
+        update={
+            "provenance": {"cluster_server_id": "cluster-a"},
+            "diagnostics": VersionedPayload(
+                schema_version="deploy-diagnostics.v1",
+                value={"cleanup": {"phase1": {"adminCleanup": {"cleanupDigest": "a" * 64}}}},
+            ),
+        }
+    )
+    deployment_store.save_execution(exec_rec)
+    monkeypatch.setattr(deploy_executions, "_store", deployment_store)
+
+    # Supplying mismatched digest returns 409
+    with pytest.raises(DeploymentExecutionConflictError, match="does not match"):
+        await deploy_executions.verify_execution_cleanup("exec-dig", cleanup_digest="b" * 64)
+
+    # force_delete_record=True fails unconditionally when canVerifyMarker=True
+    async def verified_true_marker(**_kwargs):
+        return {
+            "verified": False,
+            "status": "pending_admin_cleanup",
+            "message": "waiting",
+            "remainingOperations": [],
+            "marker": {"namespace": "lens-edit", "name": "m", "status": "missing", "verified": False},
+            "canVerifyMarker": True,
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(orphans, "verify_deployment_cleanup", verified_true_marker)
+    with pytest.raises(DeploymentExecutionConflictError) as force_err:
+        await deploy_executions.verify_execution_cleanup("exec-dig", force_delete_record=True)
+    assert force_err.value.code == "cleanup_marker_verification_required"
+
+    # 401 re-raised rather than caught by ValueError -> ConflictError
+    async def auth_401(**_kwargs):
+        raise DeploymentClusterAuthError("Unauthorized")
+
+    monkeypatch.setattr(orphans, "verify_deployment_cleanup", auth_401)
+    with pytest.raises(DeploymentClusterAuthError):
+        await deploy_executions.verify_execution_cleanup("exec-dig")

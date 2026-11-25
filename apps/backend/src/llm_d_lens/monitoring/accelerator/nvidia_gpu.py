@@ -10,8 +10,11 @@ installs the host GPU driver or a GPU Operator (decision D1).
 from __future__ import annotations
 
 import json
+import shlex
 from datetime import UTC, datetime
 from typing import Any
+
+import yaml
 
 from llm_d_lens.hardware.providers.nvidia import hardware_present
 from llm_d_lens.infrastructure import kubernetes as k8s
@@ -33,7 +36,7 @@ from .models import (
     GpuAccess,
     PreflightCheck,
 )
-from .registry import register
+from .registry import AcceleratorCleanupSpec, register
 
 _CHART_REPO = "https://nvidia.github.io/dcgm-exporter/helm-charts"
 _CHART_NAME = "dcgm-exporter"
@@ -69,6 +72,17 @@ def _runtime_class_name() -> str:
     mode = driver.mode("plugin") if driver is not None else None
     value = (mode.options or {}).get("runtime_class_name") if mode is not None else None
     return str(value) if value else "nvidia"
+
+
+def _node_label_selector() -> dict[str, str]:
+    """NVIDIA GPU node label selector read from the NVIDIA hardware profile."""
+    try:
+        from llm_d_lens.hardware.registry import get_profile
+
+        selector = dict(get_profile("nvidia").node_label_selector)
+    except Exception:  # pragma: no cover - discovery must not break install-arg construction
+        selector = {}
+    return selector or {_NODE_LABEL: "true"}
 
 
 def _json(result: Any, default: Any) -> Any:
@@ -132,9 +146,28 @@ def _exporter_component(resources: list[dict[str, Any]]) -> AcceleratorComponent
     )
 
 
+def _resolve_monitoring_namespace(cluster_id: str | None, explicit: str | None = None) -> str:
+    if explicit is not None and explicit.strip():
+        return k8s.validate_namespace(explicit)
+    if cluster_id:
+        try:
+            from llm_d_lens.cluster.registry import get_cluster_monitoring_settings  # noqa: PLC0415
+
+            settings = get_cluster_monitoring_settings(cluster_id)
+        except Exception:
+            settings = None
+        configured = str((settings or {}).get("monitoring_namespace") or "").strip()
+        if configured:
+            try:
+                return k8s.validate_namespace(configured)
+            except ValueError:
+                pass
+    return _MONITORING_DEFAULT_NAMESPACE
+
+
 def _crd_component(name: str, items: list[dict[str, Any]], source: str = "dcgm_exporter") -> AcceleratorComponent:
     if not items:
-        return AcceleratorComponent(name=name, status="missing", kind="crd", source="none")
+        return AcceleratorComponent(name=name, status="missing", kind="crd", ready=0, desired=1, source="none")
     return AcceleratorComponent(
         name=name, status="ready", kind="crd", ready=len(items), desired=len(items), source=source
     )
@@ -142,7 +175,9 @@ def _crd_component(name: str, items: list[dict[str, Any]], source: str = "dcgm_e
 
 def _dashboard_component(items: list[dict[str, Any]]) -> AcceleratorComponent:
     if not items:
-        return AcceleratorComponent(name="grafana_dashboard", status="missing", kind="configmap", source="none")
+        return AcceleratorComponent(
+            name="grafana_dashboard", status="missing", kind="configmap", ready=0, desired=1, source="none"
+        )
     return AcceleratorComponent(
         name="grafana_dashboard",
         status="ready",
@@ -231,7 +266,7 @@ class NvidiaGpuProvider:
         active_operation_id: str | None = None,
     ) -> AcceleratorStatusResponse:
         observed_at = datetime.now(UTC)
-        monitoring_namespace = monitoring_namespace or _MONITORING_DEFAULT_NAMESPACE
+        monitoring_namespace = _resolve_monitoring_namespace(cluster_id, monitoring_namespace)
         try:
             context = await k8s.current_context(cluster_id)
             reachable = await k8s.cluster_info(cluster_id)
@@ -350,7 +385,10 @@ class NvidiaGpuProvider:
         if not all(check.passed for check in checks):
             return AcceleratorPreflightResponse(allowed=False, status="unknown", checks=checks)
 
-        monitoring_namespace = monitoring_status.namespace if monitoring_status else _MONITORING_DEFAULT_NAMESPACE
+        monitoring_namespace = _resolve_monitoring_namespace(
+            cluster_id,
+            request.monitoring_namespace or (monitoring_status.namespace if monitoring_status else None),
+        )
         try:
             snapshot = await self.discover_status(
                 request.namespace,
@@ -495,6 +533,266 @@ class NvidiaGpuProvider:
         argv += ["--set", f"runtimeClassName={_runtime_class_name()}"]
         argv += ["--namespace", request.namespace, "--create-namespace"]
         return argv
+
+    def cleanup_spec(self, *, namespace: str | None = None) -> AcceleratorCleanupSpec:
+        return AcceleratorCleanupSpec(
+            provider_id="nvidia_gpu",
+            display_name="NVIDIA GPU",
+            release_name=_RELEASE_NAME,
+            namespace=k8s.validate_namespace(namespace or _DEFAULT_NAMESPACE),
+        )
+
+    @staticmethod
+    def _fallback_servicemonitor_lines(mon_rel: str) -> list[str]:
+        """Render managed-mode fallback ServiceMonitor reconciliation when exporter DS install is skipped."""
+        sm_existing_jp = (
+            "{range .items[*]}"
+            '{.metadata.name}{"\\t"}'
+            '{.metadata.labels.app\\.kubernetes\\.io/name}{"\\t"}'
+            '{.metadata.labels.app}{"\\t"}'
+            '{.spec.selector.matchLabels}{"\\n"}'
+            "{end}"
+        )
+        sm_mon_jp = (
+            "{range .items[*]}"
+            '{.metadata.name}{"\\t"}'
+            '{.spec.namespaceSelector.any}{"\\t"}'
+            '{.spec.namespaceSelector.matchNames[*]}{"\\t"}'
+            '{.spec.selector.matchLabels}{"\\n"}'
+            "{end}"
+        )
+        svc_labels_jp = (
+            '{.metadata.labels.app\\.kubernetes\\.io/name}{"\\t"}'
+            '{.metadata.labels.app}{"\\t"}'
+            '{.metadata.labels.app\\.kubernetes\\.io/instance}{"\\n"}'
+        )
+        svc_ports_jp = '{range .spec.ports[*]}{.name}{"\\t"}{.port}{"\\n"}{end}'
+        return [
+            '  EXISTING_NS="${EXISTING_DS%%/*}"',
+            '  if [[ "$EXISTING_NS" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]]; then',
+            "    if kubectl get crd servicemonitors.monitoring.coreos.com >/dev/null 2>&1; then",
+            (
+                '      EXISTING_SM="$(kubectl get servicemonitor -n "$EXISTING_NS" '
+                f"-o jsonpath='{sm_existing_jp}' 2>/dev/null "
+                "| awk -F'\\t' '!found && tolower($1 \" \" $2 \" \" $3 \" \" $4) ~ /dcgm-exporter/ "
+                '{ print $1; found=1 }\' || true)"'
+            ),
+            '      if [[ -z "$EXISTING_SM" && "$MONITORING_NS" != "$EXISTING_NS" ]]; then',
+            (
+                '        EXISTING_SM="$(kubectl get servicemonitor -n "$MONITORING_NS" '
+                f"-o jsonpath='{sm_mon_jp}' 2>/dev/null "
+                "| awk -F'\\t' -v target_ns=\"$EXISTING_NS\" "
+                "'!found && tolower($1 \" \" $4) ~ /dcgm-exporter/ "
+                '&& ($2 == "true" || index(" " $3 " ", " " target_ns " ") > 0) '
+                '{ print $1; found=1 }\' || true)"'
+            ),
+            "      fi",
+            '      if [[ -n "$EXISTING_SM" ]]; then',
+            (
+                '        echo "ServiceMonitor \'$EXISTING_SM\' already covers exporter '
+                'in namespace \'$EXISTING_NS\'; skipping fallback ServiceMonitor."'
+            ),
+            "      else",
+            (
+                '        EXPORTER_SVC="$(kubectl get svc -n "$EXISTING_NS" '
+                "-o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}' 2>/dev/null "
+                "| awk '!found && tolower($0) ~ /dcgm-exporter/ "
+                '{ print $0; found=1 }\' || true)"'
+            ),
+            (
+                '        if [[ -z "$EXPORTER_SVC" '
+                '|| ! "$EXPORTER_SVC" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]]; then'
+            ),
+            (
+                '          echo "Warning: no matching exporter Service found in '
+                '\'$EXISTING_NS\'; skipping fallback ServiceMonitor."'
+            ),
+            "        else",
+            (
+                '          SM_SELECTOR_PAIR="$(kubectl get svc "$EXPORTER_SVC" -n "$EXISTING_NS" '
+                f"-o jsonpath='{svc_labels_jp}' 2>/dev/null "
+                "| awk -F'\\t' '!found { "
+                'keys[1]="app.kubernetes.io/name"; keys[2]="app"; '
+                'keys[3]="app.kubernetes.io/instance"; '
+                'for (i=1; i<=3; i++) { '
+                'if ($i != "" && length($i) <= 63 '
+                '&& $i ~ /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/) '
+                '{ print keys[i] "\\t" $i; found=1; break } } }\' || true)"'
+            ),
+            '          SM_SELECTOR_KEY=""',
+            '          SM_SELECTOR_VAL=""',
+            '          if [[ -n "$SM_SELECTOR_PAIR" ]]; then',
+            "            SM_SELECTOR_KEY=\"${SM_SELECTOR_PAIR%%$'\\t'*}\"",
+            "            SM_SELECTOR_VAL=\"${SM_SELECTOR_PAIR#*$'\\t'}\"",
+            "          fi",
+            (
+                '          METRICS_PORT_NAME="$(kubectl get svc "$EXPORTER_SVC" -n "$EXISTING_NS" '
+                f"-o jsonpath='{svc_ports_jp}' 2>/dev/null "
+                "| awk -F'\\t' '$0 != \"\" { count++; name=$1; port=$2; "
+                'if (name ~ /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/) { '
+                'if (p1 == "" && tolower(name) ~ /metrics/) p1=name; '
+                'if (p2 == "" && port == "9400") p2=name; '
+                'if (count == 1) p3=name } } '
+                'END { if (p1 != "") print p1; else if (p2 != "") print p2; '
+                'else if (count == 1 && p3 != "") print p3 }\' || true)"'
+            ),
+            (
+                '          if [[ -z "$SM_SELECTOR_KEY" '
+                '|| ! "$SM_SELECTOR_VAL" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$ ]]; then'
+            ),
+            (
+                '            echo "Warning: Service \'$EXPORTER_SVC\' in \'$EXISTING_NS\' '
+                'lacks a safe selector label; skipping fallback ServiceMonitor."'
+            ),
+            (
+                '          elif [[ -z "$METRICS_PORT_NAME" '
+                '|| ! "$METRICS_PORT_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then'
+            ),
+            (
+                '            echo "Warning: Service \'$EXPORTER_SVC\' in \'$EXISTING_NS\' '
+                'lacks a named metrics port; skipping fallback ServiceMonitor."'
+            ),
+            "          else",
+            "            kubectl apply -f - <<LENS_FALLBACK_SM",
+            "apiVersion: monitoring.coreos.com/v1",
+            "kind: ServiceMonitor",
+            "metadata:",
+            "  name: lens-managed-dcgm-exporter",
+            "  namespace: ${EXISTING_NS}",
+            "  labels:",
+            "    app.kubernetes.io/managed-by: lens",
+            f"    release: {mon_rel}",
+            "spec:",
+            "  selector:",
+            "    matchLabels:",
+            '      ${SM_SELECTOR_KEY}: "${SM_SELECTOR_VAL}"',
+            "  endpoints:",
+            '    - port: "${METRICS_PORT_NAME}"',
+            "      path: /metrics",
+            "LENS_FALLBACK_SM",
+            "          fi",
+            "        fi",
+            "      fi",
+            "    else",
+            '      echo "ServiceMonitor CRD not present; skipping fallback ServiceMonitor."',
+            "    fi",
+            "  else",
+            (
+                '    echo "Warning: ignoring invalid exporter namespace \'$EXISTING_NS\'; '
+                'skipping fallback ServiceMonitor."'
+            ),
+            "  fi",
+        ]
+
+    def render_install_script(
+        self,
+        *,
+        namespace: str | None = None,
+        access_mode: GpuAccess | None = None,
+        monitoring_namespace: str | None = _MONITORING_DEFAULT_NAMESPACE,
+        monitoring_release: str = _MONITORING_DEFAULT_RELEASE,
+        existing_monitoring: bool = False,
+    ) -> str:
+        from .dcgm_dashboard import dashboard_manifest
+
+        target_ns = k8s.validate_namespace(namespace or _DEFAULT_NAMESPACE)
+        mon_ns = k8s.validate_namespace(monitoring_namespace or _MONITORING_DEFAULT_NAMESPACE)
+        mon_rel = k8s.validate_namespace(monitoring_release)
+        if access_mode is not None and access_mode not in _ACCESS_MODES:
+            raise ValueError(f"Unsupported NVIDIA GPU access mode: {access_mode!r}")
+
+        values_dict = {
+            "serviceMonitor": {
+                "enabled": "__SM_ENABLED__",
+                "additionalLabels": {"release": mon_rel},
+            },
+            "nodeSelector": _node_label_selector(),
+            "runtimeClassName": _runtime_class_name(),
+        }
+        values_yaml = yaml.safe_dump(values_dict, sort_keys=False).rstrip()
+        dashboard_json = json.dumps(dashboard_manifest(mon_ns))
+
+        if existing_monitoring:
+            detect_block = [
+                'if [[ -n "$EXISTING_DS" ]]; then',
+                (
+                    '  echo "Detected pre-existing DCGM exporter DaemonSet '
+                    '($EXISTING_DS); skipping dcgm-exporter install."'
+                ),
+            ]
+        else:
+            detect_block = [
+                'if [[ -n "$EXISTING_DS" ]]; then',
+                '  echo "Detected ready DCGM exporter DaemonSet ($EXISTING_DS); skipping dcgm-exporter install."',
+                *self._fallback_servicemonitor_lines(mon_rel),
+            ]
+
+        ds_jsonpath = (
+            "{range .items[*]}"
+            '{.metadata.namespace}{"\\t"}{.metadata.name}{"\\t"}'
+            '{.status.desiredNumberScheduled}{"\\t"}{.status.numberReady}{"\\n"}'
+            "{end}"
+        )
+        lines = [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "umask 077",
+            "",
+            f"TARGET_NS={shlex.quote(target_ns)}",
+            f"MONITORING_NS={shlex.quote(mon_ns)}",
+            f"RELEASE_NAME={shlex.quote(_RELEASE_NAME)}",
+            f"CHART_NAME={shlex.quote(_CHART_NAME)}",
+            f"CHART_REPO={shlex.quote(_CHART_REPO)}",
+            f"CHART_VERSION={shlex.quote(_CHART_VERSION)}",
+            'TMP_DIR="$(mktemp -d)"',
+            "trap 'rm -rf -- \"$TMP_DIR\"' EXIT",
+            "",
+            f"DS_LIST=\"$(kubectl get daemonset --all-namespaces -o jsonpath='{ds_jsonpath}')\"",
+            (
+                'EXISTING_DS="$(printf \'%s\\n\' "$DS_LIST" '
+                "| awk -F'\\t' '!found && tolower($1 \"/\" $2) ~ /dcgm-exporter/ "
+                '&& $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && ($3 + 0) > 0 && ($4 + 0) >= ($3 + 0) '
+                '{ print $1 "/" $2; found=1 }\' || true)"'
+            ),
+            *detect_block,
+            "else",
+            (
+                '  UNREADY_DS="$(printf \'%s\\n\' "$DS_LIST" '
+                "| awk -F'\\t' '!found && tolower($1 \"/\" $2) ~ /dcgm-exporter/ "
+                '{ r=($4 ~ /^[0-9]+$/ ? $4 : "0"); d=($3 ~ /^[0-9]+$/ ? $3 : "0"); '
+                'print $1 "/" $2 " (ready=" r "/" d ")"; found=1 }\' || true)"'
+            ),
+            '  if [[ -n "$UNREADY_DS" ]]; then',
+            (
+                '    echo "Detected DCGM exporter DaemonSet ($UNREADY_DS) '
+                'that is not ready; reconciling dcgm-exporter in $TARGET_NS."'
+            ),
+            "  fi",
+            '  SM_ENABLED="false"',
+            "  if kubectl get crd servicemonitors.monitoring.coreos.com >/dev/null 2>&1; then",
+            '    SM_ENABLED="true"',
+            "  fi",
+            '  VALUES_FILE="$TMP_DIR/dcgm-values.yaml"',
+            '  cat <<\'LENS_DCGM_VALUES\' | sed "s/[\'\\"]*__SM_ENABLED__[\'\\"]*/${SM_ENABLED}/" >"$VALUES_FILE"',
+            values_yaml,
+            "LENS_DCGM_VALUES",
+            '  helm upgrade --install "$RELEASE_NAME" "$CHART_NAME" \\',
+            '    --repo "$CHART_REPO" \\',
+            '    --version "$CHART_VERSION" \\',
+            '    --namespace "$TARGET_NS" \\',
+            "    --create-namespace \\",
+            '    --values "$VALUES_FILE" \\',
+            "    --wait \\",
+            "    --timeout 5m",
+            "fi",
+            "",
+            'if kubectl get namespace "$MONITORING_NS" >/dev/null 2>&1; then',
+            "  kubectl apply -f - <<'LENS_DCGM_DASHBOARD'",
+            dashboard_json,
+            "LENS_DCGM_DASHBOARD",
+            "fi",
+        ]
+        return "\n".join(lines) + "\n"
 
 
 _NVIDIA_GPU_PROVIDER = NvidiaGpuProvider()

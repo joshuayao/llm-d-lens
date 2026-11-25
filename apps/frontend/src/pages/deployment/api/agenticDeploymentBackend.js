@@ -181,3 +181,96 @@ export function previewOptimizations({ model, objective = 'balanced', maxAcceler
         available_accelerators: availableAccelerators ?? null,
     });
 }
+
+export function deploymentPermissionPayload({
+    clusterId,
+    namespace = null,
+    manifest = '',
+    namespaceLabels = null,
+    agenticDeploymentRunId = null,
+    deploymentName = null,
+    providerRef = null,
+    storageVolumeId = null,
+    usesStorage = false,
+    usesLws,
+    usesRouter,
+    eppServiceAccounts,
+    subjectOverride = null,
+    expectedDigest = null,
+} = {}) {
+    const hasLabels = namespaceLabels && typeof namespaceLabels === 'object' && Object.keys(namespaceLabels).length > 0;
+    return {
+        cluster_id: clusterId,
+        ...(namespace ? { namespace } : {}),
+        ...(manifest ? { manifest } : {}),
+        ...(hasLabels ? { namespace_labels: namespaceLabels } : {}),
+        ...(agenticDeploymentRunId ? { agentic_deployment_run_id: agenticDeploymentRunId } : {}),
+        ...(deploymentName ? { deployment_name: deploymentName } : {}),
+        ...(providerRef ? { provider_ref: providerRef } : {}),
+        ...(storageVolumeId ? { storage_volume_id: storageVolumeId } : {}),
+        uses_storage: Boolean(usesStorage || storageVolumeId),
+        ...(usesLws !== undefined ? { uses_lws: Boolean(usesLws) } : {}),
+        ...(usesRouter !== undefined ? { uses_router: Boolean(usesRouter) } : {}),
+        ...(Array.isArray(eppServiceAccounts) && eppServiceAccounts.length ? { epp_service_accounts: eppServiceAccounts } : {}),
+        ...(subjectOverride ? { subject_override: subjectOverride } : {}),
+        ...(expectedDigest ? { expected_digest: expectedDigest } : {}),
+    };
+}
+
+export function checkDeploymentPermissions(payload) {
+    return postJson('/api/v1/deployments/permission-check', payload);
+}
+
+export function generateDeploymentBootstrapScript(payload) {
+    return postJson('/api/v1/deployments/permission-remediation', payload);
+}
+
+export function verifyDeploymentBootstrap(payload) {
+    return postJson('/api/v1/deployments/admin-handoff/verify', payload);
+}
+
+export function verifyDeploymentCleanup(executionId, payload = {}) {
+    return postJson(`/api/v1/deployments/executions/${encodeURIComponent(executionId)}/cleanup-verify`, payload);
+}
+
+export function isDeploymentAdminSetupError(error) {
+    const code = error?.code || error?.body?.code || '';
+    return (error?.status === 403 || error?.status === 409) && code === 'deployment_admin_setup_required';
+}
+
+export function isDeploymentCleanupHandoffError(error) {
+    const code = error?.code || error?.body?.code || '';
+    return error?.status === 409 && code === 'deployment_cleanup_permission_denied';
+}
+
+export function parseDeploymentCleanupHandoff(error) {
+    if (!isDeploymentCleanupHandoffError(error)) return null;
+    const body = error?.body && typeof error.body === 'object' ? error.body : {};
+    const cleanup = body.adminCleanup && typeof body.adminCleanup === 'object' ? body.adminCleanup : body;
+    const canVerifyMarker = Boolean(cleanup.canVerifyMarker ?? body.canVerifyMarker);
+    return {
+        code: 'deployment_cleanup_permission_denied',
+        executionId: body.executionId ?? cleanup.executionId ?? null,
+        clusterId: body.clusterId ?? cleanup.clusterId ?? null,
+        namespace: body.namespace ?? cleanup.namespace ?? null,
+        phase1Completed: Boolean(body.phase1Completed ?? cleanup.phase1Completed ?? true),
+        deletedInNamespace: Array.isArray(body.deletedInNamespace) ? body.deletedInNamespace : [],
+        detail: (typeof body.detail === 'string' && body.detail) || cleanup.detail || error?.message || '',
+        cleanupDigest: cleanup.cleanupDigest ?? body.cleanupDigest ?? null,
+        operations: Array.isArray(cleanup.operations) ? cleanup.operations : [],
+        completedOperations: Array.isArray(cleanup.completedOperations)
+            ? cleanup.completedOperations
+            : (Array.isArray(body.deletedInNamespace) ? body.deletedInNamespace : []),
+        script: typeof (cleanup.script ?? body.script) === 'string' ? (cleanup.script ?? body.script) : '',
+        scriptFilename: cleanup.scriptFilename || cleanup.filename || body.scriptFilename || 'lens-deployment-cleanup.sh',
+        instructions: cleanup.instructions || body.instructions || '',
+        marker: cleanup.marker && typeof cleanup.marker === 'object' ? cleanup.marker : null,
+        canVerifyMarker,
+        confirmRequired: Boolean(cleanup.confirmRequired ?? body.confirmRequired ?? !canVerifyMarker),
+        unreachable: Boolean(cleanup.unreachable ?? body.unreachable),
+        warnings: Array.isArray(cleanup.warnings) ? cleanup.warnings : [],
+        status: (typeof cleanup.status === 'string' && cleanup.status)
+            || (typeof body.status === 'string' && body.status)
+            || 'pending_admin_cleanup',
+    };
+}

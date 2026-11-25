@@ -251,3 +251,258 @@ async def test_no_engine_query_without_candidates(monkeypatch, clean):
         assert await orphans.scan_orphan_namespaces("cluster-a", store=_Store(["llmd-known"])) == []
 
     assert all(argv[:3] == ["kubectl", "get", "namespaces"] for argv in runner.calls)
+
+
+@pytest.mark.asyncio
+async def test_two_phase_cleanup_refuses_protected_and_non_prefixed_namespaces(monkeypatch):
+    from llm_d_lens.cluster import registry as cluster_registry
+
+    monkeypatch.setenv("LLM_D_BENCH_NAMESPACE_PREFIX", "llmd-")
+    monkeypatch.setattr(
+        cluster_registry,
+        "get_cluster",
+        lambda _cid: SimpleNamespace(
+            hf_token_secret_namespace="custom-hf-ns",  # noqa: S106 - namespace name
+            gateway_namespace="custom-gw",
+        ),
+    )
+    for bad_ns in (
+        "default",
+        "kube-system",
+        "lens-edit",
+        "llm-d-monitoring",
+        "llm-d-bench-storage",
+        "custom-hf-ns",
+        "custom-gw",
+        "other-ns",
+        "llmd-",
+    ):
+        assert not orphans.is_deletable_deployment_namespace(bad_ns, cluster_id="cluster-a")
+        with pytest.raises(orphans.OrphanCleanupError, match="protected or non-prefixed"):
+            await orphans.cleanup_in_namespace_resources("cluster-a", bad_ns)
+
+
+@pytest.mark.asyncio
+async def test_prepare_and_verify_two_phase_deployment_cleanup(monkeypatch):
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.deploy.capabilities import DeploymentClusterAuthError
+    from llm_d_lens.infrastructure.process import CommandResult
+
+    monkeypatch.setenv("LLM_D_BENCH_NAMESPACE_PREFIX", "llmd-")
+    monkeypatch.setattr(cluster_registry, "cluster_kubeconfig_namespace", lambda _cid: "lens-edit")
+    monkeypatch.setattr(
+        cluster_registry,
+        "get_cluster",
+        lambda _cid: SimpleNamespace(
+            hf_token_secret_namespace="lens-edit",  # noqa: S106 - namespace name
+            gateway_namespace="lens-gateway",
+        ),
+    )
+
+    class _PhaseRunner:
+        def __init__(self, *, ssar_allowed=True, ns_get=None, marker_get=None, pods_get=None, unauthorized=False):
+            self.ssar_allowed = ssar_allowed
+            self.ns_get = ns_get or CommandResult(("kubectl",), 1, "", "namespaces is forbidden")
+            self.marker_get = marker_get or CommandResult(("kubectl",), 0, "", "")
+            self.pods_get = pods_get or CommandResult(("kubectl",), 1, "", "pods is forbidden")
+            self.unauthorized = unauthorized
+            self.deleted_resources: list[str] = []
+
+        async def run(self, argv, *, input=None, timeout=15):  # noqa: A002
+            if self.unauthorized:
+                return CommandResult(tuple(argv), 1, "", "Unauthorized")
+            if argv[:2] == ["kubectl", "delete"]:
+                self.deleted_resources.append(argv[2])
+                return CommandResult(tuple(argv), 0, "", "")
+            if argv[:3] == ["kubectl", "get", "pv"]:
+                return CommandResult(tuple(argv), 1, "", "persistentvolumes is forbidden")
+            if argv[:4] == ["kubectl", "create", "-o", "json"] and input:
+                return CommandResult(tuple(argv), 0, json.dumps({"status": {"allowed": self.ssar_allowed}}), "")
+            if argv[:3] == ["kubectl", "get", "namespace"]:
+                return self.ns_get
+            if argv[:3] == ["kubectl", "get", "configmap"]:
+                return self.marker_get
+            if argv[:3] == ["kubectl", "get", "pods"]:
+                return self.pods_get
+            return CommandResult(tuple(argv), 0, "", "")
+
+    phase1_runner = _PhaseRunner(ssar_allowed=True)
+    handoff = await orphans.prepare_deployment_cleanup_handoff(
+        execution_id="exec-1",
+        cluster_id="cluster-a",
+        namespace="llmd-qwen-1",
+        runner=phase1_runner,
+    )
+    assert handoff["phase1Completed"] is True
+    assert "deployments.apps" in handoff["deletedInNamespace"]
+    admin = handoff["adminCleanup"]
+    assert admin["canVerifyMarker"] is True
+    assert admin["confirmRequired"] is False
+    assert admin["marker"]["namespace"] == "lens-edit"
+    assert "llm-d-prism-epp-auth-delegator-llmd-qwen-1" in admin["script"]
+    assert "kubectl delete namespace llmd-qwen-1 --ignore-not-found=true" in admin["script"]
+
+    # When SSAR denies configmaps get in lens-edit, canVerifyMarker must be False
+    no_ssar_runner = _PhaseRunner(ssar_allowed=False)
+    handoff_no_marker = await orphans.prepare_deployment_cleanup_handoff(
+        execution_id="exec-1",
+        cluster_id="cluster-a",
+        namespace="llmd-qwen-1",
+        runner=no_ssar_runner,
+    )
+    assert handoff_no_marker["adminCleanup"]["canVerifyMarker"] is False
+    assert handoff_no_marker["adminCleanup"]["confirmRequired"] is True
+
+    # Phase 2 verification via marker ConfigMap + pods gone
+    marker_name = orphans.deployment_cleanup_marker_name("exec-1", "llmd-qwen-1")
+    marker_doc = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": marker_name, "namespace": "lens-edit"},
+        "data": {
+            "status": "completed",
+            "namespace": "llmd-qwen-1",
+            "cleanupDigest": admin["cleanupDigest"],
+        },
+    }
+    verify_runner = _PhaseRunner(
+        ssar_allowed=True,
+        ns_get=CommandResult(("kubectl",), 1, "", "namespaces is forbidden"),
+        marker_get=CommandResult(("kubectl",), 0, json.dumps(marker_doc), ""),
+        pods_get=CommandResult(("kubectl",), 1, "", "pods is forbidden"),
+    )
+    verified = await orphans.verify_deployment_cleanup(
+        execution_id="exec-1",
+        cluster_id="cluster-a",
+        namespace="llmd-qwen-1",
+        cleanup_digest=admin["cleanupDigest"],
+        runner=verify_runner,
+    )
+    assert verified["verified"] is True
+
+    # 401 never masked
+    with pytest.raises(DeploymentClusterAuthError):
+        await orphans.verify_deployment_cleanup(
+            execution_id="exec-1",
+            cluster_id="cluster-a",
+            namespace="llmd-qwen-1",
+            runner=_PhaseRunner(unauthorized=True),
+        )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_security_hardening_and_marker_validation(monkeypatch):
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.deploy import capabilities as caps
+    from llm_d_lens.deploy import orphans
+    from llm_d_lens.infrastructure.process import CommandResult
+
+    # CRDs deleted before pods
+    assert orphans._IN_NAMESPACE_RESOURCE_TYPES.index("leaderworkersets.leaderworkerset.x-k8s.io") < (
+        orphans._IN_NAMESPACE_RESOURCE_TYPES.index("pods")
+    )
+    assert orphans._IN_NAMESPACE_RESOURCE_TYPES.index("disaggregatedsets.disaggregatedset.x-k8s.io") < (
+        orphans._IN_NAMESPACE_RESOURCE_TYPES.index("pods")
+    )
+
+    # Newline injection & secret leak checks in cleanup script renderer
+    with pytest.raises(orphans.OrphanCleanupError):
+        orphans.render_deployment_cleanup_script(
+            execution_id="exec-1\nrm -rf /",
+            cluster_id="cluster-a",
+            namespace="llmd-qwen-1",
+            operations=[],
+        )
+    with pytest.raises(orphans.OrphanCleanupError):
+        orphans.render_deployment_cleanup_script(
+            execution_id="exec-1",
+            cluster_id="cluster-a",
+            namespace="llmd-qwen-1",
+            operations=[{"kind": "namespace", "name": "llmd-qwen-1", "title": "bad\ntitle"}],
+        )
+    with pytest.raises(caps.DeploymentCapabilityValidationError):
+        orphans.render_deployment_cleanup_script(
+            execution_id="exec-1",
+            cluster_id="cluster-a",
+            namespace="llmd-qwen-1",
+            operations=[{"kind": "namespace", "name": "llmd-qwen-1", "title": "Delete HF_TOKEN secret"}],
+        )
+    script_payload = orphans.render_deployment_cleanup_script(
+        execution_id="exec-1",
+        cluster_id="cluster-a",
+        namespace="llmd-qwen-1",
+        operations=[],
+        marker_namespace="lens-edit",
+    )
+    assert "set -f\n" in script_payload["script"]
+
+    # Protected kubeconfig namespace is blocked from clean_orphan_namespaces
+    monkeypatch.setattr(cluster_registry, "get_cluster", lambda _cid: None)
+    monkeypatch.setattr(cluster_registry, "cluster_kubeconfig_namespace", lambda _cid: "llmd-kubeconfig-protected")
+    monkeypatch.setattr(
+        orphans,
+        "scoped_runner",
+        lambda _cid: SimpleNamespace(run=lambda *_a, **_kw: CommandResult(("kubectl",), 0, '{"items":[]}', "")),
+    )
+    assert "llmd-kubeconfig-protected" in orphans.protected_deployment_namespaces("cluster-a")
+    cleaned, failed = await orphans.clean_orphan_namespaces(
+        "cluster-a",
+        ["outside-ns", "llmd-kubeconfig-protected"],
+        store=type("S", (), {"list_executions": lambda self: []})(),
+    )
+    assert cleaned == []
+    assert failed == [
+        {"name": "outside-ns", "error": "namespace is outside the deployment prefix"},
+        {"name": "llmd-kubeconfig-protected", "error": "namespace is protected"},
+    ]
+
+    # Stale executionId / clusterId & malformed pods JSON never verify
+    marker_name = orphans.deployment_cleanup_marker_name("exec-1", "llmd-qwen-1")
+    stale_marker_doc = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": marker_name, "namespace": "lens-edit"},
+        "data": {
+            "status": "completed",
+            "namespace": "llmd-qwen-1",
+            "executionId": "exec-other",
+            "clusterId": "cluster-a",
+            "cleanupDigest": script_payload["cleanupDigest"],
+        },
+    }
+
+    class _VerifyRunner:
+        def __init__(self, marker_doc, pods_stdout):
+            self.marker_doc = marker_doc
+            self.pods_stdout = pods_stdout
+
+        async def run(self, argv, *, input=None, timeout=15):  # noqa: A002
+            if argv[:4] == ["kubectl", "create", "-o", "json"]:
+                return CommandResult(tuple(argv), 0, json.dumps({"status": {"allowed": True}}), "")
+            if argv[:3] == ["kubectl", "get", "namespace"]:
+                return CommandResult(tuple(argv), 1, "", "namespaces is forbidden")
+            if argv[:3] == ["kubectl", "get", "configmap"]:
+                return CommandResult(tuple(argv), 0, json.dumps(self.marker_doc), "")
+            if argv[:3] == ["kubectl", "get", "pods"]:
+                return CommandResult(tuple(argv), 0, self.pods_stdout, "")
+            return CommandResult(tuple(argv), 0, "", "")
+
+    stale_res = await orphans.verify_deployment_cleanup(
+        execution_id="exec-1",
+        cluster_id="cluster-a",
+        namespace="llmd-qwen-1",
+        cleanup_digest=script_payload["cleanupDigest"],
+        runner=_VerifyRunner(stale_marker_doc, '{"items":[]}'),
+    )
+    assert stale_res["verified"] is False
+    assert stale_res["marker"]["status"] == "stale"
+
+    valid_marker_doc = {**stale_marker_doc, "data": {**stale_marker_doc["data"], "executionId": "exec-1"}}
+    bad_pods_res = await orphans.verify_deployment_cleanup(
+        execution_id="exec-1",
+        cluster_id="cluster-a",
+        namespace="llmd-qwen-1",
+        cleanup_digest=script_payload["cleanupDigest"],
+        runner=_VerifyRunner(valid_marker_doc, '{"items": null}'),
+    )
+    assert bad_pods_res["verified"] is False

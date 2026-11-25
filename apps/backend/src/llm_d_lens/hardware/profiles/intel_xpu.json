@@ -15,19 +15,26 @@
   "access_modes": ["dra", "plugin"],
   "driver": {
     "installer": "kustomize",
+    "rbac": ["namespaced", "cluster"],
     "nfd_manifest_refs": [
       "https://github.com/intel/intel-device-plugins-for-kubernetes/deployments/nfd?ref=v0.36.0",
       "https://github.com/intel/intel-device-plugins-for-kubernetes/deployments/nfd/overlays/node-feature-rules?ref=v0.36.0"
     ],
     "modes": {
       "dra": {
-        "manifest_ref": "https://github.com/intel/intel-resource-drivers-for-kubernetes/deployments/gpu?ref=gpu-v0.11.0",
+        "manifest_ref": "oci://ghcr.io/intel/intel-resource-drivers-for-kubernetes/intel-gpu-resource-driver-chart",
+        "chart_version": "0.11.0",
         "min_kubernetes_version": "1.34.0",
         "daemonset_matchers": [
           { "name_contains": "intel-gpu-resource-driver" },
           { "namespace": "intel-gpu-resource-driver" },
           { "label": "app.kubernetes.io/name=intel-gpu-resource-driver" }
-        ]
+        ],
+        "options": {
+          "privileged": true,
+          "health_monitoring_enabled": false,
+          "node_selector": { "intel.feature.node.kubernetes.io/gpu": "true" }
+        }
       },
       "plugin": {
         "manifest_ref": "https://github.com/intel/intel-device-plugins-for-kubernetes/deployments/gpu_plugin/overlays/nfd_labeled_nodes?ref=v0.36.0",
@@ -54,16 +61,17 @@
       "utilization": "hw_gpu_utilization_ratio{hw_gpu_task=\"compute-all\"}",
       "framebuffer_used": "hw_memory_usage_bytes{hw_memory_location=\"device\"}",
       "vram": "hw_memory_size_bytes",
-      "memory_read_throughput": "hw_memory_read_throughput_bytes",
-      "memory_write_throughput": "hw_memory_write_throughput_bytes",
-      "memory_bandwidth_utilization": "hw_memory_bandwidth_utilization_ratio"
+      "memory_read_throughput": "rate(hw_memory_io_bytes_total{network_io_direction=\"receive\"}[5m])",
+      "memory_write_throughput": "rate(hw_memory_io_bytes_total{network_io_direction=\"transmit\"}[5m])",
+      "memory_io_throughput": "hw_memory_io_rate_bytes_per_second",
+      "memory_bandwidth_utilization": "hw_memory_bandwidth_utilization_ratio",
+      "device_info": "hw_gpu_info"
     },
     "device_metric_sources": {
       "utilization": { "metric": "hw_gpu_utilization_ratio", "unit": "ratio", "scale": 100, "match": { "hw_gpu_task": "compute-all" }, "output_unit": "percent", "aggregation": "avg", "tile_aggregation": "avg" },
       "framebuffer_used": { "metric": "hw_memory_usage_bytes", "unit": "bytes", "match": { "hw_memory_location": "device" }, "output_unit": "bytes", "aggregation": "sum", "tile_aggregation": "sum" },
       "vram": { "metric": "hw_memory_size_bytes", "unit": "bytes", "output_unit": "bytes", "aggregation": "sum", "tile_aggregation": "sum" },
-      "memory_read_throughput": { "metric": "hw_memory_read_throughput_bytes", "unit": "bytes", "output_unit": "bytes", "aggregation": "sum", "tile_aggregation": "sum" },
-      "memory_write_throughput": { "metric": "hw_memory_write_throughput_bytes", "unit": "bytes", "output_unit": "bytes", "aggregation": "sum", "tile_aggregation": "sum" },
+      "memory_io_throughput": { "metric": "hw_memory_io_rate_bytes_per_second", "unit": "bytes_per_second", "output_unit": "bytes_per_second", "aggregation": "sum", "tile_aggregation": "sum" },
       "memory_bandwidth_utilization": { "metric": "hw_memory_bandwidth_utilization_ratio", "unit": "ratio", "scale": 100, "output_unit": "percent", "aggregation": "avg", "tile_aggregation": "avg" },
       "memory_utilization": { "metric": "hw_memory_utilization_ratio", "unit": "ratio", "output_unit": "ratio", "aggregation": "avg", "tile_aggregation": "avg" },
       "power": { "metric": "hw_power_watts", "unit": "watt", "output_unit": "watt", "aggregation": "sum", "tile_aggregation": "sum" },
@@ -75,7 +83,7 @@
       "device": "com_intel_subdevice_id",
       "namespace": "namespace",
       "pod": "pod",
-      "name": "hw_name",
+      "model": "hw_model",
       "fallback_device": "hw_id"
     },
     "allocation_join": "dra",
@@ -125,6 +133,13 @@
     "model_label_keys": [
       "intel.feature.node.kubernetes.io/gpu.product",
       "intel.feature.node.kubernetes.io/gpu.family"
+    ],
+    "model_label_patterns": [
+      {
+        "label_pattern": "^gpu\\.intel\\.com/device-id\\.0300-e211\\.present$",
+        "value": "true",
+        "model": "Intel(R) Arc(TM) Pro B60"
+      }
     ],
     "default_backend": "vllm",
     "device_class_allow_pattern": "^gpu\\.intel\\.com$",

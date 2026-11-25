@@ -21,9 +21,10 @@ from collections.abc import Callable
 from pathlib import Path
 
 from llm_d_lens.infrastructure.kubernetes import list_resources, scoped_runner
+from llm_d_lens.infrastructure.process import CommandRunner
 from llm_d_lens.model_cache.contracts import ModelCacheEntry, ModelSourceKind, NodeDownloadStatus, TokenSourceMode
 from llm_d_lens.storage.contracts import StorageVolume, StorageVolumeKind
-from llm_d_lens.storage.service import discover_nodes
+from llm_d_lens.storage.service import discover_nodes, pvc_namespace
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,9 @@ _MOUNT_PATH = "/model-cache"
 # for faster/offline starts can still override this via the env var.
 _DEFAULT_IMAGE = "python:3.12-slim"
 _ALL_NODES_KEY = "*"
+#: Identifies the plan/run that created a model-cache Job. A re-run for the same
+#: entry must not wait on Jobs left by an older plan.
+PLAN_HASH_LABEL = "lens.llm-d.ai/plan-hash"
 
 
 class ModelCacheJobError(Exception):
@@ -48,9 +52,7 @@ def _downloader_image() -> str:
 
 
 def _pvc_namespace(volume: StorageVolume) -> str:
-    if volume.kind == StorageVolumeKind.DYNAMIC_PVC and volume.dynamic_pvc:
-        return volume.dynamic_pvc.namespace
-    return "llm-d-bench-storage"
+    return pvc_namespace(volume)
 
 
 def _node_slug(node: str) -> str:
@@ -123,11 +125,11 @@ def _proxy_environment(cluster_id: str | None = None) -> list[dict]:
     return [{"name": name, "value": value} for name, value in sorted(values.items())]
 
 
-def _environment(entry: ModelCacheEntry) -> list[dict]:
+def _environment(entry: ModelCacheEntry, *, include_proxy_env: bool = True) -> list[dict]:
     environment = [
         {"name": "HF_HOME", "value": _MOUNT_PATH},
         {"name": "HF_HUB_ENABLE_HF_TRANSFER", "value": "1"},
-        *_proxy_environment(entry.cluster_id),
+        *(_proxy_environment(entry.cluster_id) if include_proxy_env else ()),
     ]
     # Both EXISTING_SECRET and HOST modes are materialized (copied, or read
     # from the backend host's token file) into a single well-known
@@ -150,7 +152,16 @@ def _environment(entry: ModelCacheEntry) -> list[dict]:
     return environment
 
 
-def _job_manifest(entry: ModelCacheEntry, volume: StorageVolume, *, node: str, command: list[str], action: str) -> dict:
+def _job_manifest(
+    entry: ModelCacheEntry,
+    volume: StorageVolume,
+    *,
+    node: str,
+    command: list[str],
+    action: str,
+    include_proxy_env: bool = True,
+    plan_hash: str | None = None,
+) -> dict:
     namespace = _pvc_namespace(volume)
     job_name = _job_name(entry, node=node, action=action)
     pod_spec: dict = {
@@ -159,7 +170,7 @@ def _job_manifest(entry: ModelCacheEntry, volume: StorageVolume, *, node: str, c
             {
                 "name": action,
                 "image": _downloader_image(),
-                "env": _environment(entry),
+                "env": _environment(entry, include_proxy_env=include_proxy_env),
                 "command": command,
                 "volumeMounts": [{"name": "model-cache", "mountPath": _MOUNT_PATH}],
             }
@@ -168,17 +179,20 @@ def _job_manifest(entry: ModelCacheEntry, volume: StorageVolume, *, node: str, c
     }
     if node != _ALL_NODES_KEY:
         pod_spec["nodeSelector"] = {"kubernetes.io/hostname": node}
+    labels = {
+        "prism.ai/model-cache-entry-id": entry.id,
+        "prism.ai/storage-volume-id": volume.id,
+        "prism.ai/model-cache-action": action,
+    }
+    if plan_hash:
+        labels[PLAN_HASH_LABEL] = plan_hash
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
             "name": job_name,
             "namespace": namespace,
-            "labels": {
-                "prism.ai/model-cache-entry-id": entry.id,
-                "prism.ai/storage-volume-id": volume.id,
-                "prism.ai/model-cache-action": action,
-            },
+            "labels": labels,
         },
         "spec": {
             "backoffLimit": 2,
@@ -220,7 +234,9 @@ async def _apply_job(manifest: dict, *, cluster_id: str) -> None:
         raise ModelCacheJobError((result.stderr or result.stdout or "kubectl apply failed").strip())
 
 
-async def delete_jobs_for_volume(volume: StorageVolume, *, cluster_id: str) -> None:
+async def delete_jobs_for_volume(
+    volume: StorageVolume, *, cluster_id: str, runner: CommandRunner | None = None
+) -> None:
     """Delete every download/delete Job (and its Pods) that ever mounted this volume.
 
     Jobs only self-clean after ``ttlSecondsAfterFinished`` (1h, see
@@ -233,8 +249,8 @@ async def delete_jobs_for_volume(volume: StorageVolume, *, cluster_id: str) -> N
     ``storage.service.delete_volume_objects`` before the PVC/PV are deleted.
     """
     namespace = _pvc_namespace(volume)
-    runner = scoped_runner(cluster_id)
-    await runner.run(
+    active = runner if runner is not None else scoped_runner(cluster_id)
+    await active.run(
         [
             "kubectl",
             "delete",
@@ -385,6 +401,7 @@ async def launch_cache_jobs(
     action: str,
     command_for_entry: Callable[[ModelCacheEntry], list[str]],
     append: bool = False,
+    plan_hash: str | None = None,
 ) -> ModelCacheEntry:
     """Apply per-node Jobs, publishing in-progress only after all submissions succeed.
 
@@ -394,7 +411,14 @@ async def launch_cache_jobs(
     pending = [NodeDownloadStatus(node=node, status="pending") for node in nodes]
     entry.node_progress = list(entry.node_progress) + pending if append else pending
     for node in nodes:
-        manifest = _job_manifest(entry, volume, node=node, command=command_for_entry(entry), action=action)
+        manifest = _job_manifest(
+            entry,
+            volume,
+            node=node,
+            command=command_for_entry(entry),
+            action=action,
+            plan_hash=plan_hash,
+        )
         await _apply_job(manifest, cluster_id=entry.cluster_id)
     for progress in entry.node_progress:
         if progress.node in nodes:
@@ -403,7 +427,11 @@ async def launch_cache_jobs(
 
 
 async def start_download(
-    entry: ModelCacheEntry, *, volume: StorageVolume, nodes: list[str] | None = None
+    entry: ModelCacheEntry,
+    *,
+    volume: StorageVolume,
+    nodes: list[str] | None = None,
+    plan_hash: str | None = None,
 ) -> ModelCacheEntry:
     """Create the download Job(s) for an entry and initialize its node_progress.
 
@@ -418,6 +446,7 @@ async def start_download(
         nodes=nodes,
         action="download",
         command_for_entry=_download_command,
+        plan_hash=plan_hash,
     )
 
 
@@ -768,3 +797,10 @@ async def scan_existing_models(volume: StorageVolume, *, cluster_id: str) -> dic
             if repo_id:
                 found.setdefault(repo_id, []).append(node_key)
     return found
+
+
+#: Public rendering helpers for the operation catalog (same names/labels as the
+#: runtime Job path).
+model_cache_job_name = _job_name
+model_cache_job_manifest = _job_manifest
+model_cache_download_command = _download_command

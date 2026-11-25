@@ -2,12 +2,25 @@ import test, { describe } from 'node:test';
 import assert from 'node:assert/strict';
 import React, { createElement, Children } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { AddModelForm, ModelServiceAdminPage, TrafficDistributionForm } from './ModelServiceAdminPage.jsx';
+import {
+    AddModelForm,
+    applyGatewayConfigSaved,
+    buildGatewayConfigPatch,
+    fetchModelServiceAdminSnapshot,
+    handoffModalSubtitle,
+    ModelServiceAdminPage,
+    ModelServiceHandoffBanner,
+    ModelServiceHandoffPanel,
+    resolveGatewayConfigFields,
+    submitGatewayConfig,
+    TrafficDistributionForm,
+} from './ModelServiceAdminPage.jsx';
 import { AuthContext } from '../../../auth/AuthContext.js';
-import { availableModelProviders, effectiveTrafficShare, filterServiceFlow, memberIsRoutable, parseTrafficWeight, routedTrafficTotal, trafficDistributionError, trafficShare, trafficTotal } from '../../model/modelService.js';
-import { ComponentLogAction, DataPlaneTopology, ManageDeploymentAction, PublicationToggleAction, ProvidersToggleAction, Flow as FlowConnector } from './DataPlaneTopology.jsx';
+import { availableModelProviders, buildHandoffModalState, buildModelCurlSamples, connectionAddressLabel, connectionEndpointUrl, effectiveTrafficShare, filterServiceFlow, gatewayAddressLabel, memberIsRoutable, parseTrafficWeight, posixSingleQuote, routedTrafficTotal, sanitizeHttpUrl, trafficDistributionError, trafficShare, trafficTotal } from '../../model/modelService.js';
+import { clusterCapabilities, clusterDot, ComponentLogAction, DataPlaneTopology, gatewayDetail, ippDetailText, ippDot, ManageDeploymentAction, PublicationToggleAction, ProvidersToggleAction, TopologyMenuItems, Flow as FlowConnector } from './DataPlaneTopology.jsx';
+import { ClusterConnectionCard } from './ModelServicePage.jsx';
 import { ComponentLogViewer } from './GatewayOperationLogDrawer.jsx';
-import { addModel, deleteGroup, getModelAccess, grantModelAccess, revokeModelAccess, setProvidersStatus } from './modelServiceBackend.js';
+import { addModel, applyMutationHandoffResult, clusterHandoffMode, componentHandoffAction, deleteGroup, deleteMember, fetchClusterHandoff, generateGatewayRemediation, getGatewayRemediation, getModelAccess, grantModelAccess, performClusterBannerRecheck, performHandoffRecheck, performHandoffScriptRefresh, revokeModelAccess, setGroupStatus, setProvidersStatus, verifyGatewayRemediation } from './modelServiceBackend.js';
 import { DeploymentManagementPage } from '../../../deployment/ui/DeploymentManagement/DeploymentManagementPage.jsx';
 
 describe("Add model", () => {
@@ -1262,5 +1275,1593 @@ describe("Page navigation", () => {
             assert.ok(input[0].includes(`value="${initialSearch || ''}"`));
             assert.doesNotMatch(input[0], /\s(?:readOnly|disabled)=/);
         }
+    });
+});
+
+describe("Non-Admin K8s capability & handoff UX", () => {
+    const statusDot = { active: 'bg-emerald-400', stopped: 'bg-slate-500', standby: 'bg-slate-500', unhealthy: 'bg-rose-500', unknown: 'bg-amber-400' };
+
+    test('capability helpers default to Admin when capability fields are absent', () => {
+        assert.deepEqual(clusterCapabilities(), {
+            canManageInfra: true,
+            canManageConfig: true,
+            canReconcile: true,
+            isNonAdmin: false,
+        });
+        assert.deepEqual(clusterCapabilities({ clusterId: 'c1' }), {
+            canManageInfra: true,
+            canManageConfig: true,
+            canReconcile: true,
+            isNonAdmin: false,
+        });
+        assert.deepEqual(clusterCapabilities({
+            accessMode: 'non_admin',
+            canManageGatewayInfra: false,
+            canManageGatewayConfig: false,
+            canReconcileRoutes: false,
+        }), {
+            canManageInfra: false,
+            canManageConfig: false,
+            canReconcile: false,
+            isNonAdmin: true,
+        });
+    });
+
+    test('Non-Admin topology renders badges, restricted status tooltips and explicit IPP/HTTPRoute permissions', () => {
+        const nonAdminCluster = {
+            clusterId: 'c-nonadmin',
+            clusterName: 'Non-Admin Cluster',
+            accessMode: 'non_admin',
+            canManageGatewayInfra: false,
+            canManageGatewayConfig: false,
+            canReconcileRoutes: false,
+            reconcileStatus: 'admin_handoff_required',
+            gatewayState: 'unknown',
+            ippState: 'unknown',
+        };
+        const html = renderToStaticMarkup(createElement(
+            AuthContext.Provider,
+            { value: { can: (perm) => perm === 'model-service:member:manage' || perm === 'model-service:gateway:reconcile' } },
+            createElement(DataPlaneTopology, {
+                clusters: [nonAdminCluster],
+                memberGroups: [{
+                    id: 'g1',
+                    name: 'chat',
+                    status: 'active',
+                    clusters: [{
+                        clusterId: 'c-nonadmin',
+                        deployments: [{
+                            memberId: 'm1',
+                            clusterId: 'c-nonadmin',
+                            name: 'dep-1',
+                            status: 'active',
+                            weight: 1,
+                            components: { httpRoute: 'unknown', inferencePool: 'ready', epp: 'ready', modelServer: 'ready' },
+                        }],
+                    }],
+                }],
+                statusDot,
+                onComponentAction: () => {},
+            }),
+        ));
+        assert.match(html, />Non-Admin</);
+        assert.match(html, />Orchestration administrator sync required</);
+        assert.match(html, /title="Gateway: status restricted \(non-admin\) \(unknown\)"/);
+        assert.match(html, /title="IPP: status restricted \(non-admin\) \(unknown\)"/);
+        assert.match(html, /title="HTTPRoute: status restricted \(non-admin\)"/);
+        assert.doesNotMatch(html, /not installed/);
+        assert.match(html, /aria-label="IPP actions"/);
+        assert.match(html, /aria-label="HTTPRoute actions"/);
+
+        const memberOnlyHtml = renderToStaticMarkup(createElement(
+            AuthContext.Provider,
+            { value: { can: (perm) => perm === 'model-service:member:manage' } },
+            createElement(DataPlaneTopology, {
+                clusters: [nonAdminCluster],
+                memberGroups: [{
+                    id: 'g1',
+                    name: 'chat',
+                    status: 'active',
+                    clusters: [{
+                        clusterId: 'c-nonadmin',
+                        deployments: [{
+                            memberId: 'm1',
+                            clusterId: 'c-nonadmin',
+                            name: 'dep-1',
+                            status: 'active',
+                            weight: 1,
+                            components: { httpRoute: 'unknown', inferencePool: 'ready', epp: 'ready', modelServer: 'ready' },
+                        }],
+                    }],
+                }],
+                statusDot,
+                onComponentAction: () => {},
+            }),
+        ));
+        assert.match(memberOnlyHtml, /aria-label="HTTPRoute actions"/);
+        assert.doesNotMatch(memberOnlyHtml, /aria-label="IPP actions"/);
+
+        const authErrCluster = { ...nonAdminCluster, authError: '401 Unauthorized' };
+        assert.equal(clusterDot(authErrCluster), 'unhealthy');
+        assert.equal(gatewayDetail(authErrCluster), 'authentication failed');
+        assert.equal(ippDot(authErrCluster), 'unhealthy');
+        assert.equal(ippDetailText(authErrCluster), 'authentication failed');
+
+        const authErrHtml = renderToStaticMarkup(createElement(
+            AuthContext.Provider,
+            { value: { can: () => true } },
+            createElement(DataPlaneTopology, { clusters: [authErrCluster], memberGroups: [], statusDot }),
+        ));
+        assert.match(authErrHtml, />Auth error</);
+
+        assert.equal(gatewayDetail({ gatewayState: 'installed', gatewayReady: true, gatewayProbeSource: 'http' }), 'ready (HTTP probe)');
+        assert.equal(gatewayDetail({ gatewayState: 'installed', gatewayReady: true, gatewayProbeSource: 'prometheus' }), 'ready (Prometheus)');
+        assert.equal(gatewayDetail({ gatewayState: 'installed', gatewayReady: true }), 'ready');
+    });
+
+    test('Non-Admin topology menus hide infra/log actions and expose handoff script actions while Admin stays unchanged', () => {
+        const adminCluster = {
+            clusterId: 'c-admin',
+            clusterName: 'Admin',
+            gatewayProvider: 'istio',
+            gatewayState: 'installed',
+            gatewayRunning: true,
+            gatewayReady: true,
+            ippState: 'installed',
+            ippReady: true,
+        };
+        const nonAdminCluster = {
+            ...adminCluster,
+            clusterId: 'c-nonadmin',
+            clusterName: 'NonAdmin',
+            accessMode: 'non_admin',
+            canManageGatewayInfra: false,
+            canManageGatewayConfig: false,
+            canReconcileRoutes: false,
+        };
+        const layout = [{
+            cluster: nonAdminCluster,
+            rows: [{ serviceId: 'g1', serviceName: 'chat', serviceStatus: 'active', members: [] }],
+        }];
+        const adminLayout = [{
+            cluster: adminCluster,
+            rows: [{ serviceId: 'g1', serviceName: 'chat', serviceStatus: 'active', members: [] }],
+        }];
+
+        const renderMenu = (menuKey, clusters, menuLayout) => renderToStaticMarkup(createElement(
+            AuthContext.Provider,
+            { value: { can: () => true } },
+            createElement(TopologyMenuItems, { menuKey, clusters, layout: menuLayout, onComponentAction: () => {} }),
+        ));
+
+        const nonAdminGw = renderMenu('gw:c-nonadmin', [nonAdminCluster], layout);
+        assert.match(nonAdminGw, / Configure<\/button>/);
+        assert.match(nonAdminGw, / Orchestration administrator sync script<\/button>/);
+        assert.match(nonAdminGw, / Gateway repair script<\/button>/);
+        assert.doesNotMatch(nonAdminGw, /Install<\/button>|Uninstall<\/button>|Start<\/button>|Stop<\/button>|View logs<\/button>|Reconcile<\/button>/);
+
+        const adminGw = renderMenu('gw:c-admin', [adminCluster], adminLayout);
+        assert.match(adminGw, / Stop<\/button>/);
+        assert.match(adminGw, / Reconcile<\/button>/);
+        assert.match(adminGw, / Uninstall<\/button>/);
+        assert.match(adminGw, / View logs<\/button>/);
+        assert.doesNotMatch(adminGw, /Orchestration administrator sync script|Gateway repair script/);
+
+        const nonAdminIpp = renderMenu('ipp:c-nonadmin', [nonAdminCluster], layout);
+        assert.match(nonAdminIpp, / Configure<\/button>/);
+        assert.match(nonAdminIpp, / IPP config script<\/button>/);
+        assert.doesNotMatch(nonAdminIpp, /Install<\/button>|Uninstall<\/button>|Start<\/button>|Stop<\/button>|View logs<\/button>/);
+
+        const adminIpp = renderMenu('ipp:c-admin', [adminCluster], adminLayout);
+        assert.match(adminIpp, / Stop<\/button>/);
+        assert.match(adminIpp, / Uninstall<\/button>/);
+        assert.match(adminIpp, / View logs<\/button>/);
+        assert.doesNotMatch(adminIpp, /IPP config script/);
+
+        const nonAdminRoute = renderMenu('route:c-nonadmin:g1', [nonAdminCluster], layout);
+        assert.match(nonAdminRoute, / Orchestration administrator sync script<\/button>/);
+        assert.doesNotMatch(nonAdminRoute, /Reconcile route/);
+
+        const adminRoute = renderMenu('route:c-admin:g1', [adminCluster], adminLayout);
+        assert.match(adminRoute, / Reconcile route<\/button>/);
+    });
+
+    test('modelServiceBackend remediation, verify, delete handoff, setProvidersStatus, and addModel helpers', async (t) => {
+        const requests = [];
+        const sampleHandoff = {
+            clusterId: 'c1',
+            reconcileStatus: 'admin_handoff_required',
+            desiredHash: 'hash123',
+            adminScript: '#!/usr/bin/env bash\necho ok\n',
+        };
+        t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
+            requests.push({ url, method: options.method || 'GET', body: options.body ? JSON.parse(options.body) : null });
+            if (url.includes('/gateway/remediation/verify')) {
+                return Response.json({ clusterId: 'c1', verified: true, reconcileStatus: 'synced' });
+            }
+            if (url.includes('/gateway/remediation')) {
+                return Response.json(sampleHandoff);
+            }
+            if (url.endsWith('/groups/g1') && options.method === 'DELETE') {
+                return Response.json({ deleted: true, groupId: 'g1', reconcileStatus: 'admin_handoff_required', handoff: sampleHandoff });
+            }
+            if (url.endsWith('/members/m1') && options.method === 'DELETE') {
+                return new Response(null, { status: 204 });
+            }
+            if (url.endsWith('/groups/g1/providers/status')) {
+                return Response.json({
+                    items: [{ id: 'm1', status: 'disabled', weight: 1 }],
+                    reconcileStatus: 'admin_handoff_required',
+                    handoff: sampleHandoff,
+                });
+            }
+            if (url.endsWith('/admin/groups')) {
+                return Response.json({ items: [{ id: 'g1', name: 'existing-model', clusterId: 'c1' }] });
+            }
+            if (url.endsWith('/admin/members')) {
+                return Response.json({ items: [] });
+            }
+            if (url.endsWith('/admin/groups/publish')) {
+                return Response.json({ id: 'g2', name: 'new-model', reconcileStatus: 'admin_handoff_required', handoff: sampleHandoff }, { status: 201 });
+            }
+            if (url.endsWith('/admin/groups/g1/traffic')) {
+                return Response.json({ items: [], operation: { status: 'succeeded' }, reconcileStatus: 'admin_handoff_required', handoff: sampleHandoff });
+            }
+            throw new Error(`Unexpected URL ${url}`);
+        });
+
+        const getRes = await getGatewayRemediation('c1', { mode: 'routes', markerNamespace: 'ns-a' });
+        assert.equal(getRes.desiredHash, 'hash123');
+        assert.match(requests[0].url, /\/api\/v1\/model-service\/admin\/gateway\/remediation\?clusterId=c1&mode=routes&markerNamespace=ns-a$/);
+
+        const postRes = await generateGatewayRemediation({ clusterId: 'c1', mode: 'ipp_config', ippConfig: 'key: val' });
+        assert.equal(postRes.reconcileStatus, 'admin_handoff_required');
+        assert.equal(requests[1].method, 'POST');
+        assert.deepEqual(requests[1].body, { clusterId: 'c1', mode: 'ipp_config', ippConfig: 'key: val' });
+
+        const verifyRes = await verifyGatewayRemediation({ clusterId: 'c1', expectedHash: 'hash123' });
+        assert.equal(verifyRes.verified, true);
+        assert.equal(requests[2].method, 'POST');
+        assert.match(requests[2].url, /\/gateway\/remediation\/verify$/);
+
+        const delGroupRes = await deleteGroup('g1');
+        assert.equal(delGroupRes.reconcileStatus, 'admin_handoff_required');
+        assert.equal(delGroupRes.handoff.desiredHash, 'hash123');
+
+        const delMemberRes = await deleteMember('m1');
+        assert.deepEqual(delMemberRes, {});
+
+        const statusItems = await setProvidersStatus('g1', 'disabled');
+        assert.equal(statusItems.length, 1);
+        assert.equal(statusItems.reconcileStatus, 'admin_handoff_required');
+        assert.equal(statusItems.handoff.desiredHash, 'hash123');
+        assert.deepEqual(Object.keys(statusItems), ['0']);
+
+        const createdRes = await addModel({ name: 'new-model', clusterId: 'c1', executionId: 'e1' });
+        assert.equal(createdRes.created, true);
+        assert.equal(createdRes.reconcileStatus, 'admin_handoff_required');
+        assert.equal(createdRes.handoff.desiredHash, 'hash123');
+
+        const updatedRes = await addModel({ name: 'existing-model', clusterId: 'c1', executionId: 'e2' });
+        assert.equal(updatedRes.created, false);
+        assert.equal(updatedRes.reconcileStatus, 'admin_handoff_required');
+        assert.equal(updatedRes.handoff.desiredHash, 'hash123');
+    });
+
+    test('ModelServiceHandoffPanel renders script actions, details, and verification banners without (s) copy', () => {
+        const handoff = {
+            clusterId: 'c1',
+            accessMode: 'non_admin',
+            reconcileStatus: 'admin_handoff_required',
+            desiredHash: 'deadbeef12345678',
+            markerNamespace: 'lens-edit',
+            markerName: 'lens-ms-handoff-deadbeef12345678',
+            filename: 'lens-ms-c1-routes.sh',
+            adminScript: '#!/usr/bin/env bash\nset -euo pipefail\nkubectl apply -f -\n',
+            instructions: 'Run this script once with Orchestration administrator kubeconfig.',
+            pendingOperations: [
+                { id: 'op-1', action: 'apply', kind: 'HTTPRoute', namespace: 'lens-gateway', name: 'chat-route', summary: 'Apply HTTPRoute' },
+                { id: 'op-2', action: 'delete', kind: 'InferenceModelRewrite', namespace: 'ns-a', name: 'old-rw', summary: 'Delete stale rewrite' },
+            ],
+            warnings: ['Gateway namespace reads are restricted.'],
+            mode: 'routes',
+        };
+
+        const baseHtml = renderToStaticMarkup(createElement(ModelServiceHandoffPanel, {
+            handoff,
+            clusterName: 'Cluster One',
+            onRecheck: () => {},
+        }));
+        assert.match(baseHtml, /Orchestration administrator route sync — Cluster One/);
+        assert.match(baseHtml, />Awaiting Orchestration administrator</);
+        assert.match(baseHtml, /Download<\/button>/);
+        assert.match(baseHtml, /Copy<\/button>/);
+        assert.match(baseHtml, /Re-check<\/button>/);
+        assert.match(baseHtml, /View operation details/);
+        assert.match(baseHtml, /<details class="group\/details[^"]*" open="">/);
+        assert.match(baseHtml, /2 pending/);
+        assert.match(baseHtml, /HTTPRoute lens-gateway\/chat-route/);
+        assert.match(baseHtml, /InferenceModelRewrite ns-a\/old-rw/);
+        assert.match(baseHtml, /deadbeef12345678/);
+        assert.match(baseHtml, /lens-edit\/lens-ms-handoff-deadbeef12345678/);
+        assert.match(baseHtml, /<pre[^>]*>[^]*kubectl apply -f -/);
+        assert.match(baseHtml, /Gateway namespace reads are restricted\./);
+        assert.doesNotMatch(baseHtml, /\(s\)/);
+
+        for (const [verifyResult, expectedText] of [
+            [{ verified: true, markerStatus: 'complete', message: 'All routes synced.', routeChecks: [{ name: 'chat', status: 'ready', httpStatus: 200 }] }, /Verified.*All routes synced\./],
+            [{ verified: false, markerStatus: 'partial', message: '' }, /Partial.*Orchestration administrator handoff is partial/],
+            [{ verified: false, markerStatus: 'stale', message: '' }, /Stale.*belongs to an older route state/],
+            [{ verified: false, markerStatus: 'missing', message: '' }, /Missing marker.*Completion marker was not found/],
+            [{ verified: false, markerStatus: 'forbidden', message: '' }, /Unconfirmed.*403 Forbidden/],
+        ]) {
+            const html = renderToStaticMarkup(createElement(ModelServiceHandoffPanel, {
+                handoff,
+                verifyResult,
+                onRecheck: () => {},
+            }));
+            assert.match(html, expectedText);
+            if (verifyResult.verified) {
+                assert.match(html, /<details class="group\/details/);
+                assert.doesNotMatch(html, /<details[^>]*open/);
+            } else {
+                assert.match(html, /<details class="group\/details[^"]*" open="">/);
+            }
+            assert.doesNotMatch(html, /\(s\)/);
+        }
+
+        const syncedHtml = renderToStaticMarkup(createElement(ModelServiceHandoffPanel, {
+            handoff: { ...handoff, reconcileStatus: 'synced' },
+            onRecheck: () => {},
+        }));
+        assert.match(syncedHtml, /Verified/);
+        assert.match(syncedHtml, /0 pending/);
+        assert.match(syncedHtml, /<details class="group\/details/);
+        assert.doesNotMatch(syncedHtml, /<details[^>]*open/);
+    });
+
+    test('recheckHandoff marks verified state cleanly, clears cluster banner, and renders verified feedback', async (t) => {
+        const calls = [];
+        t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
+            calls.push({ url, method: options.method || 'GET', body: options.body ? JSON.parse(options.body) : null });
+            if (url.endsWith('/gateway/remediation/verify')) {
+                return Response.json({
+                    clusterId: 'c1',
+                    verified: true,
+                    reconcileStatus: 'synced',
+                    desiredHash: 'aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff66660000111122223333',
+                    markerStatus: 'complete',
+                    markerNamespace: 'lens-edit',
+                    markerName: 'lens-ms-handoff-aaaa1111bbbb2222',
+                    routeChecks: [{ groupId: 'g1', groupName: 'qwen3', status: 'ready', httpStatus: 200 }],
+                    message: 'Gateway handoff verified and synced.',
+                });
+            }
+            throw new Error(`Unexpected request: ${url}`);
+        });
+
+        let statusState = {
+            clusters: [{
+                clusterId: 'c1',
+                clusterName: 'Non-Admin Cluster',
+                reconcileStatus: 'admin_handoff_required',
+                pendingOperationsCount: 2,
+            }],
+        };
+        let modalState = buildHandoffModalState({
+            clusterId: 'c1',
+            reconcileStatus: 'admin_handoff_required',
+            desiredHash: 'aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff66660000111122223333',
+            markerNamespace: 'lens-edit',
+            markerName: 'lens-ms-handoff-aaaa1111bbbb2222',
+            adminScript: '#!/usr/bin/env bash\nkubectl apply -f -\n',
+            pendingOperations: [{ id: 'op-1', action: 'apply', kind: 'HTTPRoute', namespace: 'lens-gw', name: 'qwen3' }],
+            mode: 'routes',
+        }, { clusters: statusState.clusters });
+        let notice = '';
+        let loadCalls = 0;
+
+        const beforeBannerHtml = renderToStaticMarkup(createElement(ModelServiceHandoffBanner, {
+            clusters: statusState.clusters.filter((cluster) => cluster.reconcileStatus === 'admin_handoff_required'),
+        }));
+        assert.match(beforeBannerHtml, /Orchestration administrator route sync required/);
+
+        await performHandoffRecheck({
+            handoffModal: modalState,
+            setHandoffModal: (updater) => { modalState = typeof updater === 'function' ? updater(modalState) : updater; },
+            setStatus: (updater) => { statusState = typeof updater === 'function' ? updater(statusState) : updater; },
+            setNotice: (msg) => { notice = msg; },
+            load: async () => { loadCalls += 1; },
+        });
+
+        assert.equal(calls.length, 1);
+        assert.deepEqual(calls[0].body, {
+            clusterId: 'c1',
+            expectedHash: 'aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff66660000111122223333',
+            markerNamespace: 'lens-edit',
+            mode: 'routes',
+        });
+        assert.equal(modalState.busy, false);
+        assert.equal(modalState.error, '');
+        assert.equal(modalState.verifyResult.verified, true);
+        assert.equal(modalState.handoff.reconcileStatus, 'synced');
+        assert.deepEqual(modalState.handoff.pendingOperations, []);
+        assert.equal(notice, 'Orchestration administrator route sync verified.');
+        assert.equal(loadCalls, 1);
+        assert.equal(statusState.clusters[0].reconcileStatus, 'synced');
+        assert.equal(statusState.clusters[0].pendingOperationsCount, 0);
+
+        const afterBannerHtml = renderToStaticMarkup(createElement(ModelServiceHandoffBanner, {
+            clusters: statusState.clusters.filter((cluster) => cluster.reconcileStatus === 'admin_handoff_required'),
+        }));
+        assert.equal(afterBannerHtml, '');
+
+        const panelHtml = renderToStaticMarkup(createElement(ModelServiceHandoffPanel, {
+            handoff: modalState.handoff,
+            verifyResult: modalState.verifyResult,
+            clusterName: modalState.clusterName,
+            onRecheck: () => {},
+            onRefreshScript: () => {},
+        }));
+        assert.match(panelHtml, />Verified</);
+        assert.match(panelHtml, /Gateway handoff verified and synced\./);
+        assert.match(panelHtml, /ready \(200\)/);
+        assert.match(panelHtml, /0 pending/);
+        assert.doesNotMatch(panelHtml, /Orchestration administrator script/);
+        assert.doesNotMatch(panelHtml, /Refresh script/);
+        assert.doesNotMatch(panelHtml, /<details[^>]*open/);
+    });
+
+    test('recheckHandoff refreshes stale handoff script and sends the new expectedHash on subsequent Re-check', async (t) => {
+        const oldHash = '1111111111111111222222222222222233333333333333334444444444444444';
+        const newHash = '9999999999999999888888888888888877777777777777776666666666666666';
+        const calls = [];
+        let verifyAttempt = 0;
+
+        t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
+            calls.push({ url, method: options.method || 'GET', body: options.body ? JSON.parse(options.body) : null });
+            if (url.endsWith('/gateway/remediation/verify')) {
+                verifyAttempt += 1;
+                if (verifyAttempt === 1) {
+                    return Response.json({
+                        clusterId: 'c1',
+                        verified: false,
+                        reconcileStatus: 'admin_handoff_required',
+                        desiredHash: newHash,
+                        observedHash: oldHash,
+                        markerStatus: 'stale',
+                        markerNamespace: 'lens-edit',
+                        markerName: 'lens-ms-handoff-9999999999999999',
+                        message: '',
+                    });
+                }
+                return Response.json({
+                    clusterId: 'c1',
+                    verified: true,
+                    reconcileStatus: 'synced',
+                    desiredHash: newHash,
+                    observedHash: newHash,
+                    markerStatus: 'complete',
+                    markerNamespace: 'lens-edit',
+                    markerName: 'lens-ms-handoff-9999999999999999',
+                    message: 'Gateway handoff verified and synced.',
+                });
+            }
+            if (url.includes('/gateway/remediation?clusterId=c1&mode=routes')) {
+                return Response.json({
+                    clusterId: 'c1',
+                    accessMode: 'non_admin',
+                    reconcileStatus: 'admin_handoff_required',
+                    desiredHash: newHash,
+                    markerNamespace: 'lens-edit',
+                    markerName: 'lens-ms-handoff-9999999999999999',
+                    filename: 'lens-model-service-c1-routes.sh',
+                    adminScript: '#!/usr/bin/env bash\n# UPDATED ROUTE SCRIPT\nkubectl apply -f updated-routes.yaml\n',
+                    pendingOperations: [
+                        { id: 'op-new', action: 'apply', kind: 'HTTPRoute', namespace: 'lens-gw', name: 'qwen3-v2', summary: 'Apply updated route' },
+                    ],
+                    mode: 'routes',
+                });
+            }
+            throw new Error(`Unexpected request: ${url}`);
+        });
+
+        let modalState = buildHandoffModalState({
+            clusterId: 'c1',
+            reconcileStatus: 'admin_handoff_required',
+            desiredHash: oldHash,
+            markerNamespace: 'lens-edit',
+            markerName: 'lens-ms-handoff-1111111111111111',
+            adminScript: '#!/usr/bin/env bash\n# OUTDATED SCRIPT\nkubectl apply -f old-routes.yaml\n',
+            pendingOperations: [
+                { id: 'op-old', action: 'apply', kind: 'HTTPRoute', namespace: 'lens-gw', name: 'qwen3-v1', summary: 'Apply old route' },
+            ],
+            mode: 'routes',
+        }, { clusters: [{ clusterId: 'c1', clusterName: 'Non-Admin Cluster' }] });
+
+        // 1st Re-check: verify returns markerStatus === 'stale' -> auto-fetches fresh script
+        await performHandoffRecheck({
+            handoffModal: modalState,
+            setHandoffModal: (updater) => { modalState = typeof updater === 'function' ? updater(modalState) : updater; },
+            load: async () => {},
+        });
+
+        assert.equal(calls.length, 2);
+        assert.equal(calls[0].method, 'POST');
+        assert.equal(calls[0].body.expectedHash, oldHash);
+        assert.equal(calls[1].method, 'GET');
+        assert.match(calls[1].url, /\/gateway\/remediation\?clusterId=c1&mode=routes$/);
+
+        assert.equal(modalState.busy, false);
+        assert.equal(modalState.error, '');
+        assert.equal(modalState.verifyResult.markerStatus, 'stale');
+        assert.equal(modalState.handoff.desiredHash, newHash);
+        assert.equal(modalState.handoff.markerName, 'lens-ms-handoff-9999999999999999');
+        assert.match(modalState.handoff.adminScript, /UPDATED ROUTE SCRIPT/);
+
+        const staleHtml = renderToStaticMarkup(createElement(ModelServiceHandoffPanel, {
+            handoff: modalState.handoff,
+            verifyResult: modalState.verifyResult,
+            clusterName: modalState.clusterName,
+            onRecheck: () => {},
+            onRefreshScript: () => {},
+        }));
+        assert.match(staleHtml, />Stale</);
+        assert.match(staleHtml, /belongs to an older route state/);
+        assert.match(staleHtml, /UPDATED ROUTE SCRIPT/);
+        assert.doesNotMatch(staleHtml, /OUTDATED SCRIPT/);
+        assert.match(staleHtml, new RegExp(newHash));
+        assert.doesNotMatch(staleHtml, new RegExp(oldHash));
+        assert.match(staleHtml, /lens-edit\/lens-ms-handoff-9999999999999999/);
+        assert.match(staleHtml, /qwen3-v2/);
+        assert.match(staleHtml, /Refresh script<\/button>/);
+
+        // 2nd Re-check: sends the NEW expectedHash and succeeds!
+        await performHandoffRecheck({
+            handoffModal: modalState,
+            setHandoffModal: (updater) => { modalState = typeof updater === 'function' ? updater(modalState) : updater; },
+            load: async () => {},
+        });
+
+        assert.equal(calls.length, 3);
+        assert.equal(calls[2].method, 'POST');
+        assert.equal(calls[2].body.expectedHash, newHash);
+        assert.equal(modalState.verifyResult.verified, true);
+        assert.equal(modalState.handoff.reconcileStatus, 'synced');
+    });
+
+    test('stale refresh preserves verifyResult on fetch failure and manual Refresh script recovers cleanly', async (t) => {
+        const oldHash = 'aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000';
+        const freshHash = 'bbbb1111bbbb1111bbbb1111bbbb1111bbbb1111bbbb1111bbbb1111bbbb1111';
+        let failGet = true;
+
+        t.mock.method(globalThis, 'fetch', async (url) => {
+            if (url.endsWith('/gateway/remediation/verify')) {
+                return Response.json({
+                    clusterId: 'c1',
+                    verified: false,
+                    reconcileStatus: 'admin_handoff_required',
+                    desiredHash: freshHash,
+                    markerStatus: 'missing',
+                    message: 'Routes changed concurrently.',
+                });
+            }
+            if (url.includes('/gateway/remediation?clusterId=c1&mode=gateway_repair')) {
+                if (failGet) return Response.json({ detail: 'Temporary gateway read timeout' }, { status: 503 });
+                return Response.json({
+                    clusterId: 'c1',
+                    accessMode: 'non_admin',
+                    reconcileStatus: 'admin_handoff_required',
+                    desiredHash: freshHash,
+                    markerNamespace: 'lens-edit',
+                    markerName: 'lens-ms-handoff-bbbb1111bbbb1111',
+                    adminScript: '#!/usr/bin/env bash\n# RECOVERED REPAIR SCRIPT\n',
+                    pendingOperations: [],
+                    mode: 'gateway_repair',
+                });
+            }
+            throw new Error(`Unexpected URL: ${url}`);
+        });
+
+        let modalState = buildHandoffModalState({
+            clusterId: 'c1',
+            reconcileStatus: 'admin_handoff_required',
+            desiredHash: oldHash,
+            markerNamespace: 'lens-edit',
+            markerName: 'lens-ms-handoff-aaaa0000aaaa0000',
+            adminScript: '#!/usr/bin/env bash\n# INITIAL REPAIR SCRIPT\n',
+            mode: 'gateway_repair',
+        });
+
+        // desiredHash changed even with markerStatus === 'missing' -> attempts refresh, preserves verifyResult on 503
+        await performHandoffRecheck({
+            handoffModal: modalState,
+            setHandoffModal: (updater) => { modalState = typeof updater === 'function' ? updater(modalState) : updater; },
+        });
+        assert.equal(modalState.verifyResult.desiredHash, freshHash);
+        assert.match(modalState.error, /Temporary gateway read timeout/);
+
+        // Manual Refresh script clears outdated error/verifyResult and updates script + hash
+        failGet = false;
+        await performHandoffScriptRefresh({
+            handoffModal: modalState,
+            setHandoffModal: (updater) => { modalState = typeof updater === 'function' ? updater(modalState) : updater; },
+        });
+        assert.equal(modalState.error, '');
+        assert.equal(modalState.verifyResult, null);
+        assert.equal(modalState.handoff.desiredHash, freshHash);
+        assert.match(modalState.handoff.adminScript, /RECOVERED REPAIR SCRIPT/);
+    });
+
+    test('member removal and group mutations open fresh delete handoff script or clear stuck handoff/banner when synced', async (t) => {
+        const bindHash = '1010101010101010101010101010101010101010101010101010101010101010';
+        const deleteHash = '2020202020202020202020202020202020202020202020202020202020202020';
+        let deleteNeedsHandoff = true;
+
+        t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
+            if (url.endsWith('/members/m1') && options.method === 'DELETE') {
+                if (deleteNeedsHandoff) {
+                    return Response.json({
+                        deleted: true,
+                        memberId: 'm1',
+                        reconcileStatus: 'admin_handoff_required',
+                        handoff: {
+                            clusterId: 'c1',
+                            accessMode: 'non_admin',
+                            reconcileStatus: 'admin_handoff_required',
+                            desiredHash: deleteHash,
+                            markerNamespace: 'lens-edit',
+                            markerName: 'lens-ms-handoff-2020202020202020',
+                            adminScript: '#!/usr/bin/env bash\nkubectl delete httproute qwen3 -n lens-gateway --ignore-not-found=true\n',
+                            pendingOperations: [
+                                { id: 'del-route', action: 'delete', kind: 'httproute', namespace: 'lens-gateway', name: 'qwen3', summary: 'Delete stale httproute' },
+                            ],
+                            mode: 'routes',
+                        },
+                    });
+                }
+                return new Response(null, { status: 204 });
+            }
+            if (url.endsWith('/groups/g1/status') && options.method === 'POST') {
+                return Response.json({ id: 'g1', clusterId: 'c1', status: 'disabled', reconcileStatus: 'synced' });
+            }
+            if (url.endsWith('/gateway/remediation/verify') && options.method === 'POST') {
+                const body = JSON.parse(options.body);
+                assert.equal(body.expectedHash, undefined, 'cluster banner recheck must not fail on stale poll hash');
+                return Response.json({
+                    clusterId: 'c1',
+                    verified: true,
+                    reconcileStatus: 'synced',
+                    desiredHash: deleteHash,
+                    markerStatus: 'complete',
+                });
+            }
+            throw new Error(`Unexpected request: ${url}`);
+        });
+
+        const clusters = [
+            { clusterId: 'c1', clusterName: 'Cluster One', reconcileStatus: 'admin_handoff_required', pendingOperationsCount: 1, desiredHash: bindHash },
+            { clusterId: 'c2', clusterName: 'Cluster Two', reconcileStatus: 'synced', pendingOperationsCount: 0 },
+        ];
+        let statusState = { clusters };
+        // Start with an outdated bind handoff modal open
+        let modalState = buildHandoffModalState({
+            clusterId: 'c1',
+            reconcileStatus: 'admin_handoff_required',
+            desiredHash: bindHash,
+            markerNamespace: 'lens-edit',
+            markerName: 'lens-ms-handoff-1010101010101010',
+            adminScript: '#!/usr/bin/env bash\nkubectl apply -f bind-qwen3.yaml\n',
+            mode: 'routes',
+        }, {
+            clusters,
+            verifyResult: { verified: false, markerStatus: 'partial', message: 'Earlier bind check failed' },
+        });
+
+        // 1. Removing member when earlier script ran -> returns admin_handoff_required with fresh delete script
+        const deleteResult = await deleteMember('m1');
+        const outcome1 = await applyMutationHandoffResult(deleteResult, {
+            clusterId: 'c1',
+            clusters: statusState.clusters,
+            setHandoffModal: (updater) => { modalState = typeof updater === 'function' ? updater(modalState) : updater; },
+            setStatus: (updater) => { statusState = typeof updater === 'function' ? updater(statusState) : updater; },
+        });
+        assert.equal(outcome1, 'admin_handoff_required');
+        assert.equal(modalState.handoff.desiredHash, deleteHash);
+        assert.equal(modalState.handoff.markerName, 'lens-ms-handoff-2020202020202020');
+        assert.equal(modalState.verifyResult, null, 'previous bind verifyResult cleared for new delete script');
+        assert.match(modalState.handoff.adminScript, /kubectl delete httproute qwen3/);
+
+        const deleteModalHtml = renderToStaticMarkup(createElement(ModelServiceHandoffPanel, {
+            handoff: modalState.handoff,
+            verifyResult: modalState.verifyResult,
+            clusterName: modalState.clusterName,
+            onRecheck: () => {},
+        }));
+        assert.match(deleteModalHtml, /Delete stale httproute/);
+        assert.match(deleteModalHtml, /kubectl delete httproute qwen3/);
+        assert.doesNotMatch(deleteModalHtml, /bind-qwen3\.yaml/);
+
+        // 2. Removing member when NO script ever ran (204 / synced) -> closes stale modal for c1 and clears banner immediately
+        deleteNeedsHandoff = false;
+        const noOpDeleteResult = await deleteMember('m1');
+        const outcome2 = await applyMutationHandoffResult(noOpDeleteResult, {
+            clusterId: 'c1',
+            clusters: statusState.clusters,
+            setHandoffModal: (updater) => { modalState = typeof updater === 'function' ? updater(modalState) : updater; },
+            setStatus: (updater) => { statusState = typeof updater === 'function' ? updater(statusState) : updater; },
+        });
+        assert.equal(outcome2, 'synced');
+        assert.equal(modalState, null);
+        assert.equal(statusState.clusters[0].reconcileStatus, 'synced');
+        assert.equal(
+            renderToStaticMarkup(createElement(ModelServiceHandoffBanner, {
+                clusters: statusState.clusters.filter((c) => c.reconcileStatus === 'admin_handoff_required'),
+            })),
+            '',
+        );
+
+        // 3. Toggling group when synced keeps unrelated cluster's modal open while clearing target cluster's banner
+        modalState = buildHandoffModalState({ clusterId: 'c2', desiredHash: 'other', adminScript: 'echo c2' }, { clusters });
+        statusState = {
+            clusters: [{ clusterId: 'c1', clusterName: 'Cluster One', reconcileStatus: 'admin_handoff_required', pendingOperationsCount: 1 }, clusters[1]],
+        };
+        const toggleRes = await setGroupStatus('g1', 'disabled');
+        const outcome3 = await applyMutationHandoffResult(toggleRes, {
+            clusterId: 'c1',
+            clusters: statusState.clusters,
+            setHandoffModal: (updater) => { modalState = typeof updater === 'function' ? updater(modalState) : updater; },
+            setStatus: (updater) => { statusState = typeof updater === 'function' ? updater(statusState) : updater; },
+        });
+        assert.equal(outcome3, 'synced');
+        assert.equal(modalState.handoff.clusterId, 'c2');
+        assert.equal(statusState.clusters[0].reconcileStatus, 'synced');
+
+        // 4. Cluster banner Re-check clears banner and closes any stale c1 modal when verified
+        modalState = buildHandoffModalState({ clusterId: 'c1', desiredHash: bindHash, adminScript: 'echo stale' }, { clusters });
+        statusState = {
+            clusters: [{ clusterId: 'c1', clusterName: 'Cluster One', reconcileStatus: 'admin_handoff_required', pendingOperationsCount: 1, desiredHash: bindHash }],
+        };
+        let recheckingId = '';
+        let bannerNotice = '';
+        await performClusterBannerRecheck(statusState.clusters[0], {
+            bannerRecheckingId: recheckingId,
+            setBannerRecheckingId: (id) => { recheckingId = id; },
+            setHandoffModal: (updater) => { modalState = typeof updater === 'function' ? updater(modalState) : updater; },
+            setStatus: (updater) => { statusState = typeof updater === 'function' ? updater(statusState) : updater; },
+            setNotice: (msg) => { bannerNotice = msg; },
+            load: async () => {},
+        });
+        assert.equal(recheckingId, '');
+        assert.equal(modalState, null);
+        assert.equal(statusState.clusters[0].reconcileStatus, 'synced');
+        assert.match(bannerNotice, /verified for Cluster One/);
+    });
+
+    test('ModelServiceHandoffPanel renders emerald Verified state plus non-blocking advisory note for advisory routeChecks', () => {
+        const handoff = {
+            clusterId: 'c1',
+            accessMode: 'non_admin',
+            reconcileStatus: 'synced',
+            desiredHash: 'deadbeef12345678',
+            markerNamespace: 'lens-edit',
+            markerName: 'lens-ms-handoff-deadbeef12345678',
+            adminScript: '#!/usr/bin/env bash\necho ok\n',
+            pendingOperations: [],
+            mode: 'routes',
+        };
+        const verifyResult = {
+            verified: true,
+            markerStatus: 'complete',
+            reconcileStatus: 'synced',
+            message: 'Gateway handoff verified and synced. External route probe reported advisory backend warnings.',
+            routeChecks: [
+                {
+                    groupId: 'g1',
+                    name: 'qwen3-loading',
+                    status: 'loading',
+                    httpStatus: 503,
+                    advisory: true,
+                    detail: 'Gateway route matched, but backend model is still loading or starting.',
+                },
+                {
+                    groupId: 'g2',
+                    name: 'qwen3-unreachable',
+                    status: 'unreachable',
+                    advisory: true,
+                    detail: 'Gateway URL is unreachable from Lens; handoff verified via cluster completion marker.',
+                },
+                {
+                    groupId: 'g3',
+                    name: 'qwen3-degraded',
+                    status: 'degraded',
+                    httpStatus: 500,
+                    advisory: true,
+                    detail: 'Gateway route matched, but backend returned a server error.',
+                },
+            ],
+        };
+
+        const html = renderToStaticMarkup(createElement(ModelServiceHandoffPanel, {
+            handoff,
+            verifyResult,
+            clusterName: 'sprocean-min',
+            onRecheck: () => {},
+        }));
+
+        // Emerald Verified state is preserved (never treated as failed handoff)
+        assert.match(html, /border-l-emerald-500/);
+        assert.match(html, />Verified</);
+        assert.match(html, /Gateway handoff verified and synced\. External route probe reported advisory backend warnings\./);
+        assert.doesNotMatch(html, />Stale<\/|>Partial<\/|>Missing marker<\/|>Unconfirmed<\//);
+
+        // Non-blocking advisory note is rendered above routeChecks
+        assert.match(html, /Advisory: handoff is verified and synced/);
+        assert.ok(html.indexOf('Advisory: handoff is verified and synced') < html.indexOf('Route verification checks'));
+
+        // StatusChips show exact labels, detail titles, and neutral/amber mapping for unreachable/loading
+        assert.match(html, /title="Gateway route matched, but backend model is still loading or starting\."[^>]*>loading \(503\)</);
+        assert.match(html, /bg-amber-500\/10[^"]*text-amber-700[^>]*title="Gateway route matched, but backend model is still loading or starting\."[^>]*>loading \(503\)</);
+        assert.match(html, /bg-slate-200\/70[^"]*text-slate-600[^>]*title="Gateway URL is unreachable from Lens; handoff verified via cluster completion marker\."[^>]*>unreachable</);
+        assert.match(html, /title="Gateway route matched, but backend returned a server error\."[^>]*>degraded \(500\)</);
+
+        // Modal subtitle reflects advisory verification vs clean verification
+        assert.match(
+            handoffModalSubtitle({ handoff, verifyResult }),
+            /verified\. Backend route probes reported advisory warnings\./,
+        );
+        assert.equal(
+            handoffModalSubtitle({ handoff, verifyResult: { verified: true, routeChecks: [{ status: 'ready', httpStatus: 200 }] } }),
+            'Orchestration administrator route sync verified. Routes are ready.',
+        );
+    });
+
+    test('performHandoffScriptRefresh marks cluster synced and clears pending banner when pendingOperations is empty', async (t) => {
+        t.mock.method(globalThis, 'fetch', async (url) => {
+            if (url.includes('/gateway/remediation?clusterId=c1&mode=routes')) {
+                return Response.json({
+                    clusterId: 'c1',
+                    accessMode: 'non_admin',
+                    reconcileStatus: 'synced',
+                    desiredHash: 'cccc3333cccc3333cccc3333cccc3333cccc3333cccc3333cccc3333cccc3333',
+                    markerNamespace: 'lens-edit',
+                    markerName: 'lens-ms-handoff-cccc3333cccc3333',
+                    adminScript: '#!/usr/bin/env bash\n# no-op\n',
+                    pendingOperations: [],
+                    mode: 'routes',
+                });
+            }
+            throw new Error(`Unexpected URL: ${url}`);
+        });
+
+        let statusState = {
+            clusters: [
+                { clusterId: 'c1', clusterName: 'Cluster One', reconcileStatus: 'admin_handoff_required', pendingOperationsCount: 2 },
+                { clusterId: 'c2', clusterName: 'Cluster Two', reconcileStatus: 'admin_handoff_required', pendingOperationsCount: 1 },
+            ],
+        };
+        let modalState = buildHandoffModalState({
+            clusterId: 'c1',
+            reconcileStatus: 'admin_handoff_required',
+            desiredHash: 'aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111',
+            pendingOperations: [{ id: 'op-1', action: 'apply', kind: 'HTTPRoute', namespace: 'lens-gw', name: 'qwen3' }],
+            mode: 'routes',
+        }, {
+            clusters: statusState.clusters,
+            verifyResult: { verified: false, markerStatus: 'missing' },
+        });
+
+        await performHandoffScriptRefresh({
+            handoffModal: modalState,
+            setHandoffModal: (updater) => { modalState = typeof updater === 'function' ? updater(modalState) : updater; },
+            setStatus: (updater) => { statusState = typeof updater === 'function' ? updater(statusState) : updater; },
+        });
+
+        assert.equal(modalState.handoff.reconcileStatus, 'synced');
+        assert.deepEqual(modalState.handoff.pendingOperations, []);
+        assert.equal(modalState.verifyResult, null);
+        assert.equal(statusState.clusters[0].reconcileStatus, 'synced');
+        assert.equal(statusState.clusters[0].pendingOperationsCount, 0);
+        assert.equal(statusState.clusters[1].reconcileStatus, 'admin_handoff_required');
+
+        const bannerHtml = renderToStaticMarkup(createElement(ModelServiceHandoffBanner, {
+            clusters: statusState.clusters.filter((c) => c.reconcileStatus === 'admin_handoff_required'),
+        }));
+        assert.doesNotMatch(bannerHtml, /Cluster One/);
+        assert.match(bannerHtml, /Cluster Two/);
+    });
+
+    test('GatewayConfigModal diffs submit against loadedCluster so prefilled discoveredGateway gatewayPort is preserved on save', async (t) => {
+        const statusCluster = {
+            clusterId: 'c1',
+            clusterName: 'sprocean-min',
+            gatewayProvider: 'istio',
+            gatewayPort: 32592,
+            gatewayPublicUrl: '',
+        };
+        const loadedCluster = {
+            id: 'c1',
+            name: 'sprocean-min',
+            gatewayProvider: 'istio',
+            gatewayPort: null,
+            gatewayPublicUrl: null,
+            gatewayAuthzHost: null,
+        };
+
+        // Prefill preserves discoveredGateway port 32592 even when DB fullCluster.gatewayPort is null
+        const resolved = resolveGatewayConfigFields(statusCluster, loadedCluster, ['10.112.228.10']);
+        assert.deepEqual(resolved, {
+            gatewayProvider: 'istio',
+            gatewayPort: '32592',
+            gatewayPublicUrl: '',
+            gatewayAuthzHost: '10.112.228.10',
+        });
+
+        // Diffing against loadedCluster preserves gatewayPort: 32592 (which diffing against statusCluster would drop)
+        const patchVsLoaded = buildGatewayConfigPatch(resolved, loadedCluster);
+        assert.deepEqual(patchVsLoaded, {
+            gatewayPort: 32592,
+            gatewayAuthzHost: '10.112.228.10',
+        });
+
+        // When DB already stores 32592, unchanged port is omitted from PATCH
+        const patchAlreadyPersisted = buildGatewayConfigPatch(resolved, {
+            ...loadedCluster,
+            gatewayPort: 32592,
+            gatewayAuthzHost: '10.112.228.10',
+        });
+        assert.deepEqual(patchAlreadyPersisted, {});
+
+        // submitGatewayConfig sends PATCH with preserved gatewayPort
+        const patchCalls = [];
+        t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
+            patchCalls.push({ url, method: options.method, body: JSON.parse(options.body) });
+            return Response.json({ cluster: { ...loadedCluster, gatewayPort: 32592, gatewayAuthzHost: '10.112.228.10' } });
+        });
+
+        await submitGatewayConfig({
+            clusterId: 'c1',
+            fields: resolved,
+            baselineCluster: loadedCluster,
+        });
+        assert.equal(patchCalls.length, 1);
+        assert.equal(patchCalls[0].method, 'PATCH');
+        assert.match(patchCalls[0].url, /\/api\/cluster\/clusters\/c1$/);
+        assert.deepEqual(patchCalls[0].body, {
+            gatewayPort: 32592,
+            gatewayAuthzHost: '10.112.228.10',
+        });
+
+        // Editing only Gateway host/IP sends both gatewayPublicUrl and preserved gatewayPort
+        const patchWithPublicUrl = buildGatewayConfigPatch(
+            { ...resolved, gatewayPublicUrl: '10.112.228.229' },
+            loadedCluster,
+        );
+        assert.deepEqual(patchWithPublicUrl, {
+            gatewayPort: 32592,
+            gatewayPublicUrl: '10.112.228.229',
+            gatewayAuthzHost: '10.112.228.10',
+        });
+
+        // Clearing Gateway port when DB had null omits gatewayPort; clearing when DB had 32592 sends null
+        const clearedWhenNull = buildGatewayConfigPatch(
+            { ...resolved, gatewayPort: '', gatewayPublicUrl: '10.112.228.229' },
+            loadedCluster,
+        );
+        assert.deepEqual(clearedWhenNull, {
+            gatewayPublicUrl: '10.112.228.229',
+            gatewayAuthzHost: '10.112.228.10',
+        });
+        const clearedWhenPersisted = buildGatewayConfigPatch(
+            { ...resolved, gatewayPort: '' },
+            { ...loadedCluster, gatewayPort: 32592, gatewayAuthzHost: '10.112.228.10' },
+        );
+        assert.deepEqual(clearedWhenPersisted, {
+            gatewayPort: null,
+        });
+    });
+
+    test('GatewayConfigModal onSaved immediately reloads both gateway status and members snapshot', async (t) => {
+        const fetchedUrls = [];
+        t.mock.method(globalThis, 'fetch', async (url) => {
+            fetchedUrls.push(String(url));
+            if (String(url).includes('/admin/groups')) return Response.json({ items: [{ id: 'g1', name: 'qwen3' }] });
+            if (String(url).includes('/admin/members')) return Response.json({ items: [{ id: 'm1', status: 'active', healthJson: { components: { serving: 'ready' } } }] });
+            if (String(url).includes('/admin/deployments')) return Response.json({ items: [] });
+            if (String(url).includes('/admin/gateway/status')) return Response.json({ clusters: [{ clusterId: 'e66f4591', gatewayPublicUrl: '10.112.228.229', gatewayPort: 32592, gatewayReady: true }] });
+            throw new Error(`Unexpected URL: ${url}`);
+        });
+
+        let modalCluster = { clusterId: 'e66f4591' };
+        let notice = '';
+        let loadArg = null;
+        let reloadedSnapshot = null;
+
+        await applyGatewayConfigSaved({
+            setGatewayConfigCluster: (value) => { modalCluster = value; },
+            setNotice: (value) => { notice = value; },
+            load: async (arg) => {
+                loadArg = arg;
+                reloadedSnapshot = await fetchModelServiceAdminSnapshot();
+            },
+        });
+
+        assert.equal(modalCluster, null);
+        assert.equal(notice, 'Gateway configuration saved');
+        assert.deepEqual(loadArg, { quiet: true });
+        assert.ok(fetchedUrls.some((u) => u.includes('/admin/gateway/status')));
+        assert.ok(fetchedUrls.some((u) => u.includes('/admin/members')));
+        assert.equal(reloadedSnapshot.status.clusters[0].gatewayPublicUrl, '10.112.228.229');
+        assert.equal(reloadedSnapshot.status.clusters[0].gatewayPort, 32592);
+        assert.equal(reloadedSnapshot.members[0].healthJson.components.serving, 'ready');
+    });
+
+    test('Non-Admin topology renders missing IPP as not installed while Gateway is ready via Prometheus', () => {
+        const missingIppCluster = {
+            clusterId: 'c-prom',
+            clusterName: 'sprocean-min',
+            accessMode: 'non_admin',
+            canManageGatewayInfra: false,
+            canManageGatewayConfig: false,
+            canReconcileRoutes: false,
+            reconcileStatus: 'synced',
+            gatewayState: 'installed',
+            gatewayReady: true,
+            gatewayRunning: true,
+            gatewayProbeSource: 'prometheus',
+            ippState: 'missing',
+            ippReady: false,
+        };
+
+        assert.equal(clusterDot(missingIppCluster), 'active');
+        assert.equal(gatewayDetail(missingIppCluster), 'ready (Prometheus)');
+        assert.equal(ippDot(missingIppCluster), 'missing');
+        assert.equal(ippDetailText(missingIppCluster), 'not installed');
+
+        assert.equal(ippDot({ ...missingIppCluster, ippState: 'unknown', ippReady: null }), 'unknown');
+        assert.equal(ippDetailText({ ...missingIppCluster, ippState: 'unknown', ippReady: null }), 'status restricted (non-admin)');
+        assert.equal(ippDot({ ...missingIppCluster, ippState: 'installed', ippReady: true }), 'active');
+        assert.equal(ippDetailText({ ...missingIppCluster, ippState: 'installed', ippReady: true }), 'ready (Prometheus)');
+        assert.equal(ippDot({ ...missingIppCluster, ippState: 'installed', ippReady: false }), 'stopped');
+        assert.equal(ippDetailText({ ...missingIppCluster, ippState: 'installed', ippReady: false }), 'installed, stopped');
+
+        const fullStatusDot = {
+            ...statusDot,
+            installed: 'bg-emerald-400',
+            missing: 'bg-amber-400',
+        };
+        const html = renderToStaticMarkup(createElement(
+            AuthContext.Provider,
+            { value: { can: () => true } },
+            createElement(DataPlaneTopology, {
+                clusters: [missingIppCluster],
+                memberGroups: [],
+                statusDot: fullStatusDot,
+                onComponentAction: () => {},
+            }),
+        ));
+
+        assert.match(html, /title="Gateway: ready \(Prometheus\) \(active\)"/);
+        assert.match(html, /title="IPP: not installed \(not installed\)"/);
+        assert.match(html, /bg-emerald-400[^"]*" title="Gateway: ready \(Prometheus\) \(active\)"/);
+        assert.match(html, /bg-amber-400[^"]*" title="IPP: not installed \(not installed\)"/);
+        assert.doesNotMatch(html, /Orchestration administrator sync required/);
+    });
+
+    test('handoff-repair and handoff-ipp preview scripts via non-mutating GET without POST', async (t) => {
+        const requests = [];
+        t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
+            requests.push({ url, method: options.method || 'GET' });
+            return Response.json({
+                clusterId: 'c-nonadmin',
+                reconcileStatus: 'admin_handoff_required',
+                desiredHash: 'hash-preview',
+                adminScript: '#!/usr/bin/env bash\necho preview\n',
+            });
+        });
+
+        assert.deepEqual(componentHandoffAction('handoff-routes'), { mode: 'routes', persist: false });
+        assert.deepEqual(componentHandoffAction('handoff-repair'), { mode: 'gateway_repair', persist: false });
+        assert.deepEqual(componentHandoffAction('handoff-ipp'), { mode: 'ipp_config', persist: false });
+        assert.equal(componentHandoffAction('configure'), null);
+
+        const nonAdminCluster = {
+            clusterId: 'c-nonadmin',
+            clusterName: 'NonAdmin',
+            gatewayProvider: 'istio',
+            gatewayState: 'installed',
+            gatewayRunning: true,
+            gatewayReady: true,
+            ippState: 'missing',
+            ippReady: false,
+            accessMode: 'non_admin',
+            canManageGatewayInfra: false,
+            canManageGatewayConfig: false,
+            canReconcileRoutes: false,
+        };
+        const layout = [{ cluster: nonAdminCluster, rows: [] }];
+
+        const findMenuActions = (node, acc = []) => {
+            if (!node || typeof node !== 'object') return acc;
+            if (Array.isArray(node)) {
+                node.forEach((child) => findMenuActions(child, acc));
+                return acc;
+            }
+            if (typeof node.props?.label === 'string' && typeof node.props?.onClick === 'function') {
+                acc.push(node);
+            }
+            if (node.props?.children) findMenuActions(node.props.children, acc);
+            return acc;
+        };
+
+        const triggered = [];
+        const onComponentAction = async (cluster, _kind, action) => {
+            const spec = componentHandoffAction(action);
+            assert.ok(spec, `Expected handoff action spec for ${action}`);
+            triggered.push(action);
+            await fetchClusterHandoff(cluster, spec.mode, { persist: spec.persist });
+        };
+
+        const gwMenuTree = TopologyMenuItems({
+            menuKey: 'gw:c-nonadmin',
+            clusters: [nonAdminCluster],
+            layout,
+            onComponentAction,
+        });
+        const gwRepairBtn = findMenuActions(gwMenuTree).find((action) => action.props.label === 'Gateway repair script');
+        assert.ok(gwRepairBtn, 'Expected Gateway repair script menu item');
+        await gwRepairBtn.props.onClick();
+
+        const ippMenuTree = TopologyMenuItems({
+            menuKey: 'ipp:c-nonadmin',
+            clusters: [nonAdminCluster],
+            layout,
+            onComponentAction,
+        });
+        const ippConfigBtn = findMenuActions(ippMenuTree).find((action) => action.props.label === 'IPP config script');
+        assert.ok(ippConfigBtn, 'Expected IPP config script menu item');
+        await ippConfigBtn.props.onClick();
+
+        assert.deepEqual(triggered, ['handoff-repair', 'handoff-ipp']);
+        assert.equal(requests.length, 2);
+        assert.equal(requests[0].method, 'GET');
+        assert.match(requests[0].url, /\/api\/v1\/model-service\/admin\/gateway\/remediation\?clusterId=c-nonadmin&mode=gateway_repair$/);
+        assert.equal(requests[1].method, 'GET');
+        assert.match(requests[1].url, /\/api\/v1\/model-service\/admin\/gateway\/remediation\?clusterId=c-nonadmin&mode=ipp_config$/);
+    });
+
+    test('performHandoffRecheck forwards mode, expectedHash, and markerNamespace and preserves unrelated pending routes', async (t) => {
+        const requests = [];
+        t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
+            requests.push({ url, method: options.method || 'GET', rawBody: options.body, body: options.body ? JSON.parse(options.body) : null });
+            if (url.endsWith('/gateway/remediation/verify')) {
+                const parsed = JSON.parse(options.body);
+                return Response.json({
+                    clusterId: 'c1',
+                    verified: true,
+                    reconcileStatus: parsed.mode === 'ipp_config' ? 'admin_handoff_required' : 'synced',
+                    markerStatus: 'complete',
+                    desiredHash: parsed.expectedHash,
+                    markerNamespace: parsed.markerNamespace,
+                });
+            }
+            throw new Error(`Unexpected URL: ${url}`);
+        });
+
+        await verifyGatewayRemediation({ clusterId: 'c1', expectedHash: 'h-undef', mode: undefined });
+        assert.equal('mode' in requests[0].body, false);
+
+        for (const mode of ['gateway_repair', 'ipp_config']) {
+            let statusState = {
+                clusters: [{ clusterId: 'c1', clusterName: 'Cluster One', reconcileStatus: 'admin_handoff_required', pendingOperationsCount: 1 }],
+            };
+            let modalState = buildHandoffModalState({
+                clusterId: 'c1',
+                reconcileStatus: 'admin_handoff_required',
+                desiredHash: `hash-${mode}`,
+                markerNamespace: 'lens-edit',
+                mode,
+            }, { clusters: statusState.clusters });
+
+            await performHandoffRecheck({
+                handoffModal: modalState,
+                setHandoffModal: (updater) => { modalState = typeof updater === 'function' ? updater(modalState) : updater; },
+                setStatus: (updater) => { statusState = typeof updater === 'function' ? updater(statusState) : updater; },
+                load: async () => {},
+            });
+
+            const sent = requests.at(-1).body;
+            assert.deepEqual(sent, {
+                clusterId: 'c1',
+                expectedHash: `hash-${mode}`,
+                markerNamespace: 'lens-edit',
+                mode,
+            });
+            assert.equal(modalState.verifyResult.verified, true);
+            if (mode === 'ipp_config') {
+                assert.equal(statusState.clusters[0].reconcileStatus, 'admin_handoff_required', 'pending routes banner stays intact until routes verify');
+            } else {
+                assert.equal(statusState.clusters[0].reconcileStatus, 'synced');
+            }
+        }
+    });
+
+    test('performClusterBannerRecheck and clusterHandoffMode forward cluster.handoffMode when present', async (t) => {
+        assert.equal(clusterHandoffMode({ handoffMode: 'ipp_config' }), 'ipp_config');
+        assert.equal(clusterHandoffMode({ mode: 'gateway_repair' }), 'gateway_repair');
+        assert.equal(clusterHandoffMode({}), 'routes');
+
+        const requests = [];
+        let verified = false;
+        t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
+            requests.push({ url, method: options.method || 'GET', body: options.body ? JSON.parse(options.body) : null });
+            if (url.endsWith('/gateway/remediation/verify')) {
+                return Response.json(verified
+                    ? { clusterId: 'c1', verified: true, reconcileStatus: 'synced', markerStatus: 'complete' }
+                    : { clusterId: 'c1', verified: false, reconcileStatus: 'admin_handoff_required', markerStatus: 'missing' });
+            }
+            if (url.includes('/gateway/remediation?clusterId=c1&mode=ipp_config')) {
+                return Response.json({
+                    clusterId: 'c1',
+                    reconcileStatus: 'admin_handoff_required',
+                    desiredHash: 'ipp-hash-1',
+                    markerNamespace: 'lens-edit',
+                    mode: 'ipp_config',
+                    adminScript: '#!/usr/bin/env bash\necho ipp\n',
+                });
+            }
+            throw new Error(`Unexpected URL: ${url}`);
+        });
+
+        const clusterWithMode = {
+            clusterId: 'c1',
+            clusterName: 'Cluster One',
+            reconcileStatus: 'admin_handoff_required',
+            handoffMode: 'ipp_config',
+            handoffNamespace: 'lens-edit',
+        };
+        let modalState = null;
+        let statusState = { clusters: [clusterWithMode] };
+        let recheckingId = '';
+
+        // 1. Unverified: verify sends handoffMode, then opens modal by fetching mode=ipp_config
+        await performClusterBannerRecheck(clusterWithMode, {
+            bannerRecheckingId: recheckingId,
+            setBannerRecheckingId: (id) => { recheckingId = id; },
+            setHandoffModal: (updater) => { modalState = typeof updater === 'function' ? updater(modalState) : updater; },
+            setStatus: (updater) => { statusState = typeof updater === 'function' ? updater(statusState) : updater; },
+            load: async () => {},
+        });
+        assert.deepEqual(requests[0].body, {
+            clusterId: 'c1',
+            markerNamespace: 'lens-edit',
+            mode: 'ipp_config',
+        });
+        assert.equal(requests[1].method, 'GET');
+        assert.match(requests[1].url, /\/gateway\/remediation\?clusterId=c1&mode=ipp_config$/);
+        assert.equal(modalState.handoff.mode, 'ipp_config');
+
+        // 2. Verified: verify sends handoffMode and clears banner + modal
+        verified = true;
+        await performClusterBannerRecheck(clusterWithMode, {
+            bannerRecheckingId: recheckingId,
+            setBannerRecheckingId: (id) => { recheckingId = id; },
+            setHandoffModal: (updater) => { modalState = typeof updater === 'function' ? updater(modalState) : updater; },
+            setStatus: (updater) => { statusState = typeof updater === 'function' ? updater(statusState) : updater; },
+            load: async () => {},
+        });
+        assert.deepEqual(requests[2].body, {
+            clusterId: 'c1',
+            markerNamespace: 'lens-edit',
+            mode: 'ipp_config',
+        });
+        assert.equal(modalState, null);
+        assert.equal(statusState.clusters[0].reconcileStatus, 'synced');
+    });
+
+    test('Non-Admin ready qwen3 topology renders green dots, no restricted text, and discovered gatewayNodeAddress:gatewayPort', () => {
+        const sproceanCluster = {
+            clusterId: 'e66f4591',
+            clusterName: 'sprocean-min',
+            accessMode: 'non_admin',
+            canManageGatewayInfra: false,
+            canManageGatewayConfig: false,
+            canReconcileRoutes: false,
+            reconcileStatus: 'synced',
+            gatewayProvider: 'istio',
+            gatewayState: 'installed',
+            gatewayReady: true,
+            gatewayRunning: true,
+            gatewayProbeSource: 'http',
+            gatewayAddress: null,
+            gatewayNodeAddress: '10.239.11.206',
+            gatewayPort: 32592,
+            ippState: 'installed',
+            ippReady: true,
+        };
+        assert.equal(gatewayAddressLabel(sproceanCluster), '10.239.11.206:32592');
+        assert.equal(clusterDot(sproceanCluster), 'active');
+        assert.equal(gatewayDetail(sproceanCluster), 'ready (HTTP probe) · 10.239.11.206:32592');
+        assert.equal(ippDot(sproceanCluster), 'active');
+        assert.equal(ippDetailText(sproceanCluster), 'running');
+
+        const html = renderToStaticMarkup(createElement(
+            AuthContext.Provider,
+            { value: { can: () => true } },
+            createElement(DataPlaneTopology, {
+                clusters: [sproceanCluster],
+                memberGroups: [{
+                    id: 'msg-0bd1a6d4ded3',
+                    name: 'qwen3',
+                    status: 'active',
+                    clusters: [{
+                        clusterId: 'e66f4591',
+                        deployments: [{
+                            memberId: 'msm-5828c881f2d9',
+                            clusterId: 'e66f4591',
+                            name: 'optimized-baseline',
+                            status: 'active',
+                            weight: 1,
+                            routable: true,
+                            components: {
+                                httpRoute: 'ready',
+                                ipp: 'ready',
+                                serving: 'ready',
+                                inferencePool: 'ready',
+                                epp: 'ready',
+                                modelServer: 'ready',
+                            },
+                        }],
+                    }],
+                }],
+                statusDot: { ...statusDot, pending: 'bg-amber-400' },
+                onComponentAction: () => {},
+            }),
+        ));
+
+        assert.doesNotMatch(html, /status restricted \(non-admin\)/);
+        assert.doesNotMatch(html, /address pending/);
+        assert.match(html, /10\.239\.11\.206:32592/);
+        assert.match(html, /title="Gateway endpoint: 10\.239\.11\.206:32592"/);
+        assert.match(html, /bg-emerald-400[^"]*" title="Gateway: ready \(HTTP probe\) · 10\.239\.11\.206:32592 \(active\)"/);
+        assert.match(html, /bg-emerald-400[^"]*" title="IPP: running \(active\)"/);
+        assert.match(html, /bg-emerald-400[^"]*" title="HTTPRoute: active"/);
+        assert.match(html, /bg-emerald-400[^"]*" title="InferencePool: active"/);
+        assert.match(html, /bg-emerald-400[^"]*" title="EPP: active"/);
+        assert.match(html, /bg-emerald-400[^"]*" title="model server: active"/);
+    });
+
+    test('Non-Admin topology renders httpRoute pending as amber pending, never grey unknown or red unhealthy', () => {
+        const pendingCluster = {
+            clusterId: 'e66f4591',
+            clusterName: 'sprocean-min',
+            accessMode: 'non_admin',
+            canManageGatewayInfra: false,
+            canManageGatewayConfig: false,
+            canReconcileRoutes: false,
+            reconcileStatus: 'admin_handoff_required',
+            gatewayState: 'installed',
+            gatewayReady: true,
+            gatewayRunning: true,
+            ippState: 'installed',
+            ippReady: true,
+        };
+        const html = renderToStaticMarkup(createElement(
+            AuthContext.Provider,
+            { value: { can: () => true } },
+            createElement(DataPlaneTopology, {
+                clusters: [pendingCluster],
+                memberGroups: [{
+                    id: 'msg-0bd1a6d4ded3',
+                    name: 'qwen3',
+                    status: 'active',
+                    clusters: [{
+                        clusterId: 'e66f4591',
+                        deployments: [{
+                            memberId: 'msm-5828c881f2d9',
+                            clusterId: 'e66f4591',
+                            name: 'optimized-baseline',
+                            status: 'active',
+                            weight: 1,
+                            routable: true,
+                            components: {
+                                httpRoute: 'pending',
+                                inferencePool: 'ready',
+                                epp: 'ready',
+                                modelServer: 'ready',
+                            },
+                        }],
+                    }],
+                }],
+                // Even if caller supplies a grey unknown dot without an explicit pending key,
+                // pending must still render amber rather than grey or red.
+                statusDot: { ...statusDot, unknown: 'bg-slate-500' },
+                onComponentAction: () => {},
+            }),
+        ));
+
+        assert.match(html, /bg-amber-400[^"]*" title="HTTPRoute: pending \(handoff required\)"/);
+        assert.doesNotMatch(html, /bg-slate-500[^"]*" title="HTTPRoute:/);
+        assert.doesNotMatch(html, /bg-rose-500[^"]*" title="HTTPRoute:/);
+        assert.doesNotMatch(html, /status restricted \(non-admin\)/);
+    });
+
+    test('My services ClusterConnectionCard displays discovered baseUrl, address, port, and ready status without address pending', () => {
+        const syncedNonAdmin = {
+            clusterId: 'e66f4591',
+            clusterName: 'sprocean-min',
+            provider: 'istio',
+            baseUrl: 'http://10.239.11.206:32592/v1',
+            address: '10.239.11.206',
+            port: 32592,
+            ready: true,
+            reconcileStatus: 'synced',
+            accessMode: 'non_admin',
+        };
+        const cardHtml = renderToStaticMarkup(createElement(ClusterConnectionCard, { cluster: syncedNonAdmin }));
+        assert.match(cardHtml, /http:\/\/10\.239\.11\.206:32592\/v1/);
+        assert.match(cardHtml, />Port 32592</);
+        assert.match(cardHtml, />10\.239\.11\.206</);
+        assert.match(cardHtml, />Ready</);
+        assert.doesNotMatch(cardHtml, /address pending|Gateway not ready|Route sync pending/);
+
+        // Fallback when baseUrl is omitted but address/nodeAddress + port are present
+        const derived = {
+            clusterId: 'e66f4591',
+            clusterName: 'sprocean-min',
+            provider: 'istio',
+            baseUrl: '',
+            address: null,
+            gatewayNodeAddress: '10.239.11.206',
+            port: 32592,
+            ready: true,
+            reconcileStatus: 'synced',
+        };
+        assert.equal(connectionEndpointUrl(derived), 'http://10.239.11.206:32592/v1');
+        assert.equal(connectionAddressLabel(derived), '10.239.11.206');
+        const derivedHtml = renderToStaticMarkup(createElement(ClusterConnectionCard, { cluster: derived }));
+        assert.match(derivedHtml, /http:\/\/10\.239\.11\.206:32592\/v1/);
+        assert.match(derivedHtml, />10\.239\.11\.206</);
+        assert.doesNotMatch(derivedHtml, /address pending/);
+
+        // Host extraction when only baseUrl + port are populated
+        assert.equal(connectionAddressLabel({ baseUrl: 'http://10.239.11.206:32592/v1', address: null }), '10.239.11.206');
+
+        // Unready gateway with no endpoint renders Not ready + Gateway not ready
+        const unreadyHtml = renderToStaticMarkup(createElement(ClusterConnectionCard, {
+            cluster: { clusterId: 'c2', clusterName: 'Down', provider: 'istio', ready: false },
+        }));
+        assert.match(unreadyHtml, />Not ready</);
+        assert.match(unreadyHtml, /Gateway not ready/);
+    });
+
+    test('gateway/connection helpers handle IPv6, schemeless host:port, trailing slashes, and reject unsafe URLs', () => {
+        // Schemeless host:port and paths are never bracketed as IPv6 and normalize trailing slashes
+        assert.equal(gatewayAddressLabel({ gatewayPublicUrl: '10.239.11.206:32592' }), '10.239.11.206:32592');
+        assert.equal(connectionEndpointUrl({ publicUrl: '10.239.11.206:32592' }), 'http://10.239.11.206:32592/v1');
+        assert.equal(connectionEndpointUrl({ publicUrl: 'gw.example.com:8443/v1' }), 'http://gw.example.com:8443/v1');
+        assert.equal(connectionEndpointUrl({ publicUrl: 'gw.example.com/v1/' }), 'http://gw.example.com/v1');
+        assert.equal(gatewayAddressLabel({ gatewayPublicUrl: 'gw.example.com/v1/' }), 'gw.example.com/v1');
+
+        // Bare IPv6 is bracketed cleanly with or without port
+        assert.equal(gatewayAddressLabel({ gatewayPublicUrl: '2001:db8::1', gatewayPort: 32592 }), '[2001:db8::1]:32592');
+        assert.equal(connectionEndpointUrl({ publicUrl: '2001:db8::1', port: 32592 }), 'http://[2001:db8::1]:32592/v1');
+        assert.equal(connectionEndpointUrl({ address: '2001:db8::1' }), 'http://[2001:db8::1]/v1');
+        assert.equal(gatewayAddressLabel({ gatewayAddress: '2001:db8::1' }), '[2001:db8::1]');
+        assert.equal(connectionEndpointUrl({ baseUrl: 'http://[2001:db8::1]:32592/v1' }), 'http://[2001:db8::1]:32592/v1');
+
+        // Bare gatewayPublicUrl + discovered gatewayPort=32592 appends :32592;
+        // explicit schemes, paths, explicit ports, and https:// URLs stay authoritative without duplicating :32592
+        assert.equal(gatewayAddressLabel({ gatewayPublicUrl: '10.112.228.229', gatewayPort: 32592 }), '10.112.228.229:32592');
+        assert.equal(connectionEndpointUrl({ gatewayPublicUrl: '10.112.228.229', gatewayPort: 32592 }), 'http://10.112.228.229:32592/v1');
+        assert.equal(connectionEndpointUrl({ publicUrl: '10.112.228.229', port: 32592 }), 'http://10.112.228.229:32592/v1');
+        assert.equal(connectionAddressLabel({ publicUrl: '10.112.228.229', port: 32592 }), '10.112.228.229');
+        assert.equal(gatewayAddressLabel({ gatewayPublicUrl: '[2001:db8::1]', gatewayPort: 32592 }), '[2001:db8::1]:32592');
+        assert.equal(connectionEndpointUrl({ publicUrl: '[2001:db8::1]', port: 32592 }), 'http://[2001:db8::1]:32592/v1');
+        assert.equal(gatewayAddressLabel({ gatewayPublicUrl: 'http://10.112.228.229', gatewayPort: 32592 }), 'http://10.112.228.229');
+        assert.equal(connectionEndpointUrl({ gatewayPublicUrl: 'http://10.112.228.229', gatewayPort: 32592 }), 'http://10.112.228.229/v1');
+        assert.equal(connectionEndpointUrl({ publicUrl: 'http://10.112.228.229', port: 32592 }), 'http://10.112.228.229/v1');
+        assert.equal(gatewayAddressLabel({ gatewayPublicUrl: '10.112.228.229/v1', gatewayPort: 32592 }), '10.112.228.229/v1');
+        assert.equal(connectionEndpointUrl({ publicUrl: '10.112.228.229/v1', port: 32592 }), 'http://10.112.228.229/v1');
+        assert.equal(gatewayAddressLabel({ gatewayPublicUrl: 'gw.example.com', gatewayPort: 32592 }), 'gw.example.com:32592');
+        assert.equal(connectionEndpointUrl({ publicUrl: 'gw.example.com', port: 32592 }), 'http://gw.example.com:32592/v1');
+        assert.equal(gatewayAddressLabel({ gatewayPublicUrl: '10.112.228.229:8443', gatewayPort: 32592 }), '10.112.228.229:8443');
+        assert.equal(connectionEndpointUrl({ publicUrl: '10.112.228.229:8443', port: 32592 }), 'http://10.112.228.229:8443/v1');
+        assert.equal(gatewayAddressLabel({ gatewayPublicUrl: 'http://10.112.228.229:8443/v1', gatewayPort: 32592 }), 'http://10.112.228.229:8443/v1');
+        assert.equal(connectionEndpointUrl({ publicUrl: 'http://10.112.228.229:8443/v1', port: 32592 }), 'http://10.112.228.229:8443/v1');
+        assert.equal(gatewayAddressLabel({ gatewayPublicUrl: 'https://gw.example.com', gatewayPort: 32592 }), 'https://gw.example.com');
+        assert.equal(connectionEndpointUrl({ publicUrl: 'https://gw.example.com', port: 32592 }), 'https://gw.example.com/v1');
+
+        // Topology and ClusterConnectionCard consistently render bare gatewayPublicUrl + discovered gatewayPort=32592
+        const barePublicCluster = {
+            clusterId: 'e66f4591',
+            clusterName: 'sprocean-min',
+            provider: 'istio',
+            gatewayProvider: 'istio',
+            gatewayState: 'installed',
+            gatewayReady: true,
+            gatewayRunning: true,
+            gatewayProbeSource: 'http',
+            gatewayPublicUrl: '10.112.228.229',
+            gatewayPort: 32592,
+            ippState: 'installed',
+            ippReady: true,
+        };
+        const topologyHtml = renderToStaticMarkup(createElement(
+            AuthContext.Provider,
+            { value: { can: () => true } },
+            createElement(DataPlaneTopology, {
+                clusters: [barePublicCluster],
+                memberGroups: [],
+                statusDot: { ...statusDot, pending: 'bg-amber-400' },
+                onComponentAction: () => {},
+            }),
+        ));
+        assert.match(topologyHtml, /title="Gateway endpoint: 10\.112\.228\.229:32592"/);
+        const connHtml = renderToStaticMarkup(createElement(ClusterConnectionCard, {
+            cluster: {
+                clusterId: 'e66f4591',
+                clusterName: 'sprocean-min',
+                provider: 'istio',
+                publicUrl: '10.112.228.229',
+                port: 32592,
+                ready: true,
+            },
+        }));
+        assert.match(connHtml, /http:\/\/10\.112\.228\.229:32592\/v1/);
+        assert.match(connHtml, />Port 32592</);
+        assert.match(connHtml, />10\.112\.228\.229</);
+
+        // Reject unsafe schemes, credentials, whitespace, and control characters
+        for (const bad of [
+            'javascript:alert(1)',
+            'javascript:alert(1)//',
+            'data:text/html,<script>alert(1)</script>',
+            'file:///etc/passwd',
+            'http://user:pass@10.239.11.206:32592/v1',
+            'http://user@10.239.11.206:32592/v1',
+            'user:pass@10.239.11.206',
+            '10.239.11.206:32592; id',
+            'http://10.239.11.206:32592/v1\nrm -rf /',
+        ]) {
+            assert.equal(sanitizeHttpUrl(bad), '', `sanitizeHttpUrl rejects ${bad}`);
+            assert.equal(connectionEndpointUrl({ baseUrl: bad }), '', `connectionEndpointUrl(baseUrl) rejects ${bad}`);
+            assert.equal(connectionEndpointUrl({ publicUrl: bad }), '', `connectionEndpointUrl(publicUrl) rejects ${bad}`);
+            assert.equal(connectionEndpointUrl({ address: bad }), '', `connectionEndpointUrl(address) rejects ${bad}`);
+            assert.equal(gatewayAddressLabel({ gatewayPublicUrl: bad }), '', `gatewayAddressLabel(publicUrl) rejects ${bad}`);
+            assert.equal(gatewayAddressLabel({ gatewayAddress: bad }), '', `gatewayAddressLabel(address) rejects ${bad}`);
+            assert.equal(connectionAddressLabel({ address: bad }), '', `connectionAddressLabel(address) rejects ${bad}`);
+            assert.equal(connectionAddressLabel({ baseUrl: bad }), '', `connectionAddressLabel(baseUrl) rejects ${bad}`);
+        }
+    });
+
+    test('curl snippet builder enforces http(s) URLs and POSIX single-quote escaping against shell injection', () => {
+        assert.equal(posixSingleQuote("a'b$(id)`whoami`;"), "'a'\\''b$(id)`whoami`;'");
+
+        const crafted = {
+            name: `qwen3'$(touch /tmp/pwn)\`id\`;`,
+            baseModel: `base'$(id)\nX-Evil: 1`,
+        };
+        const samples = buildModelCurlSamples({
+            baseUrl: 'http://10.239.11.206:32592/v1',
+            model: crafted,
+            autoInjectsBaseModel: false,
+        });
+        assert.equal(samples.length, 3);
+        for (const sample of samples) {
+            assert.match(sample.command, /^curl 'http:\/\/10\.239\.11\.206:32592\/v1\/(?:chat\/completions|embeddings|messages)' /);
+            assert.match(sample.command, /-H 'X-Gateway-Base-Model-Name: base'\\''\$\(id\)X-Evil: 1'/);
+            // Payload is JSON-serialized and POSIX single-quoted with no unquoted shell expansion
+            assert.match(sample.command, /-d '\{"model":"qwen3'\\''\$\(touch \/tmp\/pwn\)`id`;"/);
+        }
+
+        // Unsafe URLs are stripped before interpolation
+        const unsafeUrlSamples = buildModelCurlSamples({
+            baseUrl: 'javascript:alert(1)',
+            model: { name: 'qwen3' },
+            autoInjectsBaseModel: true,
+        });
+        assert.doesNotMatch(unsafeUrlSamples[0].command, /javascript:/);
+        assert.match(unsafeUrlSamples[0].command, /^curl '\/chat\/completions' /);
     });
 });

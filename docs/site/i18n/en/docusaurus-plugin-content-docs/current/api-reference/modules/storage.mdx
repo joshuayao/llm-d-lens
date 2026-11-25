@@ -162,7 +162,7 @@ Get live PVC and PV status for selected storage volumes. Unknown ids are ignored
           "persistentVolumeClaims": [
             {
               "name": "prism-storage-storage-3e9a0f52",
-              "namespace": "llm-d-bench-storage",
+              "namespace": "lens-storage-283db094",
               "phase": "Bound",
               "capacity": "500Gi",
               "accessModes": [
@@ -231,8 +231,8 @@ Create and provision a new Lens storage volume. The route registers the pending 
     - `capacity` (`string`): Kubernetes quantity like `500Gi`.
     - `readOnly` (`boolean`, default `true`)
     - `purposes` (`StorageVolumePurpose[]`): for example `model-cache`. A `model-cache` purpose cannot be combined with `kind: "dynamic-pvc"` (validation error); use `local-disk` or `nfs` instead.
-    - `localDisk` (`LocalDiskSpec`, optional for `local-disk`)
-    - `nfs` (`NfsSpec`, optional for `nfs`)
+    - `localDisk` (`LocalDiskSpec`, optional for `local-disk`): supports `hostPath` and optional `namespace` (DNS-1123 label; the UI defaults to `lens-storage-<short-id>` such as `lens-storage-283db094`, while omitting it on direct `POST /api/v1/storage/volumes` calls or existing rows falls back to legacy `llm-d-bench-storage`; `POST /api/v1/storage/volumes/preflight` includes per-namespace `Role` and `RoleBinding` (`lens-storage-operator`) RBAC bootstrap for Non-Admin users when needed).
+    - `nfs` (`NfsSpec`, optional for `nfs`): supports `server`, `path`, and optional `namespace` (same DNS-1123 label, `lens-storage-<short-id>` UI default, legacy `llm-d-bench-storage` omission fallback, and preflight `lens-storage-operator` RBAC bootstrap behavior as `localDisk.namespace`).
     - `dynamicPvc` (`DynamicPvcSpec`, optional for `dynamic-pvc`)
 
     Example for a `local-disk` volume:

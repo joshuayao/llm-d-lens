@@ -913,7 +913,10 @@ function MetricToggle({ value, onChange }) {
     );
 }
 
-export function DeploymentProfilingPanel({ clusterId, deployment, onBack, refreshMs = FLOW_REFRESH_MS }) {
+export function DeploymentProfilingPanel({ clusterId, monitoringNamespace, deployment, onBack, refreshMs = FLOW_REFRESH_MS }) {
+    const effectiveMonitoringNamespace = typeof monitoringNamespace === 'string'
+        ? monitoringNamespace.trim()
+        : '';
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -930,7 +933,11 @@ export function DeploymentProfilingPanel({ clusterId, deployment, onBack, refres
         const load = async (silent = false) => {
             if (!silent) setLoading(true);
             try {
-                const payload = await getDeploymentFlowMap(executionId, { clusterId, signal: controller.signal });
+                const payload = await getDeploymentFlowMap(executionId, {
+                    clusterId,
+                    monitoringNamespace: effectiveMonitoringNamespace || undefined,
+                    signal: controller.signal,
+                });
                 if (cancelled) return;
                 setData(payload);
                 setError(null);
@@ -951,7 +958,7 @@ export function DeploymentProfilingPanel({ clusterId, deployment, onBack, refres
             controller.abort();
             if (timer) window.clearTimeout(timer);
         };
-    }, [clusterId, executionId, refreshMs, revision]);
+    }, [clusterId, effectiveMonitoringNamespace, executionId, refreshMs, revision]);
 
     const refresh = () => setRevision(value => value + 1);
 
@@ -969,7 +976,11 @@ export function DeploymentProfilingPanel({ clusterId, deployment, onBack, refres
                             <div className="flex items-center gap-2">
                                 <SectionLabel tone="violet">Deployment profiling</SectionLabel>
                                 {data?.prometheus_reachable === false && (
-                                    <Badge tone="warning" size="xs">Prometheus unreachable</Badge>
+                                    <Badge tone="warning" size="xs">
+                                        {effectiveMonitoringNamespace
+                                            ? `Prometheus unreachable (${effectiveMonitoringNamespace})`
+                                            : 'Prometheus unreachable'}
+                                    </Badge>
                                 )}
                             </div>
                             <p className="mt-1 font-mono text-xs text-slate-400">

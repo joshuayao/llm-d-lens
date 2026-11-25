@@ -1,7 +1,13 @@
 // API client for the Storage module (GET/POST/DELETE /api/v1/storage/...).
 // Mirrors the fetch/error-handling conventions used by remoteDeployBackend.js.
 
-import { requestJson } from '../../../../shared/api/httpClient';
+import {
+    executionHeaders,
+    executionToken,
+    postJson,
+    requestJson,
+    requestJsonWithMeta,
+} from '../../../../shared/api/httpClient';
 
 export async function listStorageVolumes({ clusterId, kind, status, purpose, query, signal } = {}) {
     const params = new URLSearchParams();
@@ -32,13 +38,19 @@ export async function getStorageResourceStatuses(volumeIds, { signal } = {}) {
     return payload.items;
 }
 
-export async function createStorageVolume(payload) {
-    const body = await requestJson('/api/v1/storage/volumes', {
+export async function createStorageVolume(payload, execution) {
+    const url = '/api/v1/storage/volumes';
+    const request = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
+    };
+    if (execution === undefined) return requestJson(url, request);
+    const { body, response } = await requestJsonWithMeta(url, {
+        ...request,
+        headers: executionHeaders(execution, request.headers),
     });
-    return body;
+    return { body, token: executionToken(response) };
 }
 
 export async function deleteStorageVolume(volumeId, { keepModelFiles = false } = {}) {
@@ -75,4 +87,25 @@ export async function listStorageNodes({ clusterId, signal } = {}) {
     const payload = await requestJson(`/api/v1/storage/nodes?${params.toString()}`, { signal });
     if (!Array.isArray(payload.items)) throw new Error('Storage node list response is invalid');
     return payload.items;
+}
+
+export function preflightStorageVolumeCreate(payload) {
+    return postJson('/api/v1/storage/volumes/preflight', payload);
+}
+
+export function verifyStorageVolumeCreate(payload) {
+    return postJson('/api/v1/storage/volumes/verify-create', payload);
+}
+
+export function preflightStorageVolumeDelete(volumeId, { keepModelFiles = false } = {}) {
+    return postJson(`/api/v1/storage/volumes/${encodeURIComponent(volumeId)}/delete-preflight`, {
+        keepModelFiles: Boolean(keepModelFiles),
+    });
+}
+
+export function verifyStorageVolumeDelete(volumeId, { keepModelFiles = true, confirmCleanup = false } = {}) {
+    return postJson(`/api/v1/storage/volumes/${encodeURIComponent(volumeId)}/verify-delete`, {
+        keepModelFiles: Boolean(keepModelFiles),
+        confirmCleanup: Boolean(confirmCleanup),
+    });
 }

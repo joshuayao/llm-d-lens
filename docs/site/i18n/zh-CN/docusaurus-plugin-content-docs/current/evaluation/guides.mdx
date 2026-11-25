@@ -28,7 +28,7 @@ displayed_sidebar: docsSidebar
 7. 回到评估任务，选中该配置并设置测试负载。
 
 更换集群或源码版本后，重新检查可选变体。生成时提示缺少网络或存储资源，
-可改选其他支持的变体，或请管理员准备对应资源。
+可改选其他支持的变体，或请编排平台管理员准备对应资源。
 
 ## 测试 Optimized Baseline
 
@@ -44,7 +44,7 @@ displayed_sidebar: docsSidebar
 
 1. 选择 **pd-disaggregation** 和 **P/D Guide variant**。
 2. 设置 **Prefill replicas**、**Prefill tensor parallel size**、**Decode replicas** 和 **Decode tensor parallel size**。
-3. 使用 **vllm-rdma** 时，与管理员核对 **Cache & network → RDMA NICs per pod**。
+3. 使用 **vllm-rdma** 时，与编排平台管理员核对 **Cache & network → RDMA NICs per pod**。
 4. 添加加速器总数相同的聚合部署作为基线。
 5. 使用 **Add matrix** 测试应用需要的输入输出长度；完整向导中的对应选项是 **Fixed input / output lengths**。
 6. 同时比较 TTFT、TPOT 和吞吐量。生成速度变快，不一定意味着首个 token 等待时间更短。

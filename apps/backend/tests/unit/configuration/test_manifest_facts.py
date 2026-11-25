@@ -567,3 +567,57 @@ def test_disaggregated_set_roles_prove_pd_configuration_facts():
     }
 
     validate_manifest_facts(content, manifest)
+
+
+def test_pin_runtime_image_preserves_cluster_and_explicit_override_for_manifest_facts(monkeypatch):
+    from llm_d_lens.deploy.providers.hardware_profile import runtime_image
+
+    default_img = runtime_image(accelerator="nvidia")
+    managed_repo = default_img.rsplit(":", 1)[0]
+    cluster_img = f"{managed_repo}:v0.31.0-cluster"
+    override_img = f"{managed_repo}:v0.31.0-override"
+
+    monkeypatch.setattr(
+        "llm_d_lens.deploy.providers.hardware_profile.resolve_cluster_vllm_image",
+        lambda cid: cluster_img if cid == "cluster-custom" else None,
+    )
+
+    # Cluster custom tag on managed repo is preserved and matches rendered manifest
+    cluster_manifest = _manifest(_deployment(image=cluster_img))
+    cluster_content = _content(cluster_manifest)
+    cluster_content["runtime"]["image"] = cluster_img
+    service._pin_runtime_image(cluster_content, cluster_id="cluster-custom")
+    assert cluster_content["runtime"]["image"] == cluster_img
+    validate_manifest_facts(cluster_content, cluster_manifest)
+
+    # Stock image on a cluster with vllm_image pins to cluster_img
+    stock_content = _content(cluster_manifest)
+    stock_content["runtime"]["image"] = default_img
+    service._pin_runtime_image(stock_content, cluster_id="cluster-custom")
+    assert stock_content["runtime"]["image"] == cluster_img
+    validate_manifest_facts(stock_content, cluster_manifest)
+
+    # Explicit override on managed repo is preserved even when cluster_img differs
+    override_manifest = _manifest(_deployment(image=override_img))
+    override_content = _content(override_manifest)
+    override_content["runtime"]["image"] = override_img
+    override_content["runtime"]["imageOverride"] = True
+    service._pin_runtime_image(override_content, cluster_id="cluster-custom")
+    assert override_content["runtime"]["image"] == override_img
+    validate_manifest_facts(override_content, override_manifest)
+
+    # Invalid/untagged runtime.image is rejected even when imageOverride=True
+    invalid_content = _content(override_manifest)
+    invalid_content["runtime"]["image"] = "registry:5000/untagged"
+    invalid_content["runtime"]["imageOverride"] = True
+    with pytest.raises(ValueError):
+        service._pin_runtime_image(invalid_content, cluster_id="cluster-custom")
+
+    # validate_manifest_facts rejects invalid runtime.image and modelserver container.image
+    bad_manifest = _manifest(_deployment(image="registry:5000/untagged"))
+    bad_content = _content(bad_manifest)
+    bad_content["runtime"]["image"] = "registry:5000/untagged"
+    with pytest.raises(ValueError):
+        validate_manifest_facts(bad_content, bad_manifest)
+    with pytest.raises(ValueError):
+        validate_manifest_facts(_model_only_content(), bad_manifest)

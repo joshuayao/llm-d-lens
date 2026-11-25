@@ -106,18 +106,30 @@ def _component_content(component: dict[str, Any] | None) -> dict[str, Any] | Non
     return content
 
 
-def _pin_runtime_image(content: dict[str, Any]) -> None:
-    """Tag an llm-d model-server runtime image with the pinned stack version.
+def _pin_runtime_image(content: dict[str, Any], *, cluster_id: str | None = None) -> None:
+    """Tag an llm-d model-server runtime image with the cluster or stack version.
 
     The rendered manifest already carries the pinned tag, so the configuration's
     runtime image must match it or the manifest-vs-configuration validation
     fails (see ``configuration.manifest_facts``).
     """
-    from llm_d_lens.deploy.providers.hardware_profile import pin_runtime_image  # noqa: PLC0415
+    from llm_d_lens.cluster.registry import validate_container_image_ref  # noqa: PLC0415
+    from llm_d_lens.deploy.providers.hardware_profile import (  # noqa: PLC0415
+        pin_runtime_image,
+        resolve_cluster_vllm_image,
+    )
 
     runtime = content.get("runtime")
-    if isinstance(runtime, dict) and isinstance(runtime.get("image"), str):
-        runtime["image"] = pin_runtime_image(runtime["image"])
+    if isinstance(runtime, dict) and runtime.get("image") is not None:
+        validated_image = validate_container_image_ref(runtime.get("image"), field="runtime.image", allow_empty=False)
+        cluster_vllm_image = resolve_cluster_vllm_image(cluster_id)
+        explicit_override = bool(runtime.get("imageOverride") or runtime.get("runtimeImageOverride"))
+        runtime["image"] = pin_runtime_image(
+            validated_image or "",
+            accelerator=content.get("hardware_profile"),
+            cluster_vllm_image=cluster_vllm_image,
+            explicit_override=explicit_override,
+        )
 
 
 def render_configuration(request: RenderRequest) -> RenderResponse:
@@ -186,7 +198,7 @@ def render_configuration(request: RenderRequest) -> RenderResponse:
     content["model"] = {key: value for key, value in content["model"].items() if value is not None}
     if request.render.deployment_bundle is not None:
         content["officialGuide"]["deploymentBundle"] = request.render.deployment_bundle
-    _pin_runtime_image(content)
+    _pin_runtime_image(content, cluster_id=session.server_id)
     validate_manifest_facts(content, rendered_manifest)
     validate_configuration_extensions(content, rendered_manifest)
 

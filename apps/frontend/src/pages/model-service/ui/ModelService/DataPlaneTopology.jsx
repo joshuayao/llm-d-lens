@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
-    Boxes, Cpu, GitBranch, Layers, Menu, Network, Play, Plus, RotateCw, Router, ShieldCheck, Square, Settings, Terminal, Trash2, Unlink, Waypoints,
+    Boxes, Cpu, GitBranch, Layers, Menu, Network, Play, Plus, RotateCw, Router, ShieldAlert, ShieldCheck, Square, Settings, Terminal, Trash2, Unlink, Waypoints,
 } from 'lucide-react';
 import { cn } from '../../../../shared/lib/cn';
 import { Badge, StatusChip } from '../../../../shared/ui/Badge';
@@ -9,7 +9,7 @@ import { Button } from '../../../../shared/ui/Button';
 import { HelpTooltip } from '../../../../shared/ui/FormControls';
 import { Panel } from '../../../../shared/ui/Panel';
 import { PermissionGate, useAuth } from '../../../auth';
-import { effectiveTrafficShare, routedTrafficTotal } from '../../model/modelService';
+import { effectiveTrafficShare, gatewayAddressLabel, routedTrafficTotal } from '../../model/modelService';
 
 // Canonical llm-d Gateway Mode data plane.
 //   Lens control plane           (config publishing)
@@ -140,30 +140,66 @@ export function ComponentLogAction({ component, cluster, onClick }) {
     );
 }
 
+// Capability flags default to Admin when absent so callers and fixtures that do
+// not provide capability metadata retain full Admin controls.
+export function clusterCapabilities(cluster = {}) {
+    const canManageInfra = cluster?.canManageGatewayInfra !== false;
+    const canManageConfig = cluster?.canManageGatewayConfig !== false;
+    const canReconcile = cluster?.canReconcileRoutes !== false;
+    const isNonAdmin = cluster?.accessMode === 'non_admin' || !canManageInfra || !canManageConfig || !canReconcile;
+    return { canManageInfra, canManageConfig, canReconcile, isNonAdmin };
+}
+
 // "Stop" scales the Gateway's data-plane Deployment to zero but leaves the
 // Gateway resource in place, so `gatewayState` stays `installed` and the
 // `Programmed` condition behind `gatewayReady` can stay true. `gatewayRunning`
 // reports the Deployment's ready replicas, which is what separates a stopped
 // Gateway (grey) from a running one (green) or a broken one (amber).
-function clusterDot(cluster) {
+export function clusterDot(cluster) {
+    if (cluster.authError) return 'unhealthy';
+    if (cluster.gatewayState === 'unknown') return 'unknown';
     if (cluster.gatewayState !== 'installed') return 'unhealthy';
     if (cluster.gatewayRunning === false) return 'stopped';
     return cluster.gatewayReady ? 'active' : 'degraded';
 }
 
-function gatewayDetail(cluster) {
+export function gatewayDetail(cluster) {
+    if (cluster.authError) return 'authentication failed';
+    if (cluster.gatewayState === 'unknown') {
+        return clusterCapabilities(cluster).isNonAdmin ? 'status restricted (non-admin)' : 'unknown';
+    }
     if (cluster.gatewayState !== 'installed') return 'not installed';
     if (cluster.gatewayRunning === false) return 'installed, stopped';
-    return cluster.gatewayReady ? 'ready' : 'installed, not ready';
+    if (!cluster.gatewayReady) return 'installed, not ready';
+    const base = cluster.gatewayProbeSource === 'http'
+        ? 'ready (HTTP probe)'
+        : cluster.gatewayProbeSource === 'prometheus'
+            ? 'ready (Prometheus)'
+            : 'ready';
+    const endpoint = gatewayAddressLabel(cluster);
+    return endpoint ? `${base} · ${endpoint}` : base;
 }
 
 // `ippState` only says the Deployment object exists, so "Stop IPP" (which
 // scales it to zero replicas) leaves it `installed`. Pair it with `ippReady`
 // the same way the Gateway box pairs `gatewayState` with `gatewayReady`, so a
 // stopped processor is not reported as running.
-function ippDot(cluster) {
+export function ippDot(cluster) {
+    if (cluster.authError) return 'unhealthy';
+    if (cluster.ippState === 'unknown') return 'unknown';
     if (cluster.ippState !== 'installed') return 'missing';
     return cluster.ippReady ? 'active' : 'stopped';
+}
+
+export function ippDetailText(cluster) {
+    if (cluster.authError) return 'authentication failed';
+    if (cluster.ippState === 'unknown') {
+        return clusterCapabilities(cluster).isNonAdmin ? 'status restricted (non-admin)' : 'unknown';
+    }
+    if (cluster.ippState !== 'installed') return statusLabel(cluster.ippState);
+    if (!cluster.ippReady) return 'installed, stopped';
+    if (cluster.gatewayProbeSource === 'prometheus') return 'ready (Prometheus)';
+    return 'running';
 }
 
 const STATUS_LABEL = {
@@ -172,6 +208,7 @@ const STATUS_LABEL = {
     ready: 'ready',
     running: 'running',
     installed: 'installed',
+    pending: 'pending (handoff required)',
     missing: 'not installed',
     unhealthy: 'unhealthy',
     degraded: 'degraded',
@@ -189,7 +226,29 @@ function statusLabel(name) {
 
 // Per-component health reported by the backend (healthJson.components) so each
 // box reflects its own resource instead of one shared member status.
-const COMPONENT_STATE = { ready: 'active', standby: 'standby', degraded: 'degraded', missing: 'unhealthy', unknown: 'unknown' };
+const COMPONENT_STATE = {
+    ready: 'active',
+    pending: 'pending',
+    standby: 'standby',
+    degraded: 'degraded',
+    missing: 'unhealthy',
+    unreachable: 'unhealthy',
+    unknown: 'unknown',
+};
+
+const DEFAULT_STATUS_DOT = {
+    active: 'bg-emerald-400',
+    pending: 'bg-amber-400',
+    degraded: 'bg-amber-400',
+    unhealthy: 'bg-rose-500',
+    stopped: 'bg-slate-500',
+    standby: 'bg-slate-500',
+    unknown: 'bg-amber-400',
+};
+
+function resolveStatusDot(statusDot, state) {
+    return statusDot?.[state] || DEFAULT_STATUS_DOT[state] || statusDot?.unknown || DEFAULT_STATUS_DOT.unknown;
+}
 
 function componentName(member, key) {
     const state = member.components?.[key];
@@ -312,139 +371,24 @@ export function DataPlaneTopology({
 
     const menuItems = () => {
         if (!menu) return null;
-        if (menu.key.startsWith('model:')) {
-            const section = layout.find((item) => item.rows.some((row) => menu.key === `model:${item.cluster.clusterId}:${row.serviceId}`));
-            const row = section?.rows.find((item) => menu.key === `model:${section.cluster.clusterId}:${item.serviceId}`);
-            if (!row) return null;
-            return (
-                <>
-                    {onToggleService && <PermissionGate permission="model-service:group:toggle">
-                        <PublicationToggleAction kind="model" stopped={row.serviceStatus === 'disabled'}
-                            pending={publicationPending}
-                            onClick={() => choose(() => onToggleService({ id: row.serviceId, name: row.serviceName }))} />
-                    </PermissionGate>}
-                    {onSetProvidersStatus && <PermissionGate permission="model-service:member:manage">
-                        <ProvidersToggleAction members={row.members} pending={publicationPending}
-                            onClick={(online) => choose(() => onSetProvidersStatus(row.serviceId, online))} />
-                    </PermissionGate>}
-                    {onEditTraffic && <PermissionGate permission="model-service:member:manage">
-                        <MenuAction icon={<GitBranch size={12} />} label="Traffic distribution"
-                            title={TRAFFIC_HELP} disabled={publicationPending}
-                            onClick={() => choose(() => onEditTraffic(row.serviceId))} />
-                    </PermissionGate>}
-                    {onRemoveModel && <PermissionGate permission="model-service:group:remove">
-                        <MenuAction icon={<Unlink size={12} />} label="Remove model"
-                            disabled={publicationPending || row.members.length > 0}
-                            title={row.members.length ? 'Remove every deployment from this model first.' : 'Safely remove this empty model and its HTTPRoute.'}
-                            onClick={() => choose(() => onRemoveModel(row.serviceId))} />
-                    </PermissionGate>}
-                    {onManageAccess && <PermissionGate permission="model-service:group:share">
-                        <MenuAction icon={<ShieldCheck size={12} />} label="Manage access"
-                            title="Grant or revoke model inference for users and groups in this cluster."
-                            onClick={() => choose(() => onManageAccess(row.serviceId))} />
-                    </PermissionGate>}
-                </>
-            );
-        }
-        if (menu.key.startsWith('deployment:')) {
-            const memberId = menu.key.slice('deployment:'.length);
-            const row = layout.flatMap((section) => section.rows)
-                .find((item) => item.members.some((member) => member.memberId === memberId));
-            const member = row?.members.find((item) => item.memberId === memberId);
-            if (!member) return null;
-            return (
-                <>
-                    <PermissionGate permission="model-service:member:manage">
-                        {onToggleDeployment && <PublicationToggleAction kind="deployment" stopped={member.status === 'disabled'}
-                            pending={publicationPending} onClick={() => choose(() => onToggleDeployment(member))} />}
-                    </PermissionGate>
-                    {onNavigate && <ManageDeploymentAction deployment={member}
-                        onNavigate={(view, params) => choose(() => onNavigate(view, params))} />}
-                    <PermissionGate permission="model-service:member:manage">
-                        {onDeleteDeployment && <MenuAction icon={<Unlink size={12} />} label="Remove from model"
-                            title="Detach this provider from the model without deleting its deployment or Pods."
-                            onClick={() => choose(() => onDeleteDeployment(member, row.serviceName))} />}
-                    </PermissionGate>
-                </>
-            );
-        }
-        if (menu.key.startsWith('gw:')) {
-            const cluster = clusters.find((item) => item.clusterId === menu.key.slice(3));
-            if (!cluster) return null;
-            const installed = cluster.gatewayState === 'installed';
-            const running = installed && cluster.gatewayRunning !== false;
-            return (
-                <>
-                    <div className="truncate px-2 py-1 text-[10px] uppercase tracking-wide text-slate-500">{cluster.clusterName || cluster.clusterId} · {cluster.gatewayProvider || 'gateway'}</div>
-                    <PermissionGate permission="cluster:cluster:update">
-                        <MenuAction icon={<Settings size={12} />} label="Configure"
-                            onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'configure'))} />
-                    </PermissionGate>
-                    <PermissionGate permission="model-service:gateway:manage">
-                        {installed && (
-                            <MenuAction icon={running ? <Square size={12} /> : <Play size={12} />} label={running ? 'Stop' : 'Start'}
-                                onClick={() => choose(() => onComponentAction(cluster, 'gateway', running ? 'stop' : 'start'))} />
-                        )}
-                    </PermissionGate>
-                    <PermissionGate permission="model-service:gateway:reconcile">
-                        <MenuAction icon={<RotateCw size={12} />} label="Reconcile" onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'reconcile'))} />
-                    </PermissionGate>
-                    <PermissionGate permission="model-service:gateway:manage">
-                        <MenuAction icon={installed ? <Trash2 size={12} /> : <Plus size={12} />} label={installed ? 'Uninstall' : 'Install'}
-                            onClick={() => choose(() => onComponentAction(cluster, 'gateway', installed ? 'uninstall' : 'install'))} />
-                    </PermissionGate>
-                    <ComponentLogAction component="gateway" cluster={cluster}
-                        onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'logs'))} />
-                </>
-            );
-        }
-        if (menu.key.startsWith('ipp:')) {
-            const cluster = clusters.find((item) => item.clusterId === menu.key.slice(4));
-            if (!cluster) return null;
-            const installed = cluster.ippState === 'installed';
-            const running = installed && Boolean(cluster.ippReady);
-            return (
-                <>
-                    <div className="truncate px-2 py-1 text-[10px] uppercase tracking-wide text-slate-500">{cluster.clusterName || cluster.clusterId} · IPP</div>
-                    {installed && (
-                        <MenuAction icon={running ? <Square size={12} /> : <Play size={12} />} label={running ? 'Stop' : 'Start'}
-                            onClick={() => choose(() => onComponentAction(cluster, 'ipp', running ? 'stop' : 'start'))} />
-                    )}
-                    <MenuAction icon={<Settings size={12} />} label="Configure" onClick={() => choose(() => onComponentAction(cluster, 'ipp', 'configure'))} />
-                    <MenuAction icon={installed ? <Trash2 size={12} /> : <Plus size={12} />} label={installed ? 'Uninstall' : 'Install'}
-                        onClick={() => choose(() => onComponentAction(cluster, 'ipp', installed ? 'uninstall' : 'install'))} />
-                    <ComponentLogAction component="ipp" cluster={cluster}
-                        onClick={() => choose(() => onComponentAction(cluster, 'ipp', 'logs'))} />
-                </>
-            );
-        }
-        if (menu.key.startsWith('route:')) {
-            const section = layout.find((item) => item.rows.some((row) => menu.key === `route:${item.cluster.clusterId}:${row.serviceId}`));
-            const row = section?.rows.find((item) => menu.key === `route:${section.cluster.clusterId}:${item.serviceId}`);
-            if (!row) return null;
-            const cluster = section.cluster;
-            return (
-                <>
-                    <div className="truncate px-2 py-1 text-[10px] uppercase tracking-wide text-slate-500">{row.serviceName} · HTTPRoute</div>
-                    <MenuAction icon={<RotateCw size={12} />} label="Reconcile route" onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'reconcile'))} />
-                </>
-            );
-        }
-        if (menu.key.startsWith('epp:')) {
-            const memberId = menu.key.slice(4);
-            const member = layout.flatMap((section) => section.rows.flatMap((row) => row.members)).find((item) => item.memberId === memberId);
-            if (!member) return null;
-            const running = componentName(member, 'epp') === 'active';
-            return (
-                <>
-                    <div className="truncate px-2 py-1 text-[10px] uppercase tracking-wide text-slate-500">{member.name}</div>
-                    <MenuAction icon={running ? <Square size={12} /> : <Play size={12} />} label={running ? 'Stop' : 'Start'}
-                        onClick={() => choose(() => onComponentAction({ clusterId: member.clusterId }, 'epp', running ? 'stop' : 'start', null, member))} />
-                    <MenuAction icon={<Terminal size={12} />} label="View logs" onClick={() => choose(() => onComponentAction({ clusterId: member.clusterId }, 'epp', 'logs', null, member))} />
-                </>
-            );
-        }
-        return null;
+        return (
+            <TopologyMenuItems
+                menuKey={menu.key}
+                clusters={clusters}
+                layout={layout}
+                publicationPending={publicationPending}
+                choose={choose}
+                onComponentAction={onComponentAction}
+                onEditTraffic={onEditTraffic}
+                onToggleService={onToggleService}
+                onSetProvidersStatus={onSetProvidersStatus}
+                onRemoveModel={onRemoveModel}
+                onManageAccess={onManageAccess}
+                onToggleDeployment={onToggleDeployment}
+                onNavigate={onNavigate}
+                onDeleteDeployment={onDeleteDeployment}
+            />
+        );
     };
 
     return (
@@ -511,13 +455,12 @@ export function DataPlaneTopology({
 
                     {layout.map((section) => {
                         const cluster = section.cluster;
+                        const caps = clusterCapabilities(cluster);
                         const ippState = ippDot(cluster);
-                        const ippRunning = ippState === 'active';
-                        const ippDetail = cluster.ippState !== 'installed'
-                            ? statusLabel(cluster.ippState)
-                            : ippRunning ? 'running' : 'installed, stopped';
+                        const ippDetail = ippDetailText(cluster);
                         const gwState = clusterDot(cluster);
                         const gwDetail = gatewayDetail(cluster);
+                        const gwEndpoint = gatewayAddressLabel(cluster);
                         return (
                             <div key={cluster.clusterId} role="group" aria-label={`Cluster ${cluster.clusterName || cluster.clusterId}`}>
                                 <div className="absolute flex items-center gap-2.5 px-4"
@@ -526,11 +469,31 @@ export function DataPlaneTopology({
                                     <span className="truncate text-sm font-semibold text-theme-text" title={cluster.clusterName || cluster.clusterId}>
                                         {cluster.clusterName || cluster.clusterId}
                                     </span>
+                                    {caps.isNonAdmin && <Badge tone="warning" size="xs">Non-Admin</Badge>}
+                                    {cluster.authError && (
+                                        <Badge tone="danger" size="xs" title={cluster.authError}>Auth error</Badge>
+                                    )}
+                                    {gwEndpoint && (
+                                        <span className="truncate font-mono text-xs text-theme-muted" title={`Gateway endpoint: ${gwEndpoint}`}>
+                                            {gwEndpoint}
+                                        </span>
+                                    )}
+                                    {cluster.reconcileStatus === 'admin_handoff_required' && (
+                                        <Button
+                                            type="button"
+                                            variant="outline"
+                                            size="xs"
+                                            className="ml-auto shrink-0 border-amber-500/40 text-amber-700 hover:bg-amber-500/10 dark:text-amber-300"
+                                            onClick={() => onComponentAction?.(cluster, 'gateway', 'handoff-routes')}
+                                        >
+                                            Orchestration administrator sync required
+                                        </Button>
+                                    )}
                                 </div>
                                 <Box x={GW.x} y={section.gwY} w={GW.w} label="Gateway" icon={<Network size={13} className="shrink-0 text-slate-400" />}
                                     help="Gateway exposes the inference endpoint, routes requests to InferencePools using HTTPRoute rules, and works with EPP to select model-server endpoints."
                                     helpSource="https://github.com/llm-d/llm-d/blob/f83d4f331ec87a82fa11c84449738705ac4d1424/docs/infrastructure/gateway/README.md"
-                                    status={statusDot[gwState] || statusDot.unknown}
+                                    status={resolveStatusDot(statusDot, gwState)}
                                     statusText={`Gateway: ${gwDetail} (${statusLabel(gwState)})`}
                                     menuOpen={menu?.key === `gw:${cluster.clusterId}`} onToggleMenu={(event) => toggleMenu(`gw:${cluster.clusterId}`, event)}
                                     menuPermissions={['model-service:gateway:manage', 'model-service:gateway:reconcile']} />
@@ -547,9 +510,10 @@ export function DataPlaneTopology({
                                         </>
                                     }
                                     helpSource="https://github.com/llm-d/llm-d/blob/f83d4f331ec87a82fa11c84449738705ac4d1424/docs/architecture/router/ipp.md"
-                                    status={statusDot[ippState] || statusDot.unknown}
+                                    status={resolveStatusDot(statusDot, ippState)}
                                     statusText={`IPP: ${ippDetail} (${statusLabel(ippState)})`}
-                                    menuOpen={menu?.key === `ipp:${cluster.clusterId}`} onToggleMenu={(event) => toggleMenu(`ipp:${cluster.clusterId}`, event)} />
+                                    menuOpen={menu?.key === `ipp:${cluster.clusterId}`} onToggleMenu={(event) => toggleMenu(`ipp:${cluster.clusterId}`, event)}
+                                    menuPermissions={['model-service:gateway:manage', 'model-service:gateway:reconcile']} />
                                 {section.rows.map((row) => {
                                     const routeKey = `route:${cluster.clusterId}:${row.serviceId}`;
                                     const modelKey = `model:${cluster.clusterId}:${row.serviceId}`;
@@ -558,6 +522,11 @@ export function DataPlaneTopology({
                                     const routed = !stopped && totalWeight !== 0;
                                     const routedMember = row.members.find((member) => member.routable);
                                     const routeState = routed ? componentName(routedMember || row.members[0], 'httpRoute') : 'stopped';
+                                    const routeStatusText = caps.isNonAdmin && routeState === 'unknown'
+                                        ? 'HTTPRoute: status restricted (non-admin)'
+                                        : routeState === 'pending' && cluster.reconcileStatus === 'synced'
+                                            ? 'HTTPRoute: pending'
+                                            : `HTTPRoute: ${statusLabel(routeState)}`;
                                     return (
                                         <Panel key={row.serviceId} padding="none" tone="soft" className="model-service-node absolute shadow-none"
                                             role="group" aria-label={`Model ${row.serviceName}`}
@@ -612,15 +581,16 @@ export function DataPlaneTopology({
                                             <Box x={COL.httpRoute - MODEL.x} y={row.routeY} w={WB.httpRoute} label="HTTPRoute" icon={<GitBranch size={13} className="shrink-0 text-slate-400" />} crd
                                                 help="HTTPRoute defines rules for routing HTTP requests from a Gateway listener to backend resources."
                                                 helpSource="https://github.com/kubernetes-sigs/gateway-api/blob/main/site/content/en/reference/api-types/httproute.md"
-                                                status={statusDot[routeState] || statusDot.unknown} statusText={`HTTPRoute: ${statusLabel(routeState)}`}
-                                                menuOpen={menu?.key === routeKey} onToggleMenu={(event) => toggleMenu(routeKey, event)} />
+                                                status={resolveStatusDot(statusDot, routeState)} statusText={routeStatusText}
+                                                menuOpen={menu?.key === routeKey} onToggleMenu={(event) => toggleMenu(routeKey, event)}
+                                                menuPermissions={['model-service:gateway:reconcile', 'model-service:gateway:manage', 'model-service:member:manage']} />
                                             {row.members.length === 0 && <p className="absolute text-xs text-theme-muted"
                                                 style={{ left: DEPLOYMENT.x - MODEL.x, top: COMPONENT_Y, width: DEPLOYMENT.w }}>
                                                 No providers. Add providers through Traffic distribution, or remove this model.
                                             </p>}
                                             {row.members.map((member, index) => {
                                                 const name = (key) => componentName(member, key);
-                                                const dot = (key) => statusDot[name(key)] || statusDot.unknown;
+                                                const dot = (key) => resolveStatusDot(statusDot, name(key));
                                                 const eppKey = `epp:${member.memberId}`;
                                                 const deploymentKey = `deployment:${member.memberId}`;
                                                 return (
@@ -705,6 +675,190 @@ export function DataPlaneTopology({
             )}
         </div>
     );
+}
+
+export function TopologyMenuItems({
+    menuKey,
+    clusters = [],
+    layout = [],
+    publicationPending = false,
+    choose = (fn) => fn(),
+    onComponentAction,
+    onEditTraffic,
+    onToggleService,
+    onSetProvidersStatus,
+    onRemoveModel,
+    onManageAccess,
+    onToggleDeployment,
+    onNavigate,
+    onDeleteDeployment,
+}) {
+    if (!menuKey) return null;
+    if (menuKey.startsWith('model:')) {
+        const section = layout.find((item) => item.rows.some((row) => menuKey === `model:${item.cluster.clusterId}:${row.serviceId}`));
+        const row = section?.rows.find((item) => menuKey === `model:${section.cluster.clusterId}:${item.serviceId}`);
+        if (!row) return null;
+        return (
+            <>
+                {onToggleService && <PermissionGate permission="model-service:group:toggle">
+                    <PublicationToggleAction kind="model" stopped={row.serviceStatus === 'disabled'}
+                        pending={publicationPending}
+                        onClick={() => choose(() => onToggleService({ id: row.serviceId, name: row.serviceName }))} />
+                </PermissionGate>}
+                {onSetProvidersStatus && <PermissionGate permission="model-service:member:manage">
+                    <ProvidersToggleAction members={row.members} pending={publicationPending}
+                        onClick={(online) => choose(() => onSetProvidersStatus(row.serviceId, online))} />
+                </PermissionGate>}
+                {onEditTraffic && <PermissionGate permission="model-service:member:manage">
+                    <MenuAction icon={<GitBranch size={12} />} label="Traffic distribution"
+                        title={TRAFFIC_HELP} disabled={publicationPending}
+                        onClick={() => choose(() => onEditTraffic(row.serviceId))} />
+                </PermissionGate>}
+                {onRemoveModel && <PermissionGate permission="model-service:group:remove">
+                    <MenuAction icon={<Unlink size={12} />} label="Remove model"
+                        disabled={publicationPending || row.members.length > 0}
+                        title={row.members.length ? 'Remove every deployment from this model first.' : 'Safely remove this empty model and its HTTPRoute.'}
+                        onClick={() => choose(() => onRemoveModel(row.serviceId))} />
+                </PermissionGate>}
+                {onManageAccess && <PermissionGate permission="model-service:group:share">
+                    <MenuAction icon={<ShieldCheck size={12} />} label="Manage access"
+                        title="Grant or revoke model inference for users and groups in this cluster."
+                        onClick={() => choose(() => onManageAccess(row.serviceId))} />
+                </PermissionGate>}
+            </>
+        );
+    }
+    if (menuKey.startsWith('deployment:')) {
+        const memberId = menuKey.slice('deployment:'.length);
+        const row = layout.flatMap((section) => section.rows)
+            .find((item) => item.members.some((member) => member.memberId === memberId));
+        const member = row?.members.find((item) => item.memberId === memberId);
+        if (!member) return null;
+        return (
+            <>
+                <PermissionGate permission="model-service:member:manage">
+                    {onToggleDeployment && <PublicationToggleAction kind="deployment" stopped={member.status === 'disabled'}
+                        pending={publicationPending} onClick={() => choose(() => onToggleDeployment(member))} />}
+                </PermissionGate>
+                {onNavigate && <ManageDeploymentAction deployment={member}
+                    onNavigate={(view, params) => choose(() => onNavigate(view, params))} />}
+                <PermissionGate permission="model-service:member:manage">
+                    {onDeleteDeployment && <MenuAction icon={<Unlink size={12} />} label="Remove from model"
+                        title="Detach this provider from the model without deleting its deployment or Pods."
+                        onClick={() => choose(() => onDeleteDeployment(member, row.serviceName))} />}
+                </PermissionGate>
+            </>
+        );
+    }
+    if (menuKey.startsWith('gw:')) {
+        const cluster = clusters.find((item) => item.clusterId === menuKey.slice(3));
+        if (!cluster) return null;
+        const caps = clusterCapabilities(cluster);
+        const installed = cluster.gatewayState === 'installed';
+        const running = installed && cluster.gatewayRunning !== false;
+        return (
+            <>
+                <div className="truncate px-2 py-1 text-[10px] uppercase tracking-wide text-slate-500">{cluster.clusterName || cluster.clusterId} · {cluster.gatewayProvider || 'gateway'}</div>
+                <PermissionGate permission="cluster:cluster:update">
+                    <MenuAction icon={<Settings size={12} />} label="Configure"
+                        onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'configure'))} />
+                </PermissionGate>
+                {caps.canManageInfra && (
+                    <PermissionGate permission="model-service:gateway:manage">
+                        {installed && (
+                            <MenuAction icon={running ? <Square size={12} /> : <Play size={12} />} label={running ? 'Stop' : 'Start'}
+                                onClick={() => choose(() => onComponentAction(cluster, 'gateway', running ? 'stop' : 'start'))} />
+                        )}
+                    </PermissionGate>
+                )}
+                {caps.canReconcile ? (
+                    <PermissionGate permission="model-service:gateway:reconcile">
+                        <MenuAction icon={<RotateCw size={12} />} label="Reconcile" onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'reconcile'))} />
+                    </PermissionGate>
+                ) : (
+                    <PermissionGate permission={['model-service:gateway:reconcile', 'model-service:gateway:manage', 'model-service:member:manage']}>
+                        <MenuAction icon={<ShieldAlert size={12} />} label="Orchestration administrator sync script" onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'handoff-routes'))} />
+                    </PermissionGate>
+                )}
+                {caps.canManageInfra ? (
+                    <PermissionGate permission="model-service:gateway:manage">
+                        <MenuAction icon={installed ? <Trash2 size={12} /> : <Plus size={12} />} label={installed ? 'Uninstall' : 'Install'}
+                            onClick={() => choose(() => onComponentAction(cluster, 'gateway', installed ? 'uninstall' : 'install'))} />
+                    </PermissionGate>
+                ) : (
+                    <PermissionGate permission={['model-service:gateway:manage', 'model-service:gateway:reconcile']}>
+                        <MenuAction icon={<RotateCw size={12} />} label="Gateway repair script" onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'handoff-repair'))} />
+                    </PermissionGate>
+                )}
+                {caps.canManageConfig && (
+                    <ComponentLogAction component="gateway" cluster={cluster}
+                        onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'logs'))} />
+                )}
+            </>
+        );
+    }
+    if (menuKey.startsWith('ipp:')) {
+        const cluster = clusters.find((item) => item.clusterId === menuKey.slice(4));
+        if (!cluster) return null;
+        const caps = clusterCapabilities(cluster);
+        const installed = cluster.ippState === 'installed';
+        const running = installed && Boolean(cluster.ippReady);
+        return (
+            <>
+                <div className="truncate px-2 py-1 text-[10px] uppercase tracking-wide text-slate-500">{cluster.clusterName || cluster.clusterId} · IPP</div>
+                {caps.canManageConfig ? (
+                    <>
+                        {installed && (
+                            <MenuAction icon={running ? <Square size={12} /> : <Play size={12} />} label={running ? 'Stop' : 'Start'}
+                                onClick={() => choose(() => onComponentAction(cluster, 'ipp', running ? 'stop' : 'start'))} />
+                        )}
+                        <MenuAction icon={<Settings size={12} />} label="Configure" onClick={() => choose(() => onComponentAction(cluster, 'ipp', 'configure'))} />
+                        <MenuAction icon={installed ? <Trash2 size={12} /> : <Plus size={12} />} label={installed ? 'Uninstall' : 'Install'}
+                            onClick={() => choose(() => onComponentAction(cluster, 'ipp', installed ? 'uninstall' : 'install'))} />
+                        <ComponentLogAction component="ipp" cluster={cluster}
+                            onClick={() => choose(() => onComponentAction(cluster, 'ipp', 'logs'))} />
+                    </>
+                ) : (
+                    <>
+                        <MenuAction icon={<Settings size={12} />} label="Configure" onClick={() => choose(() => onComponentAction(cluster, 'ipp', 'configure'))} />
+                        <MenuAction icon={<ShieldAlert size={12} />} label="IPP config script" onClick={() => choose(() => onComponentAction(cluster, 'ipp', 'handoff-ipp'))} />
+                    </>
+                )}
+            </>
+        );
+    }
+    if (menuKey.startsWith('route:')) {
+        const section = layout.find((item) => item.rows.some((row) => menuKey === `route:${item.cluster.clusterId}:${row.serviceId}`));
+        const row = section?.rows.find((item) => menuKey === `route:${section.cluster.clusterId}:${item.serviceId}`);
+        if (!row) return null;
+        const cluster = section.cluster;
+        const caps = clusterCapabilities(cluster);
+        return (
+            <>
+                <div className="truncate px-2 py-1 text-[10px] uppercase tracking-wide text-slate-500">{row.serviceName} · HTTPRoute</div>
+                {caps.canReconcile ? (
+                    <MenuAction icon={<RotateCw size={12} />} label="Reconcile route" onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'reconcile'))} />
+                ) : (
+                    <MenuAction icon={<ShieldAlert size={12} />} label="Orchestration administrator sync script" onClick={() => choose(() => onComponentAction(cluster, 'gateway', 'handoff-routes'))} />
+                )}
+            </>
+        );
+    }
+    if (menuKey.startsWith('epp:')) {
+        const memberId = menuKey.slice(4);
+        const member = layout.flatMap((section) => section.rows.flatMap((row) => row.members)).find((item) => item.memberId === memberId);
+        if (!member) return null;
+        const running = componentName(member, 'epp') === 'active';
+        return (
+            <>
+                <div className="truncate px-2 py-1 text-[10px] uppercase tracking-wide text-slate-500">{member.name}</div>
+                <MenuAction icon={running ? <Square size={12} /> : <Play size={12} />} label={running ? 'Stop' : 'Start'}
+                    onClick={() => choose(() => onComponentAction({ clusterId: member.clusterId }, 'epp', running ? 'stop' : 'start', null, member))} />
+                <MenuAction icon={<Terminal size={12} />} label="View logs" onClick={() => choose(() => onComponentAction({ clusterId: member.clusterId }, 'epp', 'logs', null, member))} />
+            </>
+        );
+    }
+    return null;
 }
 
 export default DataPlaneTopology;

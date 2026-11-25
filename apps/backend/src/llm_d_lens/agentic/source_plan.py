@@ -588,7 +588,8 @@ def apply_source_record(run, record, *, rejected):
     if not bundle["validation"]["clusterValidated"]:
         plan.validation["pending"].append("cluster admission")
     # The review token binds the exact final resources, not only the source baseline.
-    plan.configuration = {"checksum": text_checksum(dump(bundle_documents(bundle)))}
+    deployment_yaml = next(item["content"] for item in bundle["files"] if item["name"] == "deployment.yaml")
+    plan.configuration = {"checksum": text_checksum(deployment_yaml)}
     plan.evidence_level = "recommendation"
     if record["draft"].get("finalConfiguration"):
         run.decision_evidence_ids = []
@@ -612,7 +613,15 @@ async def reviewed_deployment(manager, run, deployment_request, owner_user_id, a
     return await manager.start_run(deployment_request, owner_user_id=owner_user_id), None
 
 
-async def approve_source_plan(service, run, *, owner_user_id, request, approval=None):
+async def approve_source_plan(
+    service,
+    run,
+    *,
+    owner_user_id,
+    request,
+    approval=None,
+    target_namespace: str | None = None,
+):
     if request is None:
         raise ValueError("Source deployment requires an authorized request context.")
     plan = run.configuration_plan
@@ -663,6 +672,7 @@ async def approve_source_plan(service, run, *, owner_user_id, request, approval=
                 "agentic_deployment_run_id": run.id,
                 "plan_revision": run.revision,
                 "review_checksum": plan.configuration["checksum"],
+                **({"target_namespace": target_namespace} if target_namespace else {}),
             },
         ),
         owner_user_id,

@@ -50,6 +50,7 @@ class AuditContext:
     action: str | None = None
     cluster_id: str | None = None
     summary: str | None = None
+    required_permissions: tuple[str, ...] | None = None
 
 
 _audit_context: contextvars.ContextVar[AuditContext | None] = contextvars.ContextVar("lens_audit_context", default=None)
@@ -183,6 +184,65 @@ def _internal_principal(request: Request) -> Principal | None:
     return default_service().principal_for(user)
 
 
+def _permission_max_len() -> int:
+    from llm_d_lens.db.base import audit_string_column_limits  # noqa: PLC0415
+
+    return audit_string_column_limits()["permission"]
+
+
+def _first_allowed_permission(principal: Principal, permissions: tuple[str, ...]) -> str | None:
+    for candidate in permissions:
+        if authorize(principal, candidate).allowed:
+            return candidate
+    return None
+
+
+def _compact_permissions(permissions: tuple[str, ...]) -> tuple[str, bool]:
+    """Return a ``<= max_len`` permission string and whether compaction/truncation occurred."""
+    max_len = _permission_max_len()
+    joined = " | ".join(permissions)
+    if len(joined) <= max_len:
+        return joined, False
+    if len(permissions) == 1:
+        return (f"{permissions[0][: max_len - 1]}…" if max_len > 0 else ""), True
+    suffix = f" (+{len(permissions) - 1} more)"
+    head = permissions[0]
+    candidate = f"{head}{suffix}"
+    if len(candidate) <= max_len:
+        return candidate, True
+    avail = max_len - len(suffix) - 1
+    if avail > 0:
+        return f"{head[:avail]}…{suffix}", True
+    return (f"{joined[: max_len - 1]}…" if max_len > 0 else ""), True
+
+
+def _resolve_audit_permission(
+    *,
+    found: bool,
+    permission: str | tuple[str, ...] | None,
+    principal: Principal | None,
+) -> tuple[str | None, tuple[str, ...] | None]:
+    """Resolve the audit ``permission`` column value and optional full tuple when compacted."""
+    if not found or permission is None:
+        return None, None
+    if isinstance(permission, tuple):
+        if not permission:
+            return None, None
+        if principal is not None:
+            matched = _first_allowed_permission(principal, permission)
+            if matched is not None:
+                if len(matched) <= _permission_max_len():
+                    return matched, None
+                compact, _ = _compact_permissions((matched,))
+                return compact, permission
+        compact, compacted = _compact_permissions(permission)
+        return compact, (permission if compacted else None)
+    if len(permission) <= _permission_max_len():
+        return permission, None
+    compact, _ = _compact_permissions((permission,))
+    return compact, (permission,)
+
+
 class AuthContextMiddleware(BaseHTTPMiddleware):
     """Attach the resolved principal (or ``None``) to ``request.state``."""
 
@@ -199,6 +259,11 @@ class AuthContextMiddleware(BaseHTTPMiddleware):
         request.state.principal = principal
         request.state.principal_token = token_from_request(request)
         found, permission = resolve_route_permission(request.method, request.url.path)
+        audit_permission, required_permissions = _resolve_audit_permission(
+            found=found,
+            permission=permission,
+            principal=principal,
+        )
         context = AuditContext(
             request_id=_request_id(request),
             trace_id=_trace_id(request),
@@ -209,8 +274,9 @@ class AuthContextMiddleware(BaseHTTPMiddleware):
             path=request.url.path,
             ip=_client_ip(request),
             user_agent=request.headers.get("user-agent"),
-            permission=(" | ".join(permission) if isinstance(permission, tuple) else permission) if found else None,
+            permission=audit_permission,
             parent_request_id=request.headers.get("x-audit-parent-request-id"),
+            required_permissions=required_permissions,
         )
         token = _audit_context.set(context)
         try:
@@ -240,14 +306,29 @@ async def require_route_permission(request: Request) -> None:
     if permission == "":
         return
     permissions = permission if isinstance(permission, tuple) else (permission,)
-    if not any(authorize(principal, candidate).allowed for candidate in permissions):
+    matched = _first_allowed_permission(principal, permissions)
+    context = current_audit_context()
+    if matched is None:
+        compact, compacted = _compact_permissions(permissions)
+        if context is not None:
+            context.permission = compact
+            context.required_permissions = permissions if compacted else None
         default_service().audit(
             "access_denied",
             result="deny",
             actor_username=principal.username,
-            permission=" | ".join(permissions),
+            permission=compact,
             method=request.method,
             path=request.url.path,
             ip=_client_ip(request),
+            detail={"requiredPermissions": list(permissions)},
         )
         raise ForbiddenError("permission denied")
+    if context is not None and isinstance(permission, tuple):
+        if len(matched) <= _permission_max_len():
+            context.permission = matched
+            context.required_permissions = None
+        else:
+            compact, _ = _compact_permissions((matched,))
+            context.permission = compact
+            context.required_permissions = permission

@@ -54,10 +54,20 @@ class AcceleratorInstallRequest(StrictModel):
     accelerator: AcceleratorType = "intel_gpu"
     access_mode: GpuAccess = "dra"
     namespace: str = INTEL_GPU_DEFAULT_NAMESPACE
+    monitoring_namespace: str | None = None
 
     @field_validator("namespace")
     @classmethod
     def validate_namespace(cls, value: str) -> str:
+        from .service import validate_namespace
+
+        return validate_namespace(value)
+
+    @field_validator("monitoring_namespace")
+    @classmethod
+    def validate_monitoring_namespace(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
         from .service import validate_namespace
 
         return validate_namespace(value)
@@ -100,6 +110,8 @@ class AcceleratorLinksResponse(StrictModel):
 class AcceleratorStatusResponse(StrictModel):
     accelerator: AcceleratorType
     access_mode: GpuAccess | None = None
+    cluster_access_mode: Literal["admin", "non_admin"] | None = "admin"
+    can_manage: bool = True
     access_modes: list[AccessModeAvailability] = Field(default_factory=list)
     cluster_reachable: bool
     context: str | None = None
@@ -111,6 +123,21 @@ class AcceleratorStatusResponse(StrictModel):
     active_operation_id: str | None = None
     observed_at: datetime
     stale: bool = False
+
+
+class AcceleratorAdminScriptResponse(StrictModel):
+    filename: str
+    script: str
+    instructions: str
+    accelerator: AcceleratorType
+    namespace: str
+    access_mode: GpuAccess | None = None
+    monitoring_namespace: str
+    warnings: list[str] = Field(default_factory=list)
+
+
+class AcceleratorRecheckResponse(AcceleratorStatusResponse):
+    marker_found: bool = False
 
 
 class AcceleratorPreflightResponse(StrictModel):

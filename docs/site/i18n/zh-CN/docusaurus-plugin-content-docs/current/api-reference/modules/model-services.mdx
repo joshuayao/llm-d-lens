@@ -239,7 +239,9 @@ import TabItem from '@theme/TabItem';
           "publicUrl": null,
           "port": null,
           "baseUrl": "http://10.0.0.10/v1",
-          "ready": true
+          "ready": true,
+          "accessMode": "admin",
+          "reconcileStatus": "synced"
         }
       ]
     }
@@ -1064,6 +1066,16 @@ HTTP 处理函数会安排调谐，直接 Python 调用只持久化记录。
           "ippReady": false,
           "ippName": "lens-ipp",
           "ippNamespace": "lens-gateway-1234abcd",
+          "canManageGatewayInfra": true,
+          "canManageGatewayConfig": true,
+          "canReconcileRoutes": true,
+          "accessMode": "admin",
+          "authError": null,
+          "reconcileStatus": "synced",
+          "pendingOperationsCount": 0,
+          "desiredHash": "9f3c2a1b4e8d",
+          "handoffNamespace": "lens-edit",
+          "gatewayProbeSource": "k8s",
           "lastOperation": {
             "id": "gop-2a7f0d9c0c11",
             "kind": "reconcile-gateway",
@@ -1089,6 +1101,106 @@ HTTP 处理函数会安排调谐，直接 Python 调用只持久化记录。
         print(status.api_payload())
 
     asyncio.run(main())
+    ```
+  </TabItem>
+</Tabs>
+
+### Non-Admin `admin_handoff_required` 响应
+
+在 Non-Admin 集群上（`accessMode: "non_admin"`，或 Kubernetes RBAC 返回 `403 Forbidden` 时），变更接口——包括模型服务创建/发布、编辑、流量分配、状态启停、删除以及 IPP 配置——会将期望状态保存在数据库中，并返回 `reconcileStatus: "admin_handoff_required"` 及 `handoff` 对象，而不会直接以原始 `403` 失败：
+
+```json
+{
+  "reconcileStatus": "admin_handoff_required",
+  "handoff": {
+    "clusterId": "1234abcd",
+    "accessMode": "non_admin",
+    "reconcileStatus": "admin_handoff_required",
+    "mode": "routes",
+    "desiredHash": "9f3c2a1b4e8d",
+    "markerNamespace": "lens-edit",
+    "markerName": "lens-remediation-1234abcd",
+    "filename": "lens-remediate-1234abcd-routes.sh",
+    "adminScript": "#!/usr/bin/env bash\nset -euo pipefail\n...",
+    "instructions": "Run this script as an Orchestration administrator...",
+    "pendingOperations": [],
+    "warnings": []
+  }
+}
+```
+
+### 获取 Gateway 修复交接信息
+
+获取 Non-Admin 集群当前的编排平台管理员交接脚本和待执行操作。
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`GET /api/v1/model-service/admin/gateway/remediation`** (`operation_id: get_model_gateway_remediation`)
+
+    查询参数：`clusterId`（`string`，必填），`mode`（`"routes" | "gateway_repair" | "ipp_config" | "all"`，可选，默认 `"routes"`），`markerNamespace`（`string`，可选，最大长度 63）。
+
+    权限：需要 `model-service:gateway:read`、`model-service:group:read` 或 `model-service:member:manage`。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    import asyncio
+
+    from llm_d_lens.model_service.gateway_ops import GatewayOpsService
+
+    result = asyncio.run(GatewayOpsService().get_remediation("1234abcd", mode="routes"))
+    print(result)
+    ```
+  </TabItem>
+</Tabs>
+
+### 生成 Gateway 修复脚本
+
+为 Non-Admin 集群生成或刷新幂等的 `bash` + `kubectl` + `helm` 编排平台管理员交接脚本。
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/v1/model-service/admin/gateway/remediation`**
+
+    请求体：`{ "clusterId": "1234abcd", "mode": "routes" }`（`mode` 为 `"routes" | "gateway_repair" | "ipp_config" | "all"`，可选，默认 `"routes"`）。可选字段：`ippConfig`（`string`）、`provider`（`string`）、`markerNamespace`（`string`，最大长度 63）。
+
+    权限：`routes` 模式适用于拥有 `model-service:gateway:reconcile`、`model-service:gateway:manage`、`model-service:member:manage`、`model-service:group:manage`、`model-service:group:toggle` 或 `model-service:group:remove` 权限的用户；其他模式需要 `model-service:gateway:manage` 或 `model-service:gateway:reconcile`。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    import asyncio
+
+    from llm_d_lens.model_service.gateway_ops import GatewayOpsService
+
+    result = asyncio.run(GatewayOpsService().create_remediation("1234abcd", mode="routes"))
+    print(result)
+    ```
+  </TabItem>
+</Tabs>
+
+### 验证 Gateway 修复
+
+通过检查 `markerNamespace` 中的非涉密完成标记 `ConfigMap` 并探测实时 Gateway HTTP 路由，验证编排平台管理员是否已执行交接脚本。
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/v1/model-service/admin/gateway/remediation/verify`**
+
+    请求体：`{ "clusterId": "1234abcd", "expectedHash": "9f3c2a1b4e8d", "markerNamespace": "lens-edit" }`（`expectedHash` 和 `markerNamespace` 为可选字段）。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    import asyncio
+
+    from llm_d_lens.model_service.gateway_ops import GatewayOpsService
+
+    result = asyncio.run(
+        GatewayOpsService().verify_remediation(
+            "1234abcd",
+            expected_hash="9f3c2a1b4e8d",
+            marker_namespace="lens-edit",
+        )
+    )
+    print(result)
     ```
   </TabItem>
 </Tabs>

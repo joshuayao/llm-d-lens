@@ -1,6 +1,8 @@
 // API client for the model service domain (tokens, visible models, usage).
 import { requestJson } from '../../../../shared/api/httpClient';
 import { streamSseRequest } from '../../../../shared/api/sse.js';
+import { errorMessage } from '../../../../shared/lib/errorMessage';
+import { buildHandoffModalState, markClusterStatusSynced, normalizeHandoffMode } from '../../model/modelService';
 
 const base = '/api/v1/model-service';
 const tokenPath = (tokenId) => `${base}/tokens/${encodeURIComponent(tokenId)}`;
@@ -102,7 +104,13 @@ export async function addModel({ name, clusterId, executionId }) {
     }
     const group = groups.find((item) => item.clusterId === clusterId && item.name === publicName);
     if (!group) {
-        return { group: await publishModel({ name: publicName, clusterId, executionId }), created: true };
+        const createdGroup = await publishModel({ name: publicName, clusterId, executionId });
+        return {
+            group: createdGroup,
+            created: true,
+            ...(createdGroup?.reconcileStatus !== undefined ? { reconcileStatus: createdGroup.reconcileStatus } : {}),
+            ...(createdGroup?.handoff !== undefined ? { handoff: createdGroup.handoff } : {}),
+        };
     }
     const providers = members.filter((member) => member.groupId === group.id);
     const weight = 1;
@@ -113,7 +121,14 @@ export async function addModel({ name, clusterId, executionId }) {
             { executionId, weight },
         ],
     });
-    return { group, created: false, weight, operation: result.operation };
+    return {
+        group,
+        created: false,
+        weight,
+        operation: result.operation,
+        ...(result?.reconcileStatus !== undefined ? { reconcileStatus: result.reconcileStatus } : {}),
+        ...(result?.handoff !== undefined ? { handoff: result.handoff } : {}),
+    };
 }
 
 export function setGroupStatus(groupId, status) {
@@ -128,8 +143,8 @@ export function updateGroup(groupId, body) {
     });
 }
 
-export async function deleteGroup(groupId) {
-    await requestJson(`${admin}/groups/${encodeURIComponent(groupId)}`, { method: 'DELETE' });
+export function deleteGroup(groupId) {
+    return requestJson(`${admin}/groups/${encodeURIComponent(groupId)}`, { method: 'DELETE' });
 }
 
 export async function setProvidersStatus(groupId, status) {
@@ -139,7 +154,12 @@ export async function setProvidersStatus(groupId, status) {
         body: JSON.stringify({ status }),
     });
     if (!Array.isArray(payload?.items)) throw new Error('Provider status response is invalid; refresh before retrying.');
-    return payload.items;
+    const items = payload.items;
+    Object.defineProperties(items, {
+        reconcileStatus: { value: payload.reconcileStatus ?? null, enumerable: false, configurable: true },
+        handoff: { value: payload.handoff ?? null, enumerable: false, configurable: true },
+    });
+    return items;
 }
 
 export async function listMembers(groupId, { signal } = {}) {
@@ -175,8 +195,8 @@ export async function updateTrafficDistribution(groupId, body) {
     return payload;
 }
 
-export async function deleteMember(memberId) {
-    await requestJson(`${admin}/members/${encodeURIComponent(memberId)}`, { method: 'DELETE' });
+export function deleteMember(memberId) {
+    return requestJson(`${admin}/members/${encodeURIComponent(memberId)}`, { method: 'DELETE' });
 }
 
 export function getUsageAnalytics({ since, until, interval = 'day', groupBy = 'model', userIds, groupIds, clusterIds, signal } = {}) {
@@ -255,4 +275,287 @@ export function streamGatewayOperation(payload, onEvent, signal) {
 
 export function streamComponentLogs(payload, onEvent, signal) {
     return streamSseRequest(`${gateway}/logs`, payload, onEvent, signal);
+}
+
+// Read current Non-Admin Orchestration administrator remediation script and pending operation summary.
+export function getGatewayRemediation(clusterId, { mode, markerNamespace, signal } = {}) {
+    const params = new URLSearchParams({ clusterId });
+    if (mode) params.set('mode', mode);
+    if (markerNamespace) params.set('markerNamespace', markerNamespace);
+    return requestJson(`${gateway}/remediation?${params.toString()}`, { signal });
+}
+
+// Generate and persist an idempotent Orchestration administrator script for Non-Admin handoff.
+export function generateGatewayRemediation(body) {
+    return requestJson(`${gateway}/remediation`, {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: JSON.stringify(body),
+    });
+}
+
+export function clusterHandoffMode(cluster) {
+    return normalizeHandoffMode(cluster?.handoffMode || cluster?.mode || 'routes');
+}
+
+export function componentHandoffAction(action) {
+    if (action === 'handoff-routes') return { mode: 'routes', persist: false };
+    if (action === 'handoff-repair') return { mode: 'gateway_repair', persist: false };
+    if (action === 'handoff-ipp') return { mode: 'ipp_config', persist: false };
+    return null;
+}
+
+export function fetchClusterHandoff(cluster, mode = clusterHandoffMode(cluster), { persist = false } = {}) {
+    const normalizedMode = normalizeHandoffMode(mode);
+    return persist
+        ? generateGatewayRemediation({ clusterId: cluster.clusterId, mode: normalizedMode })
+        : getGatewayRemediation(cluster.clusterId, { mode: normalizedMode });
+}
+
+// Verify whether an Orchestration administrator script handoff has completed on the cluster.
+export function verifyGatewayRemediation(body = {}) {
+    const payload = { ...body };
+    if (!payload.mode) {
+        delete payload.mode;
+    }
+    return requestJson(`${gateway}/remediation/verify`, {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: JSON.stringify(payload),
+    });
+}
+
+export async function applyMutationHandoffResult(result, { clusterId = '', clusters = [], setHandoffModal, setStatus } = {}) {
+    const resolvedId = result?.handoff?.clusterId || result?.clusterId || clusterId;
+    if (result?.reconcileStatus === 'admin_handoff_required') {
+        if (result.handoff) {
+            setHandoffModal?.(buildHandoffModalState(result.handoff, { clusterId: resolvedId, clusters }));
+            return 'admin_handoff_required';
+        }
+        if (resolvedId) {
+            try {
+                const freshHandoff = await getGatewayRemediation(resolvedId, {
+                    mode: clusterHandoffMode(result),
+                });
+                setHandoffModal?.(buildHandoffModalState(freshHandoff, { clusterId: resolvedId, clusters }));
+            } catch {
+                // Cluster status refresh still surfaces the pending banner if script fetch fails.
+            }
+            return 'admin_handoff_required';
+        }
+    }
+    if (resolvedId) {
+        setHandoffModal?.((current) => (
+            current && current.handoff?.clusterId === resolvedId ? null : current
+        ));
+        setStatus?.((current) => markClusterStatusSynced(current, resolvedId));
+    }
+    return 'synced';
+}
+
+export async function performHandoffRecheck({
+    handoffModal,
+    setHandoffModal,
+    setStatus,
+    setNotice,
+    load,
+}) {
+    const currentHandoff = handoffModal?.handoff;
+    const clusterId = currentHandoff?.clusterId;
+    if (!clusterId || handoffModal?.busy || handoffModal?.refreshing) return null;
+    setHandoffModal((current) => (current ? { ...current, busy: true, error: '' } : current));
+    try {
+        const mode = currentHandoff.mode ? normalizeHandoffMode(currentHandoff.mode) : undefined;
+        const verifyResult = await verifyGatewayRemediation({
+            clusterId,
+            expectedHash: currentHandoff.desiredHash || undefined,
+            markerNamespace: currentHandoff.markerNamespace || undefined,
+            mode,
+        });
+        if (verifyResult.verified) {
+            setHandoffModal((current) => (
+                current && current.handoff?.clusterId === clusterId
+                    ? {
+                        ...current,
+                        busy: false,
+                        refreshing: false,
+                        error: '',
+                        verifyResult,
+                        handoff: {
+                            ...current.handoff,
+                            reconcileStatus: verifyResult.reconcileStatus || 'synced',
+                            pendingOperations: [],
+                            ...(verifyResult.desiredHash ? { desiredHash: verifyResult.desiredHash } : {}),
+                            ...(verifyResult.markerNamespace ? { markerNamespace: verifyResult.markerNamespace } : {}),
+                            ...(verifyResult.markerName ? { markerName: verifyResult.markerName } : {}),
+                        },
+                    }
+                    : current
+            ));
+            if ((verifyResult.reconcileStatus || 'synced') === 'synced') {
+                setStatus?.((current) => markClusterStatusSynced(current, clusterId));
+            }
+            setNotice?.('Orchestration administrator route sync verified.');
+            await load?.({ quiet: true });
+            return verifyResult;
+        }
+
+        const needsScriptRefresh = verifyResult.markerStatus === 'stale'
+            || Boolean(verifyResult.desiredHash && verifyResult.desiredHash !== currentHandoff.desiredHash);
+        if (needsScriptRefresh) {
+            try {
+                const freshHandoff = await getGatewayRemediation(clusterId, {
+                    mode: normalizeHandoffMode(currentHandoff.mode),
+                });
+                setHandoffModal((current) => (
+                    current && current.handoff?.clusterId === clusterId
+                        ? {
+                            ...current,
+                            busy: false,
+                            refreshing: false,
+                            error: '',
+                            verifyResult,
+                            handoff: { ...current.handoff, ...freshHandoff, clusterId },
+                        }
+                        : current
+                ));
+            } catch (refreshFailure) {
+                setHandoffModal((current) => (
+                    current && current.handoff?.clusterId === clusterId
+                        ? {
+                            ...current,
+                            busy: false,
+                            refreshing: false,
+                            verifyResult,
+                            error: errorMessage(refreshFailure, 'Failed to refresh Orchestration administrator script'),
+                        }
+                        : current
+                ));
+            }
+            await load?.({ quiet: true });
+            return verifyResult;
+        }
+
+        setHandoffModal((current) => (
+            current && current.handoff?.clusterId === clusterId
+                ? { ...current, busy: false, refreshing: false, error: '', verifyResult }
+                : current
+        ));
+        return verifyResult;
+    } catch (failure) {
+        setHandoffModal((current) => (
+            current && current.handoff?.clusterId === clusterId
+                ? { ...current, busy: false, refreshing: false, error: errorMessage(failure, 'Failed to verify Orchestration administrator handoff') }
+                : current
+        ));
+        return null;
+    }
+}
+
+export async function performHandoffScriptRefresh({ handoffModal, setHandoffModal, setStatus }) {
+    const currentHandoff = handoffModal?.handoff;
+    const clusterId = currentHandoff?.clusterId;
+    if (!clusterId || handoffModal?.busy || handoffModal?.refreshing) return null;
+    setHandoffModal((current) => (current ? { ...current, refreshing: true, error: '' } : current));
+    try {
+        const freshHandoff = await getGatewayRemediation(clusterId, {
+            mode: normalizeHandoffMode(currentHandoff.mode),
+        });
+        const hasPendingOps = Array.isArray(freshHandoff?.pendingOperations) && freshHandoff.pendingOperations.length > 0;
+        const isSynced = freshHandoff?.reconcileStatus === 'synced' && !hasPendingOps;
+        setHandoffModal((current) => (
+            current && current.handoff?.clusterId === clusterId
+                ? {
+                    ...current,
+                    busy: false,
+                    refreshing: false,
+                    error: '',
+                    verifyResult: null,
+                    handoff: {
+                        ...current.handoff,
+                        ...freshHandoff,
+                        ...(isSynced ? { pendingOperations: [] } : {}),
+                        clusterId,
+                    },
+                }
+                : current
+        ));
+        if (isSynced) {
+            setStatus?.((current) => markClusterStatusSynced(current, clusterId));
+        }
+        return freshHandoff;
+    } catch (failure) {
+        setHandoffModal((current) => (
+            current && current.handoff?.clusterId === clusterId
+                ? {
+                    ...current,
+                    busy: false,
+                    refreshing: false,
+                    error: errorMessage(failure, 'Failed to refresh Orchestration administrator script'),
+                }
+                : current
+        ));
+        return null;
+    }
+}
+
+export async function performClusterBannerRecheck(cluster, {
+    bannerRecheckingId,
+    setBannerRecheckingId,
+    setHandoffModal,
+    setStatus,
+    setNotice,
+    setError,
+    load,
+}) {
+    if (!cluster?.clusterId || bannerRecheckingId) return null;
+    const clusterId = cluster.clusterId;
+    const clusterLabel = cluster.clusterName || clusterId;
+    const explicitMode = cluster.handoffMode || cluster.mode;
+    const mode = clusterHandoffMode(cluster);
+    setBannerRecheckingId(clusterId);
+    try {
+        const verifyResult = await verifyGatewayRemediation({
+            clusterId,
+            markerNamespace: cluster.handoffNamespace || undefined,
+            mode: explicitMode ? mode : undefined,
+        });
+        if (verifyResult.verified) {
+            setHandoffModal?.((current) => (
+                current && current.handoff?.clusterId === clusterId ? null : current
+            ));
+            if ((verifyResult.reconcileStatus || 'synced') === 'synced') {
+                setStatus?.((current) => markClusterStatusSynced(current, clusterId));
+            }
+            setNotice?.(`Orchestration administrator route sync verified for ${clusterLabel}.`);
+            await load?.({ quiet: true });
+            return verifyResult;
+        }
+        try {
+            const handoff = await getGatewayRemediation(clusterId, { mode });
+            setHandoffModal(buildHandoffModalState(handoff, {
+                clusterId,
+                clusters: [{ clusterId, clusterName: clusterLabel }],
+                verifyResult,
+            }));
+        } catch (refreshFailure) {
+            if (mode !== 'routes') {
+                const fallbackHandoff = await getGatewayRemediation(clusterId, { mode: 'routes' });
+                setHandoffModal(buildHandoffModalState(fallbackHandoff, {
+                    clusterId,
+                    clusters: [{ clusterId, clusterName: clusterLabel }],
+                    verifyResult,
+                }));
+            } else {
+                throw refreshFailure;
+            }
+        }
+        await load?.({ quiet: true });
+        return verifyResult;
+    } catch (failure) {
+        setError?.(errorMessage(failure, 'Failed to verify Orchestration administrator handoff'));
+        return null;
+    } finally {
+        setBannerRecheckingId('');
+    }
 }

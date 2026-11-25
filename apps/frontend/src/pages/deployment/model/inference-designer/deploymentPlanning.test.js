@@ -128,3 +128,35 @@ test('automatic additions preserve sized candidate topology and do not install i
         assert.match(draft.optimizationDecisions.find(item => item.id === 'coordinator').reason, /sized serving topology/);
     }
 });
+
+test('candidate bridge resolves sourceNamespace from localDisk, nfs, or default fallback', () => {
+    const localDiskDraft = candidateCompositionDraft(
+        run,
+        candidate,
+        catalog,
+        profile,
+        entry,
+        { id: 'v-local', localDisk: { hostPath: '/models', namespace: 'lens-edit' } },
+    );
+    assert.equal(localDiskDraft.sourceNamespace, 'lens-edit');
+
+    const nfsDraft = candidateCompositionDraft(
+        run,
+        candidate,
+        catalog,
+        profile,
+        entry,
+        { id: 'v-nfs', nfs: { server: 'nfs.example', path: '/models', namespace: 'team-nfs' } },
+    );
+    assert.equal(nfsDraft.sourceNamespace, 'team-nfs');
+
+    const fallbackDraft = candidateCompositionDraft(
+        run,
+        candidate,
+        catalog,
+        profile,
+        entry,
+        { id: 'v-default', localDisk: { hostPath: '/models' } },
+    );
+    assert.equal(fallbackDraft.sourceNamespace, 'llm-d-bench-storage');
+});

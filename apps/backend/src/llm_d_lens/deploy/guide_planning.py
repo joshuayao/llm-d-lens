@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -14,6 +15,7 @@ import yaml
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
+from llm_d_lens.cluster.registry import validate_container_image_ref
 from llm_d_lens.configuration.disaggregated_set import (
     apply_disaggregated_set,
     normalize_disaggregated_set,
@@ -23,6 +25,7 @@ from llm_d_lens.configuration.disaggregated_set import (
 from llm_d_lens.configuration.manifest_facts import _invocation_tokens, workload_roles
 from llm_d_lens.configuration.optimization_policy import resolve_optimization_policy
 from llm_d_lens.core.exceptions import DomainError
+from llm_d_lens.deploy.providers.hardware_profile import pin_runtime_image, resolve_cluster_vllm_image
 from llm_d_lens.hardware.registry import all_profiles
 from llm_d_lens.hardware.resolver import resolve_by_accelerator_key, resolve_by_device_class, resolve_by_resource
 from llm_d_lens.versions import router_pd_sidecar_image
@@ -376,24 +379,37 @@ def resource_role(document: dict, fallback="serving") -> str:
     return fallback
 
 
-def pin_model_server_image(image: str) -> str:
-    repository = image.split("@", 1)[0]
-    if ":" in repository.rsplit("/", 1)[-1]:
-        repository = repository.rsplit(":", 1)[0]
-    return next(
-        (
-            profile.deployment.runtime_image
-            for profile in all_profiles()
-            if repository in profile.deployment.managed_image_repositories and profile.deployment.runtime_image
-        ),
+def pin_model_server_image(
+    image: str,
+    *,
+    accelerator: str | None = None,
+    cluster_vllm_image: str | None = None,
+    explicit_override: bool = False,
+) -> str:
+    return pin_runtime_image(
         image,
+        accelerator=accelerator,
+        cluster_vllm_image=cluster_vllm_image,
+        explicit_override=explicit_override,
     )
 
 
 def plan_documents(
-    documents: list[dict], model: str, machine: dict, cluster: dict | None, requested: dict | None = None
+    documents: list[dict],
+    model: str,
+    machine: dict,
+    cluster: dict | None,
+    requested: dict | None = None,
+    *,
+    cluster_vllm_image: str | None = None,
 ) -> dict:
     requested = requested or {}
+    try:
+        requested_image = validate_container_image_ref(requested.get("runtimeImage"), field="runtimeImage")
+        effective_cluster_image = validate_container_image_ref(cluster_vllm_image, field="vllmImage")
+    except ValueError as error:
+        raise GuideError(str(error)) from error
+    explicit_override = bool(requested.get("runtimeImageOverride")) and bool(requested_image)
     patches, warnings, errors = [], [], []
     settings = {}
     try:
@@ -402,6 +418,16 @@ def plan_documents(
         logger.warning("Invalid Guide settings", exc_info=True)
         errors.append("Invalid Guide settings; check cacheCpuGiB, rdmaNicCount and routerValues.")
     profile = profile_for_key(requested.get("accelerator", ""))
+    if explicit_override:
+        resolved_model_image = requested_image
+    elif requested_image:
+        resolved_model_image = pin_model_server_image(
+            requested_image,
+            accelerator=requested.get("accelerator"),
+            cluster_vllm_image=effective_cluster_image,
+        )
+    else:
+        resolved_model_image = effective_cluster_image or (profile.deployment.runtime_image if profile else None)
     workloads = workload_roles(documents)
     cluster_accel = (cluster or {}).get("accelerator") or {}
     machine_accel = machine.get("accelerator") or {}
@@ -565,12 +591,11 @@ def plan_documents(
         for container_index, container in enumerate(pod.get("containers", [])):
             container_pointer = pod_pointer + f"/containers/{container_index}"
             if container.get("name") == "modelserver":
-                image = requested.get("runtimeImage") or (profile.deployment.runtime_image if profile else None)
-                if image:
+                if resolved_model_image:
                     replace(
                         container,
                         "image",
-                        pin_model_server_image(image),
+                        resolved_model_image,
                         container_pointer + "/image",
                         "apply selected runtime image",
                     )
@@ -1005,12 +1030,29 @@ async def source_preview(request: Request, body: dict):
     from .source_composition import render_unit, rendered_optimizations
 
     async def preview():
+        from llm_d_lens.cluster.sessions import require_active_session
+
         if not re.fullmatch(r"[a-f0-9]{40}", body.get("commit", "")):
             raise GuideError("Pin the catalog commit before previewing.")
         root, inventory = await authorized_inventory(request, body)
         if not isinstance(body.get("unit"), dict):
             raise GuideError("Select a source unit.")
-        rendered = await render_unit(root, inventory, body["unit"])
+        unit = dict(body["unit"])
+        try:
+            explicit_unit_image = validate_container_image_ref(unit.get("runtimeImage"), field="runtimeImage")
+        except ValueError as error:
+            raise GuideError(str(error)) from error
+        if explicit_unit_image:
+            unit["runtimeImage"] = explicit_unit_image
+        else:
+            cluster_id = str(body.get("clusterId") or "").strip() or None
+            if not cluster_id and body.get("clusterSessionId"):
+                with contextlib.suppress(ValueError):
+                    cluster_id = require_active_session(body["clusterSessionId"]).server_id
+            cluster_vllm_image = resolve_cluster_vllm_image(cluster_id)
+            if cluster_vllm_image:
+                unit["runtimeImage"] = cluster_vllm_image
+        rendered = await render_unit(root, inventory, unit)
         return {**rendered, "optimizations": rendered_optimizations(rendered["documents"], inventory["commit"])}
 
     return await source_response(preview())
@@ -1335,6 +1377,7 @@ async def plan_resources(request: Request, body: dict):
         mode = mode if mode in {"auto", "required", "disabled"} else "auto"
         session_id = str(body.get("clusterSessionId") or "").strip()
         session = await validate_planning_session(request, session_id) if session_id else None
+        cluster_vllm_image = resolve_cluster_vllm_image(session.server_id if session is not None else None)
         remote = (
             await discover_remote_environment(environment.get("target"), environment.get("credentials"))
             if environment.get("mode") == "remote"
@@ -1357,14 +1400,17 @@ async def plan_resources(request: Request, body: dict):
                 "No accessible Kubernetes cluster was found in the selected machine's current kubectl context"
             )
         resolved = resolve_accelerator_variant(accelerator, detected_cluster)
-        body = dict(body, guide=guide, accelerator=resolved, modelServer=model_server)
+        body = {k: v for k, v in body.items() if k != "_clusterVllmImage"}
+        body.update(guide=guide, accelerator=resolved, modelServer=model_server)
         manifest = await measure("guide_source", load_selected_manifests(request, body))
         machine = remote["machine"] if remote else await machine_profile(not detected_cluster)
         if (detected_cluster or {}).get("accelerator"):
             machine = dict(machine, accelerator=detected_cluster["accelerator"])
         render_started = time.monotonic()
         documents = [document for document in yaml.safe_load_all(manifest["rendered"]) if document]
-        planned = plan_documents(documents, model, machine, detected_cluster, body)
+        planned = plan_documents(
+            documents, model, machine, detected_cluster, body, cluster_vllm_image=cluster_vllm_image
+        )
         try:
             body, optimization_decisions = resolve_optimization_policy(body, planned["documents"])
         except ValueError as error:

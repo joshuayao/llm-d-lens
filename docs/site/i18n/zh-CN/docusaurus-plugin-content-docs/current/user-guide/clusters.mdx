@@ -31,670 +31,128 @@ kubelet 会重建静态 Pod，期间 API 访问会短暂中断。清单备份应
 
 ### kubeconfig 权限
 
-最简单、兼容性最好的方式是使用具有 `cluster-admin` 角色的 kubeconfig。
-如果安全策略要求收束权限，请将下面的辅助脚本保存为临时文件，赋予执行权限，
-然后使用管理员 kubeconfig 运行：
+Lens 保留你注册时提供的 kubeconfig。它不会为集群移交创建 ServiceAccount、
+ClusterRole、ClusterRoleBinding、替换 kubeconfig 或专用 Lens 身份。编排平台管理员工作
+是一次性的 operation 脚本，而不是安装到 Lens 的凭据。
 
-```bash
-chmod +x lens-rbac-kubeconfig.sh
-./lens-rbac-kubeconfig.sh --kubeconfig ~/.kube/config --output lens-lens-minimal.kubeconfig
-```
+最直接的配置是使用能够执行普通命名空间操作的 edit kubeconfig。某些集群级
+operation 可能需要编排平台管理员；Lens 会把它们作为单独的移交展示，而不是要求更宽的
+凭据。使用命名空间作用域的 `edit` ServiceAccount kubeconfig 时，Lens 会自动将
+默认的 `create-secret` HF token 和移交命名空间对齐到 edit kubeconfig 的可写
+命名空间（绝不会覆盖显式自定义命名空间或已有 secret），因此你无需手动修改命名空间。
+对于存储卷，Lens 默认将新建 PVC 放入专属的 `lens-storage-<cluster-id>` 命名空间
+（`create` 模式，例如 `lens-storage-283db094`）；针对非管理员用户，编排平台管理员
+引导脚本会自动在该命名空间中创建 `Role` 和 `RoleBinding`（`lens-storage-operator`），
+使 kubeconfig 无需手动配置 RBAC 即可管理其中的 PVC 和模型缓存 Job。
 
-上传生成的 `lens-lens-minimal.kubeconfig`。脚本会创建
-`lens-access/lens-minimal` ServiceAccount 和 ClusterRole，执行一次实际权限自检，
-并打印输出路径。只有目标集群不允许创建测试工作负载时才使用 `--skip-self-test`。
+### 配置计划
 
-<details>
-<summary>展开 RBAC 辅助脚本</summary>
+9 步创建集群向导只保存 provisioning plan，不会在目标集群安装任何内容。
+**Review** 是纯净的计划预览（包含监控配置摘要），不包含权限检查。
 
-```bash
-#!/usr/bin/env bash
-# Generate the least-privilege Kubernetes identity Lens needs and a kubeconfig
-# for it.
-#
-# The role is deliberately NOT cluster-admin. It is an operator role:
-#   * read-only discovery across every resource/API group (Lens renders arbitrary
-#     CRDs and its namespace cleanup enumerates every listable namespaced kind);
-#   * workload, storage, networking, batch, RBAC and CRD writes needed to
-#     deploy/evaluate models, provision model-cache volumes, install the
-#     monitoring stack and install/upgrade Gateway/GPU controllers;
-#   * no impersonation, no service-account token minting, no
-#     authentication/authorization review endpoints and no CSR approval.
-#
-# Installing arbitrary third-party Helm charts (monitoring, Gateway, GPU
-# operator) inherently requires creating ClusterRoles/ClusterRoleBindings, so
-# the role includes bind/escalate on those two resources. Everything else is
-# scoped to the resources Lens actually uses.
-#
-# Usage:
-#   lens-rbac-kubeconfig.sh [options]
-#
-# Options:
-#   --kubeconfig PATH        Admin kubeconfig used to create the RBAC
-#                            (default: $KUBECONFIG, else ~/.kube/config)
-#   --context NAME           Admin context (default: current-context)
-#   --namespace NAME         Namespace for the ServiceAccount/token
-#                            (default: lens-access)
-#   --service-account NAME   ServiceAccount name (default: lens-minimal)
-#   --cluster-role NAME      ClusterRole name (default: lens-minimal)
-#   --output PATH            kubeconfig destination
-#                            (default: ./lens-<service-account>.kubeconfig)
-#   --skip-self-test         Do not create/delete a throwaway namespace
-#   --delete                 Remove the generated RBAC identity and token secret
-#   -h, --help               Show this help
-#
-# The generated kubeconfig uses a long-lived ServiceAccount token. Pass
-# --delete first if you want to rotate the token.
+在 **llm-d stack** 步骤中，你可以按需使用自定义 OCI 容器镜像引用（需包含 `:tag` 或 `@sha256:` 摘要）覆盖 **vLLM image**（`vllmImage`）。留空时，默认镜像来自所选硬件配置文件（`runtime_image`）。镜像预拉取（包括直接管理员执行与编排平台管理员脚本）以及模型部署都会使用该集群镜像，其中单次部署的显式覆盖优先级最高，其次是集群 `vllmImage`，最后是硬件配置文件默认值。
 
-set -euo pipefail
-umask 077
+同样在 **llm-d stack** 步骤中，**Monitoring（监控）** 为必填配置，支持两种模式：
 
-SOURCE_KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
-CONTEXT=""
-NAMESPACE="lens-access"
-SERVICE_ACCOUNT="lens-minimal"
-CLUSTER_ROLE="lens-minimal"
-OUTPUT=""
-SELF_TEST=1
-DELETE=0
+- **`managed`（默认）**：安装托管的 `kube-prometheus-stack`（Prometheus、Grafana、
+  `kube-state-metrics`、`node-exporter`、Alertmanager 和 Monitoring CRDs）、
+  `llm-d` Grafana 仪表盘、集群级 `llm-d-prism-metrics-reader` RBAC，并协同安装
+  所选加速器 exporter（由硬件 profile 驱动，例如 NVIDIA DCGM Exporter 或 Intel XPU
+  Manager）。可配置 Monitoring 命名空间（默认 `lens-monitoring-<cluster-id>`，例如 `lens-monitoring-283db094`）、可选的
+  Prometheus 与 Grafana NodePort（`30000`–`32767`）以及可选的 Monitoring 主机/IP。
+- **`existing`**：连接到已有 Prometheus 实例（`prometheusUrl` 必填，`grafanaUrl`
+  可选，可配置 Monitoring 命名空间，并提供开关以安装缺失的加速器 exporter 与
+  `llm-d-prism-metrics-reader` RBAC）。
 
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
-info() { printf '%s\n' "$*"; }
+点击 **Preflight** 会打开 **Execute** 步骤并在那里先运行权限检查，评估
+edit kubeconfig 并拆分为：
 
-usage() {
-  sed -n '2,/^set -euo pipefail$/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
-  exit 0
-}
+- **User operations**：Lens 使用你的 kubeconfig 执行。
+- **编排平台管理员 operations**：Lens 不执行；你把生成的脚本发给编排平台管理员。
+- **Lens operations**：本地后续工作，例如 gateway exposure 或 model cache
+  job fan-out。Lens 在 **Complete** 时执行。
+- **Blocked operations**：缺少所需 kubeconfig 权限的用户自有 secret 操作或
+  Lens operation。请授予所需访问权限或调整计划后重新检查；这些操作绝不交给
+  编排平台管理员。
 
-while (($#)); do
-  case "$1" in
-    --kubeconfig) SOURCE_KUBECONFIG="${2:?missing value}"; shift 2 ;;
-    --context) CONTEXT="${2:?missing value}"; shift 2 ;;
-    --namespace) NAMESPACE="${2:?missing value}"; shift 2 ;;
-    --service-account) SERVICE_ACCOUNT="${2:?missing value}"; shift 2 ;;
-    --cluster-role) CLUSTER_ROLE="${2:?missing value}"; shift 2 ;;
-    --output) OUTPUT="${2:?missing value}"; shift 2 ;;
-    --skip-self-test) SELF_TEST=0; shift ;;
-    --delete) DELETE=1; shift ;;
-    -h|--help) usage ;;
-    *) die "unknown option: $1 (use --help)" ;;
-  esac
-done
+在 **Model Cache** 步骤中保存新的 Hugging Face token 时，Lens 会将其加密并
+临时存储在 draft 中，绝不会写入 provisioning plan 或编排平台管理员移交脚本，也不会以
+明文形式返回展示。之后恢复 draft 时（即使关闭浏览器或切换标签页），向导也会
+保留已保存状态（`Saved for this draft`），支持无需重新输入 token 即可继续
+**Preflight** 和 **Execute**，需要时也可替换；一旦集群完成或被丢弃，该临时
+draft 副本会自动删除。
 
-for cmd in kubectl python3 base64; do
-  command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
-done
-if ((SELF_TEST)); then
-  command -v curl >/dev/null 2>&1 || die "required command not found: curl (or pass --skip-self-test)"
-fi
-[[ -f "$SOURCE_KUBECONFIG" ]] || die "kubeconfig not found: $SOURCE_KUBECONFIG"
+### 运行 Preflight
 
-KUBECTL=(kubectl --kubeconfig "$SOURCE_KUBECONFIG" --request-timeout=30s)
-if [[ -n "$CONTEXT" ]]; then
-  KUBECTL+=(--context "$CONTEXT")
-fi
+**Review** 是纯净的计划预览，不包含权限检查。Preflight 需要已保存
+计划和 Hugging Face token；点击 **Preflight** 会直接打开 **Execute** 步骤并在该步骤中
+先运行权限检查，在需要时加载或生成编排平台管理员脚本。它不会自动启动任何 user operation。恢复 draft 到 Review
+时也不会自动检查，仍需显式运行 Preflight。
 
-info "Using kubeconfig: $SOURCE_KUBECONFIG"
-info "Context: $("${KUBECTL[@]}" config current-context 2>/dev/null || true)"
+- **Ready**：权限检查通过后，点击 **Execute** 开始执行 user operations。具备完整集群权限（等效于 `cluster-admin`）的 kubeconfig 会直接以 **Ready** 通过预检，无需生成编排平台管理员移交脚本，也无需 **Waiting for marker** 步骤——一旦集群级通配符 SSAR 检查通过，Lens 会在 **Execute** 阶段自动执行所有安装操作（包括命名空间创建、来自 chart 的 CRD 如 `lws.crds`，以及由 profile 驱动的远端 Kustomize overlay 如 NFD 或非 DRA 设备插件）。
+- **Orchestration administrator operations**：Execute 显示脚本和
+  **Re-check**。在重新检查验证 marker、提供 token 且没有剩余 admin operation
+  前，user operation 保持禁用；验证通过后点击 **Execute** 开始执行。
+- **Blocked**：Execute 显示需要你修复的用户访问问题，并保持 user 执行禁用。
 
-if ((DELETE)); then
-  info "Deleting Lens RBAC identity in namespace $NAMESPACE"
-  "${KUBECTL[@]}" delete clusterrolebinding "$CLUSTER_ROLE" --ignore-not-found
-  "${KUBECTL[@]}" delete clusterrole "$CLUSTER_ROLE" --ignore-not-found
-  "${KUBECTL[@]}" -n "$NAMESPACE" delete secret "${SERVICE_ACCOUNT}-token" --ignore-not-found
-  "${KUBECTL[@]}" -n "$NAMESPACE" delete serviceaccount "$SERVICE_ACCOUNT" --ignore-not-found
-  info "Deleted. The namespace $NAMESPACE was left in place."
-  exit 0
-fi
+### 编排平台管理员移交
 
-[[ -n "$OUTPUT" ]] || OUTPUT="$PWD/lens-${SERVICE_ACCOUNT}.kubeconfig"
+当拆分包含 orchestration administrator operations 时，Lens 会显示：
 
-info "Applying namespace/ServiceAccount/ClusterRole/ClusterRoleBinding..."
+1. 编排平台管理员 operation 列表和 readiness 检查（位于 **View operation details** 下）。
+2. 可下载的幂等编排平台管理员脚本。
+3. **Re-check** 操作，用于重新检查权限并验证编排平台管理员完成状态。
 
-"${KUBECTL[@]}" apply -f - <<YAML
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: ${NAMESPACE}
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: ${SERVICE_ACCOUNT}
-  namespace: ${NAMESPACE}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: ${CLUSTER_ROLE}
-  labels:
-    app.kubernetes.io/part-of: llm-d-lens
-rules:
-  # Discovery/read for dashboards, cleanup and arbitrary CRDs.
-  - apiGroups: ["*"]
-    resources: ["*"]
-    verbs: ["get", "list", "watch"]
+把脚本发给编排平台管理员。编排平台管理员用自己的凭据运行一次。脚本只包含计划的
+orchestration administrator operations，不包含你的 kubeconfig、Lens 身份或 secret 值。所有
+orchestration administrator operation 及其 readiness 检查通过后，脚本写入完成 marker，并自动
+写入为 `managed` 监控分配的 `prometheusNodePort`、`grafanaNodePort` 与
+`monitoringHost`。
 
-  # Namespaced core workloads and configuration.
-  - apiGroups: [""]
-    resources:
-      - pods
-      - pods/log
-      - pods/exec
-      - pods/attach
-      - pods/portforward
-      - pods/status
-      - services
-      - services/proxy
-      - endpoints
-      - configmaps
-      - secrets
-      - persistentvolumeclaims
-      - serviceaccounts
-      - events
-      - replicationcontrollers
-      - replicationcontrollers/scale
-      - limitranges
-      - resourcequotas
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+编排平台管理员完成后，在 Lens 选择 **Re-check**。Lens 会重新检查权限、读取 marker、
+把 orchestration administrator operations 记录为完成、自动发现并持久化监控端点且探测 Prometheus
+健康状态（无需手动输入端口），并在完成后获取 execution token。在此之前
+user operations 保持禁用。如果 marker 缺失、部分、过期或不可读，Lens 会说明剩余
+orchestration administrator operations，不会启动 user run。
 
-  # Cluster lifecycle and node maintenance (cordon/uncordon).
-  - apiGroups: [""]
-    resources: ["namespaces"]
-    verbs: ["create", "update", "patch", "delete"]
-  - apiGroups: [""]
-    resources: ["nodes", "nodes/proxy"]
-    verbs: ["update", "patch"]
-  - apiGroups: [""]
-    resources: ["persistentvolumes"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+对于部分权限 kubeconfig，当任何 operation 缺少权限（或需要集群级通配符检查）时，Lens 会自动将其未完成的上游依赖（不包括用户自有 secret 和 Lens 侧验证步骤）提升到编排平台管理员脚本中，确保前置条件按顺序清晰执行。
 
-  # Workload controllers.
-  - apiGroups: ["apps"]
-    resources:
-      - deployments
-      - deployments/scale
-      - daemonsets
-      - statefulsets
-      - statefulsets/scale
-      - replicasets
-      - replicasets/scale
-      - controllerrevisions
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["batch"]
-    resources: ["jobs", "cronjobs"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["autoscaling"]
-    resources: ["horizontalpodautoscalers"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["policy"]
-    resources: ["poddisruptionbudgets"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses", "networkpolicies"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["events.k8s.io"]
-    resources: ["events"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+使用 **具备完整集群权限的 kubeconfig** 时，Lens 会直接执行监控与加速器 exporter 安装、发现
+NodePort 端点、持久化派生 URL，并在 **Complete** 阶段验证 Prometheus 就绪状态。
+使用 **部分权限（`edit`）kubeconfig** 时，自包含的监控与 exporter 安装脚本会包含在
+单个可下载的编排平台管理员脚本中。
 
-  # Storage and node/device APIs used by storage volumes and DRA/GPU installs.
-  - apiGroups: ["storage.k8s.io"]
-    resources:
-      - storageclasses
-      - csidrivers
-      - csinodes
-      - volumeattachments
-      - csistoragecapacities
-    verbs: ["create", "update", "patch", "delete"]
-  - apiGroups: ["node.k8s.io"]
-    resources: ["runtimeclasses"]
-    verbs: ["create", "update", "patch", "delete"]
-  - apiGroups: ["resource.k8s.io"]
-    resources:
-      - resourceclaims
-      - resourceclaimtemplates
-      - resourceslices
-      - deviceclasses
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["scheduling.k8s.io"]
-    resources: ["priorityclasses"]
-    verbs: ["create", "update", "patch", "delete"]
+### 执行 user operations
 
-  # CRD/API registration and admission configuration installed by charts.
-  - apiGroups: ["apiextensions.k8s.io"]
-    resources: ["customresourcedefinitions"]
-    verbs: ["create", "update", "patch", "delete"]
-  - apiGroups: ["apiregistration.k8s.io"]
-    resources: ["apiservices"]
-    verbs: ["create", "update", "patch", "delete"]
-  - apiGroups: ["admissionregistration.k8s.io"]
-    resources: ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"]
-    verbs: ["create", "update", "patch", "delete"]
+Preflight 打开 **Execute** 且权限检查通过（或编排平台管理员移交验证完成）后，点击 **Execute** 即可按依赖顺序执行 user operations，执行开始后会显示 **Setup progress**。每个 operation 可能有 readiness wait；
+wait 失败会停止运行，但不会把 operation 标记为完成。恢复执行时已记录的
+operation 会被跳过。
 
-  # Namespaced RBAC created by Lens and by installed charts.
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["roles", "clusterroles"]
-    verbs: ["bind", "escalate"]
+execution token 由 handoff verification 或第一个 user operation 创建；后续
+operation 复用该 token。计划变更会使旧 run 过期，并要求重新检查拆分。
 
-  # llm-d / Gateway / inference / monitoring / accelerator CRDs.
-  - apiGroups:
-      - gateway.networking.k8s.io
-      - gateway.envoyproxy.io
-      - aigateway.envoyproxy.io
-      - inference.networking.k8s.io
-      - llm-d.ai
-      - agentgateway.dev
-      - networking.istio.io
-      - security.istio.io
-      - telemetry.istio.io
-      - install.istio.io
-      - monitoring.coreos.com
-      - nvidia.com
-      - keda.sh
-      - leaderworkerset.x-k8s.io
-      - disaggregatedset.x-k8s.io
-    resources: ["*"]
-    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+**403** 表示 Kubernetes 在预检后拒绝了 operation。Lens 会刷新拆分，把该
+operation 加入编排平台管理员移交，同时保留已完成的 user operations。**401** 表示
+kubeconfig 无效或过期。**504** 表示 operation 已应用但未就绪，应在集群资源
+稳定后重试。其他错误会指出失败的 operation，并保留已完成工作。
 
-  # Prometheus scrapes and API probes.
-  - nonResourceURLs: ["/metrics", "/version", "/readyz", "/healthz", "/livez", "/apis", "/apis/*", "/api", "/api/*"]
-    verbs: ["get"]
-YAML
+### Complete
 
-"${KUBECTL[@]}" apply -f - <<YAML
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: ${CLUSTER_ROLE}
-  labels:
-    app.kubernetes.io/part-of: llm-d-lens
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: ${CLUSTER_ROLE}
-subjects:
-  - kind: ServiceAccount
-    name: ${SERVICE_ACCOUNT}
-    namespace: ${NAMESPACE}
-YAML
+**Complete** 执行剩余的 Lens 本地 operation，确认每个 operation 都是
+user-done、administrator-done 或 Lens-done，并在一步中 finalize 集群。集群随后
+离开 draft 状态。如果 Lens operation 失败——包括 **403** 权限拒绝（同时会刷新
+权限检查）——execution token 会保留，便于你修复权限并重试 Complete。
 
-"${KUBECTL[@]}" apply -f - <<YAML
-apiVersion: v1
-kind: Secret
-metadata:
-  name: ${SERVICE_ACCOUNT}-token
-  namespace: ${NAMESPACE}
-  annotations:
-    kubernetes.io/service-account.name: ${SERVICE_ACCOUNT}
-type: kubernetes.io/service-account-token
-YAML
+### 从 M5 之前的 step 流程升级
 
-info "Waiting for the token controller..."
-TOKEN=""
-CA_B64=""
-for _ in $(seq 1 30); do
-  TOKEN="$("${KUBECTL[@]}" -n "$NAMESPACE" get secret "${SERVICE_ACCOUNT}-token" -o jsonpath='{.data.token}' 2>/dev/null || true)"
-  CA_B64="$("${KUBECTL[@]}" -n "$NAMESPACE" get secret "${SERVICE_ACCOUNT}-token" -o jsonpath='{.data.ca\.crt}' 2>/dev/null || true)"
-  [[ -n "$TOKEN" ]] && break
-  sleep 2
-done
-[[ -n "$TOKEN" ]] || die "token was not generated; check the service-account token controller"
+M5 之前的 draft 使用独立的 step ledger，该 ledger 不会迁移。请重新打开
+draft，运行 **Preflight**，然后再次执行 operation 列表。仅有完成
+时间戳不足以视为完成；只有完成记录的 plan hash 与当前计划一致才算完成。
 
-# Connection details come from the admin kubeconfig, without its credentials.
-CLUSTER_JSON="$(mktemp)"
-trap 'rm -f "$CLUSTER_JSON" "$CLUSTER_JSON.tmp"' EXIT
-"${KUBECTL[@]}" config view --minify --flatten --raw -o json |
-  python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d["clusters"][0]["cluster"]))' >"$CLUSTER_JSON"
+### 凭据轮换是独立操作
 
-python3 - "$CLUSTER_JSON" "$OUTPUT" "$SERVICE_ACCOUNT" "$NAMESPACE" "$TOKEN" "$CA_B64" <<'PY'
-import base64
-import json
-import os
-import sys
-
-cluster_file, output, user, namespace, token_b64, ca_b64 = sys.argv[1:]
-with open(cluster_file, encoding="utf-8") as handle:
-    cluster = json.load(handle)
-# Prefer the CA embedded in the service-account token secret when the source
-# kubeconfig did not carry certificate-authority-data.
-if not cluster.get("certificate-authority-data") and ca_b64:
-    cluster["certificate-authority-data"] = ca_b64
-cluster.pop("certificate-authority", None)
-
-config = {
-    "apiVersion": "v1",
-    "kind": "Config",
-    "clusters": [{"name": "lens", "cluster": cluster}],
-    "users": [{"name": user, "user": {"token": base64.b64decode(token_b64).decode("utf-8")}}],
-    "contexts": [
-        {
-            "name": user,
-            "context": {"cluster": "lens", "user": user, "namespace": "default"},
-        }
-    ],
-    "current-context": user,
-}
-with open(output, "w", encoding="utf-8") as handle:
-    json.dump(config, handle, indent=2)
-    handle.write("\n")
-os.chmod(output, 0o600)
-PY
-
-unset TOKEN CA_B64
-info "Wrote kubeconfig: $OUTPUT"
-
-NEW_KUBECTL=(kubectl --kubeconfig "$OUTPUT" --request-timeout=30s)
-
-info "Checking connection..."
-"${NEW_KUBECTL[@]}" cluster-info >/dev/null
-"${NEW_KUBECTL[@]}" get --raw=/readyz >/dev/null
-"${NEW_KUBECTL[@]}" get nodes -o name >/dev/null
-
-info "Checking the permission matrix..."
-FAILED=0
-SERVED_RESOURCES=" $("${NEW_KUBECTL[@]}" api-resources -o name 2>/dev/null | sort -u | tr '\n' ' ') "
-check() {
-  local verb="$1" resource="$2"
-  shift 2
-  # A CRD that is not installed cannot be authorized; skip it here and let the
-  # wildcard group rule cover it once Lens installs the CRD or the chart/installer
-  # creates it.
-  if [[ "$resource" == *.* && "$SERVED_RESOURCES" != *" $resource "* ]]; then
-    printf '  SKIP: %-18s %-50s (CRD/API not installed)\n' "$verb" "$resource"
-    return 0
-  fi
-  if ! "${NEW_KUBECTL[@]}" auth can-i "$verb" "$resource" "$@" >/dev/null 2>&1; then
-    printf '  MISSING: %-18s %-50s %s\n' "$verb" "$resource" "$*"
-    FAILED=1
-  fi
-}
-
-for resource in nodes namespaces pods services secrets configmaps \
-  persistentvolumes persistentvolumeclaims storageclasses customresourcedefinitions \
-  deployments daemonsets statefulsets replicasets jobs cronjobs \
-  resourceclaims.resource.k8s.io resourceslices.resource.k8s.io \
-  deviceclasses.resource.k8s.io runtimeclasses.node.k8s.io; do
-  check get "$resource" --all-namespaces
-  check list "$resource" --all-namespaces
-  check watch "$resource" --all-namespaces
-done
-check get nodes.metrics.k8s.io
-check get gateways.gateway.networking.k8s.io --all-namespaces
-check get httproutes.gateway.networking.k8s.io --all-namespaces
-check get inferencepools.inference.networking.k8s.io --all-namespaces
-check get inferencemodelrewrites.llm-d.ai --all-namespaces
-check get servicemonitors.monitoring.coreos.com --all-namespaces
-
-for resource in pods services secrets configmaps persistentvolumeclaims \
-  serviceaccounts endpoints deployments daemonsets statefulsets replicasets \
-  jobs cronjobs roles rolebindings \
-  gateways.gateway.networking.k8s.io httproutes.gateway.networking.k8s.io \
-  referencegrants.gateway.networking.k8s.io \
-  inferencepools.inference.networking.k8s.io inferencemodelrewrites.llm-d.ai \
-  envoyproxies.gateway.envoyproxy.io clienttrafficpolicies.gateway.envoyproxy.io \
-  securitypolicies.gateway.envoyproxy.io \
-  agentgatewaypolicies.agentgateway.dev envoyfilters.networking.istio.io \
-  destinationrules.networking.istio.io authorizationpolicies.security.istio.io \
-  prometheuses.monitoring.coreos.com servicemonitors.monitoring.coreos.com \
-  podmonitors.monitoring.coreos.com; do
-  check create "$resource" -n "$NAMESPACE"
-  check update "$resource" -n "$NAMESPACE"
-  check patch "$resource" -n "$NAMESPACE"
-  check delete "$resource" -n "$NAMESPACE"
-done
-
-check create namespaces
-check delete namespaces
-check create persistentvolumes
-check delete persistentvolumes
-check update nodes
-check patch nodes
-check create customresourcedefinitions
-check patch customresourcedefinitions
-check create clusterroles
-check create clusterrolebindings
-check delete clusterrolebindings
-check bind clusterroles
-check escalate clusterroles
-check create gatewayclasses.gateway.networking.k8s.io
-check create runtimeclasses.node.k8s.io
-check create deviceclasses.resource.k8s.io
-check create resourceslices.resource.k8s.io
-check create mutatingwebhookconfigurations.admissionregistration.k8s.io
-check create validatingwebhookconfigurations.admissionregistration.k8s.io
-check create priorityclasses.scheduling.k8s.io
-check create apiservices.apiregistration.k8s.io
-check create pods/exec -n "$NAMESPACE"
-check create pods/portforward -n "$NAMESPACE"
-check get pods/log -n "$NAMESPACE"
-check get services/proxy -n "$NAMESPACE"
-check patch deployments/scale -n "$NAMESPACE"
-check deletecollection jobs -n "$NAMESPACE"
-check deletecollection persistentvolumeclaims -n "$NAMESPACE"
-check get /metrics
-
-if ((FAILED)); then
-  die "the generated identity is missing required permissions (see above)"
-fi
-info "Permission matrix: PASS"
-
-if ((SELF_TEST)); then
-  TEST_NS="lens-rbac-selftest-$$-$(date +%s)"
-  info "Running live smoke test in namespace $TEST_NS..."
-  cleanup() {
-    "${NEW_KUBECTL[@]}" delete namespace "$TEST_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  }
-  trap cleanup EXIT
-
-  "${NEW_KUBECTL[@]}" create namespace "$TEST_NS" >/dev/null
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" apply -f - >/dev/null <<'YAML'
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: selftest
-data:
-  key: value
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: selftest
-stringData:
-  key: value
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: selftest
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: selftest
-rules:
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: selftest
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: selftest
-subjects:
-  - kind: ServiceAccount
-    name: selftest
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: selftest
-  labels:
-    app: lens-rbac-selftest
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: lens-rbac-selftest
-  template:
-    metadata:
-      labels:
-        app: lens-rbac-selftest
-    spec:
-      containers:
-        - name: nginx
-          image: docker.io/library/nginx:1.25.2-alpine
-          ports:
-            - containerPort: 80
-          resources:
-            requests:
-              cpu: 10m
-              memory: 16Mi
-            limits:
-              cpu: 100m
-              memory: 64Mi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: selftest
-spec:
-  selector:
-    app: lens-rbac-selftest
-  ports:
-    - port: 80
-      targetPort: 80
----
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: selftest
-spec:
-  template:
-    spec:
-      restartPolicy: Never
-      containers:
-        - name: busybox
-          image: docker.io/library/nginx:1.25.2-alpine
-          command: ["sh", "-c", "echo ok"]
-YAML
-
-  DEFAULT_SC="$("${NEW_KUBECTL[@]}" get storageclasses -o json | python3 -c '
-import json, sys
-items = json.load(sys.stdin).get("items") or []
-for item in items:
-    annotations = (item.get("metadata") or {}).get("annotations") or {}
-    if annotations.get("storageclass.kubernetes.io/is-default-class") == "true":
-        print(item["metadata"]["name"])
-        break
-else:
-    print("")
-')"
-  if [[ -n "$DEFAULT_SC" ]]; then
-    "${NEW_KUBECTL[@]}" -n "$TEST_NS" apply -f - >/dev/null <<YAML
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: selftest
-spec:
-  accessModes: ["ReadWriteOnce"]
-  storageClassName: ${DEFAULT_SC}
-  resources:
-    requests:
-      storage: 64Mi
-YAML
-  fi
-
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" rollout status deployment/selftest --timeout=120s >/dev/null
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" wait --for=condition=complete job/selftest --timeout=120s >/dev/null
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" logs job/selftest >/dev/null
-  POD="$("${NEW_KUBECTL[@]}" -n "$TEST_NS" get pods -l app=lens-rbac-selftest -o jsonpath='{.items[0].metadata.name}')"
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" logs "$POD" >/dev/null
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" exec "$POD" -- true >/dev/null
-
-  # Exercise pods/portforward through a Service while its pod is Ready.
-  LOCAL_PORT=18999
-  PF_PID=""
-  for attempt in 1 2 3; do
-    "${NEW_KUBECTL[@]}" -n "$TEST_NS" port-forward service/selftest "${LOCAL_PORT}:80" >/dev/null 2>&1 &
-    PF_PID=$!
-    for _ in $(seq 1 30); do
-      if curl -fsS "http://127.0.0.1:${LOCAL_PORT}" >/dev/null 2>&1; then break; fi
-      kill -0 "$PF_PID" 2>/dev/null || break
-      sleep 0.5
-    done
-    if curl -fsS "http://127.0.0.1:${LOCAL_PORT}" >/dev/null 2>&1; then
-      break
-    fi
-    kill "$PF_PID" 2>/dev/null || true
-    wait "$PF_PID" 2>/dev/null || true
-    PF_PID=""
-    sleep 1
-  done
-  [[ -n "$PF_PID" ]] || die "port-forward smoke test failed"
-  kill "$PF_PID" 2>/dev/null || true
-  wait "$PF_PID" 2>/dev/null || true
-
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" label deployment selftest selftest=ok --overwrite >/dev/null
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" scale deployment/selftest --replicas=0 >/dev/null
-  if [[ -n "$DEFAULT_SC" ]]; then
-    "${NEW_KUBECTL[@]}" -n "$TEST_NS" get pvc/selftest >/dev/null
-  fi
-
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" delete job selftest --ignore-not-found >/dev/null
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" delete pvc selftest --ignore-not-found >/dev/null
-  "${NEW_KUBECTL[@]}" -n "$TEST_NS" delete deployment selftest --ignore-not-found >/dev/null
-  "${NEW_KUBECTL[@]}" delete namespace "$TEST_NS" --ignore-not-found >/dev/null
-  trap - EXIT
-  info "Live smoke test: PASS"
-fi
-
-info ""
-info "Done."
-info "  kubeconfig: $OUTPUT"
-info "  identity:   system:serviceaccount:${NAMESPACE}:${SERVICE_ACCOUNT}"
-info "  clusterrole: ${CLUSTER_ROLE}"
-```
-
-</details>
-
-1. 打开 **Clusters（集群）**，点击 **Add（新增）**。
-2. 填写 **Cluster name（集群名称）**，保持 **I already have a kubeconfig（已有 kubeconfig）**，点击 **Browse（浏览）**选择文件。
-3. 点击 **Next（下一步）**。连接或版本检查失败时，先解决页面提示的问题。
-4. 在 **Network Proxy（网络代理）**中保留自动检测；需要指定代理时，选择 **Custom proxy for this cluster** 并填写代理信息。
-5. 在 **Model gateway（模型网关）**中保留 **Istio**，按下表检查地址。
-6. 在 **Accelerator（加速器）**中选择集群实际安装的加速器类型及驱动访问模式。
-7. 在 **llm-d stack（llm-d 技术栈）**中检查版本，点击 **Next**，等待源码下载、镜像准备、Gateway 与 llm-d router CRD 以及 LeaderWorkerSet（LWS）控制器安装完成。
-8. 在 **Model Cache（模型缓存）**中保留建议的 Secret 命名空间和名称，将 [Hugging Face 设置](https://huggingface.co/settings/tokens)中的令牌填入 **HuggingFace token**。模型缓存存储卷为必填项：选择 **hostPath** 或 **NFS**，填写路径和容量；也可以选择立即预热模型。
-9. 点击 **Review（检查）**，核对摘要后点击 **Finish（完成）**。
-10. 等待各项操作完成，点击 **Done（结束）**。在列表中选择该集群，检查 **Workers（工作节点）**和 **Deployable GPU（可部署 GPU）**。
-
-| 模型网关字段 | 如何填写 |
-| --- | --- |
-| **Gateway exposed port (NodePort)** | 客户端调用模型时使用的端口 |
-| **Gateway host/IP** | 客户端可访问的主机名或 IP；留空由 Lens 推导 |
-| **Lens address** | 集群能访问的 Lens 主机名或 IP；自动填入的地址可达时保持不变 |
-| **Node inotify limit** | 没有管理员指定值时，保留初始值 |
-
-向导会在集群节点上安装软件并准备镜像。请只对有权管理的集群执行。
-准备步骤失败时，先解决对应错误，再完成向导。
-
-集群前置条件包括固定版本的 llm-d router CRD（`inferencemodelrewrites.llm-d.ai`）。
-Lens 会在任何新的 router 部署启动前安装它们。执行集群的 CRDs 操作时，Lens 还会重启
-pod 模板中缺少当前 CRD 修订标记、由 Lens 管理的 router EPP，使其重新注册
-`InferenceModelRewrite` API。升级后首次执行该操作时，会重启所有已发布的 EPP 一次。
+不要在权限移交面板上传替换 kubeconfig。kubeconfig 替换是独立的集群设置操作，
+仅用于凭据轮换。它不会重新运行权限检查，也不会更改 provisioning plan。
 
 ## 通过 Kubespray 创建新集群
 
@@ -704,14 +162,14 @@ pod 模板中缺少当前 CRD 修订标记、由 Lens 管理的 router EPP，使
 4. **Network proxy for target nodes** 保持 **Auto** 可沿用各机器的代理；需要指定时选择 **Custom for these nodes**。
 5. 点击 **Run preflight（运行预检）**，修正失败项并重新检查，直到全部主机通过。
 6. 点击 **Start bootstrap（开始创建）**，查看执行进度。
-7. 生成的 kubeconfig 出现后，按上面的注册步骤继续，直到 **Finish** 和 **Done**。
+7. 生成的 kubeconfig 出现后，按上面的注册步骤继续，直到 **Complete** 和 **Done**。
 
 此操作会修改目标机器。开始前请确认主机地址和节点角色。
 
 ## 修改集群设置
 
 1. 选择集群，点击 **Edit cluster（编辑集群）**。
-2. 修改名称、描述、代理、**HF_TOKEN secret** 或模型网关设置。
+2. 修改名称、描述、代理、**HF_TOKEN secret**、**vLLM image**（`vllmImage`，或重置为空以使用所选硬件配置文件的 `runtime_image` 默认值）、模型网关设置或监控设置（**Monitoring mode（监控模式）**：`Managed` 或 `Existing`；在 `Existing` 模式下可配置外部 **Prometheus URL** 与可选 **Grafana URL**；在 `Managed` 模式下，端点和 NodePort 会自动发现并以只读方式展示）。
 3. 点击 **Save changes（保存更改）**，确认新值已显示。
 
 组件版本由 Lens 发布版本提供，不能在此处修改。
@@ -763,6 +221,24 @@ Clusters 页面仅展示基础设施健康状态和工作节点，不再显示�
 [模型服务页面](/user-guide/model-services)，并在服务拓扑过滤器中自动选中当前集群。
 该过滤器同样可以更改或清除；刷新页面或使用浏览器前进、后退时，入口 URL 会恢复集群条件。
 
+配置监控后，Lens 会直接通过 HTTP 从 Prometheus 获取实时节点、CPU、内存、磁盘和加速器遥测数据，
+支持无集群级 `nodes` RBAC 权限的受限命名空间作用域 kubeconfig。
+
+**Monitoring（监控）**健康卡片在编排平台管理员与非管理员 kubeconfig 以及 `managed` 和 `existing`
+两种监控模式下均与[可观测性页面](/user-guide/observability)保持一致：
+
+- **编排平台管理员 + `managed` 模式**：直接验证 Kubernetes 监控栈。
+- **非管理员 kubeconfig 与 `existing` 模式**：探测已配置的 Prometheus 和 Grafana HTTP 端点，
+  仅统计适用组件（`existing` 模式下可选的 Grafana 以及纯 CPU 集群上的加速器 exporter
+  不计入必需数量）。
+
+点击 **Monitoring** 卡片可直接跳转至[可观测性页面](/user-guide/observability)。当监控处于降级、
+不可达或未配置状态时，概览横幅会根据角色与模式提供对应指引：
+
+- **编排平台管理员（`managed`）**：在 **Observability** 中安装或重新安装监控栈。
+- **编排平台管理员（`existing`）**：在 **Clusters（集群）**页面通过 **Edit cluster（编辑集群）**配置外部 Prometheus 和可选的 Grafana URL，然后在 **Observability** 中点击 **Re-check（重新检查）**。
+- **非管理员**：在 **Clusters（集群）**页面通过 **Edit cluster（编辑集群）**配置外部 Prometheus 和 Grafana URL，或在 **Observability** 中点击 **Install（安装）** / **Reinstall（重装）**运行**编排平台管理员**配置或修复脚本，然后点击 **Re-check（重新检查）**。
+
 ## 设置节点维护模式
 
 1. 在集群的 **Workers** 列表中选中节点。
@@ -776,14 +252,15 @@ Clusters 页面仅展示基础设施健康状态和工作节点，不再显示�
 
 1. 打开集群的 **Actions → Delete cluster（操作 → 删除集群）**。
 2. 核对集群名称和删除警告。
-3. 点击 **Delete（删除）**，确认注册记录从列表中消失。
+3. 点击 **Delete（删除）**。
+   - 如果当前 kubeconfig 有权限删除所有 Lens 自有资源，Lens 会直接清理这些资源并移除注册记录。
+   - 如果命名空间级的 `edit` kubeconfig 无法删除集群级或跨命名空间资源（或集群不可达），弹窗会切换为 **Orchestration administrator cleanup required（需要编排平台管理员清理）**（离线时显示 **Cluster unreachable（集群不可达）**）。
+4. 当出现 **Orchestration administrator cleanup required（需要编排平台管理员清理）** 或 **Cluster unreachable（集群不可达）** 时：
+   - 复制或下载幂等清理脚本，交给编排平台管理员执行。
+   - 编排平台管理员执行完成后，点击 **Re-check & Delete（重新检查并删除）**（集群不可达时为 **Retry & Delete（重试并删除）**）以验证完成标记并移除注册记录。
+   - 如果无法自动验证完成标记（`unconfirmed`）或集群不可达，勾选显式确认框并点击 **Confirm & Delete Record（确认并删除记录）** 以从 Lens 中移除注册记录。
 
-删除注册还会删除其独立 Gateway 命名空间，通常为 `lens-gateway-<cluster-id>`，
-以及其中的 Gateway、IPP 和鉴权资源。旧的共享 `lens-gateway` 命名空间和其他注册的
-命名空间不会被删除。如果 Gateway 命名空间删除失败或超时，Lens 会报告错误，
-并保留注册记录和凭据，以便重试。
-
-Lens 还会清理它在集群上创建的资源。集群的 `HF_TOKEN` Secret 会被删除；当保留其所在命名空间已无意义时，该命名空间也会一并删除：即该命名空间是 Lens 创建的，或者该 Secret 是其中唯一的内容。如果命名空间中仍有其他内容，则会保留它；集群的内置命名空间永远不会被改动。对于仍在注册过程中的集群，向导期间创建的存储卷会连同其 PVC 和 PV 一起删除，而 NFS 或 hostPath 上的模型文件会保留。已完成注册且仍存在存储卷的集群必须先删除这些卷才能删除。
+Lens 永远不会删除 `existing-secret:*` Secret、已有或共享命名空间（包括 `existing` 模式的 Gateway 或 Secret 命名空间）、裸 `lens-storage`、裸 `lens-monitoring` 或遗留的 `llm-d-bench-storage` 命名空间，以及受保护的系统命名空间（`default`、`kube-system`、`kube-public`、`kube-node-lease`、`istio-system`、`envoy-gateway-system`、`envoy-ai-gateway-system`、`agentgateway-system`）。由 Lens 创建的集群专属 `lens-storage-<cluster-id>` 以及 `managed` 模式下创建的 `lens-monitoring-<cluster-id>` 命名空间（未与其他集群共享时）可在清理时删除。删除启用 `managed` 监控的集群时，Lens 会清理托管的监控与加速器 exporter 资源（必要时通过两阶段编排平台管理员清理流程执行，同时保留同一 Kubernetes API Server 上与其他集群共享的资源）；在 `existing` 监控模式下，Lens 永远不会删除监控资源。对于仍在注册过程中的集群，向导期间创建的存储卷会连同其 PVC 和 PV 一起删除，而 NFS 或 hostPath 上的模型文件会保留。已完成注册且仍存在部署或存储卷的集群必须先删除这些资源才能删除。
 
 ## 看不到集群
 

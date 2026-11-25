@@ -69,6 +69,8 @@ Get observability status for one accelerator family, including release, componen
     {
       "accelerator": "intel_gpu",
       "access_mode": "dra",
+      "cluster_access_mode": "admin",
+      "can_manage": true,
       "access_modes": [
         {
           "mode": "dra",
@@ -237,7 +239,14 @@ Check whether the cluster-level Prometheus/Grafana monitoring stack (kube-promet
       ],
       "active_operation_id": null,
       "observed_at": "2026-09-23T08:00:00Z",
-      "stale": false
+      "stale": false,
+      "access_mode": "admin",
+      "can_manage": true,
+      "monitoring_mode": "managed",
+      "prometheus_url": null,
+      "grafana_url": null,
+      "prometheus_node_port": null,
+      "grafana_node_port": null
     }
     ```
   </TabItem>
@@ -406,6 +415,8 @@ List deployment monitoring status for every deployment in a cluster. Use this to
       "cluster_id": "cluster-123",
       "cluster_reachable": true,
       "stack_ready": true,
+      "access_mode": "admin",
+      "can_manage": true,
       "items": [
         {
           "execution_id": "deploy-exec-001",
@@ -423,7 +434,10 @@ List deployment monitoring status for every deployment in a cluster. Use this to
           },
           "servicemonitors": ["llm-d-prism-epp-monitor"],
           "podmonitors": ["llm-d-prism-modelserver-monitor"],
-          "message": "monitoring enabled"
+          "message": "monitoring enabled",
+          "access_mode": "admin",
+          "can_manage": true,
+          "rbac_restricted": false
         }
       ]
     }
@@ -475,7 +489,10 @@ Get monitoring status for one deployment execution, optionally scoped to a clust
       },
       "servicemonitors": ["llm-d-prism-epp-monitor"],
       "podmonitors": ["llm-d-prism-modelserver-monitor"],
-      "message": "monitoring enabled"
+      "message": "monitoring enabled",
+      "access_mode": "admin",
+      "can_manage": true,
+      "rbac_restricted": false
     }
     ```
   </TabItem>
@@ -525,7 +542,10 @@ Install, enable, disable, or uninstall monitoring resources for one deployment e
       },
       "servicemonitors": [],
       "podmonitors": [],
-      "message": "monitoring disabled"
+      "message": "monitoring disabled",
+      "access_mode": "admin",
+      "can_manage": true,
+      "rbac_restricted": false
     }
     ```
   </TabItem>
@@ -724,6 +744,28 @@ Additional accelerator endpoints exist for installation preflight, operation sta
 Additional cluster-stack endpoints exist for operation status and resolved Grafana/Prometheus links; see the OpenAPI reference.
 
 See the full request/response schemas in the FastAPI OpenAPI schema (regenerate with `npm run docs:api`).
+
+## Admin vs Non-Admin Access & Handoff
+
+Cluster stack (`GET /api/v1/monitoring/cluster-stack/status`), accelerator (`GET /api/v1/monitoring/accelerators/{accelerator}/status`), and deployment (`GET /api/v1/monitoring/deployments`, `GET /api/v1/monitoring/deployments/{execution_id}`) status responses include SSAR-derived access and endpoint metadata:
+
+- `cluster_access_mode` (on `AcceleratorStatusResponse`): `"admin"`, `"non_admin"`, or `null` when the cluster is unreachable or returns `401` (preserving `access_mode` on `AcceleratorStatusResponse` for the GPU access mode `"dra" | "plugin" | null`).
+- `access_mode` (on `ClusterStackStatusResponse` and deployment monitoring status items): `"admin"`, `"non_admin"`, or `null` when the cluster is unreachable or returns `401`.
+- `can_manage`: `boolean` indicating whether the caller holds cluster-scoped management permissions.
+- `rbac_restricted` (on deployment monitoring status items): `boolean` indicating whether deployment monitoring operations are restricted by RBAC.
+- `monitoring_mode`, `prometheus_url`, `grafana_url`, `prometheus_node_port`, and `grafana_node_port` (on `ClusterStackStatusResponse`): `"managed"` or `"existing"` mode, configured external HTTP(S) endpoints, and discovered NodePorts.
+- `ObservabilityLink.url`: carries the direct external base URL from the backend, while the frontend appends `dashboard_path` (or the fallback dashboard path) and `?var-namespace=` for deployment Grafana links; `non_admin` callers never trigger `port-forward`.
+
+### UI-only Orchestration Administrator Handoff & Recheck Routes
+
+- `GET /api/v1/monitoring/cluster-stack/admin-script`: generates an idempotent shell script for orchestration administrators to install or repair the cluster monitoring stack.
+- `POST /api/v1/monitoring/cluster-stack/recheck`: reads any orchestration administrator completion marker ConfigMap, persists discovered NodePort/host endpoints, invalidates SSAR and Prometheus endpoint caches, re-probes cluster stack readiness via Prometheus HTTP checks, and returns `ClusterStackRecheckResponse` including `marker_found: bool`.
+- `GET /api/v1/monitoring/accelerators/{accelerator}/admin-script`: generates an orchestration administrator script for hardware-profile accelerator exporters.
+- `POST /api/v1/monitoring/accelerators/{accelerator}/recheck`: reads any orchestration administrator completion marker ConfigMap, persists discovered NodePort/host endpoints, invalidates SSAR and Prometheus endpoint caches, re-probes accelerator exporter metrics via Prometheus, and returns `AcceleratorRecheckResponse` including `marker_found: bool`.
+
+### Deployment Monitoring `403` Orchestration Administrator Handoff
+
+When `POST /api/v1/monitoring/deployments/{execution_id}/{action}` (`install`, `enable`, `disable`, or `uninstall`) encounters an RBAC `403` error (such as missing permissions for `epp-auth-delegator` `ClusterRoleBinding`, `ServiceMonitor`, or `PodMonitor`), the endpoint returns HTTP `403` with `detail.code == "admin_handoff_required"` alongside `detail.message`, `detail.reason`, and `detail.admin_script` (`filename`, `script`, `instructions`, `action`, `namespace`, `execution_id`).
 
 ## Shared monitoring behavior
 

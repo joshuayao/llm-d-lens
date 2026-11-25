@@ -240,7 +240,9 @@ Return the Gateway connection info a client copies into its OpenAI client. Each 
           "publicUrl": null,
           "port": null,
           "baseUrl": "http://10.0.0.10/v1",
-          "ready": true
+          "ready": true,
+          "accessMode": "admin",
+          "reconcileStatus": "synced"
         }
       ]
     }
@@ -1075,6 +1077,16 @@ the stable cluster-registration short ID.
           "ippReady": false,
           "ippName": "lens-ipp",
           "ippNamespace": "lens-gateway-1234abcd",
+          "canManageGatewayInfra": true,
+          "canManageGatewayConfig": true,
+          "canReconcileRoutes": true,
+          "accessMode": "admin",
+          "authError": null,
+          "reconcileStatus": "synced",
+          "pendingOperationsCount": 0,
+          "desiredHash": "9f3c2a1b4e8d",
+          "handoffNamespace": "lens-edit",
+          "gatewayProbeSource": "k8s",
           "lastOperation": {
             "id": "gop-2a7f0d9c0c11",
             "kind": "reconcile-gateway",
@@ -1100,6 +1112,106 @@ the stable cluster-registration short ID.
         print(status.api_payload())
 
     asyncio.run(main())
+    ```
+  </TabItem>
+</Tabs>
+
+### Non-Admin `admin_handoff_required` responses
+
+On Non-Admin clusters (`accessMode: "non_admin"` or when Kubernetes RBAC returns `403 Forbidden`), mutating endpoints—including model service create/publish, edit, traffic distribution, status toggle, delete, and IPP configuration—save the desired state in the database and return `reconcileStatus: "admin_handoff_required"` with a `handoff` object instead of failing with a raw `403`:
+
+```json
+{
+  "reconcileStatus": "admin_handoff_required",
+  "handoff": {
+    "clusterId": "1234abcd",
+    "accessMode": "non_admin",
+    "reconcileStatus": "admin_handoff_required",
+    "mode": "routes",
+    "desiredHash": "9f3c2a1b4e8d",
+    "markerNamespace": "lens-edit",
+    "markerName": "lens-remediation-1234abcd",
+    "filename": "lens-remediate-1234abcd-routes.sh",
+    "adminScript": "#!/usr/bin/env bash\nset -euo pipefail\n...",
+    "instructions": "Run this script as an Orchestration administrator...",
+    "pendingOperations": [],
+    "warnings": []
+  }
+}
+```
+
+### Get gateway remediation handoff
+
+Retrieve the current orchestration administrator handoff script and pending operations for a Non-Admin cluster.
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`GET /api/v1/model-service/admin/gateway/remediation`** (`operation_id: get_model_gateway_remediation`)
+
+    Query parameters: `clusterId` (`string`, required), `mode` (`"routes" | "gateway_repair" | "ipp_config" | "all"`, optional, default `"routes"`), `markerNamespace` (`string`, optional, max length 63).
+
+    Permissions: Requires `model-service:gateway:read`, `model-service:group:read`, or `model-service:member:manage`.
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    import asyncio
+
+    from llm_d_lens.model_service.gateway_ops import GatewayOpsService
+
+    result = asyncio.run(GatewayOpsService().get_remediation("1234abcd", mode="routes"))
+    print(result)
+    ```
+  </TabItem>
+</Tabs>
+
+### Generate gateway remediation script
+
+Generate or refresh an idempotent `bash` + `kubectl` + `helm` orchestration administrator handoff script for a Non-Admin cluster.
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/v1/model-service/admin/gateway/remediation`**
+
+    Request body: `{ "clusterId": "1234abcd", "mode": "routes" }` (`mode` is `"routes" | "gateway_repair" | "ipp_config" | "all"`, optional, default `"routes"`). Optional fields: `ippConfig` (`string`), `provider` (`string`), `markerNamespace` (`string`, max length 63).
+
+    Permissions: `routes` mode is available to users with `model-service:gateway:reconcile`, `model-service:gateway:manage`, `model-service:member:manage`, `model-service:group:manage`, `model-service:group:toggle`, or `model-service:group:remove`. Other modes require `model-service:gateway:manage` or `model-service:gateway:reconcile`.
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    import asyncio
+
+    from llm_d_lens.model_service.gateway_ops import GatewayOpsService
+
+    result = asyncio.run(GatewayOpsService().create_remediation("1234abcd", mode="routes"))
+    print(result)
+    ```
+  </TabItem>
+</Tabs>
+
+### Verify gateway remediation
+
+Verify that an orchestration administrator has executed the handoff script by checking the non-secret completion marker `ConfigMap` in `markerNamespace` and probing the live Gateway HTTP route.
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/v1/model-service/admin/gateway/remediation/verify`**
+
+    Request body: `{ "clusterId": "1234abcd", "expectedHash": "9f3c2a1b4e8d", "markerNamespace": "lens-edit" }` (`expectedHash` and `markerNamespace` are optional).
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    import asyncio
+
+    from llm_d_lens.model_service.gateway_ops import GatewayOpsService
+
+    result = asyncio.run(
+        GatewayOpsService().verify_remediation(
+            "1234abcd",
+            expected_hash="9f3c2a1b4e8d",
+            marker_namespace="lens-edit",
+        )
+    )
+    print(result)
     ```
   </TabItem>
 </Tabs>

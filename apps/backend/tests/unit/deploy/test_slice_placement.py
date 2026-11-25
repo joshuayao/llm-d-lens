@@ -236,3 +236,52 @@ def test_recommendation_and_planning_respect_pod_placement(monkeypatch):
     }
     with pytest.raises(GuideError, match="separates model-server Pods"):
         asyncio.run(composition.resolve_slice_layout(None, body, [disaggregated_set(1, 1)]))
+
+
+def test_node_inventory_falls_back_to_prometheus_on_403_and_raises_401(monkeypatch):
+    from llm_d_lens.cluster.service import PrometheusNodeInventory
+    from llm_d_lens.deploy import slice_capacity
+
+    inv = PrometheusNodeInventory(
+        reachable=True,
+        all_nodes=[
+            {
+                "name": "worker-a",
+                "role": "worker",
+                "ready": True,
+                "schedulingDisabled": False,
+                "cpu": 16,
+                "memoryBytes": 64 * 1024 * 1024 * 1024,
+                "gpuByProfile": {"nvidia": 4},
+                "gpuModelsByProfile": {},
+            }
+        ],
+        allocatable_by_node={
+            "worker-a": {"cpu": 16, "memoryBytes": 64 * 1024 * 1024 * 1024, "gpuByProfile": {"nvidia": 4}}
+        },
+        allocated_gpu_by_node={"worker-a": 1},
+    )
+
+    async def kubectl_403(argv, **kwargs):
+        if argv[:2] == ["get", "nodes"]:
+            return SimpleNamespace(ok=False, stdout="", stderr="nodes is forbidden")
+        return SimpleNamespace(ok=False, stdout="", stderr="forbidden")
+
+    async def prom(_cid):
+        return inv
+
+    monkeypatch.setattr(slice_placement, "run_kubectl", kubectl_403)
+    monkeypatch.setattr(slice_capacity, "fetch_prometheus_node_inventory", prom)
+
+    items = asyncio.run(slice_placement.node_inventory("session-1"))
+    assert len(items) == 1
+    assert items[0]["name"] == "worker-a"
+    assert items[0]["free"] == 3.0
+
+    async def kubectl_401(argv, **kwargs):
+        return SimpleNamespace(ok=False, stdout="", stderr="Unauthorized")
+
+    monkeypatch.setattr(slice_placement, "run_kubectl", kubectl_401)
+    with pytest.raises(GuideError) as error:
+        asyncio.run(slice_placement.node_inventory("session-1"))
+    assert error.value.status == 401

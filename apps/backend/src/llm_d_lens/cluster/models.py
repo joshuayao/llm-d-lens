@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Literal
-from uuid import uuid4
+from datetime import datetime
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 
 class StrictModel(BaseModel):
@@ -68,22 +68,127 @@ class ClusterRecord(StrictModel):
     router_version: str | None = Field(default=None, alias="routerVersion")
     gie_version: str | None = Field(default=None, alias="gieVersion")
     ipp_version: str | None = Field(default=None, alias="ippVersion")
+    vllm_image: str | None = Field(default=None, alias="vllmImage")
     hf_token_secret: HfTokenSecretRef | None = Field(default=None, alias="hfTokenSecret")
+    kubeconfig_namespace: str | None = Field(default=None, alias="kubeconfigNamespace")
     draft: bool = False
+    monitoring_mode: Literal["managed", "existing"] = Field(default="managed", alias="monitoringMode")
+    monitoring_namespace: str = Field(default="llm-d-monitoring", alias="monitoringNamespace")
+    prometheus_url: str | None = Field(default=None, alias="prometheusUrl")
+    grafana_url: str | None = Field(default=None, alias="grafanaUrl")
+    prometheus_node_port: int | None = Field(default=None, alias="prometheusNodePort")
+    grafana_node_port: int | None = Field(default=None, alias="grafanaNodePort")
 
 
-class ImagePrepullRequest(StrictModel):
-    """Accelerators whose llm-d images should be pre-pulled onto every node."""
+class PlanResponse(StrictModel):
+    """Stored provisioning plan plus the hashes derived from it."""
 
-    accelerators: list[str] = Field(default_factory=list)
+    plan: dict[str, Any]
+    plan_hash: str = Field(alias="planHash")
+    plan_version: int = Field(alias="planVersion")
+
+
+class ClusterDetailResponse(StrictModel):
+    """Cluster record, its stored plan (when any) and the derived hashes."""
+
+    cluster: ClusterRecord
+    plan: dict[str, Any] | None = None
+    plan_hash: str | None = Field(default=None, alias="planHash")
+    plan_version: int | None = Field(default=None, alias="planVersion")
+    execution_operations: dict[str, str] | None = Field(
+        default=None,
+        alias="executionOperations",
+        description="Current operation ledger (operation id -> user_done/admin_done/lens_done/failed).",
+    )
+    execution_completed_at: datetime | None = Field(
+        default=None,
+        alias="executionCompletedAt",
+        description="When the most recent execution run completed, or null while unfinished.",
+    )
+    execution_completed_plan_hash: str | None = Field(
+        default=None,
+        alias="executionCompletedPlanHash",
+        description="Plan hash recorded by the completed run; compare with planHash before treating it as current.",
+    )
+    draft_hf_token_saved: bool = Field(
+        default=False,
+        alias="draftHfTokenSaved",
+        description="Whether an encrypted temporary HF token is currently stored for this draft cluster.",
+    )
+
+
+class KubeconfigReplaceResponse(StrictModel):
+    """Result of ``PUT /clusters/{id}/kubeconfig``.
+
+    Rotation never returns a capability report and never contains the
+    kubeconfig or its credentials.
+    """
+
+    plan_hash: str | None = Field(default=None, alias="planHash")
+    target_matched_by: str = Field(alias="targetMatchedBy")
+    endpoint_changed: bool = Field(default=False, alias="endpointChanged")
+    warning: str | None = None
+
+
+class DraftHfTokenRequest(StrictModel):
+    """``PUT /api/cluster/clusters/{id}/draft-hf-token`` payload."""
+
+    token: SecretStr = Field(..., min_length=1, max_length=16_384)
+
+
+class OperationExecuteRequest(StrictModel):
+    """Body for ``POST /clusters/{id}/operations/{operation_id}/execute``."""
+
+    secret_values: dict[str, str] | None = Field(default=None, alias="secretValues", repr=False)
+
+
+class OperationExecuteResponse(StrictModel):
+    """Result of one user operation execution."""
+
+    operation_id: str = Field(alias="operationId")
+    status: str
+    token: str
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
+class AdminHandoffStatusResponse(StrictModel):
+    """Read-only marker state or the result of an admin-handoff verification."""
+
+    plan_hash: str = Field(alias="planHash")
+    status: str
+    admin_operations: list[str] = Field(alias="adminOperations")
+    remaining_operations: list[str] = Field(alias="remainingOperations")
+    marker: dict[str, Any]
+    warnings: list[str] = Field(default_factory=list)
+    token: str | None = None
+    monitoring: dict[str, Any] | None = None
+
+
+class RemediationResponse(StrictModel):
+    """The generated Orchestration administrator operation script and handoff metadata."""
+
+    filename: str
+    script: str
+    instructions: str
+    plan_hash: str = Field(alias="planHash")
+    admin_operations: list[str] = Field(alias="adminOperations")
+    marker: dict[str, str]
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ExecutionCancelRequest(StrictModel):
+    """``POST /clusters/{id}/execution/cancel`` payload."""
+
+    token: str | None = None
+    force: bool = False
 
 
 class ClusterSettingsUpdateRequest(StrictModel):
     """``PATCH /api/cluster/clusters/{id}`` payload; every field is optional,
-    only supplied keys are changed. Covers both the wizard's Step 2/3 settings
-    (plus the wizard's final "Finish" step flipping ``draft`` to ``False``)
-    and the Clusters overview page's "Edit cluster" action (name/description/
-    proxy/version refs). ``kubeconfig`` stays immutable for now."""
+    only supplied keys are changed. Covers the wizard's review/runtime settings
+    and the Clusters overview page's "Edit cluster" action
+    (name/description/proxy/version refs). Draft state is finalized only by
+    ``POST /execution/complete``. ``kubeconfig`` is rotated separately."""
 
     name: str | None = Field(default=None, min_length=1, max_length=253)
     description: str | None = None
@@ -106,19 +211,16 @@ class ClusterSettingsUpdateRequest(StrictModel):
     router_version: str | None = Field(default=None, alias="routerVersion")
     gie_version: str | None = Field(default=None, alias="gieVersion")
     ipp_version: str | None = Field(default=None, alias="ippVersion")
+    vllm_image: str | None = Field(default=None, alias="vllmImage")
     draft: bool | None = None
-
-
-class HfTokenSecretCreateRequest(StrictModel):
-    """Standalone "create an HF_TOKEN secret" request, decoupled from any
-    Model Cache entry -- see docs/design/cluster-design.md#cluster-creation-wizard
-    section 4.4. The resulting secret is then referenced by a normal Model
-    Cache ``TokenSourceMode.EXISTING_SECRET`` token source; no new token
-    source mode is introduced."""
-
-    namespace: str = Field(min_length=1, max_length=253)
-    name: str = Field(default_factory=lambda: f"hf-token-{uuid4().hex[:8]}", max_length=253)
-    token: str = Field(min_length=1)
+    monitoring_mode: Literal["managed", "existing"] | None = Field(default=None, alias="monitoringMode")
+    monitoring_namespace: str | None = Field(default=None, alias="monitoringNamespace")
+    prometheus_url: str | None = Field(default=None, alias="prometheusUrl")
+    grafana_url: str | None = Field(default=None, alias="grafanaUrl")
+    prometheus_node_port: int | None = Field(default=None, alias="prometheusNodePort")
+    grafana_node_port: int | None = Field(default=None, alias="grafanaNodePort")
+    monitoring_host: str | None = Field(default=None, alias="monitoringHost")
+    install_accelerator_exporters: bool | None = Field(default=None, alias="installAcceleratorExporters")
 
 
 class HfTokenSecretUpdateRequest(StrictModel):
@@ -201,9 +303,37 @@ class ComponentSummary(StrictModel):
     message: str | None = None
 
 
+class MonitoringComponentDiagnosticSummary(StrictModel):
+    severity: Literal["info", "warning", "error"]
+    code: str
+    message: str
+    resource: str | None = None
+
+
+class MonitoringSubcomponentSummary(StrictModel):
+    name: str
+    status: str
+    kind: Literal["workload", "configmap", "crd"] = "workload"
+    ready: int | None = None
+    desired: int | None = None
+    source: Literal["llmd", "cluster", "none"] = "none"
+    optional: bool = False
+    diagnostics: list[MonitoringComponentDiagnosticSummary] = Field(default_factory=list)
+
+
+class MonitoringComponentSummary(ComponentSummary):
+    access_mode: Literal["admin", "non_admin"] | None = Field(default=None, alias="accessMode")
+    monitoring_mode: Literal["managed", "existing"] | None = Field(default=None, alias="monitoringMode")
+    can_manage: bool | None = Field(default=None, alias="canManage")
+    namespace: str | None = None
+    prometheus_url: str | None = Field(default=None, alias="prometheusUrl")
+    grafana_url: str | None = Field(default=None, alias="grafanaUrl")
+    components: list[MonitoringSubcomponentSummary] = Field(default_factory=list)
+
+
 class ComponentsSummary(StrictModel):
     intel_device_plugin: ComponentSummary = Field(alias="intelDevicePlugin")
-    monitoring: ComponentSummary
+    monitoring: MonitoringComponentSummary
     accelerator_device_plugins: dict[str, ComponentSummary] = Field(
         default_factory=dict, alias="acceleratorDevicePlugins"
     )
@@ -213,6 +343,7 @@ class GpuDeviceSummary(StrictModel):
     id: str
     index: int = 0
     name: str
+    model: str | None = None
     pci_address: str = Field(alias="pciAddress")
     compute_usage_percent: float = Field(default=0.0, alias="computeUsagePercent")
     vram_total_bytes: int = Field(default=0, alias="vramTotalBytes")
@@ -305,6 +436,13 @@ class KubernetesSummary(StrictModel):
     nodes: list[NodeSummary] = Field(default_factory=list)
     namespaces: list[NamespaceSummary] = Field(default_factory=list)
     hardware: ClusterHardwareSummary = Field(default_factory=ClusterHardwareSummary)
+    telemetry_source: Literal["prometheus", "kubernetes", "hybrid", "unavailable"] = Field(
+        default="kubernetes", alias="telemetrySource"
+    )
+    prometheus_reachable: bool = Field(default=False, alias="prometheusReachable")
+    monitoring_required: bool = Field(default=False, alias="monitoringRequired")
+    restricted_resources: list[str] = Field(default_factory=list, alias="restrictedResources")
+    notice: str | None = None
 
 
 class OverviewResponse(StrictModel):

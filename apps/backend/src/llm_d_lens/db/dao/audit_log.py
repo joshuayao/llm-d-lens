@@ -13,7 +13,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 
 from llm_d_lens.auth.records import AuditLogRecord, utcnow
-from llm_d_lens.db.base import redact_audit_detail
+from llm_d_lens.db.base import clamp_audit_log_fields
 from llm_d_lens.db.dao.base import BaseDao
 from llm_d_lens.db.models.audit_log import AuditLogRow
 
@@ -91,31 +91,37 @@ def _to_record(row: AuditLogRow) -> AuditLogRecord:
 
 class AuditLogDao(BaseDao):
     def append(self, record: AuditLogRecord) -> AuditLogRecord:
+        fields, detail = clamp_audit_log_fields(
+            {
+                "id": record.id,
+                "actor_user_id": record.actor_user_id,
+                "actor_username": record.actor_username,
+                "event_type": record.event_type,
+                "permission": record.permission,
+                "method": record.method,
+                "path": record.path,
+                "target_type": record.target_type,
+                "target_id": record.target_id,
+                "target_name": record.target_name,
+                "cluster_id": record.cluster_id,
+                "result": record.result,
+                "ip": record.ip,
+                "source": record.source,
+                "action": record.action,
+                "request_id": record.request_id,
+                "trace_id": record.trace_id,
+                "parent_request_id": record.parent_request_id,
+                "user_agent": record.user_agent,
+            },
+            record.detail,
+        )
         with self._transaction() as session:
             row = AuditLogRow(
-                id=record.id,
                 created_at=record.created_at,
-                actor_user_id=record.actor_user_id,
-                actor_username=record.actor_username,
-                event_type=record.event_type,
-                permission=record.permission,
-                method=record.method,
-                path=record.path,
-                target_type=record.target_type,
-                target_id=record.target_id,
-                target_name=record.target_name,
-                cluster_id=record.cluster_id,
-                result=record.result,
-                detail=redact_audit_detail(dict(record.detail)) if record.detail is not None else None,
-                ip=record.ip,
-                source=record.source,
-                action=record.action,
+                detail=detail,
                 status_code=record.status_code,
                 duration_ms=record.duration_ms,
-                request_id=record.request_id,
-                trace_id=record.trace_id,
-                parent_request_id=record.parent_request_id,
-                user_agent=record.user_agent,
+                **fields,
             )
             session.add(row)
             session.flush()

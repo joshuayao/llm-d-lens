@@ -276,3 +276,230 @@ def test_set_accelerator_request_without_claim_or_resource_name_raises(monkeypat
     monkeypatch.setattr(hardware_profile, "resource_name", lambda fallback=None, accelerator=None: None)
     with pytest.raises(ValueError):
         hardware_profile.set_accelerator_request({}, None, 1)
+
+
+def test_runtime_image_and_pin_runtime_image_follow_priority_contract(monkeypatch):
+    profile = hardware_profile.active_profile("nvidia")
+    assert profile is not None
+    profile_default = profile.deployment.runtime_image
+    assert profile_default
+    managed_repo = profile.deployment.managed_image_repositories[0]
+    custom_tag_on_managed = f"{managed_repo}:v0.31.0-custom"
+    digest_on_managed = f"{managed_repo}@sha256:{'a' * 64}"
+    cluster_custom = "registry.internal:5000/org/vllm:v0.8.5"
+
+    assert (
+        hardware_profile.runtime_image(
+            fallback="fallback:1",
+            accelerator="nvidia",
+            cluster_vllm_image=cluster_custom,
+        )
+        == cluster_custom
+    )
+    assert (
+        hardware_profile.runtime_image(
+            fallback="fallback:1",
+            accelerator="nvidia",
+            cluster_vllm_image="   ",
+        )
+        == profile_default
+    )
+    assert (
+        hardware_profile.pin_runtime_image(
+            custom_tag_on_managed,
+            accelerator="nvidia",
+            cluster_vllm_image=cluster_custom,
+            explicit_override=True,
+        )
+        == custom_tag_on_managed
+    )
+    assert (
+        hardware_profile.pin_runtime_image(
+            digest_on_managed,
+            accelerator="nvidia",
+            cluster_vllm_image=cluster_custom,
+            explicit_override=True,
+        )
+        == digest_on_managed
+    )
+    assert (
+        hardware_profile.pin_runtime_image(
+            f"{managed_repo}:v0.31.0-cluster",
+            accelerator="nvidia",
+            cluster_vllm_image=f"{managed_repo}:v0.31.0-cluster",
+            explicit_override=False,
+        )
+        == f"{managed_repo}:v0.31.0-cluster"
+    )
+    assert (
+        hardware_profile.pin_runtime_image(
+            profile_default,
+            accelerator="nvidia",
+            cluster_vllm_image=cluster_custom,
+            explicit_override=False,
+        )
+        == cluster_custom
+    )
+    assert (
+        hardware_profile.pin_runtime_image(
+            f"{managed_repo}:old-tag",
+            accelerator="nvidia",
+            cluster_vllm_image=None,
+            explicit_override=False,
+        )
+        == profile_default
+    )
+    assert (
+        hardware_profile.pin_runtime_image(
+            "private.registry.example:5000/team/vllm:custom",
+            accelerator="nvidia",
+            cluster_vllm_image=cluster_custom,
+            explicit_override=False,
+        )
+        == "private.registry.example:5000/team/vllm:custom"
+    )
+
+
+def test_cluster_accelerator_accepts_cluster_vllm_image_when_profile_image_absent(monkeypatch):
+    from dataclasses import replace
+
+    original = hardware_profile.active_profile("nvidia")
+    no_image_profile = replace(original, deployment=replace(original.deployment, runtime_image=None))
+    monkeypatch.setattr(hardware_profile, "active_profile", lambda _acc=None: no_image_profile)
+    hardware = {"accelerators": [{"id": "nvidia", "gpuCount": 2}]}
+
+    with pytest.raises(ValueError, match="no configured runtime image"):
+        hardware_profile.cluster_accelerator(hardware)
+    assert (
+        hardware_profile.cluster_accelerator(hardware, cluster_vllm_image="registry.internal:5000/vllm:v1") == "nvidia"
+    )
+
+
+def test_resolve_cluster_vllm_image_handles_missing_and_uninitialized_db(monkeypatch):
+    from types import SimpleNamespace
+
+    from llm_d_lens.cluster import registry as cluster_registry
+
+    assert hardware_profile.resolve_cluster_vllm_image(None) is None
+    assert hardware_profile.resolve_cluster_vllm_image("  ") is None
+
+    monkeypatch.setattr(cluster_registry, "get_cluster", lambda _cid: SimpleNamespace(vllm_image="  reg:5000/vllm:1  "))
+    assert hardware_profile.resolve_cluster_vllm_image("cluster-a") == "reg:5000/vllm:1"
+
+    def _boom(_cid):
+        raise RuntimeError("db not initialized")
+
+    monkeypatch.setattr(cluster_registry, "get_cluster", _boom)
+    assert hardware_profile.resolve_cluster_vllm_image("cluster-a") is None
+
+
+def test_deploy_service_preserves_official_guide_manifests_and_applies_cluster_policy(monkeypatch, tmp_path):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from llm_d_lens.deploy.contracts import ConfigurationArtifact, DeploymentCreateRequest, VersionedPayload
+    from llm_d_lens.deploy.providers.guide_adapter import GuideDeploymentArtifact, ValidationResult
+    from llm_d_lens.deploy.service import GuideAdapterDeploymentService, _apply_runtime_image_policy
+
+    monkeypatch.setattr(
+        "llm_d_lens.deploy.service.resolve_cluster_vllm_image",
+        lambda cid: "registry.internal:5000/vllm:cluster" if cid == "cluster-a" else None,
+    )
+    request = DeploymentCreateRequest(
+        configuration_artifacts=[
+            ConfigurationArtifact(
+                artifact_id="art-1",
+                schema_version="config.v1",
+                kind="baseline",
+                media_type="application/json",
+                provider_ref="source-composition",
+                checksum="abc",
+                content=json.dumps({"model": {"name": "m"}, "officialGuide": {"renderedManifest": "kind: Deployment"}}),
+            )
+        ],
+        deployment_policy=VersionedPayload(schema_version="p.v1", value={}),
+        provenance={"cluster_server_id": "cluster-a"},
+    )
+    official_overrides = {
+        "model": {"name": "m"},
+        "runtime": {"image": "docker.io/vllm/vllm-openai:v0.31.0-manual"},
+        "officialGuide": {"renderedManifest": "kind: Deployment"},
+    }
+    _apply_runtime_image_policy(official_overrides, request)
+    assert official_overrides["runtime"]["image"] == "docker.io/vllm/vllm-openai:v0.31.0-manual"
+
+    official_no_runtime = {"model": {"name": "m"}, "officialGuide": {"renderedManifest": "kind: Deployment"}}
+    _apply_runtime_image_policy(official_no_runtime, request)
+    assert "runtime" not in official_no_runtime
+
+    helm_overrides = {"model": {"name": "m"}, "hardware_profile": "nvidia"}
+    _apply_runtime_image_policy(helm_overrides, request)
+    assert helm_overrides["runtime"]["image"] == "registry.internal:5000/vllm:cluster"
+
+    helm_explicit = {
+        "model": {"name": "m"},
+        "hardware_profile": "nvidia",
+        "runtime": {"image": "docker.io/vllm/vllm-openai:v0.31.0-override", "imageOverride": True},
+    }
+    _apply_runtime_image_policy(helm_explicit, request)
+    assert helm_explicit["runtime"]["image"] == "docker.io/vllm/vllm-openai:v0.31.0-override"
+
+    helm_stock = {
+        "model": {"name": "m"},
+        "hardware_profile": "nvidia",
+        "runtime": {"image": hardware_profile.runtime_image(accelerator="nvidia")},
+    }
+    _apply_runtime_image_policy(helm_stock, request)
+    assert helm_stock["runtime"]["image"] == "registry.internal:5000/vllm:cluster"
+
+    manifest_file = tmp_path / "manifest.yaml"
+    manifest_file.write_text("apiVersion: apps/v1\nkind: Deployment\n", encoding="utf-8")
+    seen_overrides = []
+
+    class _Adapter:
+        def discover(self):
+            return SimpleNamespace(provider_ref="source-composition")
+
+        def validate_inputs(self, _definition, _snapshot, overrides):
+            seen_overrides.append(json.loads(json.dumps(overrides)))
+            return ValidationResult(accepted=True, reasons=[])
+
+        async def render(self, _definition, _overrides):
+            return GuideDeploymentArtifact(
+                guide_id="source-composition",
+                artifact_hash="hash-1",
+                manifest_ref=str(manifest_file),
+                deployment_contract={"data_plane_kind": "external"},
+            )
+
+        async def prepare_router(self, artifact, _context):
+            return artifact
+
+        async def deploy(self, *_args, **_kwargs):
+            return {"endpoint_url": "http://svc:8000"}
+
+        async def diagnostics(self, *_args, **_kwargs):
+            return {}
+
+        async def readiness(self, *_args, **_kwargs):
+            return ValidationResult(accepted=True, reasons=[])
+
+        async def endpoint(self, *_args, **_kwargs):
+            return SimpleNamespace(url="http://svc:8000", protocol="http", status="ready")
+
+    catalog = SimpleNamespace(get_adapter=lambda _ref: _Adapter())
+    service = GuideAdapterDeploymentService(catalog=catalog, namespace_factory=lambda _req: "llmd-test")
+    monkeypatch.setattr("llm_d_lens.deploy.providers.storage_mount.require_cached_model", AsyncMock())
+    monkeypatch.setattr("llm_d_lens.deploy.service.resolve_data_plane", AsyncMock(return_value=("external", None)))
+    monkeypatch.setattr(
+        "llm_d_lens.deploy.service._with_default_model_secret",
+        lambda policy, _token, _cid: policy,
+    )
+    monkeypatch.setattr("llm_d_lens.deploy.service.register_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "_log_archive", SimpleNamespace(register_execution=lambda *_a: None, append_snapshot=lambda *_a: None))
+    asyncio.run(service.prepare(request))
+    asyncio.run(service.create(request))
+    assert len(seen_overrides) == 2
+    assert all("runtime" not in item for item in seen_overrides)

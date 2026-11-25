@@ -29,12 +29,15 @@ _QUERY_TIMEOUT = 60.0
 _ROUTER_WAIT_TIMEOUT = 60
 _ROUTER_RUN_TIMEOUT = 90.0
 
-#: A representative CRD required by each bundle.
-_REQUIRED_CRDS = {
+#: The CRDs required for each pinned bundle.
+REQUIRED_CRDS = {
     "gateway_api": ("gateways.gateway.networking.k8s.io", "httproutes.gateway.networking.k8s.io"),
     "gateway_api_inference_extension": ("inferencepools.inference.networking.k8s.io",),
     "llm_d_router": ("inferencemodelrewrites.llm-d.ai",),
 }
+
+#: Backward-compatible alias for callers that imported the old private name.
+_REQUIRED_CRDS = REQUIRED_CRDS
 
 _ROUTER_CRD = "inferencemodelrewrites.llm-d.ai"
 _ROUTER_API_VERSION = "/apis/llm-d.ai/v1alpha2"
@@ -185,7 +188,7 @@ async def gateway_crds_status(cluster_id: str) -> dict[str, str]:
     names = result.stdout.split() if result.returncode == 0 else []
     status = {
         key: "ready" if all(any(name.endswith(crd) for name in names) for crd in required) else "missing"
-        for key, required in _REQUIRED_CRDS.items()
+        for key, required in REQUIRED_CRDS.items()
     }
     if status["llm_d_router"] == "ready" and not await _router_api_served(runner):
         status["llm_d_router"] = "missing"

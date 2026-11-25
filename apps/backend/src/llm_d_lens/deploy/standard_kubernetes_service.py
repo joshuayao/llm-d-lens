@@ -47,12 +47,13 @@ def build_standard_kubernetes_service_configuration(
     *,
     accelerator: str | None = None,
     model_revision: str | None = None,
+    cluster_vllm_image: str | None = None,
 ) -> DeployableConfiguration:
     """Build the immutable vLLM configuration currently used by Standard mode."""
     from llm_d_lens.deploy.providers.hardware_profile import runtime_image
 
     runtime: dict[str, object] = {
-        "image": runtime_image(accelerator=accelerator),
+        "image": runtime_image(accelerator=accelerator, cluster_vllm_image=cluster_vllm_image),
         "imageMode": "pull-existing",
         "modelSource": "auto-cache",
         "storageVolumeId": request.storage_volume_id,

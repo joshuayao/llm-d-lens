@@ -360,7 +360,7 @@ def service_issues(row: ServiceRow) -> list[DashboardIssue]:
         {"clusterId": row.cluster_id, "groupId": row.group_id},
         "model-service:member:manage",
     )
-    configured = row.providers.active + row.providers.disabled + row.providers.standby
+    configured = row.providers.active + row.providers.disabled + row.providers.standby + row.providers.unhealthy
     active_positive = row.providers.active
     if configured == 0:
         issues.append(
@@ -380,7 +380,7 @@ def service_issues(row: ServiceRow) -> list[DashboardIssue]:
                 secondary=None,
             )
         )
-    elif active_positive == 0:
+    elif active_positive == 0 and row.providers.unhealthy == 0:
         issues.append(
             _issue(
                 code="model.no_serving_target",
@@ -401,7 +401,7 @@ def service_issues(row: ServiceRow) -> list[DashboardIssue]:
                 secondary=secondary,
             )
         )
-    elif row.deployment_observed and row.providers.ready == 0:
+    elif row.deployment_observed and active_positive > 0 and row.providers.ready == 0:
         issues.append(
             _issue(
                 code="model.serving_paths_lost",
@@ -431,18 +431,26 @@ def service_issues(row: ServiceRow) -> list[DashboardIssue]:
             if names
             else f"{row.name}: {row.providers.unhealthy} provider(s) unhealthy"
         )
+        if active_positive > 0:
+            summary = (
+                f"Unhealthy provider(s): {names}. Serving redundancy or capacity is reduced."
+                if names
+                else "At least one configured provider is unhealthy; serving redundancy or capacity is reduced."
+            )
+        else:
+            summary = (
+                f"Unhealthy provider(s): {names}. No healthy provider is currently serving; "
+                "inspect provider health on the Model Service page."
+                if names
+                else "No healthy provider is currently serving; inspect provider health on the Model Service page."
+            )
         issues.append(
             _issue(
                 code="model.provider_unhealthy",
                 severity="warning",
                 category="model-service",
                 title=title,
-                message=(
-                    f"Unhealthy provider(s): {names}. Serving redundancy or capacity is reduced."
-                    if names
-                    else "At least one configured provider is unhealthy; serving redundancy or capacity is reduced."
-                )
-                + (f" Details: {detail}." if detail else ""),
+                message=summary + (f" Details: {detail}." if detail else ""),
                 cluster_id=row.cluster_id,
                 cluster_name=row.cluster_name,
                 resource_type="model_service",
@@ -634,12 +642,13 @@ def deployment_monitoring_issue(
     status: str,
     stack_ready: bool | None,
     message: str | None,
+    cluster_monitoring_ready: bool | None = None,
 ) -> DashboardIssue | None:
     """Warn when a deployment's monitoring resources are unusable."""
     if status == "unreachable":
         title = f"{execution_name}: deployment monitoring is unavailable"
         detail = "Lens could not read this deployment's monitoring resources."
-    elif status == "enabled" and stack_ready is False:
+    elif status == "enabled" and stack_ready is False and cluster_monitoring_ready is not True:
         title = f"{execution_name}: deployment monitoring is degraded"
         detail = "Monitoring resources exist, but the cluster monitoring stack is not ready."
     else:
@@ -968,16 +977,31 @@ def gateway_cluster_issues(
     )
     issues: list[DashboardIssue] = []
     state = gateway.gateway_state
-    if state == "installed" and (gateway.gateway_ready is False or gateway.gateway_running is False):
+    is_non_admin = getattr(gateway, "access_mode", "admin") == "non_admin"
+    probe_source = getattr(gateway, "gateway_probe_source", None)
+    reconcile_status = getattr(gateway, "reconcile_status", "synced")
+    auth_error = getattr(gateway, "auth_error", None)
+    pending_ops = int(getattr(gateway, "pending_operations_count", 0) or 0)
+    gateway_positively_observed = (not is_non_admin) or (probe_source in {"k8s", "http", "prometheus"})
+    ipp_positively_observed = (not is_non_admin) or (probe_source in {"k8s", "prometheus"})
+
+    handoff_emitted = False
+    if (
+        is_non_admin
+        and not auth_error
+        and reconcile_status == "admin_handoff_required"
+        and (services or gateway.members or pending_ops > 0)
+    ):
+        handoff_emitted = True
         issues.append(
             _issue(
-                code="model.gateway_unavailable",
-                severity="critical",
+                code="model.gateway_admin_handoff_required",
+                severity="warning",
                 category="model-service",
-                title=f"{cluster_name}: Gateway data plane is stopped",
+                title=f"{cluster_name}: Gateway route sync requires Orchestration administrator",
                 message=(
-                    "The shared Gateway exists but its data plane is not serving. Published model services "
-                    "on this cluster cannot receive traffic."
+                    "This kubeconfig cannot reconcile cluster Gateway resources directly. "
+                    "Ask an Orchestration administrator to run the pending Gateway handoff script."
                 ),
                 cluster_id=gate_id,
                 cluster_name=cluster_name,
@@ -986,15 +1010,73 @@ def gateway_cluster_issues(
                 resource_name=f"{cluster_name} Gateway",
                 evidence={
                     "component": "Gateway",
-                    "status": "stopped",
-                    "state": state,
+                    "reconcileStatus": reconcile_status,
+                    "pendingOperationsCount": pending_ops,
                     **affected,
                 },
                 affected=affected,
                 primary=primary,
             )
         )
-    elif state in {"missing", "unreachable"} and gateway.members:
+
+    if is_non_admin and (auth_error or not gateway_positively_observed or state == "unknown"):
+        pass
+    elif state == "installed" and (gateway.gateway_ready is False or gateway.gateway_running is False):
+        if probe_source == "http" and gateway.gateway_running is True and gateway.gateway_ready is False:
+            if not handoff_emitted:
+                issues.append(
+                    _issue(
+                        code="model.gateway_unavailable",
+                        severity="critical",
+                        category="model-service",
+                        title=f"{cluster_name}: Gateway is unhealthy",
+                        message=(
+                            "The shared Gateway responded with a server error to health probes. "
+                            "Published model services on this cluster may fail to serve traffic."
+                        ),
+                        cluster_id=gate_id,
+                        cluster_name=cluster_name,
+                        resource_type="cluster_gateway",
+                        resource_id=gate_id,
+                        resource_name=f"{cluster_name} Gateway",
+                        evidence={
+                            "component": "Gateway",
+                            "status": "unhealthy",
+                            "state": state,
+                            "probeSource": probe_source,
+                            **affected,
+                        },
+                        affected=affected,
+                        primary=primary,
+                    )
+                )
+        else:
+            issues.append(
+                _issue(
+                    code="model.gateway_unavailable",
+                    severity="critical",
+                    category="model-service",
+                    title=f"{cluster_name}: Gateway data plane is stopped",
+                    message=(
+                        "The shared Gateway exists but its data plane is not serving. Published model services "
+                        "on this cluster cannot receive traffic."
+                    ),
+                    cluster_id=gate_id,
+                    cluster_name=cluster_name,
+                    resource_type="cluster_gateway",
+                    resource_id=gate_id,
+                    resource_name=f"{cluster_name} Gateway",
+                    evidence={
+                        "component": "Gateway",
+                        "status": "stopped",
+                        "state": state,
+                        **affected,
+                    },
+                    affected=affected,
+                    primary=primary,
+                )
+            )
+    elif state in {"missing", "unreachable"} and gateway.members and gateway_positively_observed:
         issues.append(
             _issue(
                 code="model.gateway_unavailable",
@@ -1013,7 +1095,8 @@ def gateway_cluster_issues(
             )
         )
         return issues
-    if gateway.ipp_state == "installed" and gateway.ipp_ready is False:
+
+    if not auth_error and gateway.ipp_state == "installed" and gateway.ipp_ready is False:
         issues.append(
             _issue(
                 code="model.ipp_unavailable",
@@ -1039,7 +1122,7 @@ def gateway_cluster_issues(
                 primary=primary,
             )
         )
-    elif gateway.ipp_state in {"missing", "unreachable"} and services:
+    elif not auth_error and ipp_positively_observed and gateway.ipp_state in {"missing", "unreachable"} and services:
         issues.append(
             _issue(
                 code="model.ipp_unavailable",

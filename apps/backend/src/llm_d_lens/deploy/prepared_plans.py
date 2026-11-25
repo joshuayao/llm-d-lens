@@ -22,6 +22,13 @@ from llm_d_lens.deploy.placement_preflight import max_feasible_slices, placement
 from llm_d_lens.deploy.plan_service import DeploymentPlanService
 from llm_d_lens.deploy.providers.deployment_bundle import validate_review_resources
 from llm_d_lens.deploy.providers.guide_adapter import GuideDeploymentArtifact
+from llm_d_lens.deploy.slice_capacity import (
+    ClusterInventoryAuthError,
+    ClusterInventoryForbiddenError,
+    classify_kubectl_failure,
+    fetch_cluster_nodes_and_pods,
+    is_unauthorized_result,
+)
 from llm_d_lens.infrastructure.artifacts.manifests import configuration_checksum, text_checksum
 from llm_d_lens.infrastructure.artifacts.store import register_artifacts
 from llm_d_lens.infrastructure.kubernetes import scoped_runner
@@ -57,11 +64,29 @@ async def inventory(cluster_id: str, resource: str, namespace: str | None = None
         command.append("--all-namespaces")
     result = await scoped_runner(cluster_id).run(command, timeout=30)
     if result.returncode:
-        raise ValueError(f"Cluster inventory unavailable for {resource}; verify access and installed APIs")
+        classify_kubectl_failure(result, resource=resource)
+        raise ClusterInventoryForbiddenError(f"Cluster inventory access denied (403) for {resource}")
     response = json.loads(result.stdout)
     if not isinstance(response.get("items"), list) or response.get("metadata", {}).get("continue"):
         raise ValueError(f"Cluster inventory incomplete for {resource}")
     return response["items"]
+
+
+async def _api_group_available(cluster_id: str, path: str) -> bool:
+    result = await scoped_runner(cluster_id).run(["kubectl", "get", "--raw", path], timeout=15)
+    if result.returncode:
+        if is_unauthorized_result(result):
+            raise ClusterInventoryAuthError(f"Cluster kubeconfig is unauthorized (401) while probing {path}.")
+        return False
+    return True
+
+
+async def _namespace_bootstrapped(cluster_id: str, namespace: str) -> bool:
+    try:
+        from llm_d_lens.deploy.capabilities import is_bootstrap_marker_present
+    except ImportError:
+        return False
+    return bool(await is_bootstrap_marker_present(cluster_id, namespace))
 
 
 def plan_documents(plan: DeploymentPreparedPlan, index: int | None = None) -> list[dict]:
@@ -81,43 +106,117 @@ def plan_documents(plan: DeploymentPreparedPlan, index: int | None = None) -> li
 
 async def preflight(plan: DeploymentPreparedPlan, index: int | None = None) -> dict:
     documents = plan_documents(plan, index)
+    extra_unmodeled: list[str] = []
     try:
-        nodes = await inventory(plan.cluster_id, "nodes")
-        pods = await inventory(plan.cluster_id, "pods")
+        nodes, pods, inventory_source = await fetch_cluster_nodes_and_pods(plan.cluster_id)
+    except ClusterInventoryAuthError:
+        raise
+    except (ClusterInventoryForbiddenError, ValueError, TimeoutError, OSError):
+        return placement_preflight(documents, [], [], complete=False)
+
+    crds: list[dict] | None = None
+    try:
         crds = await inventory(plan.cluster_id, "customresourcedefinitions")
-        namespaces = await inventory(plan.cluster_id, "namespaces")
-        planned_volumes = {item["metadata"]["name"] for item in documents if item.get("kind") == "PersistentVolume"}
-        volumes = await inventory(plan.cluster_id, "persistentvolumes") if planned_volumes else []
-        runtime_classes = (
-            await inventory(plan.cluster_id, "runtimeclasses")
-            if any(item["pod"].get("runtimeClassName") for item in workload_pods(documents))
-            else []
-        )
+    except ClusterInventoryAuthError:
+        raise
+    except ClusterInventoryForbiddenError:
+        crds = None
     except (ValueError, TimeoutError, OSError):
         return placement_preflight(documents, [], [], complete=False)
-    report = placement_preflight(documents, nodes, pods, runtime_classes=runtime_classes)
+
+    namespaces: list[dict] | None = None
+    try:
+        namespaces = await inventory(plan.cluster_id, "namespaces")
+    except ClusterInventoryAuthError:
+        raise
+    except ClusterInventoryForbiddenError:
+        namespaces = None
+    except (ValueError, TimeoutError, OSError):
+        return placement_preflight(documents, [], [], complete=False)
+
+    planned_volumes = {item["metadata"]["name"] for item in documents if item.get("kind") == "PersistentVolume"}
+    volumes: list[dict] = []
+    if planned_volumes:
+        try:
+            volumes = await inventory(plan.cluster_id, "persistentvolumes")
+        except ClusterInventoryAuthError:
+            raise
+        except ClusterInventoryForbiddenError:
+            extra_unmodeled.append("Cluster-wide PersistentVolume inspection is restricted (403)")
+        except (ValueError, TimeoutError, OSError):
+            return placement_preflight(documents, [], [], complete=False)
+
+    needs_runtime_classes = any(item["pod"].get("runtimeClassName") for item in workload_pods(documents))
+    runtime_classes: list[dict] | None = []
+    if needs_runtime_classes:
+        try:
+            runtime_classes = await inventory(plan.cluster_id, "runtimeclasses")
+        except ClusterInventoryAuthError:
+            raise
+        except ClusterInventoryForbiddenError:
+            runtime_classes = None
+            extra_unmodeled.append("RuntimeClass inspection is restricted (403)")
+        except (ValueError, TimeoutError, OSError):
+            return placement_preflight(documents, [], [], complete=False)
+
+    report = placement_preflight(
+        documents,
+        nodes,
+        pods,
+        runtime_classes=runtime_classes,
+        inventory_source=inventory_source,
+    )
+    if extra_unmodeled:
+        report["unmodeled"] = sorted(set(report.get("unmodeled") or []) | set(extra_unmodeled))
+        if not report["errors"] and report["status"] == "pass":
+            report["status"] = "unknown"
     for volume in volumes:
         if volume["metadata"]["name"] in planned_volumes:
             report["errors"].append({"code": "PERSISTENT_VOLUME_ALREADY_EXISTS", "message": volume["metadata"]["name"]})
             report["status"] = "fail"
     selected = plan.payload["artifacts"] if index is None else [plan.payload["artifacts"][index]]
-    occupied = {item["metadata"]["name"] for item in namespaces}
-    for item in selected:
-        if item["context"]["namespace"] in occupied:
-            report["errors"].append({"code": "NAMESPACE_ALREADY_EXISTS", "message": item["context"]["namespace"]})
-            report["status"] = "fail"
-    if disaggregated_sets(documents):
-        required = {"disaggregatedsets.disaggregatedset.x-k8s.io", "leaderworkersets.leaderworkerset.x-k8s.io"}
-        established = {
-            item.get("metadata", {}).get("name")
-            for item in crds
-            if any(
-                condition.get("type") == "Established" and condition.get("status") == "True"
-                for condition in item.get("status", {}).get("conditions", [])
+    if namespaces is not None:
+        occupied = {item["metadata"]["name"] for item in namespaces}
+        for item in selected:
+            ns = item["context"]["namespace"]
+            if ns in occupied and not await _namespace_bootstrapped(plan.cluster_id, ns):
+                report["errors"].append({"code": "NAMESPACE_ALREADY_EXISTS", "message": ns})
+                report["status"] = "fail"
+    else:
+        for item in selected:
+            ns = item["context"]["namespace"]
+            if await _namespace_bootstrapped(plan.cluster_id, ns):
+                continue
+            sa_res = await scoped_runner(plan.cluster_id).run(
+                ["kubectl", "get", "serviceaccounts", "--namespace", ns, "-o", "name"],
+                timeout=15,
             )
-        }
-        for name in sorted(required - established):
-            report["errors"].append({"code": "REQUIRED_CRD_UNAVAILABLE", "message": name})
+            if is_unauthorized_result(sa_res):
+                raise ClusterInventoryAuthError(f"Cluster kubeconfig is unauthorized (401) for namespace {ns}.")
+            if sa_res.returncode == 0:
+                report["errors"].append({"code": "NAMESPACE_ALREADY_EXISTS", "message": ns})
+                report["status"] = "fail"
+    if disaggregated_sets(documents):
+        if crds is not None:
+            required = {"disaggregatedsets.disaggregatedset.x-k8s.io", "leaderworkersets.leaderworkerset.x-k8s.io"}
+            established = {
+                item.get("metadata", {}).get("name")
+                for item in crds
+                if any(
+                    condition.get("type") == "Established" and condition.get("status") == "True"
+                    for condition in item.get("status", {}).get("conditions", [])
+                )
+            }
+            for name in sorted(required - established):
+                report["errors"].append({"code": "REQUIRED_CRD_UNAVAILABLE", "message": name})
+        else:
+            api_checks = {
+                "disaggregatedsets.disaggregatedset.x-k8s.io": "/apis/disaggregatedset.x-k8s.io/v1",
+                "leaderworkersets.leaderworkerset.x-k8s.io": "/apis/leaderworkerset.x-k8s.io/v1",
+            }
+            for name, path in sorted(api_checks.items()):
+                if not await _api_group_available(plan.cluster_id, path):
+                    report["errors"].append({"code": "REQUIRED_CRD_UNAVAILABLE", "message": name})
         if report["errors"]:
             report["status"] = "fail"
     report["slicePreview"] = [

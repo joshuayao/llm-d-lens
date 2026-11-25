@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import React from 'react';
+import React, { act } from 'react';
+import { createRoot } from 'react-dom/client';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { DeploymentPlanReview } from './DeploymentPlanReview.jsx';
-import { DeploymentSummary } from './AgenticDeploymentWorkspace.jsx';
+import { AuthContext } from '../../auth/AuthContext.js';
+import { DeploymentPermissionHandoff, DeploymentPlanReview } from './DeploymentPlanReview.jsx';
+import { DeploymentSummary, DeploymentWorkflow } from './AgenticDeploymentWorkspace.jsx';
 test('default review keeps 2D editing and restores the 3D explorer', () => {
     const html = renderToStaticMarkup(<DeploymentPlanReview content={'apiVersion: v1\nkind: Service\nmetadata:\n  name: endpoint'} />);
     assert.match(html, /3D explorer/);
@@ -202,4 +204,612 @@ test('measured trials inherit latency and snapshot capacity and expose confirmat
     assert.match(html, /value="latency" selected=""/);
     assert.match(html, /Benchmark: confirmation-id/);
     assert.match(html, /warm-up failed/);
+});
+
+test('DeploymentPermissionHandoff renders bootstrap setup, collapsible details, and optional subject override', () => {
+    const html = renderToStaticMarkup(
+        <DeploymentPermissionHandoff
+            mode="bootstrap"
+            namespace="llmd-qwen"
+            report={{
+                status: 'admin_required',
+                sufficient: false,
+                namespace: 'llmd-qwen',
+                identity: { kind: 'unknown', overrideRequired: true },
+                adminOperations: [{ id: 'ns.create', title: 'Create namespace and RBAC' }],
+                userOperations: [{ id: 'deploy.apply', title: 'Apply deployment manifests' }],
+                missing: [{ operationId: 'ns.create', verb: 'create', resource: 'namespaces' }],
+                warnings: ['EPP metrics require ClusterRoleBinding'],
+                marker: { namespace: 'llmd-qwen', name: 'lens-deployment-bootstrap', status: 'missing' },
+            }}
+            script={'#!/usr/bin/env bash\nkubectl apply -f -'}
+            filename="llmd-qwen-bootstrap.sh"
+            onGenerateScript={() => {}}
+            onPrimaryAction={() => {}}
+            primaryActionLabel="Re-check &amp; Deploy"
+        />,
+    );
+    assert.match(html, /Orchestration administrator namespace setup/);
+    assert.match(html, /llmd-qwen/);
+    assert.match(html, /Awaiting Orchestration administrator/);
+    assert.match(html, /Kubernetes identity override/);
+    assert.match(html, /placeholder="team-namespace"/);
+    assert.doesNotMatch(html, /placeholder="lens-edit"/);
+    assert.match(html, /Download \.sh/);
+    assert.match(html, /Copy script/);
+    assert.match(html, /Re-check &amp; Deploy/);
+    assert.match(html, /View operation details/);
+    assert.match(html, /<details class="group\/details[^"]*" open="">/);
+    assert.match(html, /<details class="group">/);
+    assert.doesNotMatch(html, /<details class="group"[^>]*open/);
+    assert.match(html, /Create namespace and RBAC/);
+    assert.match(html, /Apply deployment manifests/);
+    assert.match(html, /create namespaces/);
+    assert.match(html, /lens-deployment-bootstrap/);
+    assert.doesNotMatch(html, /\(s\)/);
+});
+
+test('DeploymentPermissionHandoff hides subject override when identity is detected and renders cleanup fallback only when unconfirmable', () => {
+    const detectedBootstrap = renderToStaticMarkup(
+        <DeploymentPermissionHandoff
+            mode="bootstrap"
+            namespace="llmd-qwen"
+            identity={{ kind: 'ServiceAccount', name: 'lens-sa', namespace: 'lens-edit', overrideRequired: false }}
+            script="#!/usr/bin/env bash"
+            onPrimaryAction={() => {}}
+        />,
+    );
+    assert.doesNotMatch(detectedBootstrap, /Kubernetes identity override/);
+    assert.match(detectedBootstrap, /<details class="group\/details[^"]*" open="">/);
+
+    const verifiableCleanup = renderToStaticMarkup(
+        <DeploymentPermissionHandoff
+            mode="cleanup"
+            namespace="llmd-qwen"
+            handoff={{
+                canVerifyMarker: true,
+                confirmRequired: false,
+                script: '#!/usr/bin/env bash\nkubectl delete ns llmd-qwen',
+                operations: [{ id: 'delete-ns', kind: 'Namespace', name: 'llmd-qwen' }],
+                completedOperations: ['Deployment/qwen'],
+                marker: { namespace: 'lens-edit', name: 'lens-deploy-cleanup-1', status: 'missing' },
+            }}
+            onPrimaryAction={() => {}}
+            onConfirmDelete={() => {}}
+        />,
+    );
+    assert.match(verifiableCleanup, /Orchestration administrator namespace cleanup/);
+    assert.match(verifiableCleanup, /Re-check &amp; Delete/);
+    assert.doesNotMatch(verifiableCleanup, /Confirm &amp; Delete Record/);
+    assert.match(verifiableCleanup, /<details class="group\/details[^"]*" open="">/);
+    assert.match(verifiableCleanup, /<details class="group">/);
+    assert.doesNotMatch(verifiableCleanup, /<details class="group"[^>]*open/);
+
+    const unconfirmableCleanup = renderToStaticMarkup(
+        <DeploymentPermissionHandoff
+            mode="cleanup"
+            namespace="llmd-qwen"
+            handoff={{
+                canVerifyMarker: false,
+                confirmRequired: true,
+                script: '#!/usr/bin/env bash\nkubectl delete ns llmd-qwen',
+                operations: ['delete-namespace'],
+            }}
+            onPrimaryAction={() => {}}
+            onConfirmDelete={() => {}}
+        />,
+    );
+    assert.match(unconfirmableCleanup, /Unconfirmed/);
+    assert.match(unconfirmableCleanup, /Confirm &amp; Delete Record/);
+    assert.match(unconfirmableCleanup, /<details class="group\/details[^"]*" open="">/);
+    assert.match(unconfirmableCleanup, /<details class="group">/);
+    assert.doesNotMatch(unconfirmableCleanup, /<details class="group"[^>]*open/);
+    assert.doesNotMatch(unconfirmableCleanup, /\(s\)/);
+});
+
+test('DeploymentPermissionHandoff collapses operation details when verified in bootstrap and cleanup modes', () => {
+    const verifiedBootstrap = renderToStaticMarkup(
+        <DeploymentPermissionHandoff
+            mode="bootstrap"
+            namespace="llmd-qwen"
+            report={{
+                status: 'verified',
+                sufficient: true,
+                adminOperations: [{ id: 'ns.create', title: 'Create namespace' }],
+                userOperations: [{ id: 'deploy.apply', title: 'Apply manifests' }],
+            }}
+            handoff={{
+                verified: true,
+                status: 'verified',
+                script: '#!/usr/bin/env bash',
+            }}
+            onPrimaryAction={() => {}}
+        />,
+    );
+    assert.match(verifiedBootstrap, /<details class="group\/details/);
+    assert.doesNotMatch(verifiedBootstrap, /<details[^>]*open/);
+
+    const sufficientBootstrap = renderToStaticMarkup(
+        <DeploymentPermissionHandoff
+            mode="bootstrap"
+            namespace="llmd-qwen"
+            report={{
+                sufficient: true,
+                adminOperations: [{ id: 'ns.create', title: 'Create namespace' }],
+            }}
+            onPrimaryAction={() => {}}
+        />,
+    );
+    assert.match(sufficientBootstrap, /<details class="group\/details/);
+    assert.doesNotMatch(sufficientBootstrap, /<details[^>]*open/);
+
+    const verifiedCleanup = renderToStaticMarkup(
+        <DeploymentPermissionHandoff
+            mode="cleanup"
+            namespace="llmd-qwen"
+            handoff={{
+                verified: true,
+                status: 'verified',
+                operations: [{ id: 'delete-ns', kind: 'Namespace', name: 'llmd-qwen' }],
+            }}
+            onPrimaryAction={() => {}}
+        />,
+    );
+    assert.match(verifiedCleanup, /<details class="group\/details/);
+    assert.doesNotMatch(verifiedCleanup, /<details[^>]*open/);
+
+    const deletedCleanup = renderToStaticMarkup(
+        <DeploymentPermissionHandoff
+            mode="cleanup"
+            namespace="llmd-qwen"
+            handoff={{
+                status: 'deleted',
+                operations: [{ id: 'delete-ns', kind: 'Namespace', name: 'llmd-qwen' }],
+            }}
+            onPrimaryAction={() => {}}
+        />,
+    );
+    assert.match(deletedCleanup, /<details class="group\/details/);
+    assert.doesNotMatch(deletedCleanup, /<details[^>]*open/);
+});
+
+test('DeploymentSummary renders Orchestration administrator namespace setup when adminHandoff is active and disables Deploy button', () => {
+    const html = renderToStaticMarkup(
+        <DeploymentSummary
+            run={summaryRun()}
+            draft={summaryDraft}
+            adminHandoff={{
+                namespace: 'llmd-test',
+                report: { status: 'admin_required', adminOperations: [{ id: 'ns.create', title: 'Create namespace' }] },
+                script: '#!/usr/bin/env bash',
+                identity: { kind: 'ServiceAccount', overrideRequired: false },
+            }}
+            onVerifyBootstrapAndDeploy={() => {}}
+        />,
+    );
+    assert.match(html, /Orchestration administrator namespace setup/);
+    assert.match(html, /Re-check &amp; Deploy/);
+    assert.match(html, /<button[^>]*disabled=""[^>]*>Deploy<\/button>/);
+});
+
+test('DeploymentSummary renders error prominently via FormError alert', () => {
+    const html = renderToStaticMarkup(
+        <DeploymentSummary
+            run={summaryRun()}
+            draft={summaryDraft}
+            confirmLabel="Confirm deployment"
+            error="Insufficient free accelerators on cluster."
+        />,
+    );
+    assert.match(html, /<p role="alert"[^>]*>Insufficient free accelerators on cluster\.<\/p>/);
+    assert.match(html, /Confirm deployment/);
+});
+
+function createTestDom() {
+    const makeNode = (tag, doc) => ({
+        nodeType: tag === '#text' ? 3 : tag === '#comment' ? 8 : 1,
+        nodeName: tag.toUpperCase(),
+        tagName: tag.toUpperCase(),
+        namespaceURI: 'http://www.w3.org/1999/xhtml',
+        ownerDocument: doc,
+        parentNode: null,
+        childNodes: [],
+        attributes: {},
+        style: {},
+        dataset: {},
+        nodeValue: '',
+        get textContent() {
+            if (this.nodeType === 3) return this.nodeValue || '';
+            if (this.nodeType === 8) return '';
+            return this.childNodes.map((child) => child.textContent).join('');
+        },
+        set textContent(value) {
+            const text = String(value);
+            if (this.nodeType === 3) {
+                this.nodeValue = text;
+                return;
+            }
+            this.childNodes = text ? [doc.createTextNode(text)] : [];
+            for (const child of this.childNodes) child.parentNode = this;
+        },
+        addEventListener() {},
+        removeEventListener() {},
+        setAttribute(key, value) { this.attributes[key] = String(value); },
+        removeAttribute(key) { delete this.attributes[key]; },
+        getAttribute(key) { return key in this.attributes ? this.attributes[key] : null; },
+        hasAttribute(key) { return key in this.attributes; },
+        appendChild(child) {
+            if (child.parentNode) child.parentNode.removeChild(child);
+            child.parentNode = this;
+            this.childNodes.push(child);
+            return child;
+        },
+        insertBefore(child, reference) {
+            if (child.parentNode) child.parentNode.removeChild(child);
+            child.parentNode = this;
+            const index = reference ? this.childNodes.indexOf(reference) : -1;
+            if (index === -1) this.childNodes.push(child);
+            else this.childNodes.splice(index, 0, child);
+            return child;
+        },
+        removeChild(child) {
+            const index = this.childNodes.indexOf(child);
+            if (index !== -1) {
+                this.childNodes.splice(index, 1);
+                child.parentNode = null;
+            }
+            return child;
+        },
+        get firstChild() { return this.childNodes[0] || null; },
+        get options() { return findElements(this, (el) => el.tagName === 'OPTION'); },
+        get nextSibling() {
+            if (!this.parentNode) return null;
+            const index = this.parentNode.childNodes.indexOf(this);
+            return index >= 0 ? this.parentNode.childNodes[index + 1] || null : null;
+        },
+        focus() {},
+        blur() {},
+    });
+    const win = {
+        addEventListener() {},
+        removeEventListener() {},
+        setInterval,
+        clearInterval,
+        requestAnimationFrame: (callback) => setTimeout(callback, 0),
+        cancelAnimationFrame: clearTimeout,
+        HTMLIFrameElement: function HTMLIFrameElement() {},
+        HTMLElement: function HTMLElement() {},
+        SVGElement: function SVGElement() {},
+        Node: function Node() {},
+    };
+    const doc = {
+        nodeType: 9,
+        hidden: true,
+        cookie: '',
+        defaultView: win,
+        documentElement: null,
+        body: null,
+        activeElement: null,
+        createElement(tag) { return makeNode(tag, doc); },
+        createElementNS(ns, tag) {
+            const node = makeNode(tag, doc);
+            node.namespaceURI = ns;
+            return node;
+        },
+        createTextNode(text) {
+            const node = makeNode('#text', doc);
+            node.nodeValue = String(text);
+            return node;
+        },
+        createComment(text) {
+            const node = makeNode('#comment', doc);
+            node.nodeValue = String(text);
+            return node;
+        },
+        addEventListener() {},
+        removeEventListener() {},
+        getElementById() { return null; },
+    };
+    win.document = doc;
+    doc.documentElement = makeNode('html', doc);
+    doc.body = makeNode('body', doc);
+    doc.documentElement.appendChild(doc.body);
+    return { doc, win };
+}
+
+function findElements(root, predicate, acc = []) {
+    if (!root || root.nodeType !== 1) return acc;
+    if (predicate(root)) acc.push(root);
+    for (const child of root.childNodes) findElements(child, predicate, acc);
+    return acc;
+}
+
+function reactProps(element) {
+    const key = Object.keys(element).find((name) => name.startsWith('__reactProps$'));
+    return key ? element[key] : {};
+}
+
+async function withWorkflowDom(t, fetchHandler, runScenario) {
+    const prevAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
+    const prevDoc = globalThis.document;
+    const prevWin = globalThis.window;
+    const prevHtml = globalThis.HTMLElement;
+    const prevSvg = globalThis.SVGElement;
+    const prevIframe = globalThis.HTMLIFrameElement;
+    const prevFetch = globalThis.fetch;
+    const prevStorage = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');
+    const store = new Map();
+    const { doc, win } = createTestDom();
+    globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+    globalThis.document = doc;
+    globalThis.window = win;
+    globalThis.HTMLElement = win.HTMLElement;
+    globalThis.SVGElement = win.SVGElement;
+    globalThis.HTMLIFrameElement = win.HTMLIFrameElement;
+    globalThis.fetch = fetchHandler;
+    Object.defineProperty(globalThis, 'sessionStorage', {
+        configurable: true,
+        value: {
+            getItem: (key) => (store.has(key) ? store.get(key) : null),
+            setItem: (key, val) => { store.set(key, String(val)); },
+            removeItem: (key) => { store.delete(key); },
+        },
+    });
+    const container = doc.createElement('div');
+    doc.body.appendChild(container);
+    const root = createRoot(container);
+    t.after(async () => {
+        await act(async () => { root.unmount(); });
+        globalThis.IS_REACT_ACT_ENVIRONMENT = prevAct;
+        if (prevDoc === undefined) delete globalThis.document; else globalThis.document = prevDoc;
+        if (prevWin === undefined) delete globalThis.window; else globalThis.window = prevWin;
+        if (prevHtml === undefined) delete globalThis.HTMLElement; else globalThis.HTMLElement = prevHtml;
+        if (prevSvg === undefined) delete globalThis.SVGElement; else globalThis.SVGElement = prevSvg;
+        if (prevIframe === undefined) delete globalThis.HTMLIFrameElement; else globalThis.HTMLIFrameElement = prevIframe;
+        globalThis.fetch = prevFetch;
+        if (prevStorage) Object.defineProperty(globalThis, 'sessionStorage', prevStorage);
+        else delete globalThis.sessionStorage;
+    });
+    const findButton = (labelPattern) => findElements(
+        doc.body,
+        (el) => el.tagName === 'BUTTON' && labelPattern.test(el.textContent.trim()),
+    )[0] || null;
+    const clickButton = async (labelPattern) => {
+        const button = findButton(labelPattern);
+        assert.ok(button, `Expected button matching ${labelPattern}`);
+        const props = reactProps(button);
+        assert.equal(Boolean(props.disabled), false, `Expected button ${labelPattern} to be enabled`);
+        await act(async () => {
+            await props.onClick?.({ preventDefault() {}, stopPropagation() {} });
+        });
+    };
+    const alerts = () => findElements(
+        doc.body,
+        (el) => el.getAttribute('role') === 'alert',
+    ).map((el) => el.textContent.trim());
+    await runScenario({ root, doc, findButton, clickButton, alerts });
+}
+
+function makeRestoredPlanRun() {
+    return {
+        id: 'run-plan-1',
+        revision: 1,
+        status: 'awaiting_approval',
+        request: {
+            deployment_name: 'qwen-serving',
+            ai_provider_id: 'prov-1',
+            execution_policy: { allow_trials: false },
+            requirements: {
+                objective: 'balanced',
+                workload: {},
+                hard_constraints: {},
+                performance_targets: {},
+                required_features: [],
+                forbidden_features: [],
+            },
+        },
+        selected_candidate: { id: 'cand-1', replicas: 1, tensor_parallel_size: 1, provider_ref: 'optimized-baseline' },
+        candidates: [{ id: 'cand-1', replicas: 1, tensor_parallel_size: 1, required_gpus: 1, provider_ref: 'optimized-baseline' }],
+        configuration_plan: {
+            configuration: {
+                checksum: 'checksum-1',
+                content: { officialGuide: { renderedManifest: 'apiVersion: v1\nkind: Service\nmetadata:\n  name: inference-gateway' } },
+            },
+            source_bundle: {
+                files: [{ name: 'deployment.yaml', content: 'apiVersion: v1\nkind: Service\nmetadata:\n  name: inference-gateway' }],
+            },
+            endpoints: [{ value: 'inference-gateway:80', serviceName: 'inference-gateway', port: 80 }],
+            resource_estimate: { accelerators: 1, available_accelerators: 4 },
+            validation: { status: 'resources_checked', warnings: [] },
+        },
+    };
+}
+
+const workflowDraft = {
+    clusterId: 'cluster-a',
+    clusterName: 'Cluster A',
+    model: 'Qwen/Qwen3-8B',
+    deploymentName: 'qwen-serving',
+    storageVolumeId: 'vol-1',
+    resumeRunId: 'run-plan-1',
+};
+
+function jsonResponse(body, status = 200) {
+    return new Response(JSON.stringify(body), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+    });
+}
+
+test('DeploymentWorkflow verifyBootstrapAndDeploy forwards verified namespace and initialized endpoint to approve', async (t) => {
+    const planRun = makeRestoredPlanRun();
+    const approvePayloads = [];
+    const startedRuns = [];
+    await withWorkflowDom(
+        t,
+        async (url, options = {}) => {
+            if (url === '/api/agentic-deployments/run-plan-1') return jsonResponse(planRun);
+            if (url === '/api/v1/deployments/permission-check') {
+                return jsonResponse({
+                    sufficient: false,
+                    status: 'admin_required',
+                    namespace: 'llmd-pending',
+                    identity: { kind: 'ServiceAccount', name: 'deployer', namespace: 'team-ns', overrideRequired: false },
+                    adminOperations: [{ id: 'ns.create', title: 'Create namespace' }],
+                });
+            }
+            if (url === '/api/v1/deployments/permission-remediation') {
+                return jsonResponse({
+                    script: '#!/usr/bin/env bash\nkubectl apply -f -',
+                    namespace: 'llmd-bootstrapped-1',
+                    bootstrapDigest: 'digest-1',
+                });
+            }
+            if (url === '/api/v1/deployments/admin-handoff/verify') {
+                return jsonResponse({
+                    verified: true,
+                    status: 'verified',
+                    namespace: 'llmd-bootstrapped-1',
+                });
+            }
+            if (url === '/api/agentic-deployments/run-plan-1/approve') {
+                approvePayloads.push(JSON.parse(options.body));
+                return jsonResponse({ ...planRun, status: 'deploying', deployment_run_id: 'exec-run-1' }, 202);
+            }
+            throw new Error(`Unexpected fetch: ${url}`);
+        },
+        async ({ root, clickButton }) => {
+            await act(async () => {
+                root.render(
+                    <AuthContext.Provider value={{ can: () => true }}>
+                        <DeploymentWorkflow
+                            draft={workflowDraft}
+                            mode="manual"
+                            embedded
+                            onDeploymentStarted={(result) => startedRuns.push(result)}
+                        />
+                    </AuthContext.Provider>,
+                );
+            });
+            await clickButton(/Review & deploy/);
+            await clickButton(/^Confirm deployment$/);
+            await clickButton(/Re-check & Deploy/);
+
+            assert.equal(approvePayloads.length, 1);
+            assert.deepEqual(approvePayloads[0], {
+                configuration_checksum: 'checksum-1',
+                endpoint: 'inference-gateway:80',
+                namespace: 'llmd-bootstrapped-1',
+            });
+            assert.equal(startedRuns.length, 1);
+            assert.equal(startedRuns[0].deployment_run_id, 'exec-run-1');
+        },
+    );
+});
+
+test('DeploymentWorkflow verifyBootstrapAndDeploy surfaces 409 approve conflict prominently and re-enables Confirm deployment', async (t) => {
+    const planRun = makeRestoredPlanRun();
+    let approveCalls = 0;
+    await withWorkflowDom(
+        t,
+        async (url) => {
+            if (url === '/api/agentic-deployments/run-plan-1') return jsonResponse(planRun);
+            if (url === '/api/v1/deployments/permission-check') {
+                return jsonResponse({
+                    sufficient: false,
+                    status: 'admin_required',
+                    namespace: 'llmd-bootstrapped-1',
+                    identity: { kind: 'ServiceAccount', name: 'deployer', namespace: 'team-ns', overrideRequired: false },
+                    adminOperations: [{ id: 'ns.create', title: 'Create namespace' }],
+                });
+            }
+            if (url === '/api/v1/deployments/permission-remediation') {
+                return jsonResponse({
+                    script: '#!/usr/bin/env bash\nkubectl apply -f -',
+                    namespace: 'llmd-bootstrapped-1',
+                });
+            }
+            if (url === '/api/v1/deployments/admin-handoff/verify') {
+                return jsonResponse({
+                    verified: true,
+                    status: 'verified',
+                    namespace: 'llmd-bootstrapped-1',
+                });
+            }
+            if (url === '/api/agentic-deployments/run-plan-1/approve') {
+                approveCalls += 1;
+                return jsonResponse({ detail: 'Model cache PVC is not bound in target namespace.' }, 409);
+            }
+            throw new Error(`Unexpected fetch: ${url}`);
+        },
+        async ({ root, findButton, clickButton, alerts }) => {
+            await act(async () => {
+                root.render(
+                    <AuthContext.Provider value={{ can: () => true }}>
+                        <DeploymentWorkflow draft={workflowDraft} mode="manual" embedded />
+                    </AuthContext.Provider>,
+                );
+            });
+            await clickButton(/Review & deploy/);
+            await clickButton(/^Confirm deployment$/);
+            assert.equal(Boolean( reactProps(findButton(/^Confirm deployment$/)).disabled ), true);
+
+            await clickButton(/Re-check & Deploy/);
+            assert.equal(approveCalls, 1);
+            assert.ok(
+                alerts().some((text) => text.includes('Model cache PVC is not bound in target namespace.')),
+                `Expected conflict detail in alerts, got: ${JSON.stringify(alerts())}`,
+            );
+            const confirmBtn = findButton(/^Confirm deployment$/);
+            assert.ok(confirmBtn);
+            assert.equal(Boolean(reactProps(confirmBtn).disabled), false);
+        },
+    );
+});
+
+test('DeploymentWorkflow deploy passes checked namespace to approve and opens adminHandoff on 409 deployment_admin_setup_required', async (t) => {
+    const planRun = makeRestoredPlanRun();
+    const approvePayloads = [];
+    await withWorkflowDom(
+        t,
+        async (url, options = {}) => {
+            if (url === '/api/agentic-deployments/run-plan-1') return jsonResponse(planRun);
+            if (url === '/api/v1/deployments/permission-check') {
+                return jsonResponse({
+                    sufficient: true,
+                    status: 'sufficient',
+                    namespace: 'llmd-bootstrapped-1',
+                });
+            }
+            if (url === '/api/agentic-deployments/run-plan-1/approve') {
+                approvePayloads.push(JSON.parse(options.body));
+                return jsonResponse({
+                    code: 'deployment_admin_setup_required',
+                    detail: 'Namespace setup is required before deploying.',
+                    namespace: 'llmd-bootstrapped-1',
+                    identity: { kind: 'ServiceAccount', name: 'deployer', namespace: 'team-ns', overrideRequired: false },
+                    adminOperations: [{ id: 'ns.create', title: 'Create namespace and RBAC' }],
+                    script: '#!/usr/bin/env bash\nkubectl apply -f -',
+                }, 409);
+            }
+            throw new Error(`Unexpected fetch: ${url}`);
+        },
+        async ({ root, doc, findButton, clickButton }) => {
+            await act(async () => {
+                root.render(
+                    <AuthContext.Provider value={{ can: () => true }}>
+                        <DeploymentWorkflow draft={workflowDraft} mode="manual" embedded />
+                    </AuthContext.Provider>,
+                );
+            });
+            await clickButton(/Review & deploy/);
+            await clickButton(/^Confirm deployment$/);
+
+            assert.equal(approvePayloads.length, 1);
+            assert.equal(approvePayloads[0].namespace, 'llmd-bootstrapped-1');
+            assert.match(doc.body.textContent, /Orchestration administrator namespace setup/);
+            assert.ok(findButton(/Re-check & Deploy/), 'Expected adminHandoff Re-check & Deploy button to render');
+            assert.equal(Boolean(reactProps(findButton(/^Confirm deployment$/)).disabled), true);
+        },
+    );
 });

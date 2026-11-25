@@ -67,7 +67,7 @@ export function candidateCompositionDraft(run, candidate, catalog, profile, entr
         clusterId: requirements.cluster_id, model: run.request.model,
         modelCacheEntryId: entry.id, storageVolumeId: volume.id,
         profileId: profile.id, accelerator: profile.upstream_variant, image: '',
-        sourceCommit: catalog.commit, sourceNamespace: volume.dynamicPvc?.namespace || 'llm-d-bench-storage',
+        sourceCommit: catalog.commit, sourceNamespace: volume.dynamicPvc?.namespace || volume.localDisk?.namespace || volume.nfs?.namespace || 'llm-d-bench-storage',
         sourceVariables: compositionDefaults(catalog), selectedGuides, capabilityOverrides: overrides, guideChoices: {},
         candidateCapabilities: Object.keys(overrides).filter(id => !userChoices.has(id)),
         planningMode: run.request.planning_mode,

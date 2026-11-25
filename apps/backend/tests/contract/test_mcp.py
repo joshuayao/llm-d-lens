@@ -51,6 +51,28 @@ def test_generator_refuses_unclassified_operations():
         generate_catalog({"paths": {"/new-route": {"post": {"operationId": "new_route_post"}}}})
 
 
+def test_admin_handoff_status_is_mcp_read_and_verify_is_ui_only():
+    from llm_d_lens.api.main import app
+    from llm_d_lens.mcp.catalog import catalog, definitions
+
+    tools = {tool["name"]: tool for tool in catalog(app)}
+    assert tools["get_cluster_admin_handoff_status"]["riskTier"] == "read"
+    assert "verify_admin_handoff" not in tools
+    assert tools["get_model_gateway_remediation"]["riskTier"] == "read"
+    skips = set(definitions()["intentionalSkips"])
+    assert "POST /api/v1/model-service/admin/gateway/remediation" in skips
+    assert "POST /api/v1/model-service/admin/gateway/remediation/verify" in skips
+    assert not any(
+        tool.get("method") == "POST"
+        and tool.get("route")
+        in {
+            "/api/v1/model-service/admin/gateway/remediation",
+            "/api/v1/model-service/admin/gateway/remediation/verify",
+        }
+        for tool in tools.values()
+    )
+
+
 def test_full_backend_catalog_has_unique_names_and_special_risk_tiers():
     from llm_d_lens.api.main import app
 
@@ -207,3 +229,21 @@ async def test_candidate_tools_advertise_and_forward_load_targets(monkeypatch, f
         SimpleNamespace(app=app), "search_candidates", {"workload": workload, "searchConfig": {}, "sourceIds": ["aic"]}
     )
     assert upstream.call_args.args[3]["workload"] == workload
+
+
+def test_cluster_plan_routes_are_intentional_skips():
+    from llm_d_lens.api.main import app
+    from llm_d_lens.mcp.catalog import definitions, generate_catalog
+
+    skipped_routes = {
+        "GET /api/cluster/clusters/{cluster_id}",
+        "GET /api/cluster/clusters/{cluster_id}/plan",
+        "PUT /api/cluster/clusters/{cluster_id}/plan",
+        "POST /api/cluster/clusters/{cluster_id}/permission-check",
+        "POST /api/cluster/clusters/{cluster_id}/execution/cancel",
+    }
+    assert skipped_routes <= set(definitions()["intentionalSkips"])
+
+    generated = {(tool.get("method"), tool.get("route")) for tool in generate_catalog(app.openapi())}
+    expected = {(method, path) for method, path in (route.split(" ", 1) for route in skipped_routes)}
+    assert not expected & generated

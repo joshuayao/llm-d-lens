@@ -9,8 +9,12 @@ the existing Cluster infrastructure stack (``prometheus.release`` /
 from __future__ import annotations
 
 import json
+import re
+import shlex
 from datetime import UTC, datetime
 from typing import Any
+
+import yaml
 
 from llm_d_lens.infrastructure.kubernetes import (
     cluster_info,
@@ -22,6 +26,7 @@ from llm_d_lens.infrastructure.kubernetes import (
     label_node,
     list_resources,
     scoped_runner,
+    validate_namespace,
 )
 from llm_d_lens.infrastructure.process import CommandNotFoundError, CommandResult, which
 from llm_d_lens.monitoring.cluster_stack.models import (
@@ -42,7 +47,7 @@ from .models import (
     GpuAccess,
     PreflightCheck,
 )
-from .registry import register
+from .registry import AcceleratorCleanupSpec, register
 
 _CHART_REPO = "oci://ghcr.io/intel/xpumanager/charts/xpumd"
 _CHART_VERSION = "2.1.0"
@@ -227,9 +232,35 @@ def _xpumd_component(resources: list[dict[str, Any]]) -> AcceleratorComponent:
     )
 
 
+def _resolve_monitoring_namespace(cluster_id: str | None, explicit: str | None = None) -> str:
+    if explicit is not None and explicit.strip():
+        return validate_namespace(explicit)
+    if cluster_id:
+        try:
+            from llm_d_lens.cluster.registry import get_cluster_monitoring_settings  # noqa: PLC0415
+
+            settings = get_cluster_monitoring_settings(cluster_id)
+        except Exception:
+            settings = None
+        configured = str((settings or {}).get("monitoring_namespace") or "").strip()
+        if configured:
+            try:
+                return validate_namespace(configured)
+            except ValueError:
+                pass
+    return _MONITORING_DEFAULT_NAMESPACE
+
+
 def _servicemonitor_component(items: list[dict[str, Any]]) -> AcceleratorComponent:
     if not items:
-        return AcceleratorComponent(name="prometheus_service_monitor", status="missing", kind="crd", source="none")
+        return AcceleratorComponent(
+            name="prometheus_service_monitor",
+            status="missing",
+            kind="crd",
+            ready=0,
+            desired=1,
+            source="none",
+        )
     return AcceleratorComponent(
         name="prometheus_service_monitor",
         status="ready",
@@ -242,7 +273,14 @@ def _servicemonitor_component(items: list[dict[str, Any]]) -> AcceleratorCompone
 
 def _dashboard_component(items: list[dict[str, Any]]) -> AcceleratorComponent:
     if not items:
-        return AcceleratorComponent(name="grafana_dashboard", status="missing", kind="configmap", source="none")
+        return AcceleratorComponent(
+            name="grafana_dashboard",
+            status="missing",
+            kind="configmap",
+            ready=0,
+            desired=1,
+            source="none",
+        )
     return AcceleratorComponent(
         name="grafana_dashboard",
         status="ready",
@@ -373,7 +411,7 @@ class IntelGpuProvider:
         active_operation_id: str | None = None,
     ) -> AcceleratorStatusResponse:
         observed_at = datetime.now(UTC)
-        monitoring_namespace = monitoring_namespace or _MONITORING_DEFAULT_NAMESPACE
+        monitoring_namespace = _resolve_monitoring_namespace(cluster_id, monitoring_namespace)
         try:
             context = await current_context(cluster_id)
             reachable = await cluster_info(cluster_id)
@@ -543,7 +581,10 @@ class IntelGpuProvider:
         if not all(check.passed for check in checks):
             return AcceleratorPreflightResponse(allowed=False, status="unknown", checks=checks)
 
-        monitoring_namespace = monitoring_status.namespace if monitoring_status else _MONITORING_DEFAULT_NAMESPACE
+        monitoring_namespace = _resolve_monitoring_namespace(
+            cluster_id,
+            request.monitoring_namespace or (monitoring_status.namespace if monitoring_status else None),
+        )
         try:
             snapshot = await self.discover_status(
                 request.namespace,
@@ -722,6 +763,430 @@ class IntelGpuProvider:
             "--namespace",
             request.namespace,
         ]
+
+    def cleanup_spec(self, *, namespace: str | None = None) -> AcceleratorCleanupSpec:
+        return AcceleratorCleanupSpec(
+            provider_id="intel_gpu",
+            display_name="Intel GPU",
+            release_name=_RELEASE_NAME,
+            namespace=validate_namespace(namespace or _DEFAULT_NAMESPACE),
+        )
+
+    @staticmethod
+    def _fallback_servicemonitor_lines(mon_rel: str) -> list[str]:
+        """Render managed-mode fallback ServiceMonitor reconciliation when exporter DS install is skipped."""
+        sm_existing_jp = (
+            "{range .items[*]}"
+            '{.metadata.name}{"\\t"}'
+            '{.metadata.labels.app\\.kubernetes\\.io/name}{"\\t"}'
+            '{.metadata.labels.app}{"\\t"}'
+            '{.spec.selector.matchLabels}{"\\n"}'
+            "{end}"
+        )
+        sm_mon_jp = (
+            "{range .items[*]}"
+            '{.metadata.name}{"\\t"}'
+            '{.spec.namespaceSelector.any}{"\\t"}'
+            '{.spec.namespaceSelector.matchNames[*]}{"\\t"}'
+            '{.spec.selector.matchLabels}{"\\n"}'
+            "{end}"
+        )
+        svc_labels_jp = (
+            '{.metadata.labels.app\\.kubernetes\\.io/name}{"\\t"}'
+            '{.metadata.labels.app}{"\\t"}'
+            '{.metadata.labels.app\\.kubernetes\\.io/instance}{"\\n"}'
+        )
+        svc_ports_jp = '{range .spec.ports[*]}{.name}{"\\t"}{.port}{"\\n"}{end}'
+        return [
+            '  EXISTING_NS="${EXISTING_DS%%/*}"',
+            '  if [[ "$EXISTING_NS" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]]; then',
+            "    if kubectl get crd servicemonitors.monitoring.coreos.com >/dev/null 2>&1; then",
+            (
+                '      EXISTING_SM="$(kubectl get servicemonitor -n "$EXISTING_NS" '
+                f"-o jsonpath='{sm_existing_jp}' 2>/dev/null "
+                "| awk -F'\\t' '!found && tolower($1 \" \" $2 \" \" $3 \" \" $4) ~ /(xpumd|intel-xpumanager)/ "
+                '{ print $1; found=1 }\' || true)"'
+            ),
+            '      if [[ -z "$EXISTING_SM" && "$MONITORING_NS" != "$EXISTING_NS" ]]; then',
+            (
+                '        EXISTING_SM="$(kubectl get servicemonitor -n "$MONITORING_NS" '
+                f"-o jsonpath='{sm_mon_jp}' 2>/dev/null "
+                "| awk -F'\\t' -v target_ns=\"$EXISTING_NS\" "
+                "'!found && tolower($1 \" \" $4) ~ /(xpumd|intel-xpumanager)/ "
+                '&& ($2 == "true" || index(" " $3 " ", " " target_ns " ") > 0) '
+                '{ print $1; found=1 }\' || true)"'
+            ),
+            "      fi",
+            '      if [[ -n "$EXISTING_SM" ]]; then',
+            (
+                '        echo "ServiceMonitor \'$EXISTING_SM\' already covers exporter '
+                'in namespace \'$EXISTING_NS\'; skipping fallback ServiceMonitor."'
+            ),
+            "      else",
+            (
+                '        EXPORTER_SVC="$(kubectl get svc -n "$EXISTING_NS" '
+                "-o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}' 2>/dev/null "
+                "| awk '!found && tolower($0) ~ /(xpumd|intel-xpumanager)/ "
+                '{ print $0; found=1 }\' || true)"'
+            ),
+            (
+                '        if [[ -z "$EXPORTER_SVC" '
+                '|| ! "$EXPORTER_SVC" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]]; then'
+            ),
+            (
+                '          echo "Warning: no matching exporter Service found in '
+                '\'$EXISTING_NS\'; skipping fallback ServiceMonitor."'
+            ),
+            "        else",
+            (
+                '          SM_SELECTOR_PAIR="$(kubectl get svc "$EXPORTER_SVC" -n "$EXISTING_NS" '
+                f"-o jsonpath='{svc_labels_jp}' 2>/dev/null "
+                "| awk -F'\\t' '!found { "
+                'keys[1]="app.kubernetes.io/name"; keys[2]="app"; '
+                'keys[3]="app.kubernetes.io/instance"; '
+                'for (i=1; i<=3; i++) { '
+                'if ($i != "" && length($i) <= 63 '
+                '&& $i ~ /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/) '
+                '{ print keys[i] "\\t" $i; found=1; break } } }\' || true)"'
+            ),
+            '          SM_SELECTOR_KEY=""',
+            '          SM_SELECTOR_VAL=""',
+            '          if [[ -n "$SM_SELECTOR_PAIR" ]]; then',
+            "            SM_SELECTOR_KEY=\"${SM_SELECTOR_PAIR%%$'\\t'*}\"",
+            "            SM_SELECTOR_VAL=\"${SM_SELECTOR_PAIR#*$'\\t'}\"",
+            "          fi",
+            (
+                '          METRICS_PORT_NAME="$(kubectl get svc "$EXPORTER_SVC" -n "$EXISTING_NS" '
+                f"-o jsonpath='{svc_ports_jp}' 2>/dev/null "
+                "| awk -F'\\t' '$0 != \"\" { count++; name=$1; port=$2; "
+                'if (name ~ /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/) { '
+                'if (p1 == "" && tolower(name) ~ /metrics/) p1=name; '
+                'if (p2 == "" && (port == "8080" || port == "29999")) p2=name; '
+                'if (count == 1) p3=name } } '
+                'END { if (p1 != "") print p1; else if (p2 != "") print p2; '
+                'else if (count == 1 && p3 != "") print p3 }\' || true)"'
+            ),
+            (
+                '          if [[ -z "$SM_SELECTOR_KEY" '
+                '|| ! "$SM_SELECTOR_VAL" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$ ]]; then'
+            ),
+            (
+                '            echo "Warning: Service \'$EXPORTER_SVC\' in \'$EXISTING_NS\' '
+                'lacks a safe selector label; skipping fallback ServiceMonitor."'
+            ),
+            (
+                '          elif [[ -z "$METRICS_PORT_NAME" '
+                '|| ! "$METRICS_PORT_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then'
+            ),
+            (
+                '            echo "Warning: Service \'$EXPORTER_SVC\' in \'$EXISTING_NS\' '
+                'lacks a named metrics port; skipping fallback ServiceMonitor."'
+            ),
+            "          else",
+            "            kubectl apply -f - <<LENS_FALLBACK_SM",
+            "apiVersion: monitoring.coreos.com/v1",
+            "kind: ServiceMonitor",
+            "metadata:",
+            "  name: lens-managed-xpumd",
+            "  namespace: ${EXISTING_NS}",
+            "  labels:",
+            "    app.kubernetes.io/managed-by: lens",
+            f"    release: {mon_rel}",
+            "spec:",
+            "  selector:",
+            "    matchLabels:",
+            '      ${SM_SELECTOR_KEY}: "${SM_SELECTOR_VAL}"',
+            "  endpoints:",
+            '    - port: "${METRICS_PORT_NAME}"',
+            "      path: /metrics",
+            "LENS_FALLBACK_SM",
+            "          fi",
+            "        fi",
+            "      fi",
+            "    else",
+            '      echo "ServiceMonitor CRD not present; skipping fallback ServiceMonitor."',
+            "    fi",
+            "  else",
+            (
+                '    echo "Warning: ignoring invalid exporter namespace \'$EXISTING_NS\'; '
+                'skipping fallback ServiceMonitor."'
+            ),
+            "  fi",
+        ]
+
+    @staticmethod
+    def _fallback_dashboard_lines(mon_ns: str) -> list[str]:
+        """Reconcile missing xpumd Grafana dashboard ConfigMap in MONITORING_NS when Helm install is skipped."""
+        dash_values_yaml = yaml.safe_dump(
+            {
+                "prometheus": {"monitor": False},
+                "grafana": {"dashboards": True, "namespace": mon_ns},
+            },
+            sort_keys=False,
+        ).rstrip()
+        cm_mon_jp = '{range .items[*]}{.metadata.name}{"\\n"}{end}'
+        cm_all_jp = '{range .items[*]}{.metadata.namespace}{"\\t"}{.metadata.name}{"\\n"}{end}'
+        awk_extract = (
+            'BEGIN { ORS="" } '
+            "function flush_doc(    i, n, line, in_meta, skip_block, saw_ns) { "
+            'if (doc ~ /(^|\\n)kind:[[:space:]]*ConfigMap([[:space:]]|\\n|$)/ && doc ~ /grafana_dashboard/) { '
+            'gsub(/app\\.kubernetes\\.io\\/managed-by:[[:space:]]*["\\047]?Helm["\\047]?/, '
+            '"app.kubernetes.io/managed-by: lens", doc); '
+            'n = split(doc, lines, "\\n"); in_meta = 0; skip_block = 0; saw_ns = 0; print "---\\n"; '
+            "for (i = 1; i <= n; i++) { "
+            "line = lines[i]; "
+            "if (line ~ /^[^[:space:]]/) { "
+            'if (in_meta && !saw_ns) print "  namespace: " mon_ns "\\n"; '
+            "in_meta = (line ~ /^metadata:[[:space:]]*$/); skip_block = 0 "
+            "} else if (in_meta) { "
+            "if (line ~ /^  [A-Za-z0-9_.-]+:/) skip_block = 0; "
+            "if (skip_block) continue; "
+            "if (line ~ /^  (uid|resourceVersion|creationTimestamp):/) continue; "
+            "if (line ~ /^  ownerReferences:/) { skip_block = 1; continue } "
+            "if (line ~ /^    (meta\\.helm\\.sh\\/|helm\\.sh\\/chart:)/) continue; "
+            'if (line ~ /^  namespace:/) { print "  namespace: " mon_ns "\\n"; saw_ns = 1; continue } '
+            "} "
+            'if (i < n || line != "") print line "\\n" '
+            "} } "
+            'doc = "" } '
+            "/^---([[:space:]]|$)/ { flush_doc(); next } "
+            '{ doc = (doc == "" ? $0 : doc "\\n" $0) } '
+            "END { flush_doc() }"
+        )
+        return [
+            '  if kubectl get namespace "$MONITORING_NS" >/dev/null 2>&1; then',
+            (
+                '    EXISTING_MON_DASH="$(kubectl get configmap -n "$MONITORING_NS" -l grafana_dashboard=1 '
+                f"-o jsonpath='{cm_mon_jp}' 2>/dev/null "
+                "| awk '!found && tolower($0) ~ /(xpumd|intel)/ { print $0; found=1 }' || true)\""
+            ),
+            '    if [[ -n "$EXISTING_MON_DASH" ]]; then',
+            (
+                '      echo "Grafana dashboard ConfigMap \'$EXISTING_MON_DASH\' already present '
+                'in \'$MONITORING_NS\'; skipping dashboard reconciliation."'
+            ),
+            "    else",
+            (
+                '      SRC_DASH_PAIR="$(kubectl get configmap --all-namespaces -l grafana_dashboard=1 '
+                f"-o jsonpath='{cm_all_jp}' 2>/dev/null "
+                "| awk -F'\\t' -v mon_ns=\"$MONITORING_NS\" "
+                "'!found && $1 != \"\" && $1 != mon_ns && tolower($2) ~ /(xpumd|intel)/ "
+                "{ print $1 \"\\t\" $2; found=1 }' || true)\""
+            ),
+            '      DASH_JSON=""',
+            '      DASH_CM_NAME="intel-xpumd-dashboard"',
+            '      if [[ -n "$SRC_DASH_PAIR" ]]; then',
+            "        SRC_DASH_NS=\"${SRC_DASH_PAIR%%$'\\t'*}\"",
+            "        SRC_DASH_NAME=\"${SRC_DASH_PAIR#*$'\\t'}\"",
+            (
+                '        if [[ "$SRC_DASH_NS" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ '
+                '&& "$SRC_DASH_NAME" =~ ^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$ ]]; then'
+            ),
+            '          DASH_CM_NAME="$SRC_DASH_NAME"',
+            (
+                '          DASH_JSON="$(kubectl get configmap "$SRC_DASH_NAME" -n "$SRC_DASH_NS" '
+                "-o jsonpath='{.data.dashboard\\.json}' 2>/dev/null || true)\""
+            ),
+            '          if [[ -z "$DASH_JSON" ]]; then',
+            (
+                '            DASH_JSON="$(kubectl get configmap "$SRC_DASH_NAME" -n "$SRC_DASH_NS" '
+                "-o go-template='{{range $k, $v := .data}}{{$v}}{{end}}' 2>/dev/null || true)\""
+            ),
+            "          fi",
+            "        fi",
+            "      fi",
+            '      if [[ -n "$DASH_JSON" ]]; then',
+            '        DASH_CM_FILE="$TMP_DIR/xpumd-dashboard-cm.yaml"',
+            '        cat <<LENS_XPUMD_DASH_HEADER >"$DASH_CM_FILE"',
+            "apiVersion: v1",
+            "kind: ConfigMap",
+            "metadata:",
+            "  name: ${DASH_CM_NAME}",
+            "  namespace: ${MONITORING_NS}",
+            "  labels:",
+            '    grafana_dashboard: "1"',
+            "    app.kubernetes.io/managed-by: lens",
+            "data:",
+            "  dashboard.json: |-",
+            "LENS_XPUMD_DASH_HEADER",
+            "        printf '%s\\n' \"$DASH_JSON\" | sed 's/^/    /' >>\"$DASH_CM_FILE\"",
+            '        cat "$DASH_CM_FILE" | kubectl apply -f -',
+            "      else",
+            '        DASH_VALUES_FILE="$TMP_DIR/xpumd-dashboard-values.yaml"',
+            '        cat <<\'LENS_XPUMD_DASH_VALUES\' >"$DASH_VALUES_FILE"',
+            dash_values_yaml,
+            "LENS_XPUMD_DASH_VALUES",
+            (
+                '        RENDERED_DASH="$(helm template "$RELEASE_NAME" "$CHART_REPO" '
+                '--version "$CHART_VERSION" --namespace "$TARGET_NS" '
+                '--values "$DASH_VALUES_FILE" 2>/dev/null || true)"'
+            ),
+            (
+                '        DASH_MANIFEST="$(printf \'%s\\n\' "$RENDERED_DASH" '
+                f"| awk -v mon_ns=\"$MONITORING_NS\" {shlex.quote(awk_extract)})\""
+            ),
+            '        if [[ -n "$DASH_MANIFEST" ]]; then',
+            '          printf \'%s\\n\' "$DASH_MANIFEST" | kubectl apply -n "$MONITORING_NS" -f -',
+            "        fi",
+            "      fi",
+            "    fi",
+            "  fi",
+        ]
+
+    def render_install_script(
+        self,
+        *,
+        namespace: str | None = None,
+        access_mode: GpuAccess | None = None,
+        monitoring_namespace: str | None = _MONITORING_DEFAULT_NAMESPACE,
+        monitoring_release: str = _MONITORING_DEFAULT_RELEASE,
+        existing_monitoring: bool = False,
+    ) -> str:
+        target_ns = validate_namespace(namespace or _DEFAULT_NAMESPACE)
+        mon_ns = validate_namespace(monitoring_namespace or _MONITORING_DEFAULT_NAMESPACE)
+        mon_rel = validate_namespace(monitoring_release)
+        effective_mode: GpuAccess = access_mode or "dra"
+        if effective_mode not in _ACCESS_MODES:
+            raise ValueError(f"Unsupported Intel GPU access mode: {effective_mode!r}")
+
+        node_selector = _gpu_node_label_selector()
+        label_args = " ".join(shlex.quote(f"{key}={value}") for key, value in node_selector.items())
+
+        values_dict = {
+            "gpuAccess": effective_mode,
+            "nodeSelector": node_selector,
+            "prometheus": {
+                "monitor": "__SM_ENABLED__",
+                "release": mon_rel,
+            },
+            "grafana": {
+                "dashboards": "__DASHBOARDS_ENABLED__",
+                "namespace": mon_ns,
+            },
+            "config": {
+                "service": {
+                    "pipelines": {
+                        "metrics": {
+                            "exporters": ["intel_xpu_info", "prometheus"],
+                        }
+                    }
+                }
+            },
+        }
+        values_yaml = yaml.safe_dump(values_dict, sort_keys=False).rstrip()
+
+        if existing_monitoring:
+            detect_block = [
+                'if [[ -n "$EXISTING_DS" ]]; then',
+                '  echo "Detected pre-existing Intel GPU exporter DaemonSet ($EXISTING_DS); skipping xpumd install."',
+                *self._fallback_dashboard_lines(mon_ns),
+            ]
+        else:
+            detect_block = [
+                'if [[ -n "$EXISTING_DS" ]]; then',
+                '  echo "Detected ready Intel GPU exporter DaemonSet ($EXISTING_DS); skipping xpumd install."',
+                *self._fallback_servicemonitor_lines(mon_rel),
+                *self._fallback_dashboard_lines(mon_ns),
+            ]
+
+        prep_lines: list[str] = [
+            (
+                '  UNREADY_DS="$(printf \'%s\\n\' "$DS_LIST" '
+                "| awk -F'\\t' '!found && tolower($1 \"/\" $2) ~ /(xpumd|intel-xpumanager)/ "
+                '{ r=($4 ~ /^[0-9]+$/ ? $4 : "0"); d=($3 ~ /^[0-9]+$/ ? $3 : "0"); '
+                'print $1 "/" $2 " (ready=" r "/" d ")"; found=1 }\' || true)"'
+            ),
+            '  if [[ -n "$UNREADY_DS" ]]; then',
+            (
+                '    echo "Detected Intel GPU exporter DaemonSet ($UNREADY_DS) '
+                'that is not ready; reconciling xpumd in $TARGET_NS."'
+            ),
+            "  fi",
+            '  kubectl get namespace "$TARGET_NS" >/dev/null 2>&1 || kubectl create namespace "$TARGET_NS"',
+        ]
+        if effective_mode == "dra":
+            prep_lines.append(
+                '  kubectl label --overwrite namespace -- "$TARGET_NS" resource.kubernetes.io/admin-access=true'
+            )
+            driver_conditions = " || ".join(
+                f'$1 == "{re.sub(r"[^A-Za-z0-9._-]", "", driver)}"' for driver in _device_classes()
+            )
+            slices_jp = '{range .items[*]}{.spec.driver}{"\\t"}{.spec.nodeName}{"\\n"}{end}'
+            prep_lines.append(
+                f'  GPU_NODES="$(kubectl get resourceslices -o jsonpath=\'{slices_jp}\' 2>/dev/null '
+                f'| awk -F\'\\t\' \'({driver_conditions}) && $2 != "" && !seen[$2]++ {{print $2}}\' || true)"'
+            )
+        else:
+            prefix_pattern = "|".join(re.escape(prefix) for prefix in _resource_prefixes())
+            nodes_jp = '{range .items[*]}{.metadata.name}{"\\t"}{.status.allocatable}{"\\n"}{end}'
+            alloc_re = shlex.quote(f"(^|[^A-Za-z0-9_.-])({prefix_pattern})")
+            prep_lines.append(
+                f'  GPU_NODES="$(kubectl get nodes -o jsonpath=\'{nodes_jp}\' 2>/dev/null '
+                f"| grep -E {alloc_re} | cut -f1 | awk 'NF && !seen[$0]++' || true)\""
+            )
+        prep_lines.extend(
+            [
+                '  while IFS= read -r node_name; do',
+                '    [[ "$node_name" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || continue',
+                f'    kubectl label --overwrite node -- "$node_name" {label_args}',
+                '  done <<< "$GPU_NODES"',
+            ]
+        )
+
+        ds_jsonpath = (
+            "{range .items[*]}"
+            '{.metadata.namespace}{"\\t"}{.metadata.name}{"\\t"}'
+            '{.status.desiredNumberScheduled}{"\\t"}{.status.numberReady}{"\\n"}'
+            "{end}"
+        )
+        lines = [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "umask 077",
+            "",
+            f"TARGET_NS={shlex.quote(target_ns)}",
+            f"MONITORING_NS={shlex.quote(mon_ns)}",
+            f"RELEASE_NAME={shlex.quote(_RELEASE_NAME)}",
+            f"CHART_REPO={shlex.quote(_CHART_REPO)}",
+            f"CHART_VERSION={shlex.quote(_CHART_VERSION)}",
+            'TMP_DIR="$(mktemp -d)"',
+            "trap 'rm -rf -- \"$TMP_DIR\"' EXIT",
+            "",
+            f"DS_LIST=\"$(kubectl get daemonset --all-namespaces -o jsonpath='{ds_jsonpath}')\"",
+            (
+                'EXISTING_DS="$(printf \'%s\\n\' "$DS_LIST" '
+                "| awk -F'\\t' '!found && tolower($1 \"/\" $2) ~ /(xpumd|intel-xpumanager)/ "
+                '&& $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && ($3 + 0) > 0 && ($4 + 0) >= ($3 + 0) '
+                '{ print $1 "/" $2; found=1 }\' || true)"'
+            ),
+            *detect_block,
+            "else",
+            *prep_lines,
+            '  SM_ENABLED="false"',
+            "  if kubectl get crd servicemonitors.monitoring.coreos.com >/dev/null 2>&1; then",
+            '    SM_ENABLED="true"',
+            "  fi",
+            '  DASHBOARDS_ENABLED="false"',
+            '  if kubectl get namespace "$MONITORING_NS" >/dev/null 2>&1; then',
+            '    DASHBOARDS_ENABLED="true"',
+            "  fi",
+            '  VALUES_FILE="$TMP_DIR/xpumd-values.yaml"',
+            (
+                '  cat <<\'LENS_XPUMD_VALUES\' | sed -e "s/[\'\\"]*__SM_ENABLED__[\'\\"]*/${SM_ENABLED}/" '
+                '-e "s/[\'\\"]*__DASHBOARDS_ENABLED__[\'\\"]*/${DASHBOARDS_ENABLED}/" >"$VALUES_FILE"'
+            ),
+            values_yaml,
+            "LENS_XPUMD_VALUES",
+            '  helm upgrade --install "$RELEASE_NAME" "$CHART_REPO" \\',
+            '    --version "$CHART_VERSION" \\',
+            '    --namespace "$TARGET_NS" \\',
+            "    --create-namespace \\",
+            '    --values "$VALUES_FILE" \\',
+            "    --wait \\",
+            "    --timeout 5m",
+            "fi",
+        ]
+        return "\n".join(lines) + "\n"
 
 
 def _derive_status(

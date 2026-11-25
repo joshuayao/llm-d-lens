@@ -501,19 +501,33 @@ def cluster_profile(
 
 
 async def discover_local_cluster(request, session_id=None):
+    from . import slice_capacity
+
+    cluster_id = None
     if session_id:
         session = require_active_session(session_id)
         require_cluster_access(current_principal(request), session.server_id)
         await require_internal_permission(request, f"/api/cluster/sessions/{session_id}/planning-discovery/nodes")
+        cluster_id = session.server_id
 
     async def query(argv):
         try:
             result = await run_kubectl(argv, timeout=10, cluster_id=session_id)
-            return json.loads(result.stdout) if result.ok else None
+            if not result.ok:
+                if slice_capacity.is_unauthorized_result(result):
+                    raise GuideError("Cluster kubeconfig is unauthorized (401).", 401)
+                return None, slice_capacity.is_forbidden_result(result)
+            return json.loads(result.stdout), False
         except (OSError, TimeoutError, ValueError):
-            return None
+            return None, False
 
-    version, nodes, classes, slices, runtimes = await asyncio.gather(
+    (
+        (version, version_forbidden),
+        (nodes, nodes_forbidden),
+        (classes, _),
+        (slices, _),
+        (runtimes, _),
+    ) = await asyncio.gather(
         *[
             query(argv)
             for argv in [
@@ -525,6 +539,25 @@ async def discover_local_cluster(request, session_id=None):
             ]
         ]
     )
+    if (nodes is None and nodes_forbidden) or (version is None and version_forbidden and nodes is None):
+        target_id = cluster_id or session_id
+        if target_id:
+            fetcher = slice_capacity.fetch_prometheus_node_inventory
+            if fetcher is None:
+                from llm_d_lens.cluster.service import fetch_prometheus_node_inventory as fetcher
+
+            try:
+                inv = await fetcher(slice_capacity._resolve_cluster_id(target_id))
+            except Exception:
+                inv = None
+            if inv is not None and inv.reachable and inv.all_nodes:
+                synth_nodes, _synth_pods = slice_capacity.synthetic_inventory_from_prometheus(inv)
+                nodes = {"items": synth_nodes}
+                if version is None:
+                    git_version = str(inv.all_nodes[0].get("version") or "unknown")
+                    version = {"serverVersion": {"gitVersion": git_version}}
+    elif version is None and version_forbidden and nodes is not None:
+        version = {"serverVersion": {"gitVersion": "unknown"}}
     return cluster_profile(version, nodes, classes, slices, runtimes) if version and nodes else None
 
 

@@ -485,3 +485,317 @@ def test_restart_request_clears_consumed_binding_without_mutating_history():
     assert "_prepared_plan_id" not in request.provenance
     assert request.provenance["retry_of"] == {"run_id": "run", "case_id": "case"}
     assert run.provenance["_prepared_plan_id"] == "old"
+
+
+@pytest.mark.asyncio
+async def test_prepared_plan_preflight_handles_non_admin_403_fallbacks_and_401(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    import yaml
+
+    from llm_d_lens.cluster.service import PrometheusNodeInventory
+    from llm_d_lens.deploy import prepared_plans, slice_capacity
+
+    manifest = yaml.safe_dump(
+        {
+            "kind": "DisaggregatedSet",
+            "metadata": {"name": "pd"},
+            "spec": {
+                "slices": 1,
+                "roles": [
+                    {
+                        "name": "decode",
+                        "spec": {
+                            "replicas": 1,
+                            "leaderWorkerTemplate": {
+                                "workerTemplate": {
+                                    "spec": {
+                                        "runtimeClassName": "nvidia",
+                                        "containers": [{"resources": {"limits": {"nvidia.com/gpu": 2}}}],
+                                    }
+                                }
+                            },
+                        },
+                    }
+                ],
+            },
+        }
+    )
+    plan = DeploymentPreparedPlan(
+        cluster_id="cluster-1",
+        digest="sha256:test",
+        payload={
+            "artifacts": [
+                {
+                    "manifest": manifest,
+                    "context": {"namespace": "llmd-bootstrapped"},
+                    "artifact": {
+                        "deployment_contract": {
+                            "preparedStorage": [{"kind": "PersistentVolume", "metadata": {"name": "pv-sat"}}],
+                            "deploymentBundle": {
+                                "frozen": {"manifest": ""},
+                                "resources": [],
+                                "helm": {"values": [{"content": ""}]},
+                            },
+                        }
+                    },
+                }
+            ]
+        },
+        preflight={},
+    )
+    inv = PrometheusNodeInventory(
+        reachable=True,
+        all_nodes=[
+            {
+                "name": "gpu-1",
+                "role": "worker",
+                "ready": True,
+                "schedulingDisabled": False,
+                "cpu": 16,
+                "memoryBytes": 64 * 1024 * 1024 * 1024,
+                "gpuByProfile": {"nvidia": 4},
+                "gpuModelsByProfile": {},
+            }
+        ],
+        allocatable_by_node={
+            "gpu-1": {"cpu": 16, "memoryBytes": 64 * 1024 * 1024 * 1024, "gpuByProfile": {"nvidia": 4}}
+        },
+        allocated_gpu_by_node={},
+    )
+
+    class Runner403:
+        async def run(self, cmd, timeout=30):
+            if cmd[:2] == ["kubectl", "get"] and cmd[2] == "--raw":
+                return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+            if cmd[:4] == ["kubectl", "get", "serviceaccounts", "--namespace"]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="namespaces not found")
+            return SimpleNamespace(returncode=1, stdout="", stderr="Error from server (Forbidden): is forbidden")
+
+    monkeypatch.setattr(slice_capacity, "scoped_runner", lambda _cid: Runner403())
+    monkeypatch.setattr(slice_capacity, "fetch_prometheus_node_inventory", lambda _cid: asyncio.sleep(0, result=inv))
+    monkeypatch.setattr(prepared_plans, "scoped_runner", lambda _cid: Runner403())
+    monkeypatch.setattr(prepared_plans, "_namespace_bootstrapped", lambda _cid, _ns: asyncio.sleep(0, result=True))
+
+    report = await prepared_plans.preflight(plan)
+    assert report["errors"] == []
+    assert report["status"] == "unknown"
+    assert any("Prometheus" in item for item in report["unmodeled"])
+    assert any("RuntimeClass" in item for item in report["unmodeled"])
+    assert any("PersistentVolume" in item for item in report["unmodeled"])
+
+    class Runner401:
+        async def run(self, cmd, timeout=30):
+            return SimpleNamespace(returncode=1, stdout="", stderr="Unauthorized")
+
+    monkeypatch.setattr(slice_capacity, "scoped_runner", lambda _cid: Runner401())
+    with pytest.raises(slice_capacity.ClusterInventoryAuthError):
+        await prepared_plans.preflight(plan)
+
+
+@pytest.mark.asyncio
+async def test_non_admin_provider_and_storage_mount_fixes(monkeypatch, tmp_path):
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    import yaml
+
+    from llm_d_lens.deploy import slice_capacity
+    from llm_d_lens.deploy.providers import configuration_manifest as cm_module
+    from llm_d_lens.deploy.providers import hardware_profile, kubernetes, storage_mount
+    from llm_d_lens.storage import service as storage_service
+    from llm_d_lens.storage.contracts import NfsSpec, StorageVolume, StorageVolumeKind, StorageVolumeStatus
+
+    # 1. ensure_namespace_accessible
+    async def runner_ok_403(cmd):
+        if cmd[:3] == ["kubectl", "create", "namespace"]:
+            return 1, "", "namespaces is forbidden"
+        if cmd == ["kubectl", "get", "serviceaccounts", "--namespace", "llmd-ns", "-o", "name"]:
+            return 0, "serviceaccount/default\n", ""
+        return 1, "", "unexpected"
+
+    assert await kubernetes.ensure_namespace_accessible(runner_ok_403, "llmd-ns") is True
+
+    async def runner_401(cmd):
+        return 1, "", "Unauthorized"
+
+    with pytest.raises(slice_capacity.ClusterInventoryAuthError):
+        await kubernetes.ensure_namespace_accessible(runner_401, "llmd-ns")
+
+    # 2. storage_mount.resolve_mount skips ensure_mount_in_namespace when PVC is Bound
+    volume = StorageVolume(
+        clusterId="cluster-1",
+        name="shared-cache",
+        kind=StorageVolumeKind.NFS,
+        status=StorageVolumeStatus.READY,
+        capacity="10Gi",
+        readOnly=False,
+        nfs=NfsSpec(server="nfs.example.com", path="/export/shared"),
+        pvcName="prism-storage-bound",
+    )
+    monkeypatch.setattr(storage_service, "get_ready_volume", AsyncMock(return_value=volume))
+    monkeypatch.setattr(
+        storage_service,
+        "ensure_mount_in_namespace",
+        AsyncMock(side_effect=AssertionError("should not be called when PVC is already Bound")),
+    )
+
+    class BoundPvcRunner:
+        async def run(self, cmd, timeout=15):
+            assert cmd[:4] == ["kubectl", "get", "pvc", "prism-storage-bound"]
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"status": {"phase": "Bound"}}), stderr="")
+
+    monkeypatch.setattr("llm_d_lens.infrastructure.kubernetes.scoped_runner", lambda _cid: BoundPvcRunner())
+    mount = await storage_mount.resolve_mount(
+        {"storageVolumeId": volume.id}, cluster_id="cluster-1", namespace="llmd-ns"
+    )
+    assert mount["volume_source"] == {"persistentVolumeClaim": {"claimName": "prism-storage-bound"}}
+
+    # 3. discover_runtime_classes degrades cleanly on 403 and raises 401
+    class Rc403Runner:
+        async def run(self, cmd, timeout=30):
+            return SimpleNamespace(returncode=1, stdout="", stderr="is forbidden")
+
+    monkeypatch.setattr("llm_d_lens.infrastructure.kubernetes.kubeconfig_environment", lambda _cid, strict: {})
+    monkeypatch.setattr("llm_d_lens.infrastructure.kubernetes.scoped_runner", lambda _cid: Rc403Runner())
+    monkeypatch.setattr(
+        slice_capacity,
+        "prometheus_inventory_nodes_and_pods",
+        AsyncMock(return_value=([{"metadata": {"name": "n1"}}], [])),
+    )
+    rc_info = await hardware_profile.discover_runtime_classes("cluster-1")
+    assert rc_info == {"items": [], "nodes": [{"metadata": {"name": "n1"}}], "restricted": True}
+
+    # 4. ConfigurationManifestAdapter._check_prepared_namespace + SourceCompositionAdapter 403 handling
+    manifest_file = tmp_path / "manifest.yaml"
+    manifest_docs = [
+        {"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": "epp-sa", "namespace": "llmd-sc"}},
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "epp", "namespace": "llmd-sc"},
+            "spec": {"template": {"spec": {"serviceAccountName": "epp-sa", "containers": [{"name": "epp"}]}}},
+        },
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "llmd-sc-router-auth-0123456789ab"},
+            "rules": [{"apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"]}],
+        },
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "llmd-sc-router-auth-0123456789ab"},
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "llmd-sc-router-auth-0123456789ab",
+            },
+            "subjects": [{"kind": "ServiceAccount", "name": "epp-sa", "namespace": "llmd-sc"}],
+        },
+    ]
+    manifest_file.write_text(yaml.safe_dump_all(manifest_docs), encoding="utf-8")
+
+    commands = []
+
+    async def sc_runner(cmd):
+        commands.append(cmd)
+        if cmd[:3] in (
+            ["kubectl", "create", "namespace"],
+            ["kubectl", "create", "--filename"],
+            ["kubectl", "get", "namespace"],
+            ["kubectl", "delete", "namespace"],
+        ):
+            return 1, "", "is forbidden"
+        if cmd[:3] == ["kubectl", "get", "configmap"] and cmd[3] == "lens-deployment-bootstrap":
+            return (
+                0,
+                json.dumps(
+                    {"data": {"status": "completed", "eppAuthDelegator": "applied", "preparedRequest": "req-1"}}
+                ),
+                "",
+            )
+        if cmd[:3] == ["kubectl", "get", "serviceaccounts"]:
+            return 0, "serviceaccount/default\n", ""
+        if cmd[:2] == ["kubectl", "apply"]:
+            with open(cmd[-1], encoding="utf-8") as handle:
+                applied = list(yaml.safe_load_all(handle.read()))
+            assert all(doc["kind"] not in {"ClusterRole", "ClusterRoleBinding", "Namespace"} for doc in applied)
+            return 0, "ok", ""
+        return 1, "", "unexpected"
+
+    adapter = cm_module.SourceCompositionAdapter(sc_runner, "llmd-", 30, output_root=tmp_path)
+    artifact = cm_module.GuideDeploymentArtifact(
+        guide_id="source-composition",
+        artifact_hash="hash",
+        manifest_ref=str(manifest_file),
+        manifest_checksum=cm_module.text_checksum(manifest_file.read_text(encoding="utf-8")),
+        source_ref="a" * 40,
+        deployment_contract={
+            "readinessDeployments": ["epp"],
+            "endpoint": {"protocol": "http", "serviceName": "epp", "port": 80},
+            "namespaceLabels": {"example.test/team": "ai"},
+            "preparedNamespace": {"metadata": {"name": "llmd-sc", "labels": {"lens.io/prepared-request": "req-1"}}},
+            "routerRbac": [{"kind": "ClusterRole", "name": "llmd-sc-router-auth-0123456789ab"}],
+        },
+    )
+    await adapter._check_prepared_namespace({"namespace": "llmd-sc"}, artifact)
+    await adapter.deploy(artifact, {"namespace": "llmd-sc", "provenance": {"cluster_server_id": "c1"}})
+    assert not any(cmd[:3] == ["kubectl", "create", "--namespace"] for cmd in commands)
+
+    # cleanup ignores 403 on routerRbac get when super().cleanup succeeds
+    async def cleanup_runner(cmd):
+        if cmd[:3] == ["kubectl", "delete", "namespace"]:
+            return 0, "deleted", ""
+        if cmd[:3] == ["kubectl", "get", "namespace"]:
+            return 1, "", "is forbidden"
+        if cmd[:3] == ["kubectl", "get", "configmap"]:
+            return 0, json.dumps({"data": {"status": "completed", "preparedRequest": "req-1"}}), ""
+        if cmd[:3] == ["kubectl", "get", "clusterrole/llmd-sc-router-auth-0123456789ab"]:
+            return 1, "", "is forbidden"
+        return 0, "", ""
+
+    cleanup_adapter = cm_module.SourceCompositionAdapter(cleanup_runner, "llmd-", 30, output_root=tmp_path)
+    cleanup_res = await cleanup_adapter.cleanup({"namespace": "llmd-sc"}, artifact)
+    assert cleanup_res["cleaned_up"] is True
+
+
+@pytest.mark.asyncio
+async def test_prepared_plan_storage_resources_empty_when_namespace_matches_aligned_volume(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from llm_d_lens.deploy import prepared_plans
+    from llm_d_lens.storage import service as storage_service
+    from llm_d_lens.storage.contracts import LocalDiskSpec, StorageVolume, StorageVolumeKind, StorageVolumeStatus
+
+    volume = StorageVolume(
+        clusterId="cluster-1",
+        name="edit-cache",
+        kind=StorageVolumeKind.LOCAL_DISK,
+        status=StorageVolumeStatus.READY,
+        capacity="100Gi",
+        readOnly=True,
+        localDisk=LocalDiskSpec(hostPath="/data/models", namespace="lens-edit"),
+        pvcName="prism-storage-edit1",
+    )
+    monkeypatch.setattr(storage_service, "get_ready_volume", AsyncMock(return_value=volume))
+
+    same_ns = await prepared_plans.storage_resources(
+        {
+            "namespace": "lens-edit",
+            "runtime": {"storageVolumeId": volume.id},
+            "provenance": {"cluster_server_id": "cluster-1"},
+        }
+    )
+    assert same_ns == []
+
+    other_ns = await prepared_plans.storage_resources(
+        {
+            "namespace": "other-ns",
+            "runtime": {"storageVolumeId": volume.id},
+            "provenance": {"cluster_server_id": "cluster-1"},
+        }
+    )
+    assert [doc["kind"] for doc in other_ns] == ["PersistentVolume", "PersistentVolumeClaim"]

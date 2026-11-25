@@ -78,6 +78,17 @@ def require_cluster_access(principal: Principal | None, cluster_id: str | None) 
         raise ForbiddenError("cluster is not accessible")
 
 
+def require_cluster_or_owner_access(
+    principal: Principal | None,
+    cluster_id: str | None,
+    owner_user_id: str | None,
+) -> None:
+    """Allow the recording owner, otherwise fall back to cluster-scope access."""
+    if owner_user_id is not None and principal is not None and principal.user_id == owner_user_id:
+        return
+    require_cluster_access(principal, cluster_id)
+
+
 def filter_by_cluster(
     items: Iterable[T], get_cluster_id: Callable[[T], str | None], principal: Principal | None
 ) -> list[T]:

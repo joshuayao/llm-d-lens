@@ -1,5 +1,6 @@
 import { formatTimestamp } from '../../../../shared/lib/formatTimestamp';
 import { ChevronDown, Info, Loader2, RefreshCw } from 'lucide-react';
+import { Badge as SharedBadge } from '../../../../shared/ui/Badge';
 import {
     capacityLabel,
     effectiveStorageStatus,
@@ -9,9 +10,11 @@ import {
     nodeDriftMessage,
     purposeLabel,
     resourcePhaseDotClass,
+    resourceStatusSource,
     shortId,
     statusLabel,
     volumeLocation,
+    volumeNamespace,
     volumeTitle,
 } from './storagePresentation';
 
@@ -134,8 +137,8 @@ function PurposeBadges({ purposes }) {
     );
 }
 
-function VolumeSummary({ item, pvc, clusterNameById, mutatingId, onAcknowledgeNodes }) {
-    const effectiveStatus = effectiveStorageStatus(item, pvc, pvc?.persistentVolume || null);
+function VolumeSummary({ item, pvc, statusSource, clusterNameById, mutatingId, onAcknowledgeNodes }) {
+    const effectiveStatus = effectiveStorageStatus(item, pvc, pvc?.persistentVolume || null, statusSource);
     const drift = hasNodeDrift(item);
     const acknowledging = mutatingId === item.id;
     const accessModes = (pvc?.accessModes || []).join(', ') || '—';
@@ -196,7 +199,13 @@ function VolumeSummary({ item, pvc, clusterNameById, mutatingId, onAcknowledgeNo
                         <dt className="text-[11px] font-medium text-slate-500">Storage class</dt>
                         <dd className="mt-1 truncate text-xs text-slate-700 dark:text-slate-300" title={storageClass}>{storageClass}</dd>
                     </div>
-                    <div className="col-span-full min-w-0">
+                    <div className="min-w-0">
+                        <dt className="text-[11px] font-medium text-theme-muted">PVC namespace</dt>
+                        <dd className="mt-1 truncate font-mono text-xs text-theme-text" title={volumeNamespace(item)}>
+                            {volumeNamespace(item)}
+                        </dd>
+                    </div>
+                    <div className="min-w-0 sm:col-span-2">
                         <dt className="text-[11px] font-medium text-slate-500">Location</dt>
                         <dd className="mt-1 truncate font-mono text-xs text-slate-700 dark:text-slate-300" title={volumeLocation(item)}>
                             {volumeLocation(item)}
@@ -237,21 +246,36 @@ export function StorageResourceDetailPanel({ item, resourceStatuses = {}, cluste
             </div>
         );
     }
-    const claims = (resourceStatuses[item.id] || {}).persistentVolumeClaims || [];
+    const entry = resourceStatuses[item.id] || {};
+    const claims = entry.persistentVolumeClaims || [];
     const pvc = claims.length ? claims[0] : null;
     const pv = pvc ? pvc.persistentVolume : null;
+    const statusSource = resourceStatusSource(entry);
     return (
         <div className="flex h-full flex-col gap-3">
             <VolumeSummary
                 item={item}
                 pvc={pvc}
+                statusSource={statusSource}
                 clusterNameById={clusterNameById}
                 mutatingId={mutatingId}
                 onAcknowledgeNodes={onAcknowledgeNodes}
             />
             <section className="storage-detail-card shrink-0 overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-800/60 dark:bg-slate-950/40">
-                <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800/60 dark:bg-transparent">
-                    <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200">Storage binding</h3>
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800/60 dark:bg-transparent">
+                    <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200">Storage binding</h3>
+                        {statusSource === 'prometheus' && (
+                            <SharedBadge tone="info" size="xs" className="normal-case tracking-normal font-medium">
+                                Observed via Prometheus
+                            </SharedBadge>
+                        )}
+                        {statusSource === 'unverified' && (
+                            <SharedBadge tone="warning" size="xs" className="normal-case tracking-normal font-medium">
+                                Unverified (awaiting Prometheus)
+                            </SharedBadge>
+                        )}
+                    </div>
                     <span className="text-[11px] text-slate-500">PVC → PV</span>
                 </div>
                 <div className="divide-y divide-slate-200 dark:divide-slate-800/60">

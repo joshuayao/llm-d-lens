@@ -141,6 +141,39 @@ async def require_cached_model(
     overrides["_model_cache_dependencies"] = dependencies_by_role
 
 
+async def is_pvc_bound_in_namespace(pvc_name: str, *, namespace: str, cluster_id: str) -> bool:
+    """Return True when ``pvc_name`` already exists and is Bound in ``namespace``."""
+    import json
+
+    if not pvc_name or not namespace or not cluster_id:
+        return False
+    from llm_d_lens.deploy.slice_capacity import ClusterInventoryAuthError, is_unauthorized_result
+    from llm_d_lens.infrastructure.kubernetes import scoped_runner
+
+    try:
+        runner = scoped_runner(cluster_id)
+    except (FileNotFoundError, ValueError):
+        return False
+    try:
+        result = await runner.run(
+            ["kubectl", "get", "pvc", pvc_name, "--namespace", namespace, "--ignore-not-found=true", "-o", "json"],
+            timeout=15,
+        )
+    except (FileNotFoundError, OSError, TimeoutError, ValueError):
+        return False
+    if result.returncode:
+        if is_unauthorized_result(result):
+            raise ClusterInventoryAuthError("Cluster kubeconfig is unauthorized (401).")
+        return False
+    if not (result.stdout or "").strip():
+        return False
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and (payload.get("status") or {}).get("phase") == "Bound"
+
+
 async def resolve_mount(
     runtime: dict[str, Any], *, cluster_id: str | None, namespace: str | None = None
 ) -> dict[str, Any] | None:
@@ -174,12 +207,12 @@ async def resolve_mount(
     volume_id = runtime.get("storageVolumeId")
     if not volume_id or not isinstance(volume_id, str):
         return None
-    from llm_d_lens.storage.service import ensure_mount_in_namespace, get_ready_volume
+    from llm_d_lens.storage.service import _pvc_name, ensure_mount_in_namespace, get_ready_volume
 
     volume = await get_ready_volume(volume_id, cluster_id=cluster_id)
     read_only = volume.read_only or runtime.get("modelSource") == "auto-cache"
-    pvc_name = volume.pvc_name
-    if namespace:
+    pvc_name = volume.pvc_name or (_pvc_name(volume) if isinstance(getattr(volume, "id", None), str) else "")
+    if namespace and not await is_pvc_bound_in_namespace(pvc_name, namespace=namespace, cluster_id=cluster_id or ""):
         pvc_name = await ensure_mount_in_namespace(volume, namespace=namespace, cluster_id=cluster_id or "")
     return {
         "volume_source": {"persistentVolumeClaim": {"claimName": pvc_name}},

@@ -6,20 +6,33 @@ description: 管理部署所使用的模型缓存和共享存储卷。
 下载模型前，先在 **Storage（存储）**中创建存储卷。
 管理已下载的模型请使用**模型缓存**页面。
 
+在集群向导中规划的存储卷会在集群完成创建后自动出现在**存储**页面中。
+打开**存储**时，Lens 也会自动同步已定稿集群中规划的存储卷，但不会重新恢复已被显式删除的存储卷。
+
 ## 创建一个存储卷
 
 1. 打开**存储**，点击 **Storage volumes** 右侧的 **New storage volume**。
 2. 在**新建存储卷**中，选择目标**集群**。
-3. 按下表选择**类型**并填写对应的连接信息。
+3. 按下表选择**类型**并填写对应的连接信息以及可选的 **PVC 命名空间**（DNS-1123 标签；对于 **hostPath** 和 **NFS**，Lens 默认使用 `lens-storage-<short-id>`，例如 `lens-storage-283db094`）。
 4. 要存放下载的模型，将 **Purpose（用途）**设为 **Model cache（模型缓存）**，类型选择 **hostPath** 或 **NFS**。
 5. 填写**名称（可选）**和**容量**。名称只需在所选集群内唯一，因此每个集群都可以有自己的 `a100-model-cache`；在同一集群内重复使用某个名称会被拒绝，且不区分大小写。留空则由 Lens 自动生成名称。
 6. 如有需要，开启或关闭**挂载时只读**。
 7. 点击**创建存储卷**，在列表中确认新卷已出现。
 
+如果您的集群 kubeconfig 仅限于命名空间作用域，且缺少创建 PersistentVolume 或
+PersistentVolumeClaim 所需的**编排平台管理员**权限，Lens 会提供
+**编排平台管理员配置脚本**。当您选择已有命名空间且您的 kubeconfig 在该命名空间中
+已拥有 PVC 和 Job 权限时，该脚本为仅 PV（PV-only）模式，仅创建集群级 PersistentVolume；
+点击 **Re-check（重新检查）** 后，Lens 会在该命名空间中创建 PVC、验证绑定，并自动扫描已有模型。
+否则（包括默认的 `lens-storage-<short-id>` 命名空间），完整配置脚本还会为非管理员用户
+自动创建该命名空间的 `Role` 和 `RoleBinding`（`lens-storage-operator`），使您的 kubeconfig
+能够在其中管理 PVC 和模型缓存 Job。请让您的**编排平台管理员**在集群上运行完整配置脚本，
+然后点击 **Re-check（重新检查）** 以验证存储卷已就绪并将其注册到 Lens 中。
+
 | 类型 | 适用场景 | 需要填写 |
 | --- | --- | --- |
-| **hostPath** | 使用集群节点上的目录 | **Host path（主机路径）** |
-| **NFS** | 使用共享网络目录 | **Server（服务器）**、**Export path（导出路径）** |
+| **hostPath** | 使用集群节点上的目录 | **Host path（主机路径）**、**PVC namespace（PVC 命名空间，可选）** |
+| **NFS** | 使用共享网络目录 | **Server（服务器）**、**Export path（导出路径）**、**PVC namespace（PVC 命名空间，可选）** |
 | **Dynamic PVC** | 由 Kubernetes StorageClass 分配存储，不用于模型缓存下载 | **StorageClass**、**Namespace（命名空间）**、**Access mode（访问模式）** |
 
 模型缓存卷必须可写；选择此用途会关闭**挂载时只读**。
@@ -41,6 +54,11 @@ description: 管理部署所使用的模型缓存和共享存储卷。
 6. 查看**Persistent Volume Claim** 和 **Persistent Volume** 面板，
    了解实时的 Kubernetes 资源状态。
 
+在仅提供命名空间作用域 kubeconfig 的集群上，当直接的集群级 Kubernetes API 读取返回
+`403 Forbidden` 时，Lens 会回退到 Prometheus HTTP 查询来观测实时 PVC/PV 状态和节点漂移。
+如果存储卷的 Prometheus 指标尚未就绪，其资源状态会显示为
+**Unverified (awaiting Prometheus)（未验证，等待 Prometheus）**，而不会误报为失败。
+
 ## 确认 hostPath 存储卷的节点变更
 
 1. 选择显示橙色漂移警告的存储卷。
@@ -60,6 +78,14 @@ description: 管理部署所使用的模型缓存和共享存储卷。
    选择**删除模型文件**。
 5. 如果该存储卷没有模型缓存条目，直接点击**删除存储卷**。
 
+如果您的集群 kubeconfig 缺少删除 PersistentVolume 或 PersistentVolumeClaim
+所需的**编排平台管理员**权限，Lens 会提供**编排平台管理员清理脚本**。
+当您的 kubeconfig 在目标 PVC 命名空间中拥有 PVC 和 Job 权限时，该脚本为仅 PV（PV-only）模式，
+仅删除集群级 PersistentVolume；请让您的**编排平台管理员**在集群上运行该脚本，
+然后点击 **Re-check & Delete（重新检查并删除）**，由 Lens 在该命名空间中清理模型文件（如已请求）和 PVC 并移除记录。
+如果您删除的是 Lens 自有 `lens-storage-<short-id>` 命名空间中仅剩的存储卷且该命名空间已为空，Lens 也会一并清理该命名空间。
+如果 Prometheus 不可用导致无法自动确认删除，您可以在运行脚本后使用手动确认回退选项。
+
 ## 模型缓存
 
 当你需要管理已下载的模型权重本身时，使用
@@ -70,3 +96,8 @@ description: 管理部署所使用的模型缓存和共享存储卷。
 
 存储操作和 Lens 的其他部分一样按集群划分范围：维护者只能管理
 自己被绑定的集群上的存储卷，而管理员可以管理所有集群上的存储卷。
+
+在仅提供命名空间作用域 kubeconfig 的集群上，扫描存储卷中的已有模型需要该卷 PVC 命名空间内的
+`batch/jobs` 和 `core/pods` 权限；当**编排平台管理员**配置脚本引导创建了 `lens-storage-operator`
+（或您使用了 kubeconfig 已具备 PVC 和 Job 权限的已有命名空间）后，自动和手动模型扫描即可运行，无需**编排平台管理员**再次介入。
+若缺少这些权限，自动模型扫描将被跳过，手动发起的模型扫描请求会返回 `403 Forbidden`。

@@ -30,7 +30,21 @@ def active_profile(accelerator: str | None = None) -> HardwareProfile | None:
     return resolve_by_accelerator_key(key) if key else None
 
 
-def cluster_accelerator(hardware: dict) -> str:
+def resolve_cluster_vllm_image(cluster_id: str | None) -> str | None:
+    """Return the cluster's configured custom vLLM image, or ``None`` if unset."""
+    if not isinstance(cluster_id, str) or not cluster_id.strip():
+        return None
+    try:
+        from llm_d_lens.cluster import registry as cluster_registry
+
+        cluster = cluster_registry.get_cluster(cluster_id.strip())
+    except Exception:
+        return None
+    value = getattr(cluster, "vllm_image", None) if cluster is not None else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def cluster_accelerator(hardware: dict, *, cluster_vllm_image: str | None = None) -> str:
     """Select the single detected accelerator profile for a deployment."""
     profiles = {
         item.get("id")
@@ -40,7 +54,7 @@ def cluster_accelerator(hardware: dict) -> str:
     if len(profiles) != 1:
         raise ValueError("cluster must report exactly one accelerator profile for deployment")
     accelerator = profiles.pop()
-    if not runtime_image(accelerator=accelerator):
+    if not runtime_image(accelerator=accelerator, cluster_vllm_image=cluster_vllm_image):
         raise ValueError(f"cluster accelerator {accelerator} has no configured runtime image")
     return accelerator
 
@@ -103,12 +117,20 @@ def resource_name(
     return names[0] if len(names) == 1 else None
 
 
-def runtime_image(fallback: str | None = None, *, accelerator: str | None = None) -> str:
-    """The active hardware profile's model-server image (repository and version).
+def runtime_image(
+    fallback: str | None = None,
+    *,
+    accelerator: str | None = None,
+    cluster_vllm_image: str | None = None,
+) -> str:
+    """The effective model-server image: cluster custom vLLM image, else profile default.
 
-    The profile supplies the full image. If it has no image or cannot be resolved,
-    use the caller's fallback, or stay neutral when no fallback was supplied.
+    Priority: cluster custom ``vllm_image`` -> active hardware profile's
+    ``deployment.runtime_image`` -> caller ``fallback`` -> neutral ``""``.
     """
+    custom = cluster_vllm_image.strip() if isinstance(cluster_vllm_image, str) else ""
+    if custom:
+        return custom
     profile = active_profile(accelerator)
     return (profile.deployment.runtime_image if profile else None) or fallback or ""
 
@@ -144,6 +166,13 @@ def select_runtime_class(policy: dict, classes: list[dict], *, suggested: str | 
 async def discover_runtime_classes(cluster_id: str) -> dict:
     import json
 
+    from llm_d_lens.deploy.slice_capacity import (
+        ClusterInventoryAuthError,
+        ClusterInventoryForbiddenError,
+        is_forbidden_result,
+        is_unauthorized_result,
+        prometheus_inventory_nodes_and_pods,
+    )
     from llm_d_lens.infrastructure.kubernetes import kubeconfig_environment, scoped_runner
 
     if not cluster_id:
@@ -152,26 +181,66 @@ async def discover_runtime_classes(cluster_id: str) -> dict:
         kubeconfig_environment(cluster_id, strict=True)
     except Exception as error:
         raise ValueError("RuntimeClass discovery requires a resolvable target cluster") from error
-    result = {}
-    for key, resource in (("items", "runtimeclasses.node.k8s.io"), ("nodes", "nodes")):
-        try:
-            response = await scoped_runner(cluster_id).run(["kubectl", "get", resource, "-o", "json"])
-        except Exception as error:
+
+    restricted = False
+    try:
+        rc_response = await scoped_runner(cluster_id).run(
+            ["kubectl", "get", "runtimeclasses.node.k8s.io", "-o", "json"]
+        )
+    except Exception as error:
+        raise ValueError(
+            "Unable to discover runtimeclasses.node.k8s.io in the target cluster; "
+            "check connectivity and read permissions"
+        ) from error
+    if rc_response.returncode:
+        if is_unauthorized_result(rc_response):
+            raise ClusterInventoryAuthError("Cluster kubeconfig is unauthorized (401).")
+        if is_forbidden_result(rc_response):
+            restricted = True
+            items: list[dict] = []
+        else:
             raise ValueError(
-                f"Unable to discover {resource} in the target cluster; check connectivity and read permissions"
-            ) from error
-        if response.returncode:
-            raise ValueError(
-                f"Unable to discover {resource} in the target cluster; check connectivity and read permissions"
+                "Unable to discover runtimeclasses.node.k8s.io in the target cluster; "
+                "check connectivity and read permissions"
             )
+    else:
         try:
-            payload = json.loads(response.stdout)
+            payload = json.loads(rc_response.stdout)
             items = payload["items"]
             if not isinstance(items, list):
                 raise ValueError("items is not a list")
         except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(f"Invalid discovery response for {resource}") from error
-        result[key] = items
+            raise ValueError("Invalid discovery response for runtimeclasses.node.k8s.io") from error
+
+    try:
+        nodes_response = await scoped_runner(cluster_id).run(["kubectl", "get", "nodes", "-o", "json"])
+    except Exception as error:
+        raise ValueError(
+            "Unable to discover nodes in the target cluster; check connectivity and read permissions"
+        ) from error
+    if nodes_response.returncode:
+        if is_unauthorized_result(nodes_response):
+            raise ClusterInventoryAuthError("Cluster kubeconfig is unauthorized (401).")
+        if is_forbidden_result(nodes_response):
+            try:
+                nodes, _pods = await prometheus_inventory_nodes_and_pods(cluster_id)
+            except ClusterInventoryForbiddenError:
+                nodes = []
+                restricted = True
+        else:
+            raise ValueError("Unable to discover nodes in the target cluster; check connectivity and read permissions")
+    else:
+        try:
+            payload = json.loads(nodes_response.stdout)
+            nodes = payload["items"]
+            if not isinstance(nodes, list):
+                raise ValueError("items is not a list")
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("Invalid discovery response for nodes") from error
+
+    result: dict = {"items": items, "nodes": nodes}
+    if restricted:
+        result["restricted"] = True
     return result
 
 
@@ -290,20 +359,46 @@ def _image_repository(image: str) -> str:
     return image.rsplit(":", 1)[0] if ":" in image.rsplit("/", 1)[-1] else image
 
 
-def pin_runtime_image(image: str, *, accelerator: str | None = None) -> str:
-    """Normalize a managed model-server image using profile-owned repositories.
+def pin_runtime_image(
+    image: str,
+    *,
+    accelerator: str | None = None,
+    cluster_vllm_image: str | None = None,
+    explicit_override: bool = False,
+) -> str:
+    """Normalize a managed model-server image using cluster override or profile defaults.
 
-    An explicit accelerator selects the target profile; otherwise use the image's
-    owning profile. Custom images pass through unchanged.
+    Priority:
+    1. ``explicit_override=True`` returns ``image`` unchanged.
+    2. When ``cluster_vllm_image`` is set and matches ``image``, return it unchanged.
+    3. Managed profile repositories resolve to ``cluster_vllm_image`` if set,
+       otherwise the active/owning profile's ``deployment.runtime_image``.
+    4. Custom/unmanaged repositories pass through unchanged.
     """
+    if explicit_override:
+        return image
+    custom_cluster = cluster_vllm_image.strip() if isinstance(cluster_vllm_image, str) else ""
+    if custom_cluster and image == custom_cluster:
+        return image
     repository = _image_repository(image)
+    if not repository:
+        return image
     owners = [
         p
         for p in all_profiles()
-        if repository in {*p.deployment.managed_image_repositories, _image_repository(p.deployment.runtime_image or "")}
+        if repository
+        in {
+            repo
+            for repo in (*p.deployment.managed_image_repositories, _image_repository(p.deployment.runtime_image or ""))
+            if repo
+        }
     ]
-    profile = active_profile(accelerator) if accelerator else (owners[0] if owners else None)
-    return profile.deployment.runtime_image if owners and profile and profile.deployment.runtime_image else image
+    if not owners:
+        return image
+    if custom_cluster:
+        return custom_cluster
+    profile = active_profile(accelerator) if accelerator else owners[0]
+    return profile.deployment.runtime_image if profile and profile.deployment.runtime_image else image
 
 
 def guide_overlays(

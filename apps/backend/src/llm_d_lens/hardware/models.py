@@ -95,6 +95,9 @@ class DriverContribution:
     installer: str
     modes: Mapping[str, AccessModeDriver] = field(default_factory=dict)
     nfd_manifest_refs: tuple[str, ...] = ()
+    # RBAC scopes the driver install needs: namespaced, cluster, escalation.
+    # The provisioning plan snapshots this at save time (design D21).
+    rbac: tuple[str, ...] = ()
 
     def mode(self, access_mode: str) -> AccessModeDriver | None:
         return self.modes.get(access_mode)
@@ -107,6 +110,7 @@ class DriverContribution:
                 str(name): AccessModeDriver.from_dict(payload) for name, payload in (data.get("modes") or {}).items()
             },
             nfd_manifest_refs=_tuple_of_str(data.get("nfd_manifest_refs")),
+            rbac=_tuple_of_str(data.get("rbac")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -114,6 +118,7 @@ class DriverContribution:
             "installer": self.installer,
             "modes": {name: mode.to_dict() for name, mode in self.modes.items()},
             "nfd_manifest_refs": list(self.nfd_manifest_refs),
+            "rbac": list(self.rbac),
         }
 
 
@@ -317,6 +322,7 @@ class PlanningContribution:
     aic_system_patterns: tuple[str, ...] = ()
     aic_system_models: tuple[Mapping[str, str], ...] = ()
     model_label_keys: tuple[str, ...] = ()
+    model_label_patterns: tuple[Mapping[str, str], ...] = ()
     model_family_names: tuple[str, ...] = ()
     node_memory: Mapping[str, str] = field(default_factory=dict)
     default_backend: str = "vllm"
@@ -346,6 +352,7 @@ class PlanningContribution:
             aic_system_patterns=_tuple_of_str(data.get("aic_system_patterns")),
             aic_system_models=tuple(data.get("aic_system_models") or ()),
             model_label_keys=_tuple_of_str(data.get("model_label_keys")),
+            model_label_patterns=tuple(_str_map(entry) for entry in (data.get("model_label_patterns") or ())),
             model_family_names=_tuple_of_str(data.get("model_family_names")),
             node_memory=_str_map(data.get("node_memory")),
             default_backend=str(data.get("default_backend") or "vllm"),
@@ -359,6 +366,7 @@ class PlanningContribution:
             "aic_system_patterns": list(self.aic_system_patterns),
             "aic_system_models": list(self.aic_system_models),
             "model_label_keys": list(self.model_label_keys),
+            "model_label_patterns": [dict(entry) for entry in self.model_label_patterns],
             "model_family_names": list(self.model_family_names),
             "node_memory": dict(self.node_memory),
             "default_backend": self.default_backend,

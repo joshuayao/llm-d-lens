@@ -4,15 +4,19 @@ import json
 import logging
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from llm_d_lens.agentic.public_benchmark_record.access import require_query_access
 from llm_d_lens.agentic.public_benchmark_record.case_retrieval import assert_case_access
+from llm_d_lens.api.problems import problem
 from llm_d_lens.auth.access import current_principal, owner_for_create, visible_cluster_ids
 from llm_d_lens.auth.contracts import Principal
 from llm_d_lens.configuration.decision_engine import optimization_choices
 from llm_d_lens.configuration.plan_models import OptimizationChoice
 from llm_d_lens.core.exceptions import ForbiddenError, UnauthenticatedError
+from llm_d_lens.deploy.capabilities import DeploymentClusterAuthError
+from llm_d_lens.deploy.guide_planning import GuideError
+from llm_d_lens.deploy.slice_capacity import ClusterInventoryAuthError
 
 from .configuration import planning_resource_request
 from .models import (
@@ -408,7 +412,7 @@ async def approve_agentic_deployment(
     run_id: str,
     request: Request = None,
     approval: AgenticApprovalRequest | None = None,
-) -> AgenticDeploymentRun:
+) -> AgenticDeploymentRun | JSONResponse:
     try:
         run = service.get(run_id)
         if run is not None:
@@ -431,6 +435,7 @@ async def approve_agentic_deployment(
             raise ValueError(
                 "The configuration changed or was not reviewed. Confirm the current checksum before deployment."
             )
+        target_namespace = (approval.namespace.strip() or None) if approval and approval.namespace else None
         if run is not None and run.configuration_plan is not None and run.configuration_plan.source_bundle is not None:
             _optimization_run(run_id, request)
             if approval is None or approval.endpoint not in {
@@ -443,13 +448,28 @@ async def approve_agentic_deployment(
                 http_request=request,
                 source_endpoint=approval.endpoint,
                 approval=approval,
+                target_namespace=target_namespace,
             )
         return await service.approve(
-            run_id, owner_user_id=owner_for_create(current_principal(request)), approval=approval
+            run_id,
+            owner_user_id=owner_for_create(current_principal(request)),
+            approval=approval,
+            target_namespace=target_namespace,
         )
+    except GuideError as error:
+        logger.warning("Agentic deployment %s approve rejected (%s): %s", run_id, error.status, error.public_message)
+        raise HTTPException(status_code=error.status, detail=error.public_message) from error
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    except (DeploymentClusterAuthError, ClusterInventoryAuthError) as error:
+        return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
     except ValueError as error:
+        from llm_d_lens.deploy import slice_capacity
+
+        dyn_auth_cls = getattr(slice_capacity, "ClusterInventoryAuthError", None)
+        if dyn_auth_cls is not None and isinstance(error, dyn_auth_cls):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        logger.warning("Agentic deployment %s approve rejected (409): %s", run_id, error)
         raise HTTPException(status_code=409, detail=str(error)) from error
 
 

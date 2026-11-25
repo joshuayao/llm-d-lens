@@ -13,12 +13,16 @@ import tarfile
 import tempfile
 import time
 from collections import defaultdict
+from collections.abc import Mapping
 from copy import deepcopy
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
+from llm_d_lens.cluster.registry import validate_container_image_ref
 from llm_d_lens.configuration.manifest_facts import _invocation_tokens, workload_roles
+from llm_d_lens.deploy.data_plane import PLAINTEXT_EPP_VALUES_PATH
+from llm_d_lens.deploy.providers.hardware_profile import resolve_cluster_vllm_image
 from llm_d_lens.hardware.registry import all_profiles
 from llm_d_lens.hardware.resolver import resolve_by_device_class, resolve_by_resource
 from llm_d_lens.infrastructure.kubernetes import run_kubectl
@@ -244,6 +248,126 @@ def validate_local_kustomization(root: Path, entry: Path, visited: set[Path] | N
             validate_local_kustomization(root, resolved.parent / reference, visited)
 
 
+def _is_llm_d_router_chart(chart: str) -> bool:
+    """Return True when the Helm chart reference names an llm-d router chart."""
+    if not isinstance(chart, str) or not chart.strip():
+        return False
+    return PurePosixPath(chart.strip().rstrip("/")).name in {
+        "llm-d-router-standalone",
+        "llm-d-router-gateway",
+    }
+
+
+def _explicitly_sets_secure_serving(value_docs: list[dict], set_overrides: list[str]) -> bool:
+    """Return True when caller values or --set entries explicitly set router.epp.flags.secure-serving."""
+    for doc in value_docs:
+        if not isinstance(doc, Mapping):
+            continue
+        router = doc.get("router")
+        if not isinstance(router, Mapping):
+            continue
+        epp = router.get("epp")
+        if not isinstance(epp, Mapping):
+            continue
+        flags = epp.get("flags")
+        if isinstance(flags, Mapping) and "secure-serving" in flags:
+            return True
+    for entry in set_overrides:
+        if not isinstance(entry, str):
+            continue
+        for part in re.split(r"(?<!\\),", entry):
+            key, sep, _value = part.partition("=")
+            if sep and key.strip().replace("\\-", "-") == "router.epp.flags.secure-serving":
+                return True
+    return False
+
+
+def _container_has_plaintext_epp_flag(container: Mapping) -> bool:
+    tokens = [str(item) for item in [*(container.get("command") or []), *(container.get("args") or [])]]
+    for index, token in enumerate(tokens):
+        lowered = token.lower()
+        if lowered == "--secure-serving=false":
+            return True
+        if lowered == "--secure-serving" and index + 1 < len(tokens) and tokens[index + 1].lower() == "false":
+            return True
+    return False
+
+
+def _reconcile_envoy_ext_proc_transport(parsed: list[dict]) -> None:
+    """Strip TLS transport settings from Envoy ext_proc when EPP runs with --secure-serving=false."""
+    has_plaintext_epp = False
+    scoped_cm_names: set[str] = set()
+    fallback_cm_names: set[str] = set()
+    for doc in parsed:
+        if not isinstance(doc, dict) or doc.get("kind") != "Deployment":
+            continue
+        pod = ((doc.get("spec") or {}).get("template") or {}).get("spec") or {}
+        if not isinstance(pod, dict):
+            continue
+        containers = [c for c in (pod.get("containers") or []) if isinstance(c, dict)]
+        epp_plaintext = any(c.get("name") == "epp" and _container_has_plaintext_epp_flag(c) for c in containers)
+        if epp_plaintext:
+            has_plaintext_epp = True
+        volume_to_cm = {
+            vol["name"]: cm_name
+            for vol in (pod.get("volumes") or [])
+            if isinstance(vol, dict)
+            and isinstance(vol.get("name"), str)
+            and isinstance((vol.get("configMap") or {}).get("name"), str)
+            and (cm_name := vol["configMap"]["name"])
+        }
+        envoy_cms = {
+            volume_to_cm[mount["name"]]
+            for container in containers
+            if container.get("name") == "envoy-proxy"
+            for mount in (container.get("volumeMounts") or [])
+            if isinstance(mount, dict) and mount.get("name") in volume_to_cm
+        }
+        if epp_plaintext:
+            scoped_cm_names.update(envoy_cms)
+        else:
+            fallback_cm_names.update(envoy_cms)
+    if not has_plaintext_epp:
+        return
+    target_cm_names = scoped_cm_names or fallback_cm_names
+    if not target_cm_names:
+        return
+    for doc in parsed:
+        if not isinstance(doc, dict) or doc.get("kind") != "ConfigMap":
+            continue
+        name = (doc.get("metadata") or {}).get("name")
+        if name not in target_cm_names:
+            continue
+        data = doc.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("envoy.yaml"), str):
+            continue
+        try:
+            envoy_cfg = yaml.safe_load(data["envoy.yaml"])
+        except yaml.YAMLError:
+            continue
+        if not isinstance(envoy_cfg, dict):
+            continue
+        clusters = (envoy_cfg.get("static_resources") or {}).get("clusters")
+        if not isinstance(clusters, list):
+            continue
+        modified = False
+        for cluster in clusters:
+            if not isinstance(cluster, dict) or cluster.get("name") != "ext_proc":
+                continue
+            ts = cluster.get("transport_socket")
+            if isinstance(ts, dict) and ts.get("name") == "envoy.transport_sockets.tls":
+                cluster.pop("transport_socket", None)
+                modified = True
+            health_checks = cluster.get("health_checks")
+            if isinstance(health_checks, list):
+                for hc in health_checks:
+                    if isinstance(hc, dict) and "tls_options" in hc:
+                        hc.pop("tls_options", None)
+                        modified = True
+        if modified:
+            data["envoy.yaml"] = yaml.safe_dump(envoy_cfg, sort_keys=False)
+
+
 async def render_unit(root: Path, catalog: dict, selection: dict) -> dict:
     asset = next((item for item in catalog["assets"] if item["path"] == selection.get("path")), None)
     if not asset or asset["kind"] == "values":
@@ -291,7 +415,10 @@ async def render_unit(root: Path, catalog: dict, selection: dict) -> dict:
                 version = documents(await command(["helm", "show", "chart", asset["chart"]]))[0].get("version")
             archive = await chart_archive(asset["chart"], version)
             values = selection.get("values") or await command(["helm", "show", "values", str(archive)])
-            documents(text_input(values))
+            base_value_docs = documents(text_input(values))
+            caller_value_docs = (
+                [doc for doc in base_value_docs if isinstance(doc, dict)] if selection.get("values") else []
+            )
             value_file = directory / "values.yaml"
             value_file.write_text(values, encoding="utf-8")
             args = [
@@ -311,9 +438,14 @@ async def render_unit(root: Path, catalog: dict, selection: dict) -> dict:
                 )
                 if not layer:
                     raise GuideError("Unknown chart values source.")
+                caller_value_docs.extend(doc for doc in documents(layer["content"]) if isinstance(doc, dict))
                 file = directory / f"layer-{index}.yaml"
                 file.write_text(layer["content"], encoding="utf-8")
                 args.extend(["-f", str(file)])
+            if _is_llm_d_router_chart(asset["chart"]) and not _explicitly_sets_secure_serving(
+                caller_value_docs, selection.get("chartSet") or []
+            ):
+                args.extend(["-f", str(PLAINTEXT_EPP_VALUES_PATH)])
             for value in selection.get("chartSet") or []:
                 if not isinstance(value, str) or "=" not in value:
                     raise GuideError("Invalid chart override.")
@@ -331,6 +463,8 @@ async def render_unit(root: Path, catalog: dict, selection: dict) -> dict:
     if "replacementContent" in selection:
         parsed = documents(text_input(selection["replacementContent"], 2_000_000))
     parsed = scalar_edits(parsed, selection.get("edits"))
+    if asset["kind"] == "chart" and _is_llm_d_router_chart(asset["chart"]):
+        _reconcile_envoy_ext_proc_transport(parsed)
     return dict(path=asset["path"], checksum=asset["checksum"], documents=parsed, content=dump(parsed), **extras)
 
 
@@ -395,7 +529,12 @@ async def model_binding(request, body: dict) -> dict:
     volume_id = entry["storageVolumeId"]
     await require_internal_permission(request, f"/api/v1/storage/volumes/{volume_id}")
     volume = await get_volume(volume_id, request)
-    namespace = (volume.get("dynamicPvc") or {}).get("namespace") or "llm-d-bench-storage"
+    namespace = (
+        (volume.get("dynamicPvc") or {}).get("namespace")
+        or (volume.get("localDisk") or {}).get("namespace")
+        or (volume.get("nfs") or {}).get("namespace")
+        or "llm-d-bench-storage"
+    )
     if entry["clusterId"] != body["clusterId"] or volume["clusterId"] != body["clusterId"]:
         raise GuideError("Cached model and storage must belong to the selected cluster.")
     if (
@@ -988,6 +1127,13 @@ async def check_target(request, body: dict, parsed: list[dict]) -> dict:
     session = await validate_planning_session(request, session_id)
     if session.server_id != body["clusterId"]:
         raise GuideError("Cluster and session do not match.", 409)
+    from .slice_capacity import (
+        ClusterInventoryForbiddenError,
+        is_forbidden_result,
+        is_unauthorized_result,
+        prometheus_inventory_nodes_and_pods,
+    )
+
     for ref in resource_references(parsed):
         args = ["get", ref["kind"], ref["name"]]
         if ref["namespace"] is not None:
@@ -998,13 +1144,33 @@ async def check_target(request, body: dict, parsed: list[dict]) -> dict:
             cluster_id=session_id,
         )
         if not result.ok:
+            if is_unauthorized_result(result):
+                raise GuideError("Cluster kubeconfig is unauthorized (401).", 401)
             location = f" in {ref['namespace']}" if ref["namespace"] is not None else ""
+            if is_forbidden_result(result):
+                warnings.append(f"Could not verify external {ref['kind']}/{ref['name']}{location} (403 Forbidden).")
+                continue
             raise GuideError(f"Required {ref['kind']}/{ref['name']} is unavailable{location}.")
     available = defaultdict(float)
     nodes = await run_kubectl(["get", "nodes", "-o", "json"], timeout=20, cluster_id=session_id)
     pods = await run_kubectl(["get", "pods", "--all-namespaces", "-o", "json"], timeout=20, cluster_id=session_id)
+    for response in (nodes, pods):
+        if not response.ok and is_unauthorized_result(response):
+            raise GuideError("Cluster kubeconfig is unauthorized (401).", 401)
+    inventory_source = "kubernetes"
     if not nodes.ok or not pods.ok:
-        raise GuideError("Could not verify current cluster device availability.", 502)
+        if (not nodes.ok and is_forbidden_result(nodes)) or (not pods.ok and is_forbidden_result(pods)):
+            try:
+                node_items, pod_items = await prometheus_inventory_nodes_and_pods(session.server_id)
+            except ClusterInventoryForbiddenError as error:
+                raise GuideError("Could not verify current cluster device availability.", 403) from error
+            inventory_source = "prometheus"
+            warnings.append("Node capacity derived from Prometheus metrics (cluster-wide Kubernetes read restricted).")
+        else:
+            raise GuideError("Could not verify current cluster device availability.", 502)
+    else:
+        node_items = json.loads(nodes.stdout).get("items", [])
+        pod_items = json.loads(pods.stdout).get("items", [])
     constrained = any(
         workload["kind"] == "DisaggregatedSet"
         or workload["pod"].get("nodeSelector")
@@ -1015,15 +1181,13 @@ async def check_target(request, body: dict, parsed: list[dict]) -> dict:
     if constrained:
         from .placement_preflight import placement_preflight
 
-        placement = placement_preflight(
-            parsed, json.loads(nodes.stdout).get("items", []), json.loads(pods.stdout).get("items", [])
-        )
+        placement = placement_preflight(parsed, node_items, pod_items, inventory_source=inventory_source)
         if placement["status"] == "fail":
             raise GuideError(
                 "Placement validation failed: " + "; ".join(item["message"] for item in placement["errors"])
             )
         warnings.extend(placement["unmodeled"])
-    for node in json.loads(nodes.stdout).get("items", []):
+    for node in node_items:
         if node.get("spec", {}).get("unschedulable") or not any(
             condition.get("type") == "Ready" and condition.get("status") == "True"
             for condition in node.get("status", {}).get("conditions", [])
@@ -1032,7 +1196,7 @@ async def check_target(request, body: dict, parsed: list[dict]) -> dict:
         for key, value in node.get("status", {}).get("allocatable", {}).items():
             if resolve_by_resource(key):
                 available[key] += float(value)
-    for pod in json.loads(pods.stdout).get("items", []):
+    for pod in pod_items:
         if pod.get("status", {}).get("phase") not in {"Succeeded", "Failed"}:
             for key, value in pod_demand(pod.get("spec", {})).items():
                 available[key] -= value
@@ -1073,6 +1237,7 @@ async def render_router(catalog: dict, body: dict) -> list[dict]:
         chart = f"oci://ghcr.io/llm-d/charts/llm-d-router-{router['mode']}"
         archive = await chart_archive(chart, router.get("version"))
         args = ["helm", "template", router["release"], str(archive), "--include-crds", "--namespace", body["namespace"]]
+        parsed_value_docs: list[dict] = []
         for index, layer in enumerate(router["values"]):
             asset = next(
                 (item for item in catalog["assets"] if item["path"] == layer.get("path") and item["kind"] == "values"),
@@ -1084,6 +1249,7 @@ async def render_router(catalog: dict, body: dict) -> list[dict]:
             values = documents(content)
             if len(values) > 1:
                 raise GuideError("Router values must be one YAML mapping.")
+            parsed_value_docs.extend(doc for doc in values if isinstance(doc, dict))
             overrides = (body.get("guideSelection") or {}).get("capabilities") or {}
             if "tracing" in overrides:
                 value = values[0] if values else {}
@@ -1092,11 +1258,17 @@ async def render_router(catalog: dict, body: dict) -> list[dict]:
             file = directory / f"values-{index}.yaml"
             file.write_text(content, encoding="utf-8")
             args.extend(["-f", str(file)])
+        if _is_llm_d_router_chart(chart) and not _explicitly_sets_secure_serving(
+            parsed_value_docs, router.get("set") or []
+        ):
+            args.extend(["-f", str(PLAINTEXT_EPP_VALUES_PATH)])
         for value in router.get("set") or []:
             if not isinstance(value, str) or "=" not in value:
                 raise GuideError("Invalid router override.")
             args.extend(["--set", value])
-        return documents(await command(args))
+        rendered_docs = documents(await command(args))
+        _reconcile_envoy_ext_proc_transport(rendered_docs)
+        return rendered_docs
 
 
 async def resolve_slice_layout(request, body: dict, parsed: list[dict]) -> dict | None:
@@ -1207,6 +1379,11 @@ async def compose(request, body: dict, shared: dict | None = None) -> dict:
             raise GuideError(f"{field} must be a mapping.")
     if not re.fullmatch(r"[a-f0-9]{40}", body.get("commit", "")):
         raise GuideError("Pin the catalog commit before generating.")
+    try:
+        explicit_image = validate_container_image_ref(body.get("runtimeImage"), field="runtimeImage")
+    except ValueError as error:
+        raise GuideError(str(error)) from error
+    explicit_override = bool(body.get("runtimeImageOverride")) and bool(explicit_image)
     started = last = time.perf_counter()
     timings: dict[str, float] = {}
 
@@ -1238,6 +1415,8 @@ async def compose(request, body: dict, shared: dict | None = None) -> dict:
     plan = body.get("sourcePlan") or {}
     if plan.get("workloadPatches") or plan.get("existingModelIntegration") or plan.get("existingPoolIntegration"):
         raise GuideError("Existing-workload mutations require a separate operational workflow.")
+    cluster_vllm_image = resolve_cluster_vllm_image(body["clusterId"])
+    effective_unit_image = explicit_image or cluster_vllm_image
     for selection in units:
         asset = next((item for item in catalog["assets"] if item["path"] == selection.get("path")), None)
         if not asset:
@@ -1245,7 +1424,7 @@ async def compose(request, body: dict, shared: dict | None = None) -> dict:
         selected = {
             **selection,
             "namespace": body["namespace"],
-            "runtimeImage": body.get("runtimeImage"),
+            "runtimeImage": effective_unit_image,
             "variables": (body.get("variables") or {}).get(asset["guide"], selection.get("variables")),
         }
         rendered = await render_unit(root, catalog, selected)
@@ -1308,7 +1487,7 @@ async def compose(request, body: dict, shared: dict | None = None) -> dict:
             {
                 "path": donor["path"],
                 "namespace": body["namespace"],
-                "runtimeImage": body.get("runtimeImage"),
+                "runtimeImage": effective_unit_image,
                 "variables": (body.get("variables") or {}).get("tiered-prefix-cache"),
             },
         )
@@ -1322,7 +1501,7 @@ async def compose(request, body: dict, shared: dict | None = None) -> dict:
         )
         provenance.append({"path": donor["path"], "checksum": checksum(rendered["content"])})
         lap("cpu_cache")
-    bind_model(parsed, binding, body.get("runtimeImage") if body.get("runtimeImageOverride") else None)
+    bind_model(parsed, binding, explicit_image if explicit_override else cluster_vllm_image)
     apply_runtime(parsed, body.get("runtimeConfiguration"), binding["model"])
     slice_layout = await resolve_slice_layout(request, body, parsed)
     lap("slice_layout")
@@ -1336,7 +1515,7 @@ async def compose(request, body: dict, shared: dict | None = None) -> dict:
         parsed = compose_documents([documents(text_input(edited.get("content")))], body["namespace"])
         if not any(doc["kind"] == "Namespace" and doc["metadata"]["name"] == body["namespace"] for doc in parsed):
             raise GuideError("Final YAML must retain the deployment namespace.")
-        bind_model(parsed, binding, body.get("runtimeImage") if body.get("runtimeImageOverride") else None)
+        bind_model(parsed, binding, explicit_image if explicit_override else None)
         validate_engine_parameters(parsed)
         parsed = apply_reviewed_placement(parsed, body.get("runtimeConfiguration") or {}, body.get("_placement"))
 
@@ -1346,6 +1525,15 @@ async def compose(request, body: dict, shared: dict | None = None) -> dict:
         return text
 
     transform(parsed, resolved)
+    for workload in workload_roles(parsed):
+        for container in workload["pod"].get("containers", []):
+            if container.get("name") == "modelserver":
+                try:
+                    validate_container_image_ref(
+                        container.get("image"), field="modelserver.image", allow_empty=False
+                    )
+                except ValueError as error:
+                    raise GuideError(str(error)) from error
     resource_references(parsed)
     facts = rendered_optimizations(parsed, catalog["commit"])
     for identifier in ("prefix", "chunked", "affinity", "load-routing"):
@@ -1383,8 +1571,21 @@ async def compose(request, body: dict, shared: dict | None = None) -> dict:
                 cluster_id=body["clusterSessionId"],
             )
             if not result.ok:
-                raise GuideError("Kubernetes admission dry-run failed. Check required CRDs, namespaces and references.")
-            validation.update(clusterValidated=True, level="admission")
+                from .slice_capacity import is_forbidden_result, is_unauthorized_result
+
+                if is_unauthorized_result(result):
+                    raise GuideError("Cluster kubeconfig is unauthorized (401).", 401)
+                if is_forbidden_result(result):
+                    validation["warnings"] = [
+                        *validation["warnings"],
+                        "Cluster admission dry-run skipped (namespace or resource permissions not yet granted).",
+                    ]
+                else:
+                    raise GuideError(
+                        "Kubernetes admission dry-run failed. Check required CRDs, namespaces and references."
+                    )
+            else:
+                validation.update(clusterValidated=True, level="admission")
         lap("admission")
     timing_logger.info(
         "Guide composition units=%s stage_seconds=%s total=%.1fs",

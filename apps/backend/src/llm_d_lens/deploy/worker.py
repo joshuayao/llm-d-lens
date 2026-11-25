@@ -177,14 +177,9 @@ class DeploymentRunWorker:
                 result = await monitoring.enable(execution.execution_id)
             setup = {**result, "started_at": started_at}
         except Exception as error:
-            # Monitoring failure must not turn a working model deployment into a failure.
-            setup = {
-                "status": "unavailable",
-                "enabled": False,
-                "code": getattr(error, "code", "monitoring_enable_failed"),
-                "message": str(error) or "Monitoring setup timed out",
-                "started_at": started_at,
-            }
+            setup = await self._handle_monitoring_enable_error(
+                execution, error, started_at=started_at, monitoring=monitoring
+            )
         finally:
             _monitoring_inflight.discard(execution.execution_id)
         setup["finished_at"] = datetime.now(UTC).isoformat()
@@ -196,6 +191,108 @@ class DeploymentRunWorker:
         execution = latest.model_copy(update={"monitoring_setup": setup})
         self._store.save_execution(execution)
         return execution
+
+    @staticmethod
+    async def _handle_monitoring_enable_error(
+        execution,
+        error: Exception,
+        *,
+        started_at: str,
+        monitoring,
+    ) -> dict[str, object]:
+        import yaml
+
+        from llm_d_lens.cluster.service import _is_forbidden_output, _is_unauthorized_output
+        from llm_d_lens.deploy.capabilities import (
+            DeploymentClusterAuthError,
+            _run_ssar_checks,
+            _ssar_key,
+            is_bootstrap_marker_present,
+            redact_kubectl_error,
+        )
+        from llm_d_lens.infrastructure.kubernetes import scoped_runner
+        from llm_d_lens.infrastructure.process import CommandResult
+
+        raw_err_msg = str(error) or "Monitoring setup timed out"
+        err_msg = redact_kubectl_error(raw_err_msg)
+        err_code = getattr(error, "code", "monitoring_enable_failed")
+        err_result = CommandResult(argv=("kubectl",), returncode=1, stdout="", stderr=raw_err_msg)
+        if isinstance(error, DeploymentClusterAuthError) or _is_unauthorized_output(err_result):
+            return {
+                "status": "unavailable",
+                "enabled": False,
+                "code": "kubeconfig_unauthorized",
+                "message": err_msg,
+                "started_at": started_at,
+            }
+
+        eligible_for_fallback = err_code == "stack_not_ready" or (
+            err_code == "apply_failed" and _is_forbidden_output(err_result)
+        )
+        cluster_id = str((getattr(execution, "provenance", None) or {}).get("cluster_server_id") or "")
+        namespace = getattr(execution, "namespace", None)
+        if eligible_for_fallback and cluster_id and namespace:
+            try:
+                runner = scoped_runner(cluster_id)
+                permitted = await is_bootstrap_marker_present(cluster_id, namespace, runner=runner)
+                if not permitted:
+                    keys = [
+                        _ssar_key("create", "monitoring.coreos.com", "servicemonitors", namespace),
+                        _ssar_key("create", "monitoring.coreos.com", "podmonitors", namespace),
+                    ]
+                    answers = await _run_ssar_checks(keys, runner=runner)
+                    permitted = all(answers.get(key) is True for key in keys)
+                if permitted:
+                    epp_service = await monitoring._discover_epp_service(namespace, cluster_id)
+                    manifests = []
+                    if epp_service:
+                        manifests.append(monitoring._epp_service_monitor(namespace, epp_service))
+                    manifests.append(monitoring._modelserver_pod_monitor(namespace))
+                    manifests.append(monitoring._marker_configmap(namespace, "enabled"))
+                    document = yaml.safe_dump_all(manifests, sort_keys=False)
+                    apply_res = await runner.run(
+                        ["kubectl", "apply", "--namespace", namespace, "-f", "-"],
+                        input=document,
+                        timeout=30,
+                    )
+                    if _is_unauthorized_output(apply_res):
+                        return {
+                            "status": "unavailable",
+                            "enabled": False,
+                            "code": "kubeconfig_unauthorized",
+                            "message": "Kubernetes cluster rejected kubeconfig credentials (401 Unauthorized).",
+                            "started_at": started_at,
+                        }
+                    if apply_res.returncode == 0:
+                        return {
+                            "status": "ready",
+                            "enabled": True,
+                            "mode": "namespace_scoped_fallback",
+                            "namespace": namespace,
+                            "started_at": started_at,
+                        }
+            except DeploymentClusterAuthError as auth_err:
+                return {
+                    "status": "unavailable",
+                    "enabled": False,
+                    "code": "kubeconfig_unauthorized",
+                    "message": redact_kubectl_error(str(auth_err)),
+                    "started_at": started_at,
+                }
+            except Exception as fallback_error:
+                logger.debug(
+                    "Namespace-scoped monitoring fallback failed for %s: %s",
+                    namespace,
+                    redact_kubectl_error(str(fallback_error)),
+                )
+
+        return {
+            "status": "unavailable",
+            "enabled": False,
+            "code": err_code,
+            "message": err_msg,
+            "started_at": started_at,
+        }
 
     async def refresh_case_execution(self, run_id: str, case_id: str):
         run, case, execution = self._case_execution(run_id, case_id)

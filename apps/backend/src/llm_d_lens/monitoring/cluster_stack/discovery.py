@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
+from llm_d_lens.hardware import registry as hardware_registry
 from llm_d_lens.infrastructure.process import CommandNotFoundError, CommandResult, CommandRunner
 from llm_d_lens.monitoring.command_output import parse_command_json
+from llm_d_lens.monitoring.prometheus import (
+    check_prometheus_health,
+    create_prometheus_client,
+    query_vector,
+    resolve_prometheus_endpoint,
+)
+from llm_d_lens.monitoring.service_links import (
+    check_http_endpoint_reachable,
+    probe_accelerator_metrics_via_prometheus,
+    redact_monitoring_error,
+)
 
 from .errors import ClusterStackError
 from .models import (
@@ -103,6 +118,11 @@ def _component(
     )
 
 
+_SUFFIXED_OPERATOR_RE = re.compile(r"^[a-z0-9-]+-[0-9a-f]{8}-operator(?:-[a-z0-9]+){0,2}$")
+_SUFFIXED_KSM_RE = re.compile(r"^[a-z0-9-]+-[0-9a-f]{8}-ksm(?:-[a-z0-9]+){0,2}$")
+_SUFFIXED_NE_RE = re.compile(r"^[a-z0-9-]+-[0-9a-f]{8}-ne(?:-[a-z0-9]+)?$")
+
+
 def _matching(
     items: list[dict[str, Any]],
     include: tuple[str, ...],
@@ -122,6 +142,87 @@ def _by_label_name(items: list[dict[str, Any]], value: str) -> list[dict[str, An
         for item in items
         if ((item.get("metadata") or {}).get("labels") or {}).get("app.kubernetes.io/name") == value
     ]
+
+
+def _filter_items(
+    items: list[dict[str, Any]],
+    predicate: Callable[[dict[str, Any]], bool],
+) -> list[dict[str, Any]]:
+    return [item for item in items if isinstance(item, dict) and predicate(item)]
+
+
+def _is_grafana_resource(item: dict[str, Any]) -> bool:
+    metadata = item.get("metadata") or {}
+    labels = metadata.get("labels") or {}
+    name = str(metadata.get("name") or "").lower()
+    app_name = str(labels.get("app.kubernetes.io/name") or "").lower()
+    return app_name == "grafana" or "grafana" in name
+
+
+def _is_prometheus_operator_resource(item: dict[str, Any]) -> bool:
+    metadata = item.get("metadata") or {}
+    labels = metadata.get("labels") or {}
+    name = str(metadata.get("name") or "").lower()
+    app_name = str(labels.get("app.kubernetes.io/name") or "").lower()
+    app_label = str(labels.get("app") or "").lower()
+    component_label = str(labels.get("app.kubernetes.io/component") or "").lower()
+    if "admission" in name or "admission" in app_label or "admission" in component_label:
+        return False
+    if (
+        "prometheus-operator" in app_name
+        or "prometheus-stack-operator" in app_name
+        or "prometheus-operator" in app_label
+        or "prometheus-stack-operator" in app_label
+        or component_label == "prometheus-operator"
+    ):
+        return True
+    if "prometheus-stack-operator" in name or "prometheus-operator" in name:
+        return True
+    return bool(_SUFFIXED_OPERATOR_RE.fullmatch(name))
+
+
+def _is_kube_state_metrics_resource(item: dict[str, Any]) -> bool:
+    metadata = item.get("metadata") or {}
+    labels = metadata.get("labels") or {}
+    name = str(metadata.get("name") or "").lower()
+    app_name = str(labels.get("app.kubernetes.io/name") or "").lower()
+    app_label = str(labels.get("app") or "").lower()
+    if app_name == "kube-state-metrics" or app_label == "kube-state-metrics":
+        return True
+    if "kube-state-metrics" in name:
+        return True
+    return bool(_SUFFIXED_KSM_RE.fullmatch(name))
+
+
+def _is_node_exporter_resource(item: dict[str, Any]) -> bool:
+    metadata = item.get("metadata") or {}
+    labels = metadata.get("labels") or {}
+    name = str(metadata.get("name") or "").lower()
+    app_name = str(labels.get("app.kubernetes.io/name") or "").lower()
+    app_label = str(labels.get("app") or "").lower()
+    if app_name in {"prometheus-node-exporter", "node-exporter"} or app_label in {
+        "prometheus-node-exporter",
+        "node-exporter",
+    }:
+        return True
+    if "node-exporter" in name or "nodeexporter" in name:
+        return True
+    return bool(_SUFFIXED_NE_RE.fullmatch(name))
+
+
+def _exclude_local_and_scaled_zero(
+    items: list[dict[str, Any]],
+    namespace: str,
+) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for item in items:
+        meta = item.get("metadata") or {}
+        if meta.get("namespace") == namespace:
+            continue
+        if item.get("kind") in {"Deployment", "StatefulSet"} and (item.get("spec") or {}).get("replicas") == 0:
+            continue
+        filtered.append(item)
+    return filtered
 
 
 def _local_or_external_component(
@@ -228,12 +329,13 @@ async def discover_cluster_stack(
         ) from error
 
     if reachable.returncode != 0:
+        err_detail = redact_monitoring_error(reachable.stderr.strip())
         return ClusterStackStatusResponse(
             cluster=ClusterSummary(context=context, reachable=False, platform="unknown"),
             namespace=namespace,
             release=HelmReleaseSummary(),
             status="unreachable",
-            message=reachable.stderr.strip() or "Kubernetes cluster is unreachable",
+            message=err_detail or "Kubernetes cluster is unreachable",
             observed_at=observed_at,
             active_operation_id=active_operation_id,
         )
@@ -295,46 +397,91 @@ async def discover_cluster_stack(
         ]
     )
     monitoring_resources = (_json(monitoring_result, {}) or {}).get("items", [])
-    operator_result = await runner.run(
-        [
-            "kubectl",
-            "get",
-            "pods,deployments",
-            "--all-namespaces",
-            "-l",
-            "app.kubernetes.io/name=prometheus-operator",
-            "-o",
-            "json",
-        ]
-    )
-    operator_resources = (_json(operator_result, {}) or {}).get("items", [])
-    if not operator_resources:
-        # Existing operators may not carry the standard label; fall back to
-        # matching pod/deployment names, mirroring the installer's detection.
-        operator_any = await runner.run(["kubectl", "get", "pods,deployments", "--all-namespaces", "-o", "json"])
-        operator_resources = _matching(
-            (_json(operator_any, {}) or {}).get("items", []),
-            ("prometheus-stack-operator", "prometheus-operator"),
+    local_operator_resources = _filter_items(resources, _is_prometheus_operator_resource)
+    local_node_exporter = _filter_items(resources, _is_node_exporter_resource)
+    local_kube_state = _filter_items(resources, _is_kube_state_metrics_resource)
+
+    all_pods_deployments: list[dict[str, Any]] | None = None
+    operator_resources: list[dict[str, Any]] = []
+    if not local_operator_resources:
+        operator_result = await runner.run(
+            [
+                "kubectl",
+                "get",
+                "pods,deployments",
+                "--all-namespaces",
+                "-l",
+                "app.kubernetes.io/name=prometheus-operator",
+                "-o",
+                "json",
+            ]
         )
-    node_exporter_result = await runner.run(
-        [
-            "kubectl",
-            "get",
-            "pods,daemonsets",
-            "--all-namespaces",
-            "-l",
-            "app=node-exporter",
-            "-o",
-            "json",
-        ]
-    )
-    node_exporter_resources = (_json(node_exporter_result, {}) or {}).get("items", [])
-    if not node_exporter_resources:
-        node_exporter_any = await runner.run(["kubectl", "get", "pods,daemonsets", "--all-namespaces", "-o", "json"])
-        node_exporter_resources = _matching(
-            (_json(node_exporter_any, {}) or {}).get("items", []),
-            ("node-exporter", "nodeexporter"),
+        operator_resources = _exclude_local_and_scaled_zero(
+            _filter_items((_json(operator_result, {}) or {}).get("items", []), _is_prometheus_operator_resource),
+            namespace,
         )
+        if not operator_resources:
+            operator_any = await runner.run(["kubectl", "get", "pods,deployments", "--all-namespaces", "-o", "json"])
+            all_pods_deployments = (_json(operator_any, {}) or {}).get("items", [])
+            operator_resources = _exclude_local_and_scaled_zero(
+                _filter_items(all_pods_deployments, _is_prometheus_operator_resource),
+                namespace,
+            )
+
+    node_exporter_resources: list[dict[str, Any]] = []
+    if not local_node_exporter:
+        node_exporter_result = await runner.run(
+            [
+                "kubectl",
+                "get",
+                "pods,daemonsets",
+                "--all-namespaces",
+                "-l",
+                "app=node-exporter",
+                "-o",
+                "json",
+            ]
+        )
+        node_exporter_resources = _exclude_local_and_scaled_zero(
+            _filter_items((_json(node_exporter_result, {}) or {}).get("items", []), _is_node_exporter_resource),
+            namespace,
+        )
+        if not node_exporter_resources:
+            node_exporter_any = await runner.run(
+                ["kubectl", "get", "pods,daemonsets", "--all-namespaces", "-o", "json"]
+            )
+            node_exporter_resources = _exclude_local_and_scaled_zero(
+                _filter_items((_json(node_exporter_any, {}) or {}).get("items", []), _is_node_exporter_resource),
+                namespace,
+            )
+
+    kube_state_resources: list[dict[str, Any]] = []
+    if not local_kube_state:
+        ksm_result = await runner.run(
+            [
+                "kubectl",
+                "get",
+                "pods,deployments",
+                "--all-namespaces",
+                "-l",
+                "app.kubernetes.io/name=kube-state-metrics",
+                "-o",
+                "json",
+            ]
+        )
+        kube_state_resources = _exclude_local_and_scaled_zero(
+            _filter_items((_json(ksm_result, {}) or {}).get("items", []), _is_kube_state_metrics_resource),
+            namespace,
+        )
+        if not kube_state_resources:
+            if all_pods_deployments is None:
+                ksm_any = await runner.run(["kubectl", "get", "pods,deployments", "--all-namespaces", "-o", "json"])
+                all_pods_deployments = (_json(ksm_any, {}) or {}).get("items", [])
+            kube_state_resources = _exclude_local_and_scaled_zero(
+                _filter_items(all_pods_deployments, _is_kube_state_metrics_resource),
+                namespace,
+            )
+
     dashboards_result = await runner.run(
         ["kubectl", "get", "configmaps", "-n", namespace, "-l", "grafana_dashboard=1", "-o", "json"]
     )
@@ -350,19 +497,19 @@ async def discover_cluster_stack(
         result = await runner.run(["kubectl", "get", "crd", crd_name, "-o", "name"])
         crd_ready += int(result.returncode == 0)
 
-    prometheus = _component("prometheus", _by_label_name(monitoring_resources, "prometheus"))
-    grafana = _component("grafana", _matching(resources, ("grafana",)))
-    local_operator_resources = _matching(resources, ("prometheus-stack-operator", "prometheus-operator"))
+    prometheus = _component(
+        "prometheus",
+        _by_label_name(monitoring_resources, "prometheus")
+        or _matching(monitoring_resources, ("prometheus",), exclude=("alertmanager",)),
+    )
+    grafana = _component("grafana", _filter_items(resources, _is_grafana_resource))
     operator = _local_or_external_component("prometheus_operator", local_operator_resources, operator_resources)
     alertmanager = _component(
         "alertmanager",
-        _by_label_name(monitoring_resources, "alertmanager"),
+        _by_label_name(monitoring_resources, "alertmanager")
+        or _matching(monitoring_resources, ("alertmanager",)),
     )
-    kube_state = _component(
-        "kube_state_metrics",
-        _matching(resources, ("kube-state-metrics",)),
-    )
-    local_node_exporter = _matching(resources, ("node-exporter", "nodeexporter"))
+    kube_state = _local_or_external_component("kube_state_metrics", local_kube_state, kube_state_resources)
     node_exporter = _local_or_external_component("node_exporter", local_node_exporter, node_exporter_resources)
     dashboard_component = _dashboard_component(dashboards, expected_dashboards)
     crds = ClusterStackComponent(
@@ -417,4 +564,363 @@ async def discover_cluster_stack(
         components=components,
         active_operation_id=active_operation_id,
         observed_at=observed_at,
+    )
+
+
+def _parse_scalar_count(rows: list[dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    value_pair = rows[0].get("value")
+    if not isinstance(value_pair, list | tuple) or len(value_pair) < 2:
+        return 0
+    try:
+        return max(0, int(float(value_pair[1])))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _probe_grafana_component(
+    grafana_url: str | None,
+    monitoring_mode: Literal["managed", "existing"] | None,
+) -> ClusterStackComponent:
+    cleaned = grafana_url.strip() if isinstance(grafana_url, str) else ""
+    if cleaned:
+        reachable = await check_http_endpoint_reachable(cleaned)
+        if reachable:
+            return ClusterStackComponent(name="grafana", status="ready", ready=1, desired=1, source="cluster")
+        return ClusterStackComponent(
+            name="grafana",
+            status="degraded",
+            ready=0,
+            desired=1,
+            source="cluster",
+            diagnostics=[
+                ComponentDiagnostic(
+                    severity="warning",
+                    code="GRAFANA_UNREACHABLE",
+                    message=f"Grafana endpoint {cleaned} is unreachable",
+                )
+            ],
+        )
+    if monitoring_mode == "existing":
+        return ClusterStackComponent(
+            name="grafana",
+            status="missing",
+            ready=0,
+            desired=None,
+            source="none",
+            diagnostics=[
+                ComponentDiagnostic(
+                    severity="info",
+                    code="GRAFANA_URL_OPTIONAL",
+                    message="Grafana URL is not configured (optional in existing monitoring mode)",
+                )
+            ],
+        )
+    return ClusterStackComponent(
+        name="grafana",
+        status="missing",
+        ready=0,
+        desired=1,
+        source="none",
+        diagnostics=[
+            ComponentDiagnostic(
+                severity="warning",
+                code="GRAFANA_URL_UNSET",
+                message="Grafana URL is not configured",
+            )
+        ],
+    )
+
+
+def _settings_fields(
+    settings: Mapping[str, Any] | None,
+) -> tuple[Literal["managed", "existing"] | None, str | None, str | None, int | None, int | None]:
+    raw_mode = (settings or {}).get("monitoring_mode")
+    mon_mode: Literal["managed", "existing"] | None = raw_mode if raw_mode in ("managed", "existing") else None
+    prom_url = (settings or {}).get("prometheus_url")
+    graf_url = (settings or {}).get("grafana_url")
+    prom_np = (settings or {}).get("prometheus_node_port")
+    graf_np = (settings or {}).get("grafana_node_port")
+    return (
+        mon_mode,
+        prom_url if isinstance(prom_url, str) and prom_url.strip() else None,
+        graf_url if isinstance(graf_url, str) and graf_url.strip() else None,
+        prom_np if isinstance(prom_np, int) and not isinstance(prom_np, bool) else None,
+        graf_np if isinstance(graf_np, int) and not isinstance(graf_np, bool) else None,
+    )
+
+
+async def discover_cluster_stack_via_http(
+    namespace: str,
+    cluster_id: str,
+    *,
+    context: str | None = None,
+    settings: Mapping[str, Any] | None = None,
+    active_operation_id: str | None = None,
+    access_mode: Literal["admin", "non_admin"] = "non_admin",
+    can_manage: bool = False,
+    allow_port_forward: bool = False,
+) -> ClusterStackStatusResponse:
+    """Discover monitoring stack health via Prometheus and Grafana HTTP endpoints."""
+    observed_at = datetime.now(UTC)
+    mon_mode, prom_url, graf_url, prom_np, graf_np = _settings_fields(settings)
+
+    endpoint = await resolve_prometheus_endpoint(
+        cluster_id,
+        allow_port_forward=allow_port_forward,
+        use_cache=False,
+    )
+    if endpoint is None:
+        graf_comp = await _probe_grafana_component(graf_url, mon_mode)
+        prom_code = "PROMETHEUS_URL_INVALID" if prom_url else "PROMETHEUS_URL_UNSET"
+        prom_msg = (
+            "Configured Prometheus URL is invalid or blocked"
+            if prom_url
+            else "Prometheus HTTP endpoint is not configured"
+        )
+        prom_comp = ClusterStackComponent(
+            name="prometheus",
+            status="missing",
+            ready=0,
+            desired=1,
+            source="none",
+            diagnostics=[ComponentDiagnostic(severity="warning", code=prom_code, message=prom_msg)],
+        )
+        status = "degraded" if (prom_url or graf_comp.status == "ready") else "absent"
+        absent_message = (
+            "Existing monitoring endpoints are not configured"
+            if access_mode == "admin"
+            else "Monitoring stack is not configured for non-admin access"
+        )
+        message = (
+            "Prometheus endpoint is invalid or unreachable"
+            if status == "degraded"
+            else absent_message
+        )
+        return ClusterStackStatusResponse(
+            cluster=ClusterSummary(context=context, reachable=True, platform="kubernetes"),
+            namespace=namespace,
+            release=HelmReleaseSummary(),
+            status=status,
+            message=message,
+            components=[prom_comp, graf_comp],
+            active_operation_id=active_operation_id,
+            observed_at=observed_at,
+            access_mode=access_mode,
+            can_manage=can_manage,
+            monitoring_mode=mon_mode,
+            prometheus_url=prom_url,
+            grafana_url=graf_url,
+            prometheus_node_port=prom_np,
+            grafana_node_port=graf_np,
+        )
+
+    # Never leak local port-forward loopback URLs into the user-configured URL field.
+    snapshot_prom_url = prom_url if endpoint.source == "port_forward" else (prom_url or endpoint.base_url)
+    target_label = snapshot_prom_url or (
+        "in-cluster port-forward" if endpoint.source == "port_forward" else endpoint.base_url
+    )
+    try:
+        client_cm = create_prometheus_client(endpoint, timeout=5.0)
+    except ValueError:
+        client_cm = None
+
+    if client_cm is not None:
+        async with client_cm as client:
+            healthy = await check_prometheus_health(endpoint, client=client)
+            if healthy:
+                profiles = hardware_registry.all_profiles()
+                (
+                    graf_comp,
+                    kube_state_rows,
+                    node_uname_rows,
+                    node_cpu_rows,
+                    *accel_results,
+                ) = await asyncio.gather(
+                    _probe_grafana_component(graf_url, mon_mode),
+                    query_vector(client, "count(kube_node_info)"),
+                    query_vector(client, "count(node_uname_info)"),
+                    query_vector(client, "count(count by (instance) (node_cpu_seconds_total))"),
+                    *(probe_accelerator_metrics_via_prometheus(client, profile) for profile in profiles),
+                )
+
+                prom_comp = ClusterStackComponent(
+                    name="prometheus",
+                    status="ready",
+                    ready=1,
+                    desired=1,
+                    source="cluster",
+                )
+                kube_state_count = _parse_scalar_count(kube_state_rows)
+                if kube_state_count > 0:
+                    kube_state_comp = ClusterStackComponent(
+                        name="kube_state_metrics",
+                        status="ready",
+                        ready=1,
+                        desired=1,
+                        source="cluster",
+                    )
+                else:
+                    kube_state_comp = ClusterStackComponent(
+                        name="kube_state_metrics",
+                        status="missing",
+                        ready=0,
+                        desired=1,
+                        source="none",
+                        diagnostics=[
+                            ComponentDiagnostic(
+                                severity="warning",
+                                code="KUBE_STATE_METRICS_MISSING",
+                                message="kube-state-metrics series (kube_node_info) not found in Prometheus",
+                            )
+                        ],
+                    )
+
+                node_count = _parse_scalar_count(node_uname_rows) or _parse_scalar_count(node_cpu_rows)
+                if node_count > 0:
+                    node_exp_comp = ClusterStackComponent(
+                        name="node_exporter",
+                        status="ready",
+                        ready=node_count,
+                        desired=node_count,
+                        source="cluster",
+                    )
+                else:
+                    node_exp_comp = ClusterStackComponent(
+                        name="node_exporter",
+                        status="missing",
+                        ready=0,
+                        desired=1,
+                        source="none",
+                        diagnostics=[
+                            ComponentDiagnostic(
+                                severity="warning",
+                                code="NODE_EXPORTER_MISSING",
+                                message="node_exporter metrics not found in Prometheus",
+                            )
+                        ],
+                    )
+
+                detected_names = [
+                    profile.display_name
+                    for profile, probe_res in zip(profiles, accel_results, strict=True)
+                    if probe_res.get("detected")
+                ]
+                if detected_names:
+                    accel_comp = ClusterStackComponent(
+                        name="accelerator_exporters",
+                        status="ready",
+                        ready=len(detected_names),
+                        desired=len(detected_names),
+                        source="cluster",
+                        diagnostics=[
+                            ComponentDiagnostic(
+                                severity="info",
+                                code="ACCELERATOR_METRICS_DETECTED",
+                                message=f"Detected accelerator metrics for: {', '.join(detected_names)}",
+                            )
+                        ],
+                    )
+                else:
+                    accel_comp = ClusterStackComponent(
+                        name="accelerator_exporters",
+                        status="missing",
+                        ready=0,
+                        desired=None,
+                        source="none",
+                        diagnostics=[
+                            ComponentDiagnostic(
+                                severity="info",
+                                code="ACCELERATOR_METRICS_NOT_DETECTED",
+                                message=(
+                                    "No accelerator exporter metrics detected in Prometheus "
+                                    "(optional for CPU-only clusters)"
+                                ),
+                            )
+                        ],
+                    )
+
+                grafana_ok = graf_comp.status == "ready" or (mon_mode == "existing" and graf_url is None)
+                all_core_ok = (
+                    grafana_ok
+                    and kube_state_comp.status == "ready"
+                    and node_exp_comp.status == "ready"
+                )
+                status = "ready" if all_core_ok else "degraded"
+                message = (
+                    "Monitoring stack is reachable via Prometheus HTTP"
+                    if status == "ready"
+                    else "Monitoring stack requires attention"
+                )
+                return ClusterStackStatusResponse(
+                    cluster=ClusterSummary(context=context, reachable=True, platform="kubernetes"),
+                    namespace=namespace,
+                    release=HelmReleaseSummary(),
+                    status=status,
+                    message=message,
+                    components=[prom_comp, graf_comp, kube_state_comp, node_exp_comp, accel_comp],
+                    active_operation_id=active_operation_id,
+                    observed_at=observed_at,
+                    access_mode=access_mode,
+                    can_manage=can_manage,
+                    monitoring_mode=mon_mode,
+                    prometheus_url=snapshot_prom_url,
+                    grafana_url=graf_url,
+                    prometheus_node_port=prom_np,
+                    grafana_node_port=graf_np,
+                )
+
+    graf_comp = await _probe_grafana_component(graf_url, mon_mode)
+    prom_comp = ClusterStackComponent(
+        name="prometheus",
+        status="degraded",
+        ready=0,
+        desired=1,
+        source="cluster",
+        diagnostics=[
+            ComponentDiagnostic(
+                severity="warning",
+                code="PROMETHEUS_UNREACHABLE",
+                message=f"Prometheus endpoint {target_label} is unreachable",
+            )
+        ],
+    )
+    return ClusterStackStatusResponse(
+        cluster=ClusterSummary(context=context, reachable=True, platform="kubernetes"),
+        namespace=namespace,
+        release=HelmReleaseSummary(),
+        status="degraded",
+        message=f"Prometheus endpoint {target_label} is unreachable",
+        components=[prom_comp, graf_comp],
+        active_operation_id=active_operation_id,
+        observed_at=observed_at,
+        access_mode=access_mode,
+        can_manage=can_manage,
+        monitoring_mode=mon_mode,
+        prometheus_url=snapshot_prom_url,
+        grafana_url=graf_url,
+        prometheus_node_port=prom_np,
+        grafana_node_port=graf_np,
+    )
+
+
+async def discover_cluster_stack_non_admin(
+    namespace: str,
+    cluster_id: str,
+    *,
+    context: str | None = None,
+    settings: Mapping[str, Any] | None = None,
+    active_operation_id: str | None = None,
+) -> ClusterStackStatusResponse:
+    """Discover monitoring stack health via Prometheus/Grafana HTTP without cluster-admin RBAC."""
+    return await discover_cluster_stack_via_http(
+        namespace,
+        cluster_id,
+        context=context,
+        settings=settings,
+        active_operation_id=active_operation_id,
+        access_mode="non_admin",
+        can_manage=False,
+        allow_port_forward=False,
     )

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { canAccessView, hasPermission, permissionMatches } from './permissions.js';
+import { canAccessView, hasPermission, permissionMatches, VIEW_PERMISSIONS } from './permissions.js';
 import { NAVIGATION_GROUPS } from '../../app/routes/views.js';
 
 test('permissionMatches supports segment wildcards', () => {
@@ -17,6 +17,48 @@ test('hasPermission returns true when any grant matches', () => {
     assert.equal(hasPermission(permissions, 'cluster:cluster:delete'), true);
     assert.equal(hasPermission(permissions, 'storage:volume:delete'), false);
     assert.equal(hasPermission(permissions, ''), true);
+});
+
+test('hasPermission supports any-of arrays including VIEW_PERMISSIONS', () => {
+    const clusterMonitoring = VIEW_PERMISSIONS['cluster-monitoring-stack'];
+    assert.equal(hasPermission(['monitoring:cluster-stack:read'], clusterMonitoring), true);
+    assert.equal(hasPermission(['monitoring:accelerator:read'], clusterMonitoring), true);
+    assert.equal(hasPermission(['cluster:cluster:read'], clusterMonitoring), false);
+
+    assert.equal(hasPermission([], []), true);
+    assert.equal(hasPermission(['deployment:run:read'], ['evaluate:run:read', 'deployment:run:read']), true);
+    assert.equal(hasPermission(['deployment:run:read'], ['evaluate:run:read', 'storage:volume:read']), false);
+    assert.equal(hasPermission(['monitoring:*:read'], ['cluster:cluster:read', 'monitoring:accelerator:read']), true);
+});
+
+test('permissionMatches and hasPermission fail closed on non-string and non-array inputs', () => {
+    for (const invalid of [null, undefined, 123, {}, ['a:b:c']]) {
+        assert.equal(permissionMatches(invalid, 'cluster:cluster:read'), false);
+        assert.equal(permissionMatches('cluster:cluster:read', invalid), false);
+    }
+    for (const invalidRequired of [123, 0, false, NaN, {}, { code: 'cluster:cluster:read' }]) {
+        assert.equal(hasPermission(['*:*:*'], invalidRequired), false);
+    }
+    for (const falsyOrNested of [
+        ['admin:secret:read', ''],
+        ['admin:secret:read', null],
+        ['admin:secret:read', undefined],
+        [[]],
+        ['admin:secret:read', []],
+        [['cluster:cluster:read']],
+        ['', null, undefined, [], false, 0],
+    ]) {
+        assert.equal(hasPermission([], falsyOrNested), false);
+        assert.equal(hasPermission(null, falsyOrNested), false);
+    }
+    assert.equal(hasPermission(['*:*:*'], ['', null, undefined, [], false, 0]), false);
+    assert.equal(hasPermission(['*:*:*'], [['cluster:cluster:read']]), false);
+    for (const invalidPermissions of [null, 'cluster:cluster:read', {}]) {
+        assert.equal(hasPermission(invalidPermissions, 'cluster:cluster:read'), false);
+        assert.equal(hasPermission(invalidPermissions, ['cluster:cluster:read']), false);
+        assert.equal(hasPermission(invalidPermissions, ''), true);
+        assert.equal(hasPermission(invalidPermissions, []), true);
+    }
 });
 
 test('canAccessView enforces the route catalog', () => {

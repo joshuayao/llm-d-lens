@@ -540,3 +540,179 @@ def test_weight_migration_preserves_first_published_pool_and_round_trips():
                 column["name"] for column in sa.inspect(connection).get_columns("model_service_members")
             }
     engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_publication_mutations_return_200_handoff_instead_of_502(monkeypatch):
+    from llm_d_lens.model_service.contracts import GroupStatusRequest
+    from llm_d_lens.model_service.gateway_contracts import GatewayHandoffPayload
+
+    service, group, principal, first, _ = _setup(monkeypatch)
+    monkeypatch.setattr(router, "_service", service)
+    monkeypatch.setattr(router, "current_principal", lambda _: principal)
+    handoff = GatewayHandoffPayload(
+        cluster_id="cluster-a",
+        access_mode="non_admin",
+        reconcile_status="admin_handoff_required",
+        desired_hash="h" * 64,
+        marker_namespace="ns-a",
+        marker_name="lens-ms-handoff-hhhhhhhhhhhhhhhh",
+        filename="remediate.sh",
+        admin_script="#!/usr/bin/env bash\n",
+        instructions="Apply as an Orchestration administrator",
+        pending_operations=[],
+        warnings=[],
+    )
+
+    async def reconcile(cluster_id, *, actor=None):
+        return GatewayOperation(
+            kind="reconcile-gateway",
+            cluster_id=cluster_id,
+            status="succeeded",
+            detail_json={"reconcileStatus": "admin_handoff_required", "handoff": handoff.api_payload()},
+        )
+
+    monkeypatch.setattr(router._gateway_ops, "reconcile_cluster", reconcile)
+
+    traffic = await router.admin_update_traffic(group.id, _request(), SimpleNamespace())
+    assert traffic["reconcileStatus"] == "admin_handoff_required"
+    assert traffic["handoff"]["clusterId"] == "cluster-a"
+
+    patched_group = await router.admin_update_group(
+        group.id, GroupUpdateRequest(displayName="Updated"), SimpleNamespace()
+    )
+    assert patched_group["reconcileStatus"] == "admin_handoff_required"
+    assert patched_group["handoff"]["desiredHash"] == "h" * 64
+
+    toggled_group = await router.admin_set_group_status(
+        group.id, GroupStatusRequest(status="disabled"), SimpleNamespace()
+    )
+    assert toggled_group["reconcileStatus"] == "admin_handoff_required"
+
+    providers = await router.admin_set_providers_status(
+        group.id, ProvidersStatusRequest(status="disabled"), SimpleNamespace()
+    )
+    assert providers["reconcileStatus"] == "admin_handoff_required"
+    assert len(providers["items"]) == 2
+
+    patched_member = await router.admin_update_member(
+        first.id, MemberUpdateRequest(status="disabled"), SimpleNamespace()
+    )
+    assert patched_member["reconcileStatus"] == "admin_handoff_required"
+
+
+@pytest.mark.asyncio
+async def test_remove_model_non_admin_handoff_deletes_record_and_returns_200(monkeypatch):
+    from llm_d_lens.model_service.gateway_contracts import GatewayHandoffPayload
+    from llm_d_lens.model_service.gateway_ops import GatewayAdminHandoffRequired
+
+    service, group, principal, first, _ = _setup(monkeypatch)
+    service.delete_member(first.id)
+    monkeypatch.setattr(router, "_service", service)
+    monkeypatch.setattr(router, "current_principal", lambda _: principal)
+    handoff = GatewayHandoffPayload(
+        cluster_id="cluster-a",
+        access_mode="non_admin",
+        reconcile_status="admin_handoff_required",
+        desired_hash="d" * 64,
+        marker_namespace="ns-a",
+        marker_name="lens-ms-handoff-dddddddddddddddd",
+        filename="remediate.sh",
+        admin_script="#!/usr/bin/env bash\n",
+        instructions="Apply as an Orchestration administrator",
+        pending_operations=[],
+        warnings=[],
+    )
+
+    async def cleanup(_group):
+        raise GatewayAdminHandoffRequired(handoff)
+
+    monkeypatch.setattr(router._gateway_ops, "remove_model_route", cleanup)
+    response = await router.admin_delete_group(group.id, SimpleNamespace())
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    assert body["deleted"] is True
+    assert body["groupId"] == group.id
+    assert body["reconcileStatus"] == "admin_handoff_required"
+    assert body["handoff"]["desiredHash"] == "d" * 64
+    assert service.groups.get(group.id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("non_admin", [False, True])
+async def test_delete_member_admin_vs_non_admin(monkeypatch, non_admin):
+    from fastapi import BackgroundTasks
+
+    from llm_d_lens.model_service.gateway_contracts import GatewayHandoffPayload
+
+    service, group, principal, first, _ = _setup(monkeypatch)
+    second = service.create_member(MemberCreateRequest(groupId=group.id, executionId="b"), published_by=None)
+    monkeypatch.setattr(router, "_service", service)
+    monkeypatch.setattr(router, "current_principal", lambda _: principal)
+    captured = {}
+
+    handoff = GatewayHandoffPayload(
+        cluster_id="cluster-a",
+        access_mode="non_admin",
+        reconcile_status="admin_handoff_required",
+        desired_hash="m" * 64,
+        marker_namespace="ns-a",
+        marker_name="lens-ms-handoff-mmmmmmmmmmmmmmmm",
+        filename="remediate.sh",
+        admin_script="#!/usr/bin/env bash\n",
+        instructions="Apply as an Orchestration administrator",
+        pending_operations=[],
+        warnings=[],
+    )
+
+    async def record_deletion(member, grp, *, remaining_members, actor=None):
+        captured["member_id"] = member.id
+        captured["group_id"] = grp.id if grp else None
+        captured["remaining_ids"] = [item.id for item in remaining_members]
+        captured["actor"] = actor
+        return handoff if non_admin else None
+
+    monkeypatch.setattr(router._gateway_ops, "record_member_deletion", record_deletion)
+    background = BackgroundTasks()
+    response = await router.admin_delete_member(first.id, background, SimpleNamespace())
+    assert service.members.get(first.id) is None
+    assert captured == {
+        "member_id": first.id,
+        "group_id": group.id,
+        "remaining_ids": [second.id],
+        "actor": principal.user_id,
+    }
+    if non_admin:
+        assert response.status_code == 200
+        body = json.loads(response.body)
+        assert body["deleted"] is True
+        assert body["memberId"] == first.id
+        assert body["reconcileStatus"] == "admin_handoff_required"
+        assert len(background.tasks) == 0
+    else:
+        assert response.status_code == 204
+        assert len(background.tasks) == 1
+        assert background.tasks[0].args == (["cluster-a"],)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("err_kind,expected_status", [("not_found", 204), ("unauth", 401)])
+async def test_delete_member_maps_gateway_errors_without_500(monkeypatch, err_kind, expected_status):
+    from fastapi import BackgroundTasks
+
+    from llm_d_lens.model_service.gateway_ops import GatewayClusterNotFoundError, GatewayUnauthenticatedError
+
+    service, _group, principal, first, _ = _setup(monkeypatch)
+    monkeypatch.setattr(router, "_service", service)
+    monkeypatch.setattr(router, "current_principal", lambda _: principal)
+
+    async def fail_deletion(*_args, **_kwargs):
+        if err_kind == "not_found":
+            raise GatewayClusterNotFoundError("cluster deleted")
+        raise GatewayUnauthenticatedError("401 unauthorized")
+
+    monkeypatch.setattr(router._gateway_ops, "record_member_deletion", fail_deletion)
+    response = await router.admin_delete_member(first.id, BackgroundTasks(), SimpleNamespace())
+    assert response.status_code == expected_status
+    if expected_status == 401:
+        assert json.loads(response.body)["code"] == "cluster_unauthenticated"

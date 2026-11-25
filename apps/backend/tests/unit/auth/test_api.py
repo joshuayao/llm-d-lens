@@ -868,3 +868,155 @@ def test_audit_update_events_are_suppressed_for_high_frequency_workloads():
         assert audit_tracks_write(table, "delete")
 
     assert audit_tracks_write("clusters", "update")
+
+
+def _isolate_cluster_storage(monkeypatch, tmp_path):
+    from llm_d_lens.cluster import sessions
+    from llm_d_lens.cluster.settings import ClusterSettings
+
+    settings = ClusterSettings(tmp_path / "sessions", "llm-d-bench-", tmp_path)
+    monkeypatch.setattr("llm_d_lens.cluster.registry.cluster_settings", settings)
+    monkeypatch.setattr(sessions, "_SESSION_DIRECTORY", settings.session_directory)
+
+
+def _create_draft_cluster(client: TestClient, *, headers: dict[str, str] | None = None):
+    return client.post(
+        "/api/cluster/clusters",
+        data={"name": "route-owner-draft", "draft": "true"},
+        files={
+            "file": (
+                "kubeconfig.yaml",
+                b"apiVersion: v1\nkind: Config\nclusters:\n- name: target\n  cluster:\n    server: https://10.0.0.1:6443\n",
+                "application/yaml",
+            )
+        },
+        headers=headers or {},
+    )
+
+
+def test_create_cluster_route_records_current_user_as_owner(monkeypatch, tmp_path):
+    from llm_d_lens.db.dao.cluster import ClusterDao
+
+    _isolate_cluster_storage(monkeypatch, tmp_path)
+    with _client() as client:
+        _bootstrap_and_login(client)
+        user_id = client.get("/api/v1/auth/session").json()["userId"]
+        response = _create_draft_cluster(client, headers=_csrf_headers(client))
+        assert response.status_code == 201, response.text
+        cluster_id = response.json()["cluster"]["id"]
+        assert response.json()["cluster"]["draft"] is True
+        assert ClusterDao().get_owner_user_id(cluster_id) == user_id
+
+
+def test_create_cluster_route_leaves_owner_unset_when_auth_is_disabled(monkeypatch, tmp_path):
+    from llm_d_lens.db.dao.cluster import ClusterDao
+
+    _isolate_cluster_storage(monkeypatch, tmp_path)
+    set_settings_for_testing(AuthSettings(auth_mode="disabled", allow_unauthenticated=True))
+    with _client() as client:
+        response = _create_draft_cluster(client)
+        assert response.status_code == 201, response.text
+        cluster_id = response.json()["cluster"]["id"]
+        assert ClusterDao().get_owner_user_id(cluster_id) is None
+
+
+def test_multi_permission_remediation_route_records_matched_or_compacted_audit_permission(monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock
+
+    from llm_d_lens.auth.contracts import Principal, RoleBinding, ScopeType
+    from llm_d_lens.auth.service import default_service
+    from llm_d_lens.db.dao.audit_log import AuditLogDao
+    from llm_d_lens.db.dao.cluster import ClusterDao
+    from llm_d_lens.model_service import router as ms_router
+
+    _isolate_cluster_storage(monkeypatch, tmp_path)
+    cluster = ClusterDao().create("remediation-test", "", "apiVersion: v1\nkind: Config")
+    expected_tuple = [
+        "model-service:gateway:reconcile",
+        "model-service:gateway:manage",
+        "model-service:member:manage",
+        "model-service:group:manage",
+        "model-service:group:toggle",
+        "model-service:group:remove",
+    ]
+    assert len(" | ".join(expected_tuple)) == 179
+
+    async def fake_create_remediation(cluster_id, **_kwargs):
+        from llm_d_lens.auth.context import current_audit_context
+        from llm_d_lens.auth.records import GroupRecord
+        from llm_d_lens.db.dao.group import GroupDao
+
+        # Trigger both an automatic ORM audit write and verify AuditContext.permission.
+        GroupDao().create(GroupRecord(name=f"remediation-audit-{cluster_id}"))
+        assert current_audit_context().permission == "model-service:group:manage"
+
+        class _Payload:
+            def api_payload(self):
+                return {"clusterId": cluster_id, "mode": "routes", "pendingOperations": []}
+
+        return _Payload()
+
+    monkeypatch.setattr(ms_router._gateway_ops, "create_remediation", AsyncMock(side_effect=fake_create_remediation))
+
+    service = default_service()
+    ops_user = service.create_user(username="ops-user", password=STRONG)
+    viewer_user = service.create_user(username="viewer-user", password=STRONG)
+
+    authorized_principal = Principal(
+        user_id=ops_user.id,
+        username=ops_user.username,
+        bindings=(RoleBinding(role="group-mgr", scope_type=ScopeType.GLOBAL),),
+        role_permissions={"group-mgr": frozenset({"model-service:group:manage"})},
+        role_self_scoped={"group-mgr": frozenset()},
+        authz_version=0,
+    )
+    denied_principal = Principal(
+        user_id=viewer_user.id,
+        username=viewer_user.username,
+        bindings=(RoleBinding(role="viewer", scope_type=ScopeType.GLOBAL),),
+        role_permissions={"viewer": frozenset({"cluster:cluster:read"})},
+        role_self_scoped={"viewer": frozenset()},
+        authz_version=0,
+    )
+
+    active = {"principal": authorized_principal}
+    monkeypatch.setattr(type(service), "validate", lambda _self, _token: active["principal"])
+
+    with _client() as client:
+        ok = client.post(
+            "/api/v1/model-service/admin/gateway/remediation",
+            json={"clusterId": cluster.id, "mode": "routes"},
+            headers={"authorization": "Bearer fixture", "x-request-id": "remed-ok"},
+        )
+        assert ok.status_code == 200, ok.text
+
+        ok_events = AuditLogDao().list(request_id="remed-ok")
+        assert len(ok_events) == 1
+        assert ok_events[0].permission == "model-service:group:manage"
+        assert len(ok_events[0].permission) <= 100
+
+        active["principal"] = denied_principal
+        denied = client.post(
+            "/api/v1/model-service/admin/gateway/remediation",
+            json={"clusterId": cluster.id, "mode": "routes"},
+            headers={"authorization": "Bearer fixture", "x-request-id": "remed-deny"},
+        )
+        assert denied.status_code == 403, denied.text
+
+        deny_events = AuditLogDao().list(request_id="remed-deny", event_type="access_denied")
+        assert len(deny_events) == 1
+        assert deny_events[0].permission == "model-service:gateway:reconcile (+5 more)"
+        assert len(deny_events[0].permission) <= 100
+        assert deny_events[0].detail["requiredPermissions"] == expected_tuple
+
+        # Short tuples (<= 100 chars) preserve existing joined formatting on deny while adding requiredPermissions.
+        short_deny = client.post(
+            "/api/mcp",
+            json={},
+            headers={"authorization": "Bearer fixture", "x-request-id": "mcp-deny"},
+        )
+        assert short_deny.status_code == 403, short_deny.text
+        mcp_deny_events = AuditLogDao().list(request_id="mcp-deny", event_type="access_denied")
+        assert len(mcp_deny_events) == 1
+        assert mcp_deny_events[0].permission == "mcp:tool:invoke | playground:chat:use"
+        assert mcp_deny_events[0].detail["requiredPermissions"] == ["mcp:tool:invoke", "playground:chat:use"]

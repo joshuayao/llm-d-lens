@@ -571,3 +571,177 @@ def test_gateway_mode_proxy_disable_skipped_for_evaluation_owned_deployments(tmp
     assert adapter._gateway_mode_args({"provenance": {"evaluate_workflow": True}}) == plaintext
     assert adapter._gateway_mode_args({"provenance": {"evaluation_id": "eval-1"}}) == plaintext
     assert adapter._gateway_mode_args({"provenance": {"evaluation_case_id": "case-1"}}) == plaintext
+
+
+@pytest.mark.parametrize(
+    ("valid_image", "expected_parts"),
+    [
+        ("registry.internal:5000/org/vllm:v0.8.5", ("registry.internal:5000/org/vllm", "v0.8.5")),
+        (
+            f"registry.internal:5000/org/vllm@sha256:{'a' * 64}",
+            ("registry.internal:5000/org/vllm", f"sha256:{'a' * 64}"),
+        ),
+        (
+            f"docker.io/vllm/vllm-openai:v0.8.5@sha256:{'b' * 64}",
+            ("docker.io/vllm/vllm-openai", f"v0.8.5@sha256:{'b' * 64}"),
+        ),
+    ],
+)
+def test_deploy_providers_accept_registry_ports_and_digests(tmp_path, valid_image, expected_parts):
+    from llm_d_lens.deploy.providers.baseline_vllm import BaselineVllmAdapter
+    from llm_d_lens.deploy.providers.helm_kustomize import HelmKustomizeGuideAdapter, HelmKustomizeGuideDescriptor
+    from llm_d_lens.deploy.providers.optimized_baseline import _image_parts
+    from llm_d_lens.deploy.providers.pd_disaggregation import PdDisaggregationAdapter
+    from llm_d_lens.deploy.providers.precise_prefix_cache_routing import PrecisePrefixCacheRoutingAdapter
+
+    adapter, _ = _adapter(tmp_path)
+    _, _, ob_runtime = adapter._deployment_parameters(
+        {
+            "model": {"name": "Qwen/Qwen3-0.6B"},
+            "decode": {"replicaCount": 1, "tensorParallelSize": 1},
+            "runtime": {"image": valid_image, "imageMode": "use-upstream-image"},
+        }
+    )
+    assert ob_runtime["image"] == valid_image
+    assert _image_parts(valid_image) == expected_parts
+
+    bv_params = BaselineVllmAdapter._parameters(
+        {
+            "model": {"name": "Qwen/Qwen3-0.6B"},
+            "decode": {"replicaCount": 1, "tensorParallelSize": 1},
+            "runtime": {"image": valid_image, "imageMode": "pull-existing"},
+        }
+    )
+    assert bv_params["image"] == valid_image
+
+    hk = HelmKustomizeGuideAdapter.__new__(HelmKustomizeGuideAdapter)
+    hk._accelerator = "nvidia"
+    hk._descriptor = HelmKustomizeGuideDescriptor(
+        guide_id="tiered-prefix-cache",
+        guide_root=tmp_path,
+        variants={"base": tmp_path},
+        default_variant="base",
+        router_chart="chart",
+        router_version="1",
+        router_values=(),
+        release_name="rel",
+        readiness_deployments=(),
+        endpoint_service="svc",
+        endpoint_port=8000,
+    )
+    hk_params = hk._parameters(
+        {
+            "guideVariant": "base",
+            "model": {"name": "Qwen/Qwen3-0.6B"},
+            "decode": {"replicaCount": 1, "tensorParallelSize": 1},
+            "runtime": {"image": valid_image},
+        }
+    )
+    assert hk_params["image"] == valid_image
+
+    pd = PdDisaggregationAdapter.__new__(PdDisaggregationAdapter)
+    pd._accelerator = "nvidia"
+    pd._sources = {"base": tmp_path}
+    pd_params = pd._parameters(
+        {
+            "guideVariant": "base",
+            "model": {"name": "Qwen/Qwen3-0.6B"},
+            "prefill": {"replicaCount": 1, "tensorParallelSize": 1},
+            "decode": {"replicaCount": 1, "tensorParallelSize": 1},
+            "runtime": {"image": valid_image},
+        }
+    )
+    assert pd_params["image"] == valid_image
+
+    pp = PrecisePrefixCacheRoutingAdapter.__new__(PrecisePrefixCacheRoutingAdapter)
+    pp_params = pp._parameters(
+        {
+            "model": {"name": "Qwen/Qwen3-0.6B"},
+            "decode": {"replicaCount": 1, "tensorParallelSize": 1},
+            "runtime": {"image": valid_image},
+        }
+    )
+    assert pp_params["image"] == valid_image
+
+
+@pytest.mark.parametrize(
+    "invalid_image",
+    [
+        "registry.internal:5000/org/vllm",
+        "untagged",
+        "docker.io/vllm/vllm-openai:latest;id",
+        "",
+    ],
+)
+def test_deploy_providers_reject_invalid_or_untagged_images(tmp_path, invalid_image):
+    from llm_d_lens.deploy.providers.baseline_vllm import BaselineVllmAdapter
+    from llm_d_lens.deploy.providers.helm_kustomize import HelmKustomizeGuideAdapter, HelmKustomizeGuideDescriptor
+    from llm_d_lens.deploy.providers.pd_disaggregation import PdDisaggregationAdapter
+    from llm_d_lens.deploy.providers.precise_prefix_cache_routing import PrecisePrefixCacheRoutingAdapter
+
+    adapter, _ = _adapter(tmp_path)
+    with pytest.raises(ValueError):
+        adapter._deployment_parameters(
+            {
+                "model": {"name": "Qwen/Qwen3-0.6B"},
+                "decode": {"replicaCount": 1, "tensorParallelSize": 1},
+                "runtime": {"image": invalid_image, "imageMode": "use-upstream-image"},
+            }
+        )
+    with pytest.raises(ValueError):
+        BaselineVllmAdapter._parameters(
+            {
+                "model": {"name": "Qwen/Qwen3-0.6B"},
+                "decode": {"replicaCount": 1, "tensorParallelSize": 1},
+                "runtime": {"image": invalid_image},
+            }
+        )
+
+    hk = HelmKustomizeGuideAdapter.__new__(HelmKustomizeGuideAdapter)
+    hk._accelerator = "nvidia"
+    hk._descriptor = HelmKustomizeGuideDescriptor(
+        guide_id="tiered-prefix-cache",
+        guide_root=tmp_path,
+        variants={"base": tmp_path},
+        default_variant="base",
+        router_chart="chart",
+        router_version="1",
+        router_values=(),
+        release_name="rel",
+        readiness_deployments=(),
+        endpoint_service="svc",
+        endpoint_port=8000,
+    )
+    with pytest.raises(ValueError):
+        hk._parameters(
+            {
+                "guideVariant": "base",
+                "model": {"name": "Qwen/Qwen3-0.6B"},
+                "decode": {"replicaCount": 1, "tensorParallelSize": 1},
+                "runtime": {"image": invalid_image},
+            }
+        )
+
+    pd = PdDisaggregationAdapter.__new__(PdDisaggregationAdapter)
+    pd._accelerator = "nvidia"
+    pd._sources = {"base": tmp_path}
+    with pytest.raises(ValueError):
+        pd._parameters(
+            {
+                "guideVariant": "base",
+                "model": {"name": "Qwen/Qwen3-0.6B"},
+                "prefill": {"replicaCount": 1, "tensorParallelSize": 1},
+                "decode": {"replicaCount": 1, "tensorParallelSize": 1},
+                "runtime": {"image": invalid_image},
+            }
+        )
+
+    pp = PrecisePrefixCacheRoutingAdapter.__new__(PrecisePrefixCacheRoutingAdapter)
+    with pytest.raises(ValueError, match="tagged runtime.image"):
+        pp._parameters(
+            {
+                "model": {"name": "Qwen/Qwen3-0.6B"},
+                "decode": {"replicaCount": 1, "tensorParallelSize": 1},
+                "runtime": {"image": invalid_image},
+            }
+        )

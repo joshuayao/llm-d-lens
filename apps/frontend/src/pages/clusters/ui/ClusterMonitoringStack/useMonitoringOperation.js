@@ -1,7 +1,7 @@
 import { useEffect } from 'react';
 const ACTIVE_OPERATION_STATUSES = new Set(['queued', 'running']);
 
-export function useMonitoringOperation({ operationId, operationStatus, completedOperationId, namespace, loadOperation, refreshStatus, setOperation, setOperationError, setCompletedOperationId, setInstallSuccess }) {
+export function useMonitoringOperation({ operationId, operationStatus, completedOperationId, namespace, loadOperation, refreshStatus, onSucceeded, setOperation, setOperationError, setCompletedOperationId, setInstallSuccess }) {
     useEffect(() => {
         if (!operationId || !ACTIVE_OPERATION_STATUSES.has(operationStatus || 'running')) return undefined;
         let cancelled = false;
@@ -24,6 +24,7 @@ export function useMonitoringOperation({ operationId, operationStatus, completed
                     });
                     setOperation(null);
                     refreshStatus();
+                    onSucceeded?.(nextOperation);
                     return;
                 }
                 setOperation(nextOperation);
@@ -48,6 +49,6 @@ export function useMonitoringOperation({ operationId, operationStatus, completed
             controller?.abort();
             document.removeEventListener('visibilitychange', onVisibilityChange);
         };
-    }, [completedOperationId, namespace, operationId, operationStatus, refreshStatus, loadOperation, setOperation, setOperationError, setCompletedOperationId, setInstallSuccess]);
+    }, [completedOperationId, namespace, operationId, operationStatus, refreshStatus, onSucceeded, loadOperation, setOperation, setOperationError, setCompletedOperationId, setInstallSuccess]);
 
 }

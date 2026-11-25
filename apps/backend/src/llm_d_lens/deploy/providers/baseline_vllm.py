@@ -11,6 +11,7 @@ from typing import Any
 
 import yaml
 
+from llm_d_lens.cluster.registry import validate_container_image_ref
 from llm_d_lens.core.hashing import stable_hash
 from llm_d_lens.deploy.providers.gpu_selection import gpu_device_selectors
 from llm_d_lens.deploy.providers.guide_adapter import (
@@ -106,10 +107,10 @@ class BaselineVllmAdapter:
         )
 
     async def deploy(self, artifact: GuideDeploymentArtifact, execution_context: dict[str, Any]) -> dict[str, Any]:
+        from llm_d_lens.deploy.providers.kubernetes import ensure_namespace_accessible
+
         namespace = self._namespace(execution_context)
-        status, stdout, stderr = await self._runner(["kubectl", "create", "namespace", namespace])
-        if status != 0 and "AlreadyExists" not in stderr:
-            raise RuntimeError((stderr or stdout).strip())
+        await ensure_namespace_accessible(self._runner, namespace)
         policy = execution_context.get("deployment_policy") or {}
         model_secret = policy.get("model_secret") or {}
         model_token = execution_context.get("model_token")
@@ -257,9 +258,7 @@ class BaselineVllmAdapter:
         runtime = overrides.get("runtime") or {}
         if not isinstance(model.get("name"), str) or not model["name"]:
             raise ValueError("baseline requires model.name")
-        image = runtime.get("image")
-        if not isinstance(image, str) or ":" not in image:
-            raise ValueError("baseline requires runtime.image with a tag")
+        image = validate_container_image_ref(runtime.get("image"), field="runtime.image", allow_empty=False) or ""
         replicas = decode.get("replicaCount")
         tensor_parallel = decode.get("tensorParallelSize")
         if not isinstance(replicas, int) or replicas < 1 or not isinstance(tensor_parallel, int) or tensor_parallel < 1:

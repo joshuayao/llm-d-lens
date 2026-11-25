@@ -29,7 +29,7 @@ Check with `kubectl get svc -n envoy-gateway-system`.
 ## HTTPRoute `ResolvedRefs=False` (`InvalidKind`) for InferencePool
 
 This repair is for **Envoy AI Gateway**, not the **Istio** provider selected by
-the cluster wizard. Ask the cluster administrator to install Envoy Gateway with
+the cluster wizard. Ask the orchestration administrator to install Envoy Gateway with
 its inference-pool addon. Without it, routes to `InferencePool` return 500.
 
 Using the target cluster's kubeconfig, run:

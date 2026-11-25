@@ -9,8 +9,12 @@ deployment facts are served by the Deploy API.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
+
+from llm_d_lens.auth.access import current_principal, require_cluster_access
+from llm_d_lens.monitoring.service_links import authorize_monitoring_cluster_request
 
 from . import service as deployment_monitoring
 
@@ -26,9 +30,14 @@ _ACTIONS = {
 
 
 def _http_error(error: deployment_monitoring.DeploymentMonitoringError) -> HTTPException:
+    detail: dict[str, Any] = {
+        **(error.extra or {}),
+        "code": error.code,
+        "message": error.message,
+    }
     return HTTPException(
         status_code=error.status_code,
-        detail={"code": error.code, "message": error.message},
+        detail=detail,
     )
 
 
@@ -41,10 +50,21 @@ def _http_error(error: deployment_monitoring.DeploymentMonitoringError) -> HTTPE
     ),
     operation_id="list_deployment_monitoring",
 )
-async def list_deployment_monitoring(cluster_id: str = Query(max_length=64)):
+async def list_deployment_monitoring(
+    http_request: Request,
+    cluster_id: str = Query(max_length=64),
+):
     """Report monitoring state for every deployment in a cluster."""
+    normalized_cluster_id = authorize_monitoring_cluster_request(
+        current_principal(http_request),
+        cluster_id,
+        "monitoring:deployment:read",
+        require_cluster_access_fn=require_cluster_access,
+    )
+    if normalized_cluster_id is None:
+        raise HTTPException(status_code=422, detail="cluster_id must not be empty")
     try:
-        return await deployment_monitoring.get_cluster_status(cluster_id)
+        return await deployment_monitoring.get_cluster_status(normalized_cluster_id)
     except deployment_monitoring.DeploymentMonitoringError as error:
         raise _http_error(error) from error
     except FileNotFoundError as error:
@@ -59,11 +79,30 @@ async def list_deployment_monitoring(cluster_id: str = Query(max_length=64)):
 )
 async def get_deployment_monitoring(
     execution_id: str,
+    http_request: Request,
     cluster_id: str | None = Query(default=None, max_length=64),
 ):
     """Report monitoring state for one deployment execution."""
+    principal = current_principal(http_request)
+    normalized_cluster_id = cluster_id.strip() or None if cluster_id is not None else None
+    if normalized_cluster_id is not None:
+        authorize_monitoring_cluster_request(
+            principal,
+            normalized_cluster_id,
+            "monitoring:deployment:read",
+            require_cluster_access_fn=require_cluster_access,
+        )
     try:
-        return await deployment_monitoring.get_status(execution_id, cluster_id)
+        resolved_cluster_id = deployment_monitoring.resolve_execution_cluster_id(
+            execution_id, normalized_cluster_id
+        )
+        authorize_monitoring_cluster_request(
+            principal,
+            resolved_cluster_id,
+            "monitoring:deployment:read",
+            require_cluster_access_fn=require_cluster_access,
+        )
+        return await deployment_monitoring.get_status(execution_id, normalized_cluster_id)
     except deployment_monitoring.DeploymentMonitoringError as error:
         raise _http_error(error) from error
     except FileNotFoundError as error:
@@ -79,14 +118,33 @@ async def get_deployment_monitoring(
 async def manage_deployment_monitoring(
     execution_id: str,
     action: str,
+    http_request: Request,
     cluster_id: str | None = Query(default=None, max_length=64),
 ):
     """Install, enable, disable, or uninstall a deployment's monitoring resources."""
     handler = _ACTIONS.get(action)
     if handler is None:
         raise HTTPException(status_code=404, detail=f"unknown monitoring action '{action}'")
+    principal = current_principal(http_request)
+    normalized_cluster_id = cluster_id.strip() or None if cluster_id is not None else None
+    if normalized_cluster_id is not None:
+        authorize_monitoring_cluster_request(
+            principal,
+            normalized_cluster_id,
+            "monitoring:deployment:action",
+            require_cluster_access_fn=require_cluster_access,
+        )
     try:
-        return await handler(execution_id, cluster_id)
+        resolved_cluster_id = deployment_monitoring.resolve_execution_cluster_id(
+            execution_id, normalized_cluster_id
+        )
+        authorize_monitoring_cluster_request(
+            principal,
+            resolved_cluster_id,
+            "monitoring:deployment:action",
+            require_cluster_access_fn=require_cluster_access,
+        )
+        return await handler(execution_id, normalized_cluster_id)
     except deployment_monitoring.DeploymentMonitoringError as error:
         raise _http_error(error) from error
     except FileNotFoundError as error:

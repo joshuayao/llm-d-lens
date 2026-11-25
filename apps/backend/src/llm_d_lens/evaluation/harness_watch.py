@@ -5,6 +5,8 @@ import json
 import os
 from contextlib import aclosing, suppress
 
+from llm_d_lens.monitoring.service_links import redact_monitoring_error
+
 _POLL_SECONDS = 10
 
 #: Printed by every upstream harness script once the load generator finished,
@@ -46,12 +48,15 @@ async def _read(environment, *args):
 
 
 def pod_failure(pod):
+    deleting = bool(pod.get("metadata", {}).get("deletionTimestamp"))
     status = pod.get("status", {})
     for container in status.get("initContainerStatuses", []) + status.get("containerStatuses", []):
         state = container.get("state", {})
         terminated = state.get("terminated", {})
         waiting = state.get("waiting", {})
         if terminated.get("exitCode", 0) != 0:
+            if deleting and terminated.get("reason") != "OOMKilled":
+                continue
             return f"{container['name']}: {terminated.get('reason', 'exited')} (exit {terminated['exitCode']})"
         if waiting.get("reason") in {
             "CrashLoopBackOff",
@@ -59,8 +64,10 @@ def pod_failure(pod):
             "ErrImagePull",
             "CreateContainerConfigError",
         }:
+            if deleting:
+                continue
             return f"{container['name']}: {waiting['reason']} {waiting.get('message', '')}"
-    if status.get("phase") == "Failed":
+    if status.get("phase") == "Failed" and not deleting:
         return status.get("message") or status.get("reason") or "Pod failed"
     return None
 
@@ -90,7 +97,7 @@ async def _poll_harness(run, namespace, environment, save, now, live=None):
                     )
                 )
         except (OSError, RuntimeError, TimeoutError, ValueError) as error:
-            run["harness_warning"] = f"Cannot inspect benchmark pods: {error}"
+            run["harness_warning"] = f"Cannot inspect benchmark pods: {redact_monitoring_error(str(error))}"
             save(run)
             await _wait_for_pods(live, _POLL_SECONDS)
             continue
@@ -116,10 +123,14 @@ async def _poll_harness(run, namespace, environment, save, now, live=None):
             # load-generation marker below is seen before deciding to fail.
             if not refresh and not failure:
                 continue
+            deleting = bool(pod.get("metadata", {}).get("deletionTimestamp"))
             try:
                 output = await _read(environment, "-n", namespace, "logs", name, "--all-containers=true", "--tail=80")
             except (OSError, RuntimeError, TimeoutError) as error:
-                output = f"Log retrieval unavailable: {error}"
+                if deleting or run.get("harness_logs"):
+                    output = ""
+                else:
+                    output = f"Log retrieval unavailable: {redact_monitoring_error(str(error))}"
             if output:
                 logs.append(f"[{name}]\n{output}")
             if "Network is unreachable" in output:

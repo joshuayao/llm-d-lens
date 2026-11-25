@@ -87,9 +87,22 @@ def _request_id(
 
 async def _default_fetch_series(cluster_id: str, promql: str) -> list[dict]:
     # Local import breaks the model_service -> monitoring import cycle at module load.
-    from llm_d_lens.monitoring.profiling.service import query_prometheus  # noqa: PLC0415
+    from llm_d_lens.monitoring.prometheus import (  # noqa: PLC0415
+        create_prometheus_client,
+        query_vector,
+        resolve_prometheus_endpoint,
+    )
 
-    return await query_prometheus(cluster_id, promql)
+    try:
+        endpoint = await resolve_prometheus_endpoint(cluster_id, allow_port_forward=False)
+        if endpoint is None:
+            endpoint = await resolve_prometheus_endpoint(cluster_id, allow_port_forward=True)
+        if endpoint is None:
+            return []
+        async with create_prometheus_client(endpoint, timeout=15.0) as client:
+            return await query_vector(client, promql)
+    except Exception:  # noqa: BLE001 - degrade cleanly on 403/port-forward/HTTP errors
+        return []
 
 
 class GatewayUsageSync:

@@ -77,7 +77,6 @@ _PERMISSIONS: tuple[Permission, ...] = (
     _permission("cluster:cluster:update", "Edit clusters"),
     _permission("cluster:cluster:delete", "Delete clusters"),
     _permission("cluster:cluster:grant-access", "Grant cluster access"),
-    _permission("cluster:hf-token:create", "Create the HF_TOKEN Secret"),
     _permission("cluster:hf-token:update", "Rotate the HF_TOKEN Secret"),
     _permission("cluster:node:operate", "Cordon/uncordon nodes"),
     _permission("cluster:session:connect", "Open a cluster session"),

@@ -30,6 +30,7 @@ from typing import Any
 
 import yaml
 
+from llm_d_lens.cluster.registry import validate_container_image_ref
 from llm_d_lens.configuration.manifest_facts import _invocation_tokens, _model_argument, _option
 from llm_d_lens.core.hashing import stable_hash
 from llm_d_lens.deploy.data_plane import router_data_plane_args, router_data_plane_effective_values
@@ -257,10 +258,10 @@ class PrecisePrefixCacheRoutingAdapter:
         )
 
     async def deploy(self, artifact: GuideDeploymentArtifact, execution_context: dict[str, Any]) -> dict[str, Any]:
+        from llm_d_lens.deploy.providers.kubernetes import ensure_namespace_accessible
+
         namespace = self._namespace(execution_context)
-        status, stdout, stderr = await self._runner(["kubectl", "create", "namespace", namespace])
-        if status != 0 and "AlreadyExists" not in stderr:
-            raise RuntimeError((stderr or stdout).strip())
+        await ensure_namespace_accessible(self._runner, namespace)
         model_secret = (execution_context.get("deployment_policy") or {}).get("model_secret") or {}
         if "endpoint" not in artifact.deployment_contract and model_secret.get("mode") == "existing-secret":
             await self._runner.copy_model_secret(namespace, model_secret["sourceNamespace"], model_secret["sourceName"])
@@ -766,8 +767,10 @@ class PrecisePrefixCacheRoutingAdapter:
         router = overrides.get("router") or {}
         if not isinstance(model.get("name"), str) or not model["name"]:
             raise ValueError("precise-prefix-cache-routing requires model.name")
-        if not isinstance(runtime.get("image"), str) or ":" not in runtime["image"]:
-            raise ValueError("precise-prefix-cache-routing requires a tagged runtime.image")
+        try:
+            image = validate_container_image_ref(runtime.get("image"), field="runtime.image", allow_empty=False) or ""
+        except ValueError as error:
+            raise ValueError(f"precise-prefix-cache-routing requires a tagged runtime.image: {error}") from error
         replicas, tensor_parallel = decode.get("replicaCount"), decode.get("tensorParallelSize")
         if not isinstance(replicas, int) or replicas < 1 or not isinstance(tensor_parallel, int) or tensor_parallel < 1:
             raise ValueError(
@@ -786,7 +789,7 @@ class PrecisePrefixCacheRoutingAdapter:
             raise ValueError("runtime.mountPath must be an absolute host path")
         return {
             "model": model["name"],
-            "image": runtime["image"],
+            "image": image,
             "mount_path": mount_path,
             "replicas": replicas,
             "tensor_parallel_size": tensor_parallel,

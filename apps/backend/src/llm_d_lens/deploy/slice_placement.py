@@ -153,18 +153,41 @@ async def node_inventory(session_id: str) -> list[dict]:
     """Ready nodes with labels and currently unreserved accelerator devices."""
     from llm_d_lens.cluster.service import _active_gpu_device_keys, _resource_slice_gpu_devices
 
+    from .slice_capacity import (
+        ClusterInventoryForbiddenError,
+        is_forbidden_result,
+        is_unauthorized_result,
+        prometheus_inventory_nodes_and_pods,
+    )
     from .source_composition import pod_demand
 
     nodes = await run_kubectl(["get", "nodes", "-o", "json"], timeout=20, cluster_id=session_id)
     pods = await run_kubectl(["get", "pods", "--all-namespaces", "-o", "json"], timeout=20, cluster_id=session_id)
+    for response in (nodes, pods):
+        if not response.ok and is_unauthorized_result(response):
+            raise GuideError("Cluster kubeconfig is unauthorized (401).", 401)
     if not nodes.ok or not pods.ok:
-        raise GuideError("Could not read cluster topology for slice placement.", 502)
+        if (not nodes.ok and is_forbidden_result(nodes)) or (not pods.ok and is_forbidden_result(pods)):
+            try:
+                node_items, pod_items = await prometheus_inventory_nodes_and_pods(session_id)
+            except ClusterInventoryForbiddenError as error:
+                raise GuideError("Could not read cluster topology for slice placement.", 403) from error
+        else:
+            raise GuideError("Could not read cluster topology for slice placement.", 502)
+    else:
+        node_items = json.loads(nodes.stdout).get("items", [])
+        pod_items = json.loads(pods.stdout).get("items", [])
+
     slices = await run_kubectl(
         ["get", "resourceslices.resource.k8s.io", "-o", "json"], timeout=20, cluster_id=session_id
     )
+    if not slices.ok and is_unauthorized_result(slices):
+        raise GuideError("Cluster kubeconfig is unauthorized (401).", 401)
     claims = await run_kubectl(
         ["get", "resourceclaims.resource.k8s.io", "-A", "-o", "json"], timeout=20, cluster_id=session_id
     )
+    if not claims.ok and is_unauthorized_result(claims):
+        raise GuideError("Cluster kubeconfig is unauthorized (401).", 401)
     devices = _resource_slice_gpu_devices(json.loads(slices.stdout).get("items", [])) if slices.ok else {}
     allocated = _active_gpu_device_keys(json.loads(claims.stdout).get("items", [])) if claims.ok else set()
     free = defaultdict(float)
@@ -172,7 +195,7 @@ async def node_inventory(session_id: str) -> list[dict]:
     for key, device in devices.items():
         if key not in allocated:
             free[device["node"]] += 1
-    for pod in json.loads(pods.stdout).get("items", []):
+    for pod in pod_items:
         spec = pod.get("spec", {})
         node = spec.get("nodeName")
         if not node or pod.get("status", {}).get("phase") in {"Succeeded", "Failed"}:
@@ -183,7 +206,7 @@ async def node_inventory(session_id: str) -> list[dict]:
             if resolve_by_resource(key):
                 free[node] -= value
     result = []
-    for node in json.loads(nodes.stdout).get("items", []):
+    for node in node_items:
         name = node.get("metadata", {}).get("name")
         if node.get("spec", {}).get("unschedulable") or not any(
             condition.get("type") == "Ready" and condition.get("status") == "True"

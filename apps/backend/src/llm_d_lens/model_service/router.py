@@ -18,7 +18,7 @@ import os
 import re
 from contextlib import suppress
 from datetime import datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -33,7 +33,10 @@ from llm_d_lens.auth.access import (
     resource_readable,
     visible_cluster_ids,
 )
-from llm_d_lens.cluster.registry import gateway_lock
+from llm_d_lens.auth.contracts import Principal, ResourceRef
+from llm_d_lens.auth.policy import authorize
+from llm_d_lens.cluster.registry import extract_url_host, gateway_lock
+from llm_d_lens.core.exceptions import ForbiddenError
 from llm_d_lens.model_service.contracts import (
     AuthorizeRequest,
     GroupCreateRequest,
@@ -53,12 +56,19 @@ from llm_d_lens.model_service.gateway_contracts import (
     ComponentLogsRequest,
     ComponentScaleRequest,
     GatewayReconcileRequest,
+    GatewayRemediationMode,
+    GatewayRemediationRequest,
+    GatewayRemediationVerifyRequest,
     GatewayStreamRequest,
     IppConfigRequest,
 )
 from llm_d_lens.model_service.gateway_ops import (
+    GatewayAdminHandoffRequired,
+    GatewayClusterNotFoundError,
     GatewayOpsError,
     GatewayOpsService,
+    GatewayUnauthenticatedError,
+    GatewayValidationError,
     gateway_base_url,
     local_public_ip,
 )
@@ -140,21 +150,86 @@ async def _reconcile_clusters(cluster_ids: list[str]) -> None:
         await _gateway_ops.reconcile_cluster(cluster_id)
 
 
-async def _apply_publication_change(cluster_ids: list[str], *, actor: str | None) -> Response | None:
+async def _schedule_or_handoff_reconcile(
+    cluster_id: str, background: BackgroundTasks, *, actor: str | None
+) -> dict[str, Any]:
+    """Schedule background sync on Admin clusters, or run sync handoff on Non-Admin clusters."""
+    _gateway_ops._invalidate_capability_cache(cluster_id)
+    caps = await _gateway_ops.probe_capabilities(cluster_id, refresh=True)
+    if caps.can_reconcile_routes:
+        background.add_task(_reconcile_clusters, [cluster_id])
+        return {}
+    try:
+        operation = await _gateway_ops.reconcile_cluster(cluster_id, actor=actor)
+    except (GatewayOpsError, OSError, ValueError):
+        logger.exception("Non-Admin post-create reconciliation handoff failed for cluster %s", cluster_id)
+        return {}
+    handoff = _gateway_ops.handoff_from_operation(operation)
+    if handoff is not None:
+        return {"reconcileStatus": "admin_handoff_required", "handoff": handoff}
+    return {}
+
+
+async def _apply_publication_change(
+    cluster_ids: list[str], *, actor: str | None
+) -> tuple[Response | None, dict[str, Any] | None]:
+    handoff: dict[str, Any] | None = None
     try:
         for cluster_id in sorted(set(cluster_ids)):
+            _gateway_ops._invalidate_capability_cache(cluster_id)
             operation = await _gateway_ops.reconcile_cluster(cluster_id, actor=actor)
+            op_handoff = _gateway_ops.handoff_from_operation(operation)
+            if op_handoff is not None:
+                handoff = op_handoff
+                continue
             if operation.status != "succeeded":
                 raise GatewayOpsError(operation.message)
     except (GatewayOpsError, OSError, ValueError):
         logger.exception("publication state saved but Gateway reconciliation failed for %s", cluster_ids)
-        return problem(
-            502,
-            "State saved; Gateway reconciliation failed",
-            "The requested state was saved, but routing could not be updated. Reload and use Reconcile to retry.",
-            "model_publication_apply_failed",
+        return (
+            problem(
+                502,
+                "State saved; Gateway reconciliation failed",
+                "The requested state was saved, but routing could not be updated. Reload and use Reconcile to retry.",
+                "model_publication_apply_failed",
+            ),
+            None,
         )
-    return None
+    return None, handoff
+
+
+def _require_cluster_permissions(
+    principal: Principal | None,
+    cluster_id: str,
+    permissions: tuple[str, ...],
+    *,
+    always_enforce: bool = False,
+) -> None:
+    require_cluster_access(principal, cluster_id)
+    if principal is None:
+        return
+    if not always_enforce and not principal.role_permissions:
+        return
+    resource = ResourceRef(resource_type="cluster", resource_id=cluster_id, cluster_id=cluster_id)
+    if not any(authorize(principal, permission, resource=resource).allowed for permission in permissions):
+        raise ForbiddenError(f"permission denied: {' or '.join(permissions)}")
+
+
+def _handle_remediation_error(error: GatewayOpsError) -> Response:
+    if isinstance(error, GatewayClusterNotFoundError):
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    if isinstance(error, GatewayValidationError):
+        return problem(400, "Invalid remediation request", str(error), "model_gateway_remediation_invalid")
+    if isinstance(error, GatewayUnauthenticatedError):
+        return problem(401, "Cluster authentication failed", str(error), "cluster_unauthenticated")
+    logger.warning("Gateway remediation failed: %s", error)
+    return problem(
+        502,
+        "Gateway remediation failed",
+        "Gateway remediation could not be completed. Check cluster connectivity and retry.",
+        "model_gateway_remediation_failed",
+        expose_detail=True,
+    )
 
 
 # --- user: tokens ------------------------------------------------------------
@@ -255,17 +330,28 @@ async def model_service_connection(request: Request) -> dict:
         if allowed is not None and cluster.cluster_id not in allowed:
             continue
         base_url = gateway_base_url(cluster, public_host, global_url)
+        try:
+            public_host_label = extract_url_host(cluster.gateway_public_url)
+        except ValueError:
+            public_host_label = None
+        address = (
+            public_host_label
+            or cluster.gateway_address
+            or (cluster.gateway_node_address if cluster.gateway_port else None)
+        )
         clusters.append(
             {
                 "clusterId": cluster.cluster_id,
                 "clusterName": cluster.cluster_name,
                 "provider": cluster.gateway_provider,
                 "gatewayName": cluster.gateway_name,
-                "address": cluster.gateway_address,
+                "address": address,
                 "publicUrl": cluster.gateway_public_url,
                 "port": cluster.gateway_port,
                 "baseUrl": base_url,
                 "ready": bool(cluster.gateway_ready),
+                "reconcileStatus": cluster.reconcile_status,
+                "accessMode": cluster.access_mode,
             }
         )
     return {"baseUrl": global_url, "clusters": clusters}
@@ -397,9 +483,12 @@ async def admin_create_group(request: Request, body: GroupCreateRequest, backgro
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ModelServiceConflictError as error:
         return problem(409, "Model group conflict", str(error), "model_group_conflict")
-    if body.execution_id is not None:
-        background.add_task(_reconcile_clusters, [group.cluster_id])
-    return group.api_payload()
+    payload = group.api_payload()
+    if body.execution_id is not None and group.cluster_id:
+        payload.update(
+            await _schedule_or_handoff_reconcile(group.cluster_id, background, actor=owner_for_create(principal))
+        )
+    return payload
 
 
 @admin_router.post(
@@ -423,8 +512,12 @@ async def admin_publish_group(request: Request, body: GroupPublishRequest, backg
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ModelServiceConflictError as error:
         return problem(409, "Model group conflict", str(error), "model_group_conflict")
-    background.add_task(_reconcile_clusters, [group.cluster_id])
-    return group.api_payload()
+    payload = group.api_payload()
+    if group.cluster_id:
+        payload.update(
+            await _schedule_or_handoff_reconcile(group.cluster_id, background, actor=owner_for_create(principal))
+        )
+    return payload
 
 
 @admin_router.get(
@@ -515,7 +608,8 @@ async def admin_update_traffic(group_id: str, body: TrafficUpdateRequest, reques
     except ModelServiceConflictError as error:
         return problem(409, "Traffic distribution conflict", str(error), "model_traffic_conflict")
     try:
-        operation = await _gateway_ops.reconcile_cluster(members[0].cluster_id, actor=principal.user_id)
+        _gateway_ops._invalidate_capability_cache(members[0].cluster_id)
+        operation = await _gateway_ops.reconcile_cluster(members[0].cluster_id, actor=owner_for_create(principal))
     except (GatewayOpsError, OSError, ValueError):
         logger.exception("traffic configuration saved but Gateway reconciliation failed for group %s", group_id)
         return problem(
@@ -524,7 +618,15 @@ async def admin_update_traffic(group_id: str, body: TrafficUpdateRequest, reques
             "Traffic weights were saved. Reload the configuration and use Reconcile to retry.",
             "model_traffic_apply_failed",
         )
-    return {"items": [member.api_payload() for member in members], "operation": operation.api_payload()}
+    payload: dict[str, Any] = {
+        "items": [member.api_payload() for member in members],
+        "operation": operation.api_payload(),
+    }
+    handoff = _gateway_ops.handoff_from_operation(operation)
+    if handoff is not None:
+        payload["reconcileStatus"] = "admin_handoff_required"
+        payload["handoff"] = handoff
+    return payload
 
 
 @admin_router.patch(
@@ -550,10 +652,14 @@ async def admin_update_group(group_id: str, body: GroupUpdateRequest, request: R
         return problem(409, "Model group conflict", str(error), "model_group_conflict")
     if group.cluster_id:
         cluster_ids.append(group.cluster_id)
-    failure = await _apply_publication_change(cluster_ids, actor=principal.user_id if principal else None)
+    failure, handoff = await _apply_publication_change(cluster_ids, actor=owner_for_create(principal))
     if failure is not None:
         return failure
-    return group.api_payload()
+    payload = group.api_payload()
+    if handoff is not None:
+        payload["reconcileStatus"] = "admin_handoff_required"
+        payload["handoff"] = handoff
+    return payload
 
 
 @admin_router.post(
@@ -585,10 +691,14 @@ async def admin_set_group_status(group_id: str, body: GroupStatusRequest, reques
         return problem(409, "Model group conflict", str(error), "model_group_conflict")
     if group.cluster_id:
         cluster_ids.append(group.cluster_id)
-    failure = await _apply_publication_change(cluster_ids, actor=principal.user_id if principal else None)
+    failure, handoff = await _apply_publication_change(cluster_ids, actor=owner_for_create(principal))
     if failure is not None:
         return failure
-    return group.api_payload()
+    payload = group.api_payload()
+    if handoff is not None:
+        payload["reconcileStatus"] = "admin_handoff_required"
+        payload["handoff"] = handoff
+    return payload
 
 
 @admin_router.delete(
@@ -597,13 +707,17 @@ async def admin_set_group_status(group_id: str, body: GroupStatusRequest, reques
     summary="Safely remove an empty model.",
     description="Requires group management in the model's cluster. Returns 409 model_group_conflict "
     "while any provider remains, including offline providers. Removes the model's Lens-managed HTTPRoute "
-    "and IPP mapping and confirms deletion before deleting the record. Returns 404 for a missing model; "
-    "502 model_removal_failed preserves the record for retry when cleanup fails. Deployments, Pods, "
-    "other models and shared Gateway resources are not deleted. Associated model inference grants are revoked.",
+    "and IPP mapping and confirms deletion before deleting the record. On Non-Admin clusters where route "
+    "cleanup requires Orchestration administrator handoff, records pending deletion and returns 200 with "
+    "handoff details. "
+    "Returns 404 for a missing model; 502 model_removal_failed preserves the record for retry when cleanup "
+    "fails. Deployments, Pods, other models and shared Gateway resources are not deleted. Associated model "
+    "inference grants are revoked.",
     operation_id="delete_model_service_group",
 )
 async def admin_delete_group(group_id: str, request: Request) -> Response:
     principal = current_principal(request)
+    handoff_payload: dict[str, Any] | None = None
     try:
         group = _service.require_empty_group(
             group_id, principal=principal, required_permission="model-service:group:remove"
@@ -612,7 +726,10 @@ async def admin_delete_group(group_id: str, request: Request) -> Response:
             group = _service.require_empty_group(
                 group_id, principal=principal, required_permission="model-service:group:remove"
             )
-            await _gateway_ops.remove_model_route(group)
+            try:
+                await _gateway_ops.remove_model_route(group)
+            except GatewayAdminHandoffRequired as error:
+                handoff_payload = error.handoff.api_payload()
             _service.delete_group(group_id, principal=principal, required_permission="model-service:group:remove")
     except ModelServiceNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
@@ -626,6 +743,16 @@ async def admin_delete_group(group_id: str, request: Request) -> Response:
             "Route cleanup could not be confirmed. The model record was retained; retry Remove model.",
             "model_removal_failed",
             expose_detail=True,
+        )
+    if handoff_payload is not None:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "deleted": True,
+                "groupId": group_id,
+                "reconcileStatus": "admin_handoff_required",
+                "handoff": handoff_payload,
+            },
         )
     return Response(status_code=204)
 
@@ -648,12 +775,16 @@ async def admin_set_providers_status(group_id: str, body: ProvidersStatusRequest
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ModelServiceConflictError as error:
         return problem(409, "Model member conflict", str(error), "model_member_conflict")
-    failure = await _apply_publication_change(
-        [member.cluster_id for member in members], actor=principal.user_id if principal else None
+    failure, handoff = await _apply_publication_change(
+        [member.cluster_id for member in members], actor=owner_for_create(principal)
     )
     if failure is not None:
         return failure
-    return {"items": [member.api_payload() for member in members]}
+    payload: dict[str, Any] = {"items": [member.api_payload() for member in members]}
+    if handoff is not None:
+        payload["reconcileStatus"] = "admin_handoff_required"
+        payload["handoff"] = handoff
+    return payload
 
 
 @admin_router.get(
@@ -709,8 +840,11 @@ async def admin_create_member(request: Request, body: MemberCreateRequest, backg
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ModelServiceConflictError as error:
         return problem(409, "Model member conflict", str(error), "model_member_conflict")
-    background.add_task(_reconcile_clusters, [member.cluster_id])
-    return member.api_payload()
+    payload = member.api_payload()
+    payload.update(
+        await _schedule_or_handoff_reconcile(member.cluster_id, background, actor=owner_for_create(principal))
+    )
+    return payload
 
 
 @admin_router.patch(
@@ -731,24 +865,61 @@ async def admin_update_member(member_id: str, body: MemberUpdateRequest, request
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ModelServiceConflictError as error:
         return problem(409, "Model member conflict", str(error), "model_member_conflict")
-    failure = await _apply_publication_change([member.cluster_id], actor=principal.user_id if principal else None)
+    failure, handoff = await _apply_publication_change([member.cluster_id], actor=owner_for_create(principal))
     if failure is not None:
         return failure
-    return member.api_payload()
+    payload = member.api_payload()
+    if handoff is not None:
+        payload["reconcileStatus"] = "admin_handoff_required"
+        payload["handoff"] = handoff
+    return payload
 
 
 @admin_router.delete(
     "/members/{member_id}",
     status_code=204,
     summary="Remove a member.",
-    description="Remove a model service member and reconcile its cluster routing. Missing members return 404.",
+    description=(
+        "Remove a model service member and reconcile its cluster routing. "
+        "Returns 204 for Admin clusters or 200 with Orchestration administrator handoff details on Non-Admin clusters. "
+        "Missing members return 404."
+    ),
     operation_id="delete_model_service_member",
 )
 async def admin_delete_member(member_id: str, background: BackgroundTasks, request: Request) -> Response:
+    principal = current_principal(request)
     member = _service.members.get(member_id)
-    _service.delete_member(member_id, principal=current_principal(request))
-    if member is not None:
-        background.add_task(_reconcile_clusters, [member.cluster_id])
+    group = _service.groups.get(member.group_id) if member is not None else None
+    _service.delete_member(member_id, principal=principal)
+    if member is None:
+        return Response(status_code=204)
+    remaining_members = [
+        item for item in _service.list_members(member.group_id) if item.cluster_id == member.cluster_id
+    ]
+    try:
+        handoff = await _gateway_ops.record_member_deletion(
+            member,
+            group,
+            remaining_members=remaining_members,
+            actor=owner_for_create(principal),
+        )
+    except GatewayClusterNotFoundError:
+        return Response(status_code=204)
+    except GatewayOpsError as error:
+        return _handle_remediation_error(error)
+    if handoff is not None:
+        if handoff.reconcile_status == "synced":
+            return Response(status_code=204)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "deleted": True,
+                "memberId": member_id,
+                "reconcileStatus": "admin_handoff_required",
+                "handoff": handoff.api_payload(),
+            },
+        )
+    background.add_task(_reconcile_clusters, [member.cluster_id])
     return Response(status_code=204)
 
 
@@ -826,16 +997,182 @@ async def admin_gateway_status(request: Request) -> dict:
 
 @admin_router.post(
     "/gateway/reconcile",
-    summary="Sync the shared Gateway and model routes for every cluster with members.",
-    description="Schedule Gateway and HTTPRoute reconciliation. Each enabled positive-weight provider contributes "
-    "a weighted InferencePool backendRef; zero-weight providers remain stored but are omitted. Returns the scheduled "
-    "cluster IDs, not proof of controller acceptance or observed traffic ratios.",
+    summary="Sync the shared Gateway and model routes for every visible cluster with members.",
+    description="Schedule Gateway and HTTPRoute reconciliation for visible clusters. Each enabled positive-weight "
+    "provider contributes a weighted InferencePool backendRef; zero-weight providers remain stored but are omitted. "
+    "For Non-Admin clusters, records and returns Orchestration administrator handoff scripts instead of "
+    "failing in the background. "
+    "Returns the scheduled cluster IDs and any handoffs, not proof of controller acceptance or observed "
+    "traffic ratios.",
     operation_id="reconcile_model_gateway",
 )
-async def admin_gateway_reconcile(background: BackgroundTasks) -> dict:
-    cluster_ids = sorted({member.cluster_id for member in _service.members.list_all() if member.status == "active"})
-    background.add_task(_reconcile_clusters, cluster_ids)
-    return {"scheduled": True, "clusters": cluster_ids}
+async def admin_gateway_reconcile(request: Request, background: BackgroundTasks) -> dict:
+    principal = current_principal(request)
+    allowed = visible_cluster_ids(principal)
+    cluster_ids = sorted(
+        {
+            member.cluster_id
+            for member in _service.members.list_all()
+            if member.status == "active"
+            and (allowed is None or member.cluster_id in allowed)
+            and (
+                principal is None
+                or not principal.role_permissions
+                or authorize(
+                    principal,
+                    "model-service:gateway:manage",
+                    resource=ResourceRef(
+                        resource_type="cluster",
+                        resource_id=member.cluster_id,
+                        cluster_id=member.cluster_id,
+                    ),
+                ).allowed
+            )
+        }
+    )
+    admin_clusters: list[str] = []
+    handoffs: list[dict[str, Any]] = []
+    actor = owner_for_create(principal)
+    for cluster_id in cluster_ids:
+        _gateway_ops._invalidate_capability_cache(cluster_id)
+        caps = await _gateway_ops.probe_capabilities(cluster_id, refresh=True)
+        if caps.can_reconcile_routes:
+            admin_clusters.append(cluster_id)
+            continue
+        operation = await _gateway_ops.reconcile_cluster(cluster_id, actor=actor)
+        handoff = _gateway_ops.handoff_from_operation(operation)
+        if handoff is not None:
+            handoffs.append(handoff)
+    if admin_clusters:
+        background.add_task(_reconcile_clusters, admin_clusters)
+    payload: dict[str, Any] = {"scheduled": bool(admin_clusters), "clusters": admin_clusters, "handoffs": handoffs}
+    if handoffs:
+        payload["reconcileStatus"] = "admin_handoff_required"
+    return payload
+
+
+@admin_router.get(
+    "/gateway/remediation",
+    summary="Read Orchestration administrator remediation script and pending route handoff details for a cluster.",
+    description=(
+        "Return the current desired-state Orchestration administrator bash script, completion marker coordinates, "
+        "pending operations, and warnings for one accessible cluster without modifying cluster state."
+    ),
+    operation_id="get_model_gateway_remediation",
+)
+async def admin_gateway_get_remediation(
+    request: Request,
+    cluster_id: Annotated[str, Query(alias="clusterId")],
+    mode: Annotated[GatewayRemediationMode, Query()] = "routes",
+    marker_namespace: Annotated[str | None, Query(alias="markerNamespace", max_length=63)] = None,
+) -> Any:
+    principal = current_principal(request)
+    _require_cluster_permissions(
+        principal,
+        cluster_id,
+        ("model-service:gateway:read", "model-service:group:read", "model-service:member:manage"),
+    )
+    if mode != "routes":
+        _require_cluster_permissions(
+            principal,
+            cluster_id,
+            ("model-service:gateway:manage", "model-service:gateway:reconcile"),
+            always_enforce=True,
+        )
+    try:
+        handoff = await _gateway_ops.get_remediation(
+            cluster_id,
+            mode=mode,
+            marker_namespace=marker_namespace,
+        )
+    except GatewayOpsError as error:
+        return _handle_remediation_error(error)
+    return handoff.api_payload()
+
+
+@admin_router.post(
+    "/gateway/remediation",
+    summary="Generate and record an Orchestration administrator remediation script for a cluster.",
+)
+async def admin_gateway_create_remediation(body: GatewayRemediationRequest, request: Request) -> Any:
+    principal = current_principal(request)
+    _require_cluster_permissions(
+        principal,
+        body.cluster_id,
+        (
+            "model-service:gateway:reconcile",
+            "model-service:gateway:manage",
+            "model-service:member:manage",
+            "model-service:group:manage",
+            "model-service:group:toggle",
+            "model-service:group:remove",
+        ),
+    )
+    if body.mode != "routes":
+        _require_cluster_permissions(
+            principal,
+            body.cluster_id,
+            ("model-service:gateway:manage", "model-service:gateway:reconcile"),
+            always_enforce=True,
+        )
+    try:
+        handoff = await _gateway_ops.create_remediation(
+            body.cluster_id,
+            mode=body.mode,
+            ipp_config=body.ipp_config,
+            provider=body.provider,
+            marker_namespace=body.marker_namespace,
+            actor=owner_for_create(principal),
+        )
+    except GatewayOpsError as error:
+        return _handle_remediation_error(error)
+    return handoff.api_payload()
+
+
+@admin_router.post(
+    "/gateway/remediation/verify",
+    summary="Verify Orchestration administrator remediation completion for a cluster.",
+)
+async def admin_gateway_verify_remediation(body: GatewayRemediationVerifyRequest, request: Request) -> Any:
+    principal = current_principal(request)
+    _require_cluster_permissions(
+        principal,
+        body.cluster_id,
+        (
+            "model-service:gateway:reconcile",
+            "model-service:gateway:manage",
+            "model-service:member:manage",
+            "model-service:group:manage",
+            "model-service:group:toggle",
+            "model-service:group:remove",
+        ),
+    )
+    if body.mode is not None and body.mode != "routes":
+        _require_cluster_permissions(
+            principal,
+            body.cluster_id,
+            ("model-service:gateway:manage", "model-service:gateway:reconcile"),
+            always_enforce=True,
+        )
+    try:
+        verify_kwargs: dict[str, Any] = {
+            "expected_hash": body.expected_hash,
+            "marker_namespace": body.marker_namespace,
+            "actor": owner_for_create(principal),
+        }
+        if body.mode is not None:
+            verify_kwargs["mode"] = body.mode
+        elif principal is not None and principal.role_permissions:
+            resource = ResourceRef(resource_type="cluster", resource_id=body.cluster_id, cluster_id=body.cluster_id)
+            if not any(
+                authorize(principal, perm, resource=resource).allowed
+                for perm in ("model-service:gateway:manage", "model-service:gateway:reconcile")
+            ):
+                verify_kwargs["mode"] = "routes"
+        result = await _gateway_ops.verify_remediation(body.cluster_id, **verify_kwargs)
+    except GatewayOpsError as error:
+        return _handle_remediation_error(error)
+    return result.api_payload()
 
 
 @admin_router.post(
@@ -858,9 +1195,21 @@ async def admin_gateway_probe() -> dict:
     description="Read the live Inference Payload Processor config for one accessible cluster.",
     operation_id="get_model_gateway_ipp_config",
 )
-async def admin_gateway_get_ipp_config(request: Request, cluster_id: str = Query(alias="clusterId")) -> dict:
+async def admin_gateway_get_ipp_config(request: Request, cluster_id: str = Query(alias="clusterId")) -> Any:
     require_cluster_access(current_principal(request), cluster_id)
-    return await _gateway_ops.get_ipp_config(cluster_id)
+    try:
+        return await _gateway_ops.get_ipp_config(cluster_id)
+    except GatewayOpsError as error:
+        return _handle_remediation_error(error)
+
+
+def _operation_payload_with_handoff(operation: Any) -> dict:
+    payload = operation.api_payload()
+    handoff = _gateway_ops.handoff_from_operation(operation)
+    if handoff is not None:
+        payload["reconcileStatus"] = "admin_handoff_required"
+        payload["handoff"] = handoff
+    return payload
 
 
 @admin_router.post(
@@ -870,11 +1219,12 @@ async def admin_gateway_get_ipp_config(request: Request, cluster_id: str = Query
     operation_id="set_model_gateway_ipp_config",
 )
 async def admin_gateway_ipp_config(body: IppConfigRequest, request: Request) -> dict:
-    require_cluster_access(current_principal(request), body.cluster_id)
+    principal = current_principal(request)
+    require_cluster_access(principal, body.cluster_id)
     operation = await _gateway_ops.set_ipp_config(
-        body.cluster_id, body.config, actor=owner_for_create(current_principal(request))
+        body.cluster_id, body.config, actor=owner_for_create(principal)
     )
-    return operation.api_payload()
+    return _operation_payload_with_handoff(operation)
 
 
 @admin_router.post(
@@ -914,7 +1264,7 @@ async def admin_gateway_install(body: ClusterGatewayRequest, request: Request) -
     operation = await _gateway_ops.install_cluster_gateway(
         body.cluster_id, provider=body.provider, actor=owner_for_create(current_principal(request))
     )
-    return operation.api_payload()
+    return _operation_payload_with_handoff(operation)
 
 
 @admin_router.post(
@@ -933,7 +1283,7 @@ async def admin_gateway_scale(body: ComponentScaleRequest, request: Request) -> 
         kind=body.kind,
         actor=owner_for_create(current_principal(request)),
     )
-    return operation.api_payload()
+    return _operation_payload_with_handoff(operation)
 
 
 @admin_router.post("/gateway/stream", summary="Run a data-plane operation and stream its log lines (SSE).")

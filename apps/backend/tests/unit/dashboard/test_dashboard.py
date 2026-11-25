@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient
 from llm_d_lens.api.main import app
 from llm_d_lens.auth.contracts import Principal, RoleBinding, ScopeType
 from llm_d_lens.auth.permissions import BUILTIN_ROLE_MAINTAINER, BUILTIN_ROLE_PERMISSIONS
+from llm_d_lens.dashboard import collector as collector_module
 from llm_d_lens.dashboard import service as service_module
 from llm_d_lens.dashboard.collector import DashboardCollector
 from llm_d_lens.dashboard.contracts import Coverage, DashboardIssue, WelcomeIssueSnapshot
@@ -233,6 +235,82 @@ def test_missing_accelerator_driver_is_reported():
     )
     issues = cluster_issues(row, has_services=False)
     assert [issue.code for issue in issues] == ["cluster.accelerator_driver_missing"]
+
+
+def test_unknown_accelerator_driver_and_restricted_workloads_do_not_trigger_missing_issue():
+    from llm_d_lens.dashboard.contracts import ClusterRow, ComponentRow
+    from llm_d_lens.dashboard.rules import cluster_issues
+
+    # 1. Explicit "unknown" status does not emit cluster.accelerator_driver_missing.
+    unknown_row = ClusterRow(
+        id="a",
+        name="sprocean-min",
+        available=True,
+        nodes_ready=2,
+        nodes_total=2,
+        components=[ComponentRow(name="intel-xpu accelerator-driver", status="unknown")],
+    )
+    assert cluster_issues(unknown_row, has_services=False) == []
+
+    # 2. Defense-in-depth: cached/legacy overview with restrictedResources=["workloads"]
+    #    coerces "missing" driver status to "unknown" (both flat and wrapped overview shapes).
+    cached_overview = _overview(node_disks=[10, 10])
+    cached_overview["restrictedResources"] = ["nodes", "workloads"]
+    cached_overview["hardware"]["accelerators"] = [{"id": "intel-xpu", "gpuCount": 8, "models": ["B60"]}]
+    cached_overview["components"]["acceleratorDevicePlugins"] = {
+        "intel-xpu": {"installed": False, "ready": 0, "desired": 0, "status": "missing"},
+    }
+    row_flat = service_module._cluster_row("a", "sprocean-min", cached_overview, datetime.now(UTC), False, None)
+    driver_comp = next(c for c in row_flat.components if c.name == "intel-xpu accelerator-driver")
+    assert driver_comp.status == "unknown"
+    assert cluster_issues(row_flat, has_services=False) == []
+
+    row_wrapped = service_module._cluster_row(
+        "a",
+        "sprocean-min",
+        {"kubernetes": cached_overview},
+        datetime.now(UTC),
+        False,
+        None,
+    )
+    assert next(c for c in row_wrapped.components if c.name == "intel-xpu accelerator-driver").status == "unknown"
+    assert cluster_issues(row_wrapped, has_services=False) == []
+
+    # 3. Genuine "missing" without restricted workloads (including NFD-detected node profile with 0 schedulable GPUs)
+    #    still emits cluster.accelerator_driver_missing.
+    admin_nfd_overview = _overview(gpu_total=0, gpu_available=0, node_disks=[10, 10])
+    admin_nfd_overview["restrictedResources"] = []
+    admin_nfd_overview["hardware"]["accelerators"] = []
+    admin_nfd_overview["nodes"][0]["gpuModelsByProfile"] = {"intel-xpu": []}
+    admin_nfd_overview["components"]["acceleratorDevicePlugins"] = {
+        "intel-xpu": {"installed": False, "ready": 0, "desired": 0, "status": "missing"},
+        "nvidia": {"installed": False, "ready": 0, "desired": 0, "status": "missing"},
+    }
+    row_missing = service_module._cluster_row("a", "sprocean-min", admin_nfd_overview, datetime.now(UTC), False, None)
+    issues = cluster_issues(row_missing, has_services=False)
+    assert [issue.code for issue in issues] == ["cluster.accelerator_driver_missing"]
+    assert issues[0].title == "sprocean-min: intel-xpu accelerator-driver is not installed"
+
+    # 4. Malformed overview structures (string restrictedResources, non-iterable restrictedResources,
+    #    malformed gpuByProfile / gpuModelsByProfile / acceleratorDevicePlugins) never split chars or raise TypeError.
+    str_restricted = _overview(node_disks=[10, 10])
+    str_restricted["restrictedResources"] = "workloads"
+    str_restricted["hardware"]["accelerators"] = [{"id": "intel-xpu", "gpuCount": 4, "models": []}]
+    str_restricted["components"]["acceleratorDevicePlugins"] = {
+        "intel-xpu": {"installed": False, "ready": 0, "desired": 0, "status": "missing"},
+    }
+    row_str = service_module._cluster_row("a", "sprocean-min", str_restricted, datetime.now(UTC), False, None)
+    assert next(c for c in row_str.components if c.name == "intel-xpu accelerator-driver").status == "unknown"
+    assert cluster_issues(row_str, has_services=False) == []
+
+    malformed_overview = _overview(node_disks=[10, 10])
+    malformed_overview["restrictedResources"] = 123
+    malformed_overview["nodes"][0]["gpuByProfile"] = "not-a-mapping"
+    malformed_overview["nodes"][0]["gpuModelsByProfile"] = "not-a-mapping"
+    malformed_overview["nodes"][1]["gpuByProfile"] = {"intel-xpu": "invalid-int"}
+    malformed_overview["components"]["acceleratorDevicePlugins"] = "not-a-mapping"
+    row_malformed = service_module._cluster_row("a", "sprocean-min", malformed_overview, datetime.now(UTC), False, None)
+    assert row_malformed.available is True
 
 
 def test_ready_deployment_without_a_model_service_is_flagged():
@@ -721,3 +799,716 @@ def test_welcome_routes_are_registered(monkeypatch):
     alerts = client.get("/api/v1/welcome/issues?severity=warning&limit=10")
     assert alerts.status_code == 200
     assert "snapshotId" in alerts.json()
+
+
+@pytest.mark.asyncio
+async def test_collector_overview_timeout_escalation_and_reset(monkeypatch):
+    from llm_d_lens.dashboard.rules import cluster_issues
+
+    cluster = SimpleNamespace(id="c1", name="sprocean-min")
+    collector = DashboardCollector()
+    monkeypatch.setattr(collector_module.registry, "get_cluster", lambda cid: cluster if cid == "c1" else None)
+
+    async def timeout_overview(_cluster):
+        raise TimeoutError
+
+    monkeypatch.setattr(collector_module.cluster_service, "build_overview", timeout_overview)
+
+    # 1st TimeoutError -> overview_timeout (suppressed by cluster_issues)
+    await collector._refresh_overview("c1")
+    _, _, _, reason1 = await collector.cluster_overview(cluster)
+    assert reason1 == "overview_timeout"
+    row1 = service_module._cluster_row("c1", "sprocean-min", None, None, False, reason1)
+    assert cluster_issues(row1, has_services=False) == []
+
+    # 2nd consecutive TimeoutError -> overview_unavailable (emits cluster.observation_unavailable)
+    await collector._refresh_overview("c1")
+    _, _, _, reason2 = await collector.cluster_overview(cluster)
+    assert reason2 == "overview_unavailable"
+    row2 = service_module._cluster_row("c1", "sprocean-min", None, None, False, reason2)
+    assert [issue.code for issue in cluster_issues(row2, has_services=False)] == ["cluster.observation_unavailable"]
+
+    # Success resets timeout counter so a subsequent single timeout returns to overview_timeout
+    async def ok_overview(_cluster):
+        return _overview()
+
+    monkeypatch.setattr(collector_module.cluster_service, "build_overview", ok_overview)
+    await collector._refresh_overview("c1")
+    overview, _, stale, reason_ok = await collector.cluster_overview(cluster)
+    assert overview is not None
+    assert stale is False
+    assert reason_ok is None
+    assert "c1" not in collector._overview_timeouts
+
+    # Failed forced refresh marks cached entry stale and TTL hit preserves entry.stale without retry storm
+    monkeypatch.setattr(collector_module.cluster_service, "build_overview", timeout_overview)
+    await collector._refresh_overview("c1")
+    cached_val, _, cached_stale, _ = await collector.cluster_overview(cluster)
+    assert cached_val is not None
+    assert cached_stale is True
+
+    # Non-timeout exception escalates to overview_unavailable immediately
+    collector2 = DashboardCollector()
+
+    async def auth_error(_cluster):
+        raise RuntimeError("401 unauthorized")
+
+    monkeypatch.setattr(collector_module.cluster_service, "build_overview", auth_error)
+    await collector2._refresh_overview("c1")
+    _, _, _, err_reason = await collector2.cluster_overview(cluster)
+    assert err_reason == "overview_unavailable"
+
+    collector.close()
+    collector2.close()
+
+
+@pytest.mark.asyncio
+async def test_cold_run_snapshot_check_waits_for_overview_and_coalesces_refresh(monkeypatch):
+    cluster = SimpleNamespace(
+        id="c1",
+        name="sprocean-min",
+        hf_token_secret_namespace=None,
+        hf_token_secret_name=None,
+    )
+    collector = DashboardCollector()
+    monkeypatch.setattr(collector, "cluster_list", lambda include_drafts=False: [cluster])
+    monkeypatch.setattr(collector, "storage_volumes", list)
+    monkeypatch.setattr(collector_module.registry, "get_cluster", lambda cid: cluster if cid == "c1" else None)
+
+    overview_calls = 0
+
+    async def slow_overview(_cluster):
+        nonlocal overview_calls
+        overview_calls += 1
+        await asyncio.sleep(0.02)
+        return _overview()
+
+    async def ok_secret(_cluster):
+        return "present"
+
+    monkeypatch.setattr(collector_module.cluster_service, "build_overview", slow_overview)
+    monkeypatch.setattr(collector_module.cluster_service, "hf_token_secret_status", ok_secret)
+    monkeypatch.setattr(collector_module.GatewayOpsService, "status", lambda self: asyncio.sleep(0, result=None))
+
+    async def empty_cache(self):
+        return []
+
+    monkeypatch.setattr(collector_module.ModelCacheService, "list", empty_cache)
+    monkeypatch.setattr(service_module, "list_execution_contexts", lambda **kwargs: [])
+
+    dao = WelcomeIssueSnapshotDao()
+    service = DashboardService(collector=collector, model_service=FakeModelService(), snapshot_dao=dao)
+
+    # Cold run_snapshot_check waits for overview and persists state="complete", 1/1
+    snapshot = await service.run_snapshot_check()
+    assert snapshot is not None
+    assert snapshot.state == "complete"
+    assert snapshot.stale is False
+    assert snapshot.observed_at is not None
+    assert snapshot.coverage == Coverage(observed=1, expected=1, unit="clusters")
+    assert overview_calls == 1
+
+    # Cold recovery after prior overview_unavailable also waits for the fresh overview
+    collector._overview.clear()
+    collector._overview_errors["c1"] = "overview_unavailable"
+    recovered = await service.run_snapshot_check()
+    assert recovered is not None
+    assert recovered.state == "complete"
+    assert recovered.coverage == Coverage(observed=1, expected=1, unit="clusters")
+    assert overview_calls == 2
+
+    # welcome_overview(refresh=True) awaits coalesced snapshot refresh and returns updated snapshot
+    refreshed = await service.welcome_overview(None, refresh=True)
+    assert refreshed.issues.state == "complete"
+    assert refreshed.issues.stale is False
+    assert overview_calls == 3
+
+    # Timeout while waiting in welcome_overview(refresh=True) returns existing snapshot marked stale=True
+    async def hanging_refresh():
+        await asyncio.sleep(1.0)
+        return snapshot
+
+    monkeypatch.setattr(service_module, "REFRESH_WAIT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(service, "_run_snapshot_check_once", hanging_refresh)
+    timed_out_view = await service.welcome_overview(None, refresh=True)
+    assert timed_out_view.issues.stale is True
+
+    if service._snapshot_task is not None and not service._snapshot_task.done():
+        service._snapshot_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await service._snapshot_task
+    collector.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_overview_returns_timeout_when_exceeded(monkeypatch):
+    cluster = SimpleNamespace(id="c1", name="sprocean-min")
+    collector = DashboardCollector()
+    monkeypatch.setattr(collector_module.registry, "get_cluster", lambda cid: cluster if cid == "c1" else None)
+
+    async def hanging_overview(_cluster):
+        await asyncio.sleep(1.0)
+        return _overview()
+
+    monkeypatch.setattr(collector_module.cluster_service, "build_overview", hanging_overview)
+    overview, observed_at, stale, reason = await collector.wait_for_overview(cluster, timeout=0.01)
+    assert overview is None
+    assert observed_at is None
+    assert stale is False
+    assert reason == "overview_timeout"
+    collector.close()
+
+
+def test_deployment_monitoring_issue_respects_cluster_monitoring_ready():
+    from llm_d_lens.dashboard.rules import deployment_monitoring_issue
+
+    # Suppressed when cluster monitoring is positively confirmed ready
+    assert (
+        deployment_monitoring_issue(
+            execution_id="e1",
+            execution_name="qwen",
+            cluster_id="a",
+            cluster_name="sprocean-min",
+            status="enabled",
+            stack_ready=False,
+            message="monitoring enabled",
+            cluster_monitoring_ready=True,
+        )
+        is None
+    )
+
+    # Preserved when cluster monitoring is False or None
+    for ready_flag in (False, None):
+        degraded = deployment_monitoring_issue(
+            execution_id="e1",
+            execution_name="qwen",
+            cluster_id="a",
+            cluster_name="sprocean-min",
+            status="enabled",
+            stack_ready=False,
+            message="monitoring enabled",
+            cluster_monitoring_ready=ready_flag,
+        )
+        assert degraded is not None
+        assert degraded.code == "monitoring.deployment_unavailable"
+
+    # Always warns on status == "unreachable" even if cluster monitoring is ready
+    unreachable = deployment_monitoring_issue(
+        execution_id="e1",
+        execution_name="qwen",
+        cluster_id="a",
+        cluster_name="sprocean-min",
+        status="unreachable",
+        stack_ready=True,
+        message="forbidden",
+        cluster_monitoring_ready=True,
+    )
+    assert unreachable is not None
+    assert unreachable.code == "monitoring.deployment_unavailable"
+
+
+def test_gateway_cluster_issues_handles_non_admin_visibility_handoff_and_http_unhealthy():
+    from llm_d_lens.dashboard.rules import gateway_cluster_issues
+
+    base = {
+        "cluster_id": "c1",
+        "cluster_name": "sprocean-min",
+        "members": [SimpleNamespace(execution_id="e1")],
+        "gateway_state": "unknown",
+        "gateway_ready": None,
+        "gateway_running": None,
+        "ipp_state": "unknown",
+        "ipp_ready": None,
+        "access_mode": "non_admin",
+        "gateway_probe_source": "none",
+        "reconcile_status": "synced",
+        "auth_error": None,
+        "pending_operations_count": 0,
+    }
+
+    # 1. Non-Admin visibility gap (probe_source="none", state="unknown") -> zero false critical alerts
+    assert gateway_cluster_issues(SimpleNamespace(**base), cluster_name="sprocean-min", service_names=["qwen3"]) == []
+    assert (
+        gateway_cluster_issues(
+            SimpleNamespace(**{**base, "gateway_state": "missing", "ipp_state": "missing"}),
+            cluster_name="sprocean-min",
+            service_names=["qwen3"],
+        )
+        == []
+    )
+
+    # 2. Expired token (auth_error set) suppresses both gateway unavailable and handoff warning
+    assert (
+        gateway_cluster_issues(
+            SimpleNamespace(
+                **{
+                    **base,
+                    "gateway_state": "missing",
+                    "reconcile_status": "admin_handoff_required",
+                    "auth_error": "kubeconfig token expired",
+                }
+            ),
+            cluster_name="sprocean-min",
+            service_names=["qwen3"],
+        )
+        == []
+    )
+
+    # 3. Non-Admin pending Orchestration administrator handoff -> warning
+    handoff_issues = gateway_cluster_issues(
+        SimpleNamespace(
+            **{
+                **base,
+                "reconcile_status": "admin_handoff_required",
+                "pending_operations_count": 2,
+            }
+        ),
+        cluster_name="sprocean-min",
+        service_names=["qwen3"],
+    )
+    assert [issue.code for issue in handoff_issues] == ["model.gateway_admin_handoff_required"]
+    assert handoff_issues[0].severity == "warning"
+    assert "Orchestration administrator" in handoff_issues[0].title
+    assert "Orchestration administrator" in handoff_issues[0].message
+
+    # 4. Non-Admin HTTP 5xx (probe_source="http", running=True, ready=False) -> "Gateway is unhealthy"
+    http_unhealthy = gateway_cluster_issues(
+        SimpleNamespace(
+            **{
+                **base,
+                "gateway_state": "installed",
+                "gateway_running": True,
+                "gateway_ready": False,
+                "gateway_probe_source": "http",
+                "ipp_state": "missing",
+            }
+        ),
+        cluster_name="sprocean-min",
+        service_names=["qwen3"],
+    )
+    assert [issue.code for issue in http_unhealthy] == ["model.gateway_unavailable"]
+    assert http_unhealthy[0].title == "sprocean-min: Gateway is unhealthy"
+
+    # HTTP 5xx + admin_handoff_required -> only handoff warning (no duplicate critical)
+    http_handoff = gateway_cluster_issues(
+        SimpleNamespace(
+            **{
+                **base,
+                "gateway_state": "installed",
+                "gateway_running": True,
+                "gateway_ready": False,
+                "gateway_probe_source": "http",
+                "reconcile_status": "admin_handoff_required",
+            }
+        ),
+        cluster_name="sprocean-min",
+        service_names=["qwen3"],
+    )
+    assert [issue.code for issue in http_handoff] == ["model.gateway_admin_handoff_required"]
+
+    # 5. Non-Admin probe_source="http" still reports stopped IPP if Prometheus observed ipp_state="installed", ready=False
+    http_with_stopped_ipp = gateway_cluster_issues(
+        SimpleNamespace(
+            **{
+                **base,
+                "gateway_state": "installed",
+                "gateway_running": True,
+                "gateway_ready": True,
+                "gateway_probe_source": "http",
+                "ipp_state": "installed",
+                "ipp_ready": False,
+            }
+        ),
+        cluster_name="sprocean-min",
+        service_names=["qwen3"],
+    )
+    assert [issue.code for issue in http_with_stopped_ipp] == ["model.ipp_unavailable"]
+
+    # 6. Positive k8s/prometheus failures still emit critical Gateway & warning IPP alerts
+    prom_down = gateway_cluster_issues(
+        SimpleNamespace(
+            **{
+                **base,
+                "gateway_state": "missing",
+                "gateway_probe_source": "prometheus",
+            }
+        ),
+        cluster_name="sprocean-min",
+        service_names=["qwen3"],
+    )
+    assert [issue.code for issue in prom_down] == ["model.gateway_unavailable"]
+    assert prom_down[0].severity == "critical"
+
+
+def test_service_availability_ignores_unobserved_non_admin_gateway():
+    from llm_d_lens.dashboard.contracts import ProviderCounts
+
+    providers = ProviderCounts(total=1, active=1, ready=1)
+    gateway = SimpleNamespace(
+        access_mode="non_admin",
+        gateway_probe_source="none",
+        gateway_state="missing",
+        gateway_ready=False,
+        gateway_running=False,
+        ipp_state="missing",
+        ipp_ready=False,
+    )
+    availability = service_module._service_availability(
+        "active",
+        providers,
+        gateway,
+        {"exec-a": SimpleNamespace(status="ready")},
+        ["exec-a"],
+        has_deployment_access=True,
+        has_gateway_access=True,
+    )
+    assert availability == "available"
+
+
+def test_service_issues_reports_unhealthy_provider_instead_of_no_provider():
+    from llm_d_lens.dashboard.contracts import ProviderCounts, ProviderHealth, ServiceRow
+    from llm_d_lens.dashboard.rules import service_issues
+
+    row = ServiceRow(
+        group_id="g1",
+        name="qwen3",
+        cluster_id="c1",
+        cluster_name="sprocean-min",
+        providers=ProviderCounts(total=1, active=0, ready=0, unhealthy=1),
+        provider_details=[
+            ProviderHealth(
+                execution_id="exec-1",
+                name="qwen-qwen3-0-6b",
+                status="unhealthy",
+                weight=1,
+                ready=True,
+                reason="epp=missing, ipp=missing, httpRoute=missing",
+            )
+        ],
+        deployment_observed=True,
+    )
+    issues = service_issues(row)
+    assert [issue.code for issue in issues] == ["model.provider_unhealthy"]
+    assert issues[0].severity == "warning"
+    assert "No healthy provider is currently serving" in issues[0].message
+
+
+@pytest.mark.asyncio
+async def test_supporting_issues_skips_cache_empty_when_cache_read_failed(monkeypatch):
+    service, collector, _ = _service()
+    collector.storage_volumes_value = [
+        SimpleNamespace(
+            id="v1",
+            cluster_id="a",
+            name="model-cache",
+            purposes=[SimpleNamespace(value="model-cache")],
+            status=SimpleNamespace(value="ready"),
+            capacity="100Gi",
+            used_bytes=None,
+            updated_at=None,
+        )
+    ]
+
+    # Use real DashboardCollector.model_cache_entries with failing ModelCacheService().list()
+    real_collector = DashboardCollector()
+    monkeypatch.setattr(real_collector, "storage_volumes", lambda: collector.storage_volumes_value)
+
+    async def failing_list(self):
+        raise TimeoutError
+
+    monkeypatch.setattr(collector_module.ModelCacheService, "list", failing_list)
+    service._collector = real_collector
+
+    issues = await service._supporting_issues(None, [collector.clusters[0]], {"a"})
+    assert real_collector._cache_failed is True
+    assert not any(
+        issue.code in {"cluster.model_cache_empty", "cluster.model_cache_storage_empty"} for issue in issues
+    )
+
+    # Recovery via _refresh_model_cache resets _cache_failed to False
+    async def ok_list(self):
+        return []
+
+    monkeypatch.setattr(collector_module.ModelCacheService, "list", ok_list)
+    await real_collector._refresh_model_cache()
+    assert real_collector._cache_failed is False
+    real_collector.close()
+
+
+@pytest.mark.asyncio
+async def test_compose_suppresses_degraded_deployment_monitoring_when_cluster_monitoring_ready(monkeypatch):
+    service, collector, _ = _service()
+    monkeypatch.setattr(service_module, "list_execution_contexts", lambda **kwargs: [_context("a", "exec-a")])
+
+    async def fake_dep_mon(cluster_id, *, force=False):
+        return (
+            {
+                "items": [
+                    {
+                        "execution_id": "exec-a",
+                        "status": "enabled",
+                        "stack_ready": False,
+                        "message": "monitoring enabled",
+                    }
+                ]
+            }
+            if cluster_id == "a"
+            else {"items": []}
+        )
+
+    monkeypatch.setattr(collector, "deployment_monitoring_status", fake_dep_mon)
+    composition = await service._compose(None, [collector.clusters[0]], cluster_id="a", refresh=False)
+    assert not any(issue.code == "monitoring.deployment_unavailable" for issue in composition.issues)
+
+
+def test_http_unhealthy_gateway_not_silently_suppressed_without_handoff_warning():
+    from llm_d_lens.dashboard.rules import gateway_cluster_issues
+
+    # Admin cluster with stale reconcile_status="admin_handoff_required" or Non-Admin with no
+    # services/members/pending_ops does NOT emit handoff warning, so HTTP 5xx must still report unhealthy.
+    for access_mode, members in [("admin", [SimpleNamespace(execution_id="e1")]), ("non_admin", [])]:
+        gateway = SimpleNamespace(
+            cluster_id="c1",
+            cluster_name="sprocean-min",
+            members=members,
+            gateway_state="installed",
+            gateway_ready=False,
+            gateway_running=True,
+            ipp_state="unknown",
+            ipp_ready=None,
+            access_mode=access_mode,
+            gateway_probe_source="http",
+            reconcile_status="admin_handoff_required",
+            auth_error=None,
+            pending_operations_count=0,
+        )
+        issues = gateway_cluster_issues(gateway, cluster_name="sprocean-min", service_names=[])
+        assert [issue.code for issue in issues] == ["model.gateway_unavailable"]
+        assert issues[0].title == "sprocean-min: Gateway is unhealthy"
+
+
+@pytest.mark.asyncio
+async def test_gateway_issues_enforce_gateway_and_group_read_per_cluster_and_snapshot(monkeypatch):
+    service, collector, _ = _service()
+    now = datetime.now(UTC)
+    gateway_issues = [
+        DashboardIssue(
+            id="gw-a",
+            code="model.gateway_unavailable",
+            severity="critical",
+            category="model-service",
+            title="A gateway unavailable",
+            message="A",
+            cluster_id="a",
+            resource={"type": "cluster_gateway", "id": "a"},
+        ),
+        DashboardIssue(
+            id="ipp-a",
+            code="model.ipp_unavailable",
+            severity="warning",
+            category="model-service",
+            title="A IPP unavailable",
+            message="A",
+            cluster_id="a",
+            resource={"type": "cluster_ipp", "id": "a"},
+        ),
+        DashboardIssue(
+            id="handoff-a",
+            code="model.gateway_admin_handoff_required",
+            severity="warning",
+            category="model-service",
+            title="A handoff",
+            message="A",
+            cluster_id="a",
+            resource={"type": "cluster_gateway", "id": "a"},
+        ),
+    ]
+    WelcomeIssueSnapshotDao().put(
+        WelcomeIssueSnapshot(
+            snapshot_id="snap-gw",
+            generated_at=now,
+            observed_at=now,
+            state="complete",
+            coverage=Coverage(observed=2, expected=2, unit="clusters"),
+            issues=gateway_issues,
+        )
+    )
+
+    # Snapshot filtering: needs BOTH model-service:gateway:read AND model-service:group:read
+    only_group = _principal("group-only", frozenset({"cluster:cluster:read", "model-service:group:read"}), cluster="a")
+    only_gateway = _principal(
+        "gateway-only", frozenset({"cluster:cluster:read", "model-service:gateway:read"}), cluster="a"
+    )
+    both = _principal(
+        "both",
+        frozenset({"cluster:cluster:read", "model-service:group:read", "model-service:gateway:read"}),
+        cluster="a",
+    )
+    assert (await service.welcome_overview(only_group)).issues.data == []
+    assert (await service.welcome_overview(only_gateway)).issues.data == []
+    assert [issue.id for issue in (await service.welcome_overview(both)).issues.data] == [
+        "gw-a",
+        "ipp-a",
+        "handoff-a",
+    ]
+
+    # Zero-cluster principal must not trigger global snapshot refresh via refresh=True
+    no_cluster_principal = _principal("none", frozenset({"cluster:cluster:read"}), cluster="nonexistent")
+    refresh_calls = 0
+
+    def fail_refresh():
+        nonlocal refresh_calls
+        refresh_calls += 1
+        raise AssertionError("request_snapshot_check should not be called for zero-cluster principal")
+
+    monkeypatch.setattr(service, "request_snapshot_check", fail_refresh)
+    empty_view = await service.welcome_overview(no_cluster_principal, refresh=True)
+    assert empty_view.issues.data == []
+    assert refresh_calls == 0
+
+    # Per-cluster gateway:read check inside _compose: principal has gateway:read on A only, cluster:read on A & B
+    gateway_status = SimpleNamespace(
+        clusters=[
+            SimpleNamespace(
+                cluster_id="a",
+                cluster_name="Cluster A",
+                members=[SimpleNamespace(execution_id="exec-a")],
+                gateway_state="installed",
+                gateway_ready=False,
+                gateway_running=False,
+                ipp_state="installed",
+                ipp_ready=True,
+                access_mode="admin",
+                gateway_probe_source="k8s",
+                reconcile_status="synced",
+                auth_error=None,
+                pending_operations_count=0,
+            ),
+            SimpleNamespace(
+                cluster_id="b",
+                cluster_name="Cluster B",
+                members=[SimpleNamespace(execution_id="exec-b")],
+                gateway_state="installed",
+                gateway_ready=False,
+                gateway_running=False,
+                ipp_state="installed",
+                ipp_ready=True,
+                access_mode="admin",
+                gateway_probe_source="k8s",
+                reconcile_status="synced",
+                auth_error=None,
+                pending_operations_count=0,
+            ),
+        ]
+    )
+
+    async def fake_gateway_status(*, force=False):
+        return gateway_status, now, False, None
+
+    monkeypatch.setattr(collector, "gateway_status", fake_gateway_status)
+    monkeypatch.setattr(service_module, "list_execution_contexts", lambda **kwargs: [])
+
+    scoped_principal = Principal(
+        user_id="scoped",
+        username="scoped",
+        bindings=(
+            RoleBinding("cluster-a-gw", ScopeType.CLUSTER, scope_cluster_id="a"),
+            RoleBinding("cluster-b-read", ScopeType.CLUSTER, scope_cluster_id="b"),
+        ),
+        role_permissions={
+            "cluster-a-gw": frozenset({"cluster:cluster:read", "model-service:group:read", "model-service:gateway:read"}),
+            "cluster-b-read": frozenset({"cluster:cluster:read", "model-service:group:read"}),
+        },
+    )
+    composition = await service._compose(scoped_principal, collector.clusters, cluster_id=None, refresh=False)
+    gw_clusters = [issue.cluster_id for issue in composition.issues if issue.code == "model.gateway_unavailable"]
+    assert gw_clusters == ["a"]
+
+
+def test_non_admin_prometheus_healthy_gateway_with_missing_ipp():
+    from llm_d_lens.dashboard.rules import gateway_cluster_issues
+
+    healthy_gw_missing_ipp = {
+        "cluster_id": "c-na",
+        "cluster_name": "sprocean-min",
+        "members": [],
+        "gateway_state": "installed",
+        "gateway_ready": True,
+        "gateway_running": True,
+        "ipp_state": "missing",
+        "ipp_ready": False,
+        "access_mode": "non_admin",
+        "gateway_probe_source": "prometheus",
+        "reconcile_status": "synced",
+        "auth_error": None,
+        "pending_operations_count": 0,
+    }
+    assert (
+        gateway_cluster_issues(
+            SimpleNamespace(**healthy_gw_missing_ipp), cluster_name="sprocean-min", service_names=[]
+        )
+        == []
+    )
+    with_services = gateway_cluster_issues(
+        SimpleNamespace(**{**healthy_gw_missing_ipp, "members": [SimpleNamespace(execution_id="e1")]}),
+        cluster_name="sprocean-min",
+        service_names=["qwen3"],
+    )
+    assert [issue.code for issue in with_services] == ["model.ipp_unavailable"]
+    assert with_services[0].severity == "warning"
+
+
+def test_non_admin_synced_http_probed_qwen3_has_available_status_and_no_issues():
+    from llm_d_lens.dashboard.contracts import ProviderCounts
+    from llm_d_lens.dashboard.rules import gateway_cluster_issues, service_issues
+
+    gateway = SimpleNamespace(
+        cluster_id="c-na",
+        cluster_name="sprocean-min",
+        members=[SimpleNamespace(execution_id="exec-qwen3")],
+        gateway_state="installed",
+        gateway_ready=True,
+        gateway_running=True,
+        ipp_state="installed",
+        ipp_ready=True,
+        access_mode="non_admin",
+        gateway_probe_source="http",
+        reconcile_status="synced",
+        auth_error=None,
+        pending_operations_count=0,
+    )
+    gateway_status = SimpleNamespace(clusters=[gateway])
+    group = SimpleNamespace(id="g-qwen3", name="qwen3", cluster_id="c-na", status="active")
+    member = SimpleNamespace(
+        group_id="g-qwen3",
+        execution_id="exec-qwen3",
+        cluster_id="c-na",
+        status="active",
+        weight=100,
+        health_json={
+            "ready": True,
+            "components": {"epp": "ready", "httpRoute": "ready", "ipp": "ready", "serving": "ready"},
+        },
+    )
+    context_by_id = {
+        "exec-qwen3": SimpleNamespace(execution_id="exec-qwen3", name="qwen3-vllm", display_name="qwen3", status="ready")
+    }
+    principal = _principal(BUILTIN_ROLE_MAINTAINER, BUILTIN_ROLE_PERMISSIONS[BUILTIN_ROLE_MAINTAINER])
+    svc = service_module.DashboardService()
+    rows, state, _reason = svc._service_rows(
+        principal,
+        [SimpleNamespace(id="c-na", name="sprocean-min")],
+        [group],
+        {"g-qwen3": [member]},
+        gateway_status,
+        context_by_id,
+        {},
+        {"c-na"},
+        True,
+    )
+    assert state == "complete"
+    assert len(rows) == 1
+    assert rows[0].availability == "available"
+    assert rows[0].providers == ProviderCounts(total=1, active=1, ready=1, unhealthy=0)
+    assert service_issues(rows[0]) == []
+    assert gateway_cluster_issues(gateway, cluster_name="sprocean-min", service_names=["qwen3"]) == []

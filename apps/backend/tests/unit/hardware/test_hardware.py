@@ -68,10 +68,12 @@ def test_bundled_intel_profile_matches_legacy_constants():
     assert profile.deployment.arch == "xpu"
     assert profile.driver is not None
     assert profile.driver.installer == "kustomize"
+    assert profile.driver.rbac == ("namespaced", "cluster")
     dra = profile.driver.mode("dra")
     plugin = profile.driver.mode("plugin")
     assert dra is not None and plugin is not None
-    assert dra.manifest_ref.endswith("ref=gpu-v0.11.0")
+    assert dra.manifest_ref == "oci://ghcr.io/intel/intel-resource-drivers-for-kubernetes/intel-gpu-resource-driver-chart"
+    assert dra.chart_version == "0.11.0"
     assert plugin.manifest_ref.endswith("ref=v0.36.0")
     assert plugin.monitoring_flag == "-enable-monitoring"
     assert profile.presence is not None
@@ -81,12 +83,44 @@ def test_bundled_intel_profile_matches_legacy_constants():
     assert profile.telemetry.provider_id == "intel_gpu"
     assert profile.telemetry.allocation_join == "dra"
     assert profile.telemetry.device_metrics["vram"] == "hw_memory_size_bytes"
+    assert (
+        profile.telemetry.device_metrics["memory_read_throughput"]
+        == 'rate(hw_memory_io_bytes_total{network_io_direction="receive"}[5m])'
+    )
+    assert (
+        profile.telemetry.device_metrics["memory_write_throughput"]
+        == 'rate(hw_memory_io_bytes_total{network_io_direction="transmit"}[5m])'
+    )
+    assert profile.telemetry.device_metrics["memory_io_throughput"] == "hw_memory_io_rate_bytes_per_second"
+    assert profile.telemetry.device_metrics["device_info"] == "hw_gpu_info"
+    assert profile.telemetry.device_metric_sources["memory_io_throughput"].metric == "hw_memory_io_rate_bytes_per_second"
+    assert profile.telemetry.device_metric_sources["memory_io_throughput"].tile_aggregation == "sum"
     assert profile.telemetry.label_schema["pci"] == "pci_bdf"
+    assert profile.telemetry.label_schema["model"] == "hw_model"
+    assert "name" not in profile.telemetry.label_schema
+    assert profile.planning.model_label_patterns == (
+        {
+            "label_pattern": r"^gpu\.intel\.com/device-id\.0300-e211\.present$",
+            "value": "true",
+            "model": "Intel(R) Arc(TM) Pro B60",
+        },
+    )
+    assert (
+        HardwareProfile.from_dict(profile.to_dict()).planning.model_label_patterns
+        == profile.planning.model_label_patterns
+    )
 
 
 def test_bundled_payloads_validate_against_schema():
     for payload in discovery.bundled_profile_payloads():
         discovery.validate_profile_payload(payload)
+
+
+def test_bundled_nvidia_profile_declares_escalation_rbac():
+    profile = get_profile("nvidia")
+    assert profile.driver is not None
+    assert profile.driver.rbac == ("escalation",)
+    assert HardwareProfile.from_dict(profile.to_dict()).driver.rbac == ("escalation",)
 
 
 def test_node_memory_label_contract_round_trips():
@@ -119,6 +153,7 @@ def test_node_memory_label_contract_round_trips():
                 }
             }
         ),
+        _payload(planning={"model_label_patterns": [{"label_pattern": "^gpu\\.example/id$"}]}),
     ],
 )
 def test_invalid_profile_payloads_are_rejected(payload):

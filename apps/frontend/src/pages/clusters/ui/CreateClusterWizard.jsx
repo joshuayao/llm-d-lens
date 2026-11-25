@@ -1,16 +1,14 @@
-import { applyClusterCrds, downloadClusterSoftware, installClusterLws, listLensHosts, loadClusterCrds, loadClusterKubernetesVersion, loadClusterLws, loadStackVersions, startClusterImagePrepull, waitForClusterImagePrepull } from '../../optimization';
+import { downloadClusterSoftware, listLensHosts, loadClusterCrds, loadClusterKubernetesVersion, loadClusterLws, loadStackVersions } from '../../optimization';
 import { requestJson } from '../../../shared/api/httpClient';
 // Multi-step "Create Cluster" wizard.
 //
-// See docs/design/cluster-design.md#cluster-creation-wizard for the full design.
-// Step 1 creates the cluster immediately (so Step 2-4 have a real
-// `cluster_id` to attach kubeconfig-backed operations to); Step 2/3 PATCH
-// the cluster's proxy/version-pin settings; Step 4 creates a standalone
-// HF_TOKEN secret and a required Storage volume, then optionally prewarms a
-// Model Cache entry that references that secret via the existing
-// `existing-secret` token source (no new token source mode -- see section 4.4
-// of the design doc).
-import { useEffect, useMemo, useRef, useState } from 'react';
+// The wizard is configuration-first: every configuration step saves the
+// backend provisioning plan and never mutates the target cluster. Review
+// previews the saved plan, and Execute runs the plan-scoped permission check
+// followed by the guarded plan steps.
+// See docs/design/cluster-permission-preflight-design.md sections 4.4/4.5/4.6
+// and 8.
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
     AlertTriangle,
     ArrowRight,
@@ -20,28 +18,91 @@ import {
     Cpu,
     Database,
     Globe,
+    HardDrive,
     KeyRound,
     ListChecks,
-    Loader2,
     Rocket,
     Server,
     Tag,
     Upload,
     Waypoints,
 } from 'lucide-react';
-import { Badge, Button, Checkbox, Input, Label, Modal, Panel, SectionLabel, Select, StatusChip, Textarea } from '../../../shared/ui';
+import { Badge, Button, Checkbox, Input, Label, Modal, Panel, SectionLabel, Select, Spinner, Textarea, ToggleGroup } from '../../../shared/ui';
 import { HelpTooltip } from '../../../shared/ui/FormControls';
+import { FormError } from '../../../shared/ui/FormError';
 import { cn } from '../../../shared/lib/cn';
-import {
-    createStorageVolume,
-    getStorageVolume,
-    listStorageNodes,
-} from '../../storage';
+import { listStorageNodes } from '../../storage';
 import { errorMessage } from '../../storage';
-import { createModelCacheEntry } from '../../model-cache';
-import { getGpuDriverStatus, installGpuDriver, waitForGpuDriverReady } from './ClusterMonitoringStack/gpuDriverBackend';
 import { getHardwareProfiles, acceleratorVendorsFromProfiles, accessModesForVendor } from './ClusterMonitoringStack/hardwareProfilesBackend';
 import { BootstrapNodesPanel } from './ClusterBootstrap/BootstrapNodesPanel';
+import {
+    adminHandoffStatus,
+    cancelExecution,
+    completeExecution,
+    executeOperation,
+    getCluster,
+    permissionCheck,
+    permissionDetails,
+    permissionRemediation,
+    putPlan,
+    saveDraftHfToken,
+    verifyAdminHandoff,
+} from './clusterPermissionBackend';
+import {
+    CAPACITY_PATTERN,
+    REPO_ID_PATTERN,
+    WIZARD_STEP_IDS,
+    canExecuteOperationRun,
+    canNavigateBackFromExecute,
+    canResumeOperationRun,
+    clearExecutionToken,
+    clearResumeState,
+    clusterDetailSyncForReport,
+    defaultMonitoringNamespace,
+    defaultStorageNamespace,
+    executeDisabledReason,
+    hfTokenSatisfiedForRun,
+    loadExecutionToken,
+    loadResumeDraftId,
+    loadResumeStep,
+    monitoringValidationError,
+    operationDone,
+    operationLedgerForRun,
+    operationProgressForLedger,
+    planFromWizardState,
+    planSyncFromPermissionReport,
+    planToWizardFields,
+    plannedStorageVolumeName,
+    nextExecutionCompleted,
+    planInvalidatesRun,
+    proxyFieldsFromCluster,
+    resumeStepForPlan,
+    saveExecutionToken,
+    saveResumeDraftId,
+    saveResumeStep,
+    shouldAutoCheckResumedPlan,
+    shouldAutoVerifyHandoff,
+    shouldClearResumeOnLoadError,
+    shouldLoadHandoff,
+    shouldShowSetupProgress,
+    storageNamespaceValid,
+    adminVerificationReady,
+    canRunPreflight,
+    completeFailureAction,
+    createResumeGate,
+    executionCompletedForPlan,
+    executionFailureAction,
+    handoffFallbackFromVerifyError,
+    permissionPanelVisible,
+    verificationFailureAction,
+    verificationBlocksRun,
+    verifyRefreshesOperationLedger,
+    versionCheckBlocks,
+    versionCheckMessage,
+    vllmImageValidationError,
+    wizardStepCanAdvance,
+} from './clusterWizardState';
+import { PermissionHandoffPanel } from './PermissionHandoffPanel';
 
 const KUBECONFIG_GUIDE_URL = 'https://llm-d-incubation.github.io/llm-d-lens/user-guide/clusters#kubeconfig-permissions';
 
@@ -52,8 +113,19 @@ const STEPS = [
     { id: 'accelerator', label: 'Accelerator', icon: Cpu },
     { id: 'versions', label: 'llm-d stack', icon: Tag },
     { id: 'modelCache', label: 'Model Cache', icon: Database },
-    { id: 'confirm', label: 'Confirm', icon: Rocket },
+    { id: 'storage', label: 'Storage', icon: HardDrive },
+    { id: 'review', label: 'Review', icon: ListChecks },
+    { id: 'execute', label: 'Execute', icon: Rocket },
 ];
+
+const REVIEW_STEP_INDEX = 7;
+const EXECUTE_STEP_INDEX = 8;
+
+function isPermissionError(error) {
+    return error?.status === 403
+        || error?.code === 'kubernetes_permission_denied'
+        || error?.code === 'operation_blocked';
+}
 
 const ACCESS_MODE_LABEL = { dra: 'DRA (Dynamic Resource Allocation)', plugin: 'Device plugin' };
 const ACCESS_MODE_SHORT = { dra: 'DRA', plugin: 'Device plugin' };
@@ -67,7 +139,7 @@ const STORAGE_KIND_LABEL = { 'local-disk': 'hostPath', nfs: 'NFS' };
 
 function ReviewRow({ label, children, mono = false }) {
     return (
-        <div className="grid grid-cols-[7.5rem_minmax(0,1fr)] items-baseline gap-3 py-2">
+        <div className="grid grid-cols-[8.5rem_minmax(0,1fr)] items-baseline gap-3 py-2">
             <dt className="text-[11px] font-medium text-theme-muted">{label}</dt>
             <dd className={cn(
                 'min-w-0 break-words text-xs text-theme-text',
@@ -93,29 +165,70 @@ const ACCELERATOR_VENDORS = [
     { id: 'nvidia', label: 'Nvidia GPU', disabled: true, accessModes: ['dra', 'plugin'] },
 ];
 
-const CAPACITY_PATTERN = /^\d+(Gi|Mi|Ti)$/;
-const REPO_ID_PATTERN = /^[\w.-]+\/[\w.-]+$/;
-
 function request(path, options = {}) {
     return requestJson(path, { headers: { 'Content-Type': 'application/json' }, ...options });
 }
 
-// Polls a just-created Storage volume until it leaves the "pending"
-// provisioning state (or a timeout elapses), since Model Cache downloads
-// require a READY volume (see model_cache/service.py::get_ready_volume).
-async function waitForVolumeReady(volumeId, { timeoutMs = 120000, intervalMs = 2000 } = {}) {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-        const volume = await getStorageVolume(volumeId);
-        if (volume.status === 'ready') return volume;
-        if (volume.status === 'failed') {
-            throw new Error(volume.failureDetail || 'Storage volume provisioning failed');
-        }
-        if (Date.now() > deadline) {
-            throw new Error('Timed out waiting for the storage volume to become ready');
-        }
-        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+function InlineHfTokenBanner({
+    message,
+    token,
+    onTokenChange,
+    onSave,
+    busy,
+    disabled,
+    error,
+}) {
+    return (
+        <div
+            role="status"
+            className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-700 dark:text-amber-200"
+        >
+            <div className="flex flex-wrap items-center gap-2">
+                <AlertTriangle size={13} className="shrink-0" aria-hidden="true" />
+                <span className="min-w-0 flex-1">{message}</span>
+                <Input
+                    type="password"
+                    autoComplete="new-password"
+                    value={token}
+                    onChange={(event) => onTokenChange(event.target.value)}
+                    placeholder="hf_..."
+                    aria-label="Hugging Face token"
+                    disabled={busy || disabled}
+                    className="h-8 w-48 py-1 text-xs sm:w-56"
+                />
+                <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={onSave}
+                    isLoading={busy}
+                    disabled={disabled || busy || !token.trim()}
+                >
+                    Save token
+                </Button>
+            </div>
+            {error && (
+                <p role="alert" className="text-[11px] text-rose-600 dark:text-rose-300">
+                    {error}
+                </p>
+            )}
+        </div>
+    );
+}
+
+function secretValuesFor(operation, hfToken, { hfTokenSaved = false } = {}) {
+    if (operation?.secretCopy) return undefined;
+    const fields = Array.isArray(operation?.userSecretFields) ? operation.userSecretFields : [];
+    if (!fields.length) return undefined;
+    const trimmed = hfToken.trim();
+    if (fields.includes('HF_TOKEN') && !trimmed && hfTokenSaved && fields.length === 1) {
+        return undefined;
     }
+    const values = {};
+    for (const field of fields) {
+        if (field === 'HF_TOKEN') values[field] = trimmed;
+        else values[field] = '';
+    }
+    return values;
 }
 
 // Polls the llm-d versions step's real llm-d / llm-d-benchmark downloads
@@ -149,6 +262,32 @@ export function CreateClusterWizard({ onClose, onCreated }) {
     const [error, setError] = useState('');
     const [busy, setBusy] = useState(false);
 
+    // Configuration-first plan state. Every configuration step saves the plan
+    // through PUT /plan; Review evaluates its permission report and Execute
+    // runs the guarded operations with the same plan hash.
+    const [plan, setPlan] = useState(null);
+    const [planHash, setPlanHash] = useState(null);
+    const [planVersion, setPlanVersion] = useState(null);
+    const [permissionReport, setPermissionReport] = useState(null);
+    const [permissionBusy, setPermissionBusy] = useState(false);
+    const [permissionError, setPermissionError] = useState('');
+    const [executionToken, setExecutionToken] = useState(null);
+    const [resumeBusy, setResumeBusy] = useState(false);
+    const [resumeError, setResumeError] = useState('');
+    const [resumeAttempt, setResumeAttempt] = useState(0);
+    const [executionBlocked, setExecutionBlocked] = useState(false);
+    const [cancelling, setCancelling] = useState(false);
+    const [notice, setNotice] = useState('');
+
+    // Plan-scoped administrator handoff (also used after a 403 during Execute).
+    const [remediationScript, setRemediationScript] = useState('');
+    const [remediationInfo, setRemediationInfo] = useState(null);
+    const [handoffInfo, setHandoffInfo] = useState(null);
+    const [operationLedger, setOperationLedger] = useState({});
+    const [handoffBusy, setHandoffBusy] = useState(false);
+    const [handoffError, setHandoffError] = useState('');
+    const [handoffWarning, setHandoffWarning] = useState('');
+
     // Step 1: basic info
     const [name, setName] = useState('');
     const [description, setDescription] = useState('');
@@ -158,6 +297,9 @@ export function CreateClusterWizard({ onClose, onCreated }) {
     // kubeconfig string that gets wrapped into a synthetic File below, so
     // every other Step 1 field/validation/submit path stays untouched.
     const [kubeconfigSource, setKubeconfigSource] = useState('upload'); // 'upload' | 'bootstrap'
+    // Remount the native file input when a failed draft is discarded so the
+    // same file can be selected again (a value-less input keeps the old file).
+    const [kubeconfigInputKey, setKubeconfigInputKey] = useState(0);
 
     // Step 2: proxy
     const [proxyMode, setProxyMode] = useState('auto');
@@ -168,9 +310,21 @@ export function CreateClusterWizard({ onClose, onCreated }) {
     // Step 4: the llm-d component versions are fixed by the Lens stack profile
     // (GET /api/v1/versions) and shown read-only; they are never user choices.
     const [stackVersions, setStackVersions] = useState(null);
+    // Version values written into the plan. They default from the read stack
+    // profile and are restored on resume so a saved plan never loses them.
+    const [routerVersion, setRouterVersion] = useState('');
+    const [gieVersion, setGieVersion] = useState('');
+    const [ippVersion, setIppVersion] = useState('');
+    const [lwsVersion, setLwsVersion] = useState('');
+    // Optional cluster-wide vLLM runtime image override (empty = hardware profile default).
+    const [vllmImage, setVllmImage] = useState('');
     // Shared llm-d Gateway provider installed once at cluster creation (the
     // model service then publishes HTTPRoute/IPP against it).
     const [gatewayProvider, setGatewayProvider] = useState('istio');
+    // Backend-normalized effective Gateway coordinates from the stored plan.
+    const [gatewayNamespace, setGatewayNamespace] = useState('');
+    const [gatewayName, setGatewayName] = useState('');
+    const [gatewayServiceType, setGatewayServiceType] = useState('');
     const [gatewayPort, setGatewayPort] = useState('');
     // Optional externally reachable Gateway host/IP (or full URL); empty lets
     // Lens derive one from the cluster.
@@ -185,18 +339,28 @@ export function CreateClusterWizard({ onClose, onCreated }) {
     const [versionsDownloading, setVersionsDownloading] = useState(false);
     const [versionsDownloadStatus, setVersionsDownloadStatus] = useState(null); // { llmD, llmDBenchmark }
     // Model-server/router image pre-pull onto every node for the selected accelerators.
-    const [imagePulling, setImagePulling] = useState(false);
-    const [imagePullStatus, setImagePullStatus] = useState(null); // { state, ready, desired, nodes, images }
     // Gateway API / Gateway API Inference Extension / llm-d Router CRD presence on the cluster.
     const [crdStatus, setCrdStatus] = useState(null); // { gateway_api, gateway_api_inference_extension, llm_d_router }
     // LeaderWorkerSet controller + DisaggregatedSet API used by the P/D Guide.
     const [lwsStatus, setLwsStatus] = useState(null); // { ready, crd, controller, version, message }
     // Reachability + Kubernetes-version check after the kubeconfig upload.
     const [k8sCheck, setK8sCheck] = useState(null); // { reachable, version, min_k8s_version, supported }
+    // A `forbidden` version read during configuration is a warning, not a block.
+    const [k8sWarning, setK8sWarning] = useState('');
 
-    // Step 4: accelerator (optional). Installs the Intel GPU DRA driver or
-    // device plugin itself -- detection scans every namespace, so there is
-    // no namespace for the user to pick.
+    // Step 5 (index 4, llm-d stack): mandatory cluster monitoring configuration.
+    const [monitoringMode, setMonitoringMode] = useState('managed');
+    const [monitoringNamespace, setMonitoringNamespace] = useState('');
+    const [monitoringNamespaceTouched, setMonitoringNamespaceTouched] = useState(false);
+    const [prometheusUrl, setPrometheusUrl] = useState('');
+    const [grafanaUrl, setGrafanaUrl] = useState('');
+    const [prometheusNodePort, setPrometheusNodePort] = useState('');
+    const [grafanaNodePort, setGrafanaNodePort] = useState('');
+    const [monitoringHost, setMonitoringHost] = useState('');
+    const [installAcceleratorExporters, setInstallAcceleratorExporters] = useState(true);
+
+    // Step 4: accelerator (optional). Selection only writes the plan; the
+    // driver/plugin install is deferred to Execute.
     const [acceleratorVendors, setAcceleratorVendors] = useState(ACCELERATOR_VENDORS);
     // vendor -> model-server image (repository and version). Owned by the
     // hardware profile, not the pinned stack, so it is read from capabilities.
@@ -204,8 +368,6 @@ export function CreateClusterWizard({ onClose, onCreated }) {
     // Multi-select: vendor id -> selected driver access modes. Candidates are
     // the device-plugin-supported hardware profiles, not cluster discovery.
     const [selectedAccelerators, setSelectedAccelerators] = useState({});
-    // `${vendorId}:${mode}` -> { state, message } detect/install progress.
-    const [acceleratorPairStatus, setAcceleratorPairStatus] = useState({});
 
     // Accelerator candidates come from the registered hardware profiles (the
     // device-plugin-supported set); the static list is the fallback. The same
@@ -234,7 +396,11 @@ export function CreateClusterWizard({ onClose, onCreated }) {
         const controller = new AbortController();
         loadStackVersions()
             .then((payload) => {
-                if (!controller.signal.aborted) setStackVersions(payload);
+                if (controller.signal.aborted) return;
+                setStackVersions(payload);
+                setRouterVersion((current) => current || payload?.llm_d_router || '');
+                setGieVersion((current) => current || payload?.k8s_gateway_api_inference_extension || '');
+                setIppVersion((current) => current || payload?.llm_d_inference_payload_processor || '');
             })
             .catch(() => {});
         return () => controller.abort();
@@ -257,9 +423,8 @@ export function CreateClusterWizard({ onClose, onCreated }) {
         return () => controller.abort();
     }, [stepIndex, cluster]);
 
-    // Selected (vendor, mode) pairs, flattened for status/install and for the
-    // image pre-pull on the versions step. A heterogeneous cluster selects
-    // several vendors.
+    // Selected (vendor, mode) pairs, flattened for the plan and the Review /
+    // Execute views. A heterogeneous cluster selects several vendors.
     const acceleratorPairs = useMemo(
         () =>
             Object.entries(selectedAccelerators).flatMap(([vendorId, modes]) =>
@@ -277,79 +442,47 @@ export function CreateClusterWizard({ onClose, onCreated }) {
         () => [...new Set(acceleratorPairs.map((pair) => pair.vendorId))],
         [acceleratorPairs],
     );
-    const acceleratorReady = acceleratorPairs.length > 0
-        && acceleratorPairs.every((pair) => acceleratorPairStatus[pair.key]?.state === 'ready');
 
-    // Detect each selected (vendor, mode): reuse when the driver/plugin is
-    // already ready, otherwise install it and wait. Runs while the Accelerator
-    // step is active; failures are surfaced per pair.
-    useEffect(() => {
-        if (stepIndex !== 3 || !cluster) return undefined;
-        const pending = acceleratorPairs.filter((pair) => acceleratorPairStatus[pair.key]?.state !== 'ready');
-        if (!pending.length) return undefined;
-        const controller = new AbortController();
-        let cancelled = false;
-        (async () => {
-            for (const pair of pending) {
-                if (cancelled || controller.signal.aborted) return;
-                try {
-                    const snapshot = await getGpuDriverStatus(pair.mode, {
-                        clusterId: cluster.id,
-                        hardware: pair.profileId,
-                        signal: controller.signal,
-                    });
-                    if (snapshot?.cluster_reachable && snapshot.ready) {
-                        setAcceleratorPairStatus((current) => ({ ...current, [pair.key]: { state: 'ready' } }));
-                        continue;
-                    }
-                    setAcceleratorPairStatus((current) => ({ ...current, [pair.key]: { state: 'installing' } }));
-                    await installGpuDriver(pair.mode, { clusterId: cluster.id, hardware: pair.profileId });
-                    await waitForGpuDriverReady(pair.mode, { clusterId: cluster.id, hardware: pair.profileId });
-                    if (!cancelled) {
-                        setAcceleratorPairStatus((current) => ({ ...current, [pair.key]: { state: 'ready' } }));
-                    }
-                } catch (pairError) {
-                    if (pairError.name === 'AbortError' || cancelled) return;
-                    setAcceleratorPairStatus((current) => ({
-                        ...current,
-                        [pair.key]: { state: 'failed', message: errorMessage(pairError) },
-                    }));
-                }
-            }
-        })();
-        return () => {
-            cancelled = true;
-            controller.abort();
-        };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [stepIndex, cluster, acceleratorPairs]);
-
-    // Step 5: model cache storage (required) and prewarm (optional)
+    // Step 6: model cache prewarm (optional) and the HF_TOKEN secret that is
+    // created during Execute (never during configuration).
     const [prewarmEnabled, setPrewarmEnabled] = useState(false);
     const [secretNamespace, setSecretNamespace] = useState('llm-d-bench-storage');
+    const [secretNamespaceMode, setSecretNamespaceMode] = useState('');
     const [secretNamespaceTouched, setSecretNamespaceTouched] = useState(false);
+    const [handoffNamespace, setHandoffNamespace] = useState('');
     // Suffix the Secret name so two clusters sharing an API server never collide.
     const [secretName, setSecretName] = useState(() => `hf-token-${crypto.randomUUID().slice(0, 8)}`);
     const [hfToken, setHfToken] = useState('');
-    // Set once the Step-5 HF_TOKEN secret has actually been created on the
-    // cluster (see goNext's stepIndex === 4 branch below); recorded on the
-    // cluster itself so later Deploy/Evaluate flows can reuse it without the
-    // user re-entering a token for every deployment.
-    const [secretRef, setSecretRef] = useState(null);
+    const [hfTokenSaved, setHfTokenSaved] = useState(false);
+    const [inlineToken, setInlineToken] = useState('');
+    const [inlineTokenBusy, setInlineTokenBusy] = useState(false);
+    const [inlineTokenError, setInlineTokenError] = useState('');
+    // Set once the Execute HF_SECRET step has created the Secret; used by the
+    // Model Cache step that follows it.
     const [repoId, setRepoId] = useState('');
     const [revision, setRevision] = useState('main');
+    const [modelCacheEntryId, setModelCacheEntryId] = useState('');
+    // Step 7: storage volume.
     const [storageKind, setStorageKind] = useState('local-disk');
+    const [storageVolumeId, setStorageVolumeId] = useState('');
     const [storageName, setStorageName] = useState('');
+    const [storageNamespace, setStorageNamespace] = useState('');
+    const [storageNamespaceMode, setStorageNamespaceMode] = useState('');
+    const [storageNamespaceTouched, setStorageNamespaceTouched] = useState(false);
     const [storageCapacity, setStorageCapacity] = useState('');
     const [hostPath, setHostPath] = useState('');
     const [nfsServer, setNfsServer] = useState('');
     const [nfsPath, setNfsPath] = useState('');
     const [storageNodes, setStorageNodes] = useState([]);
 
-    // Step 5: finishing progress
+    // Step 9: execution progress
     const [finishing, setFinishing] = useState(false);
-    const [finishStatus, setFinishStatus] = useState([]); // [{label, state: 'pending'|'running'|'done'|'failed', detail}]
+    const [finishStatus, setFinishStatus] = useState([]); // [{key, label, state: 'pending'|'running'|'done'|'failed', detail}]
     const [finished, setFinished] = useState(false);
+    // The backend recorded a completion for this plan: every operation is
+    // already done, so Review offers finalize instead of running anything again.
+    const [executionCompleted, setExecutionCompleted] = useState(false);
+    const [executionFailedKey, setExecutionFailedKey] = useState(null);
 
     const firstFieldRef = useRef(null);
     useEffect(() => {
@@ -357,21 +490,26 @@ export function CreateClusterWizard({ onClose, onCreated }) {
     }, [stepIndex]);
 
     // Draft cleanup on hard navigation away (tab close/refresh/browser back).
-    // handleClose below covers the in-app cancel/close paths, but those never
-    // run if the user leaves the page outright, so the Step-1 draft would
-    // linger forever and permanently squat its name (see cluster_name_conflict
-    // in llm_d_lens/cluster/registry.py). `keepalive: true` lets the DELETE
-    // survive the page unloading, unlike a normal fetch.
-    const draftCleanupRef = useRef({ cluster: null, finished: false });
+    // A draft that has a saved plan or is in an administrator handoff must
+    // survive the unload so the user can resume it; only an early draft without
+    // a plan is deleted here. An explicit Discard is the only other delete.
+    // `keepalive: true` lets the DELETE survive the page unloading.
+    const draftCleanupRef = useRef({ cluster: null, finished: false, planHash: null, handoff: false });
     useEffect(() => {
-        draftCleanupRef.current = { cluster, finished };
-    }, [cluster, finished]);
+        draftCleanupRef.current = {
+            cluster,
+            finished,
+            planHash,
+            handoff: Boolean(permissionReport && ['admin_required', 'blocked'].includes(permissionReport.status)),
+        };
+    }, [cluster, finished, planHash, permissionReport]);
     useEffect(() => {
         const cleanupDraft = () => {
-            const { cluster: currentCluster, finished: currentFinished } = draftCleanupRef.current;
-            if (currentCluster && !currentFinished) {
-                requestJson(`/api/cluster/clusters/${encodeURIComponent(currentCluster.id)}`, { method: 'DELETE', keepalive: true }).catch(() => {});
-            }
+            const current = draftCleanupRef.current;
+            if (!current.cluster || current.finished) return;
+            if (current.planHash || current.handoff) return; // resumable draft
+            requestJson(`/api/cluster/clusters/${encodeURIComponent(current.cluster.id)}`, { method: 'DELETE', keepalive: true }).catch(() => {});
+            clearResumeState();
         };
         window.addEventListener('pagehide', cleanupDraft);
         return () => window.removeEventListener('pagehide', cleanupDraft);
@@ -386,16 +524,29 @@ export function CreateClusterWizard({ onClose, onCreated }) {
         return () => { alive = false; };
     }, []);
 
-    // Default HF_TOKEN secret namespace is per-cluster to avoid collisions
-    // across clusters sharing the same underlying k8s API server; keeps in
-    // sync with the cluster id unless the user has typed their own value.
+    // Default HF_TOKEN secret namespace uses the kubeconfig's readable namespace
+    // hint when available (so namespace-scoped edit ServiceAccounts use an
+    // existing writable namespace), or falls back to a per-cluster namespace.
+    const kubeconfigNamespace = cluster?.kubeconfigNamespace || k8sCheck?.kubeconfig_namespace || '';
     useEffect(() => {
         if (secretNamespaceTouched || !cluster?.id) return;
-        setSecretNamespace(`llm-d-bench-storage-${cluster.id}`);
-    }, [cluster?.id, secretNamespaceTouched]);
+        setSecretNamespace(kubeconfigNamespace || `llm-d-bench-storage-${cluster.id}`);
+        setSecretNamespaceMode(kubeconfigNamespace ? 'existing' : 'create');
+    }, [cluster?.id, kubeconfigNamespace, secretNamespaceTouched]);
 
     useEffect(() => {
-        if (stepIndex !== 4 || !cluster || storageKind !== 'local-disk') return undefined;
+        if (storageNamespaceTouched || !cluster?.id) return;
+        setStorageNamespace(defaultStorageNamespace(cluster.id));
+        setStorageNamespaceMode('create');
+    }, [cluster?.id, storageNamespaceTouched]);
+
+    useEffect(() => {
+        if (monitoringNamespaceTouched || !cluster?.id) return;
+        setMonitoringNamespace(defaultMonitoringNamespace(cluster.id));
+    }, [cluster?.id, monitoringNamespaceTouched]);
+
+    useEffect(() => {
+        if (stepIndex !== 6 || !cluster || storageKind !== 'local-disk') return undefined;
         const controller = new AbortController();
         (async () => {
             try {
@@ -408,30 +559,842 @@ export function CreateClusterWizard({ onClose, onCreated }) {
         return () => controller.abort();
     }, [stepIndex, storageKind, cluster]);
 
-    const basicsValid = name.trim().length > 0 && !!file;
-    const proxyValid = proxyMode === 'auto' || Boolean(httpProxy.trim() || httpsProxy.trim() || noProxy.trim());
-    const modelCacheStorageSpecValid = useMemo(() => {
-        if (storageKind === 'local-disk') return hostPath.trim().startsWith('/');
-        if (storageKind === 'nfs') return Boolean(nfsServer.trim() && nfsPath.trim().startsWith('/'));
-        return false;
-    }, [storageKind, hostPath, nfsServer, nfsPath]);
-    // The HF_TOKEN secret is always required (independent of Model Cache) --
-    // Deploy/Evaluate default to reusing it (see llm_d_lens/deploy/service.py's
-    // ``_default_model_secret``) so any deployment on this cluster can pull
-    // gated models without the user re-entering a token every time.
-    const hfTokenSecretValid = Boolean(secretNamespace.trim() && secretName.trim() && hfToken.trim());
-    const modelCacheValid =
-        modelCacheStorageSpecValid &&
-        CAPACITY_PATTERN.test(storageCapacity.trim()) &&
-        (!prewarmEnabled ||
-            (REPO_ID_PATTERN.test(repoId.trim()) &&
-                revision.trim()));
+    const permissionReady = permissionReport?.status === 'ready';
+    const permissionBlocked = permissionReport?.status === 'blocked';
+    const adminRequired = permissionReport?.status === 'admin_required';
+    const adminVerified = adminVerificationReady(handoffInfo);
+    const hfTokenExternal = Boolean(plan?.hfTokenSecret?.tokenSource?.startsWith('existing-secret:'));
+    const hasHfTokenForRun = hfTokenSatisfiedForRun({
+        hfToken,
+        hfTokenSaved,
+        hfTokenExternal,
+        operationLedger,
+        hasExecutionToken: Boolean(executionToken),
+        executionCompleted,
+    });
+    const hfSecretAlreadyCreated = Boolean(executionCompleted)
+        || operationDone(
+            operationLedgerForRun(operationLedger, { hasToken: Boolean(executionToken) }),
+            'cache.hf-secret',
+        );
+    const hfTokenStatusLabel = hfToken.trim()
+        ? 'token provided'
+        : hfTokenSaved
+            ? 'token saved for draft'
+            : hfTokenExternal
+                ? 'existing secret'
+                : hfSecretAlreadyCreated
+                    ? 'secret already created'
+                    : 'token required';
+    const wizardState = {
+        clusterId: cluster?.id,
+        kubeconfigNamespace,
+        name,
+        file,
+        proxyMode,
+        httpProxy,
+        httpsProxy,
+        noProxy,
+        gatewayProvider,
+        gatewayServiceType,
+        gatewayNamespace,
+        gatewayName,
+        gatewayPort,
+        gatewayPublicUrl,
+        gatewayAuthzHost,
+        inotifyMaxUserInstances,
+        acceleratorVendors,
+        selectedAccelerators,
+        routerVersion: routerVersion || stackVersions?.llm_d_router || '',
+        gieVersion: gieVersion || stackVersions?.k8s_gateway_api_inference_extension || '',
+        ippVersion: ippVersion || stackVersions?.llm_d_inference_payload_processor || '',
+        lwsVersion,
+        vllmImage,
+        monitoringMode,
+        monitoringNamespace,
+        prometheusUrl,
+        grafanaUrl,
+        prometheusNodePort,
+        grafanaNodePort,
+        monitoringHost,
+        installAcceleratorExporters,
+        storageKind,
+        storageVolumeId,
+        storageNamespace,
+        storageNamespaceMode,
+        storageCapacity,
+        storageName,
+        hostPath,
+        nfsServer,
+        nfsPath,
+        prewarmEnabled,
+        modelCacheEntryId,
+        repoId,
+        revision,
+        secretNamespace,
+        secretNamespaceMode,
+        secretName,
+        handoffNamespace,
+        hfToken,
+        hfTokenSaved,
+        hfTokenExternal,
+        operationLedger,
+        hasExecutionToken: Boolean(executionToken),
+        executionCompleted,
+        permissionsSufficient: !permissionBlocked && (permissionReady || adminVerified),
+        permissionsFresh: !permissionReport?.planHash || permissionReport.planHash === planHash,
+    };
+    const canGoNext = wizardStepCanAdvance(WIZARD_STEP_IDS[stepIndex], wizardState);
+    const canExecute = Boolean(cluster?.id && plan)
+        && wizardStepCanAdvance('review', wizardState)
+        && !finishing
+        && !permissionBusy
+        && !executionBlocked
+        && canExecuteOperationRun({
+            reportStatus: permissionReport?.status,
+            adminVerified,
+            hasToken: Boolean(executionToken),
+            busy: handoffBusy || resumeBusy,
+        });
+    const canPreflight = canRunPreflight({
+        hasCluster: Boolean(cluster?.id),
+        planHash,
+        permissionBusy,
+        handoffBusy,
+        resumeBusy,
+        finishing,
+        executionBlocked,
+        hasSecretInput: hasHfTokenForRun,
+    });
+    const canGoBackFromExecute = canNavigateBackFromExecute({
+        finished,
+        finishing,
+        cancelling,
+        permissionBusy,
+        handoffBusy,
+        executionBlocked,
+    });
+
+    // Apply a stored plan back onto the wizard fields (resume path only).
+    const applyWizardFields = useCallback((fields) => {
+        if (!fields) return;
+        if (fields.gatewayProvider !== undefined) setGatewayProvider(fields.gatewayProvider);
+        if (fields.gatewayServiceType !== undefined) setGatewayServiceType(fields.gatewayServiceType || '');
+        if (fields.gatewayNamespace !== undefined) setGatewayNamespace(fields.gatewayNamespace);
+        if (fields.gatewayName !== undefined) setGatewayName(fields.gatewayName);
+        if (fields.gatewayPort !== undefined) setGatewayPort(fields.gatewayPort);
+        if (fields.gatewayPublicUrl !== undefined) setGatewayPublicUrl(fields.gatewayPublicUrl || '');
+        if (fields.gatewayAuthzHost !== undefined) setGatewayAuthzHost(fields.gatewayAuthzHost || '');
+        if (fields.inotifyMaxUserInstances !== undefined) setInotifyMaxUserInstances(fields.inotifyMaxUserInstances);
+        if (fields.selectedAccelerators !== undefined) setSelectedAccelerators(fields.selectedAccelerators);
+        if (fields.routerVersion !== undefined) setRouterVersion(fields.routerVersion || '');
+        if (fields.gieVersion !== undefined) setGieVersion(fields.gieVersion || '');
+        if (fields.ippVersion !== undefined) setIppVersion(fields.ippVersion || '');
+        if (fields.lwsVersion !== undefined) setLwsVersion(fields.lwsVersion || '');
+        if (fields.vllmImage !== undefined) setVllmImage(fields.vllmImage || '');
+        if (fields.monitoringMode !== undefined) setMonitoringMode(fields.monitoringMode);
+        if (fields.monitoringNamespace !== undefined) {
+            setMonitoringNamespace(fields.monitoringNamespace);
+            setMonitoringNamespaceTouched(true);
+        }
+        if (fields.prometheusUrl !== undefined) setPrometheusUrl(fields.prometheusUrl || '');
+        if (fields.grafanaUrl !== undefined) setGrafanaUrl(fields.grafanaUrl || '');
+        if (fields.prometheusNodePort !== undefined) setPrometheusNodePort(fields.prometheusNodePort || '');
+        if (fields.grafanaNodePort !== undefined) setGrafanaNodePort(fields.grafanaNodePort || '');
+        if (fields.monitoringHost !== undefined) setMonitoringHost(fields.monitoringHost || '');
+        if (fields.installAcceleratorExporters !== undefined) {
+            setInstallAcceleratorExporters(Boolean(fields.installAcceleratorExporters));
+        }
+        if (fields.storageKind !== undefined) setStorageKind(fields.storageKind);
+        if (fields.storageVolumeId !== undefined) setStorageVolumeId(fields.storageVolumeId || '');
+        if (fields.storageNamespace !== undefined) {
+            setStorageNamespace(fields.storageNamespace);
+            setStorageNamespaceTouched(true);
+        }
+        if (fields.storageNamespaceMode !== undefined) {
+            setStorageNamespaceMode(fields.storageNamespaceMode || '');
+        }
+        if (fields.storageCapacity !== undefined) setStorageCapacity(fields.storageCapacity || '');
+        if (fields.storageName !== undefined) setStorageName(fields.storageName || '');
+        if (fields.hostPath !== undefined) setHostPath(fields.hostPath || '');
+        if (fields.nfsServer !== undefined) setNfsServer(fields.nfsServer || '');
+        if (fields.nfsPath !== undefined) setNfsPath(fields.nfsPath || '');
+        if (fields.secretNamespace !== undefined) {
+            setSecretNamespace(fields.secretNamespace);
+            setSecretNamespaceTouched(true);
+        }
+        if (fields.secretNamespaceMode !== undefined) setSecretNamespaceMode(fields.secretNamespaceMode || '');
+        if (fields.secretName !== undefined) setSecretName(fields.secretName);
+        if (fields.handoffNamespace !== undefined) setHandoffNamespace(fields.handoffNamespace || '');
+        if (fields.prewarmEnabled !== undefined) setPrewarmEnabled(fields.prewarmEnabled);
+        if (fields.modelCacheEntryId !== undefined) setModelCacheEntryId(fields.modelCacheEntryId || '');
+        if (fields.repoId !== undefined) setRepoId(fields.repoId || '');
+        if (fields.revision !== undefined) setRevision(fields.revision || 'main');
+    }, []);
+
+    // Adopt an updated plan/hash returned by POST /permission-check (e.g.
+    // auto-aligned HF secret/handoff namespaces) and clear stale run state.
+    const adoptPermissionCheckPlan = useCallback((report, clusterId, currentPlanHash) => {
+        const sync = planSyncFromPermissionReport(report, { currentPlanHash });
+        if (sync.plan) {
+            setPlan(sync.plan);
+            if (sync.secretNamespace) {
+                setSecretNamespace(sync.secretNamespace);
+                setSecretNamespaceTouched(true);
+            }
+            if (sync.secretNamespaceMode) setSecretNamespaceMode(sync.secretNamespaceMode);
+            if (sync.storageNamespace) {
+                setStorageNamespace(sync.storageNamespace);
+                setStorageNamespaceTouched(true);
+            }
+            if (sync.storageNamespaceMode) setStorageNamespaceMode(sync.storageNamespaceMode);
+            if (sync.monitoringNamespace) {
+                setMonitoringNamespace(sync.monitoringNamespace);
+                setMonitoringNamespaceTouched(true);
+            }
+            if (sync.handoffNamespace) setHandoffNamespace(sync.handoffNamespace);
+        }
+        if (sync.planHash) setPlanHash(sync.planHash);
+        if (sync.planVersion !== null) setPlanVersion(sync.planVersion);
+        if (sync.planChanged) {
+            setExecutionCompleted((current) => nextExecutionCompleted(current, currentPlanHash, sync.planHash));
+            setExecutionToken(null);
+            setOperationLedger({});
+            setExecutionFailedKey(null);
+            setRemediationScript('');
+            setRemediationInfo(null);
+            setHandoffInfo(null);
+            if (clusterId) clearExecutionToken(clusterId);
+        }
+        return sync;
+    }, []);
+
+    // Resume a draft stored by a previous visit (refresh, tab close, or a wait
+    // for the administrator). The draft id lives in localStorage, so a hard
+    // navigation can bring the plan and any handoff back. The HF token itself
+    // is never returned by GET APIs; the server reports `draftHfTokenSaved` so
+    // the wizard knows whether an encrypted draft token is already stored.
+    const resumeGateRef = useRef(null);
+    if (!resumeGateRef.current) resumeGateRef.current = createResumeGate();
+    useEffect(() => {
+        const draftId = loadResumeDraftId();
+        if (!draftId) return undefined;
+        const loadId = resumeGateRef.current.begin();
+        const controller = new AbortController();
+        const isCurrent = () => !controller.signal.aborted && resumeGateRef.current.isCurrent(loadId);
+        setResumeBusy(true);
+        setResumeError('');
+        getCluster(draftId, { signal: controller.signal })
+            .then((detail) => {
+                if (!isCurrent()) return;
+                const resumedCluster = detail?.cluster || null;
+                if (!resumedCluster?.id) {
+                    clearResumeState();
+                    return;
+                }
+                setCluster(resumedCluster);
+                setName(resumedCluster.name || '');
+                setDescription(resumedCluster.description || '');
+                const resumedFields = planToWizardFields(detail?.plan);
+                applyWizardFields(resumedFields);
+                if (resumedFields.vllmImage === undefined && resumedCluster.vllmImage) {
+                    setVllmImage(resumedCluster.vllmImage);
+                }
+                setHfTokenSaved(Boolean(detail?.draftHfTokenSaved));
+                setHfToken('');
+                setInlineToken('');
+                setInlineTokenError('');
+                // Restore the saved proxy; the default "auto" must not overwrite it.
+                const proxyFields = proxyFieldsFromCluster(resumedCluster);
+                setProxyMode(proxyFields.proxyMode);
+                setHttpProxy(proxyFields.httpProxy);
+                setHttpsProxy(proxyFields.httpsProxy);
+                setNoProxy(proxyFields.noProxy);
+                setPlan(detail?.plan || null);
+                setPlanHash(detail?.planHash || null);
+                setPlanVersion(detail?.planVersion ?? null);
+                const resumedFinished = resumedCluster.draft === false;
+                setFinished(resumedFinished);
+                // Resume the operation ledger so a refresh mid-run continues
+                // at the first incomplete user operation instead of replaying
+                // completed work.
+                const resumedLedger = detail?.executionOperations || {};
+                setOperationLedger(resumedLedger);
+                const completedForPlan = executionCompletedForPlan(detail);
+                setExecutionCompleted(completedForPlan || resumedFinished);
+                setFinishStatus([]);
+                const resumedToken = resumedFinished || completedForPlan
+                    ? null
+                    : loadExecutionToken(resumedCluster.id);
+                setExecutionToken(resumedToken);
+                const resumeStep = resumeStepForPlan(detail?.plan, {
+                    hasCluster: true,
+                    finished: resumedFinished,
+                    lastStep: loadResumeStep(),
+                });
+                const resumeIndex = WIZARD_STEP_IDS.indexOf(resumeStep);
+                setStepIndex(resumeIndex >= 0 ? resumeIndex : 0);
+                saveResumeDraftId(resumedCluster.id);
+                saveResumeStep(resumeStep);
+                loadClusterKubernetesVersion(resumedCluster.id)
+                    .then((check) => {
+                        if (!isCurrent()) return;
+                        setK8sCheck(check);
+                        setK8sWarning(check?.reason === 'forbidden' ? versionCheckMessage(check) : '');
+                    })
+                    .catch(() => {});
+                if (shouldAutoCheckResumedPlan({ hasPlan: Boolean(detail?.plan), finished: resumedFinished, resumeStep })) {
+                    setPermissionBusy(true);
+                    setPermissionError('');
+                    permissionCheck(resumedCluster.id)
+                        .then(async (report) => {
+                            if (!isCurrent()) return;
+                            const sync = adoptPermissionCheckPlan(report, resumedCluster.id, detail?.planHash || null);
+                            const effectiveLedger = sync.planChanged ? {} : resumedLedger;
+                            const effectiveToken = sync.planChanged ? null : resumedToken;
+                            setPermissionReport(report);
+                            setFinishStatus(operationProgressForLedger(report, effectiveLedger));
+                            if (shouldLoadHandoff(report)) {
+                                let status = null;
+                                try {
+                                    status = await adminHandoffStatus(resumedCluster.id);
+                                    if (!isCurrent()) return;
+                                    setHandoffInfo(status || null);
+                                } catch (statusError) {
+                                    if (!isCurrent()) return;
+                                    setHandoffError(errorMessage(statusError, 'Could not load the Orchestration administrator handoff'));
+                                }
+                                if (!adminVerificationReady(status)) {
+                                    if (status?.status !== 'ready' && (!status || (status.adminOperations || []).length > 0)) {
+                                        try {
+                                            const remediation = await permissionRemediation(resumedCluster.id);
+                                            if (!isCurrent()) return;
+                                            setRemediationScript(remediation?.script || '');
+                                            setRemediationInfo(remediation || null);
+                                        } catch (remediationError) {
+                                            if (!isCurrent()) return;
+                                            if (status) {
+                                                setHandoffError(errorMessage(remediationError, 'Could not generate the Orchestration administrator script'));
+                                            }
+                                        }
+                                    }
+                                }
+                                if (shouldAutoVerifyHandoff(status, { hasToken: Boolean(effectiveToken), ledger: effectiveLedger, force: true })) {
+                                    try {
+                                        const verified = await verifyAdminHandoff(resumedCluster.id);
+                                        if (!isCurrent()) return;
+                                        setHandoffInfo(verified.body || status);
+                                        setHandoffError('');
+                                        setExecutionBlocked(false);
+                                        const freshLedger = await refreshOperationLedger(resumedCluster.id, {
+                                            reportPlanHash: report?.planHash || null,
+                                            currentPlanHash: sync.planHash || detail?.planHash || null,
+                                            isCurrent,
+                                        });
+                                        if (!isCurrent()) return;
+                                        setExecutionToken(verified.token || null);
+                                        setFinishStatus(operationProgressForLedger(report, freshLedger));
+                                    } catch (verifyError) {
+                                        if (!isCurrent()) return;
+                                        const action = verificationFailureAction(verifyError);
+                                        if (action.blocked) {
+                                            setExecutionBlocked(true);
+                                            setHandoffError('Another execution run is active for this cluster. Wait for it to finish or cancel it.');
+                                        } else {
+                                            if (verifyError?.code === 'execution_token_invalid') {
+                                                setExecutionToken(null);
+                                                clearExecutionToken(resumedCluster.id);
+                                            }
+                                            if (action.refreshHandoff) {
+                                                setHandoffInfo(handoffFallbackFromVerifyError(
+                                                    verifyError,
+                                                    status,
+                                                    permissionDetails(verifyError),
+                                                ));
+                                                setHandoffError(errorMessage(verifyError, 'Could not verify the Orchestration administrator handoff'));
+                                                const freshStatus = await adminHandoffStatus(resumedCluster.id).catch(() => null);
+                                                if (!isCurrent()) return;
+                                                if (freshStatus) setHandoffInfo(freshStatus);
+                                            } else {
+                                                setHandoffInfo(null);
+                                                setHandoffError(errorMessage(verifyError, 'Could not verify the Orchestration administrator handoff'));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                        .catch((nextError) => {
+                            if (isCurrent()) setPermissionError(errorMessage(nextError, 'Permission check failed'));
+                        })
+                        .finally(() => {
+                            if (resumeGateRef.current.isCurrent(loadId)) setPermissionBusy(false);
+                        });
+                }
+            })
+            .catch((nextError) => {
+                if (!isCurrent()) return;
+                // A missing/forbidden draft can be forgotten, but a transient
+                // network/5xx error must keep the key so the user can retry.
+                if (shouldClearResumeOnLoadError(nextError)) clearResumeState();
+                else setResumeError(errorMessage(nextError, 'Could not resume the saved draft. Retry.'));
+            })
+            .finally(() => {
+                if (resumeGateRef.current.isCurrent(loadId)) setResumeBusy(false);
+            });
+        return () => {
+            controller.abort();
+            if (resumeGateRef.current.isCurrent(loadId)) {
+                setResumeBusy(false);
+                setPermissionBusy(false);
+            }
+        };
+        // Resume runs once per attempt. Auto-verify uses explicit cluster ids
+        // and must not restart when those callbacks are recreated.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [applyWizardFields, resumeAttempt]);
+
+    // Keep the live execution token across a page refresh in this tab so a
+    // mid-run reload can resume instead of restarting from the first step.
+    useEffect(() => {
+        if (!cluster?.id) return;
+        if (executionToken) saveExecutionToken(cluster.id, executionToken);
+        else clearExecutionToken(cluster.id);
+    }, [cluster?.id, executionToken]);
+
+    const loadRemediation = async (inline = null) => {
+        setHandoffError('');
+        if (inline?.script) {
+            setRemediationScript(inline.script);
+            setRemediationInfo(inline);
+            return;
+        }
+        if (!cluster?.id) return;
+        setHandoffBusy(true);
+        try {
+            const response = await permissionRemediation(cluster.id);
+            setRemediationScript(response?.script || '');
+            setRemediationInfo(response || null);
+        } catch (nextError) {
+            setHandoffError(errorMessage(nextError, 'Could not generate the Orchestration administrator script'));
+        } finally {
+            setHandoffBusy(false);
+        }
+    };
+
+    const refreshOperationLedger = useCallback(async (
+        clusterId = cluster?.id,
+        { reportPlanHash = null, currentPlanHash, isCurrent } = {},
+    ) => {
+        if (!clusterId) return {};
+        const detail = await getCluster(clusterId).catch(() => null);
+        if (isCurrent && !isCurrent()) return {};
+        const sync = clusterDetailSyncForReport(detail, {
+            reportPlanHash,
+            currentPlanHash: currentPlanHash !== undefined ? currentPlanHash : planHash,
+        });
+        setOperationLedger(sync.ledger);
+        if (sync.draftHfTokenSaved !== null) {
+            setHfTokenSaved(sync.draftHfTokenSaved);
+        }
+        if (sync.alignPlan) {
+            if (sync.plan) {
+                setPlan(sync.plan);
+                if (sync.secretNamespace) {
+                    setSecretNamespace(sync.secretNamespace);
+                    setSecretNamespaceTouched(true);
+                }
+                if (sync.secretNamespaceMode) setSecretNamespaceMode(sync.secretNamespaceMode);
+                if (sync.storageNamespace) {
+                    setStorageNamespace(sync.storageNamespace);
+                    setStorageNamespaceTouched(true);
+                }
+                if (sync.storageNamespaceMode) setStorageNamespaceMode(sync.storageNamespaceMode);
+                if (sync.monitoringNamespace) {
+                    setMonitoringNamespace(sync.monitoringNamespace);
+                    setMonitoringNamespaceTouched(true);
+                }
+                if (sync.handoffNamespace) setHandoffNamespace(sync.handoffNamespace);
+            }
+            setPlanHash(sync.planHash);
+            if (sync.planVersion !== null) setPlanVersion(sync.planVersion);
+        }
+        return sync.ledger;
+    }, [cluster?.id, planHash]);
+
+    const loadHandoff = useCallback(async (
+        report,
+        clusterId = cluster?.id,
+        {
+            autoVerify = true,
+            forceVerify = false,
+            manualRecheck = false,
+            preserveError = false,
+            ledger,
+            tokenOverride,
+        } = {},
+    ) => {
+        if (!clusterId || !shouldLoadHandoff(report)) return;
+        setHandoffBusy(true);
+        if (!preserveError) setHandoffError('');
+        setHandoffWarning('');
+        try {
+            let status = null;
+            try {
+                status = await adminHandoffStatus(clusterId);
+                setHandoffInfo(status || null);
+            } catch (statusError) {
+                setHandoffInfo(null);
+                setHandoffError(errorMessage(statusError, 'Could not load the Orchestration administrator handoff'));
+            }
+            if (!adminVerificationReady(status)) {
+                let remediationFailed = false;
+                if (status?.status !== 'ready' && (!status || (status.adminOperations || []).length > 0)) {
+                    try {
+                        const remediation = await permissionRemediation(clusterId);
+                        setRemediationScript(remediation?.script || '');
+                        setRemediationInfo(remediation || null);
+                    } catch (remediationError) {
+                        remediationFailed = true;
+                        if (status) {
+                            setHandoffError(errorMessage(remediationError, 'Could not generate the Orchestration administrator script'));
+                        }
+                    }
+                }
+                if (manualRecheck && !remediationFailed && status && (status.status === 'missing' || status.status === 'unknown')) {
+                    setHandoffWarning('Orchestration administrator completion marker not found yet. Once your Orchestration administrator finishes running the script, click Re-check again.');
+                }
+                return;
+            }
+            const currentToken = tokenOverride !== undefined ? tokenOverride : executionToken;
+            const currentLedger = ledger ?? operationLedger;
+            const shouldVerify = (autoVerify || forceVerify)
+                && shouldAutoVerifyHandoff(status, {
+                    hasToken: Boolean(currentToken),
+                    ledger: currentLedger,
+                    force: forceVerify,
+                });
+            if (shouldVerify) {
+                try {
+                    const verified = await verifyAdminHandoff(clusterId);
+                    const verifiedBody = verified.body || status;
+                    setHandoffInfo(verifiedBody);
+                    if (!preserveError) setHandoffError('');
+                    setHandoffWarning('');
+                    setExecutionBlocked(false);
+                    const verifiedAdminIds = (verifiedBody?.adminOperations || [])
+                        .map((entry) => (typeof entry === 'string' ? entry : entry?.id))
+                        .filter(Boolean);
+                    const needsLedgerRefresh = verifyRefreshesOperationLedger(currentToken, verified.token)
+                        || verifiedAdminIds.some((id) => currentLedger?.[id] !== 'admin_done')
+                        || !hasHfTokenForRun
+                        || Boolean(report?.planHash && report.planHash !== planHash);
+                    const freshLedger = needsLedgerRefresh
+                        ? await refreshOperationLedger(clusterId, { reportPlanHash: report?.planHash || null })
+                        : currentLedger;
+                    setExecutionToken(verified.token || null);
+                    if (report) setFinishStatus(operationProgressForLedger(report, freshLedger));
+                } catch (verifyError) {
+                    const action = verificationFailureAction(verifyError);
+                    if (action.blocked) {
+                        setExecutionBlocked(true);
+                        setHandoffError('Another execution run is active for this cluster. Wait for it to finish or cancel it.');
+                        return;
+                    }
+                    if (verifyError?.code === 'execution_token_invalid') {
+                        setExecutionToken(null);
+                        clearExecutionToken(clusterId);
+                    }
+                    if (action.refreshHandoff) {
+                        setHandoffInfo(handoffFallbackFromVerifyError(
+                            verifyError,
+                            status,
+                            permissionDetails(verifyError),
+                        ));
+                        setHandoffError(errorMessage(verifyError, 'Could not verify the Orchestration administrator handoff'));
+                        const freshStatus = await adminHandoffStatus(clusterId).catch(() => null);
+                        if (freshStatus) setHandoffInfo(freshStatus);
+                    } else {
+                        setHandoffInfo(null);
+                        setHandoffError(errorMessage(verifyError, 'Could not verify the Orchestration administrator handoff'));
+                    }
+                }
+            } else if (!hasHfTokenForRun || Boolean(report?.planHash && report.planHash !== planHash)) {
+                const freshLedger = await refreshOperationLedger(clusterId, { reportPlanHash: report?.planHash || null });
+                if (report) setFinishStatus(operationProgressForLedger(report, freshLedger));
+            }
+        } finally {
+            setHandoffBusy(false);
+        }
+    }, [cluster?.id, executionToken, hasHfTokenForRun, operationLedger, planHash, refreshOperationLedger]);
+
+    const applyPermissionError = async (nextError, clusterId = cluster?.id) => {
+        const details = permissionDetails(nextError);
+        const tokenFromError = nextError?.executionToken;
+        if (tokenFromError) setExecutionToken(tokenFromError);
+        const effectiveToken = tokenFromError ?? executionToken;
+        setPermissionError('');
+        setHandoffWarning('');
+        if (nextError?.code === 'operation_blocked') {
+            const blockedReport = {
+                ...(permissionReport || {}),
+                status: 'blocked',
+                sufficient: false,
+                planHash: details.planHash || permissionReport?.planHash || null,
+                adminOperations: details.adminOperations.length
+                    ? details.adminOperations
+                    : permissionReport?.adminOperations || [],
+                blockedOperations: details.blockedOperations.length
+                    ? details.blockedOperations
+                    : [{ id: details.operationId, executor: 'user' }],
+                missing: details.missing,
+            };
+            setPermissionReport(blockedReport);
+            setHandoffError(errorMessage(nextError, 'Fix the user-owned access before retrying'));
+            if (shouldLoadHandoff(blockedReport)) {
+                await loadHandoff(blockedReport, clusterId, { tokenOverride: effectiveToken, preserveError: true });
+            } else {
+                setHandoffInfo(null);
+                setRemediationScript('');
+                setRemediationInfo(null);
+            }
+            return blockedReport;
+        }
+        setHandoffError(errorMessage(nextError, 'The plan check changed'));
+        if (!clusterId) return null;
+        try {
+            const report = await permissionCheck(clusterId);
+            const sync = adoptPermissionCheckPlan(report, clusterId, planHash);
+            const effectiveTokenAfterSync = sync.planChanged ? null : effectiveToken;
+            setPermissionReport(report);
+            const freshLedger = sync.planChanged
+                ? {}
+                : await refreshOperationLedger(clusterId, {
+                    reportPlanHash: report?.planHash || null,
+                    currentPlanHash: sync.planHash || planHash,
+                });
+            setFinishStatus(operationProgressForLedger(report, freshLedger));
+            if (shouldLoadHandoff(report)) {
+                await loadHandoff(report, clusterId, {
+                    tokenOverride: effectiveTokenAfterSync,
+                    ledger: freshLedger,
+                    preserveError: true,
+                });
+            } else {
+                setHandoffInfo(null);
+                setRemediationScript('');
+                setRemediationInfo(null);
+            }
+            return report;
+        } catch {
+            setPermissionReport(null);
+            setRemediationScript('');
+            setRemediationInfo(null);
+            setHandoffInfo(null);
+            setHandoffError('');
+            setHandoffWarning('');
+            setPermissionError(errorMessage(nextError, 'Permission check failed. No current report is available; retry the check.'));
+            return null;
+        }
+    };
+
+    const runPermissionCheck = async ({
+        clusterId = cluster?.id,
+        ledgerOverride,
+        tokenOverride,
+        autoVerify = true,
+        forceVerify = false,
+        manualRecheck = false,
+    } = {}) => {
+        if (!clusterId) return null;
+        setPermissionBusy(true);
+        setPermissionError('');
+        setHandoffWarning('');
+        try {
+            const report = await permissionCheck(clusterId);
+            const sync = adoptPermissionCheckPlan(report, clusterId, planHash);
+            const effectiveLedger = sync.planChanged ? {} : (ledgerOverride ?? operationLedger);
+            const effectiveToken = sync.planChanged ? null : tokenOverride;
+            setPermissionReport(report);
+            setFinishStatus(operationProgressForLedger(report, effectiveLedger));
+            if (shouldLoadHandoff(report)) {
+                await loadHandoff(report, clusterId, {
+                    autoVerify,
+                    forceVerify,
+                    manualRecheck,
+                    ledger: effectiveLedger,
+                    tokenOverride: effectiveToken,
+                });
+            } else {
+                setRemediationScript('');
+                setRemediationInfo(null);
+                setHandoffInfo(null);
+                setHandoffError('');
+                setHandoffWarning('');
+                if (!hasHfTokenForRun) {
+                    const freshLedger = await refreshOperationLedger(clusterId, {
+                        reportPlanHash: report?.planHash || null,
+                        currentPlanHash: sync.planHash || planHash,
+                    });
+                    setFinishStatus(operationProgressForLedger(report, freshLedger));
+                }
+            }
+            return report;
+        } catch (nextError) {
+            if (isPermissionError(nextError)) return applyPermissionError(nextError, clusterId);
+            setPermissionReport(null);
+            setRemediationScript('');
+            setRemediationInfo(null);
+            setHandoffInfo(null);
+            setHandoffError('');
+            setHandoffWarning('');
+            setPermissionError(errorMessage(nextError, 'Permission check failed. No current report is available; retry the check.'));
+            return null;
+        } finally {
+            setPermissionBusy(false);
+        }
+    };
+
+    const recheckPermissions = () => {
+        setError('');
+        setExecutionFailedKey(null);
+        return runPermissionCheck({ forceVerify: true, manualRecheck: Boolean(permissionReport) });
+    };
+
+    const enterExecuteStep = () => {
+        setStepIndex(EXECUTE_STEP_INDEX);
+        saveResumeStep(WIZARD_STEP_IDS[EXECUTE_STEP_INDEX]);
+    };
+
+    const runPreflight = async () => {
+        if (!canPreflight) return null;
+        setError('');
+        setNotice('');
+        enterExecuteStep();
+        return runPermissionCheck({ forceVerify: true });
+    };
+
+    // Save the current plan. A failed save keeps the wizard on the current
+    // step; a successful save stores the new hashes and invalidates the report.
+    const savePlan = async () => {
+        const nextPlan = planFromWizardState(wizardState);
+        const response = await putPlan(cluster.id, nextPlan, { ifMatch: planHash || undefined });
+        const savedPlan = response.plan || nextPlan;
+        setPlan(savedPlan);
+        // Adopt the backend-normalized effective gateway coordinates so later
+        // saves and the Review view never fall back to the raw default.
+        if (savedPlan.gateway?.namespace) setGatewayNamespace(savedPlan.gateway.namespace);
+        if (savedPlan.gateway?.name) setGatewayName(savedPlan.gateway.name);
+        if (savedPlan.hfTokenSecret?.secretNamespace) {
+            setSecretNamespace(savedPlan.hfTokenSecret.secretNamespace);
+            setSecretNamespaceTouched(true);
+        }
+        if (savedPlan.hfTokenSecret?.secretNamespaceMode) setSecretNamespaceMode(savedPlan.hfTokenSecret.secretNamespaceMode);
+        if (savedPlan.storage?.kind && savedPlan.storage.kind !== 'none') {
+            if (savedPlan.storage.namespace) {
+                setStorageNamespace(savedPlan.storage.namespace);
+                setStorageNamespaceTouched(true);
+            }
+            if (savedPlan.storage.namespaceMode) setStorageNamespaceMode(savedPlan.storage.namespaceMode);
+        }
+        if (savedPlan.handoff?.namespace) setHandoffNamespace(savedPlan.handoff.namespace);
+        if (savedPlan.stack?.routerVersion) setRouterVersion(savedPlan.stack.routerVersion);
+        if (savedPlan.stack?.gieVersion) setGieVersion(savedPlan.stack.gieVersion);
+        if (savedPlan.stack?.ippVersion) setIppVersion(savedPlan.stack.ippVersion);
+        if (savedPlan.monitoring?.namespace) {
+            setMonitoringNamespace(savedPlan.monitoring.namespace);
+            setMonitoringNamespaceTouched(true);
+        }
+        const nextPlanHash = response.planHash || null;
+        const planChanged = planInvalidatesRun(planHash, nextPlanHash);
+        setPlanHash(nextPlanHash);
+        setPlanVersion(response.planVersion ?? null);
+        setPermissionReport(null);
+        setPermissionError('');
+        setRemediationScript('');
+        setRemediationInfo(null);
+        setHandoffInfo(null);
+        setHandoffError('');
+        setHandoffWarning('');
+        setExecutionBlocked(false);
+        if (planChanged) {
+            // Only a changed plan invalidates the live token/ledger. Saving
+            // unchanged configuration must not lose a verified handoff token.
+            setExecutionCompleted((current) => nextExecutionCompleted(current, planHash, nextPlanHash));
+            setExecutionToken(null);
+            setOperationLedger({});
+            setExecutionFailedKey(null);
+            setFinishStatus([]);
+            clearExecutionToken(cluster.id);
+        }
+        return response;
+    };
+
+    const handleSaveInlineToken = async () => {
+        const trimmed = inlineToken.trim();
+        if (!cluster?.id || !trimmed || inlineTokenBusy) return;
+        setInlineTokenBusy(true);
+        setInlineTokenError('');
+        try {
+            await saveDraftHfToken(cluster.id, trimmed, { executionToken });
+            setHfTokenSaved(true);
+            setInlineToken('');
+            setError('');
+        } catch (nextError) {
+            if (nextError?.code === 'execution_in_progress') {
+                setExecutionBlocked(true);
+            }
+            setInlineTokenError(errorMessage(nextError, 'Could not save the Hugging Face token'));
+        } finally {
+            setInlineTokenBusy(false);
+        }
+    };
+
+    // A draft whose uploaded kubeconfig cannot be used is deleted (best
+    // effort) and its resume key is cleared, so a later Next re-uploads and
+    // re-checks instead of silently reusing the unusable draft.
+    const discardUnusableDraft = async (draftId) => {
+        if (draftId) {
+            try {
+                await requestJson(`/api/cluster/clusters/${encodeURIComponent(draftId)}`, { method: 'DELETE' });
+            } catch {
+                // The resume key still prevents reuse when the delete fails.
+            }
+        }
+        clearResumeState();
+        setCluster(null);
+        setK8sCheck(null);
+        setFile(null);
+        setSecretNamespace('llm-d-bench-storage');
+        setSecretNamespaceMode('');
+        setSecretNamespaceTouched(false);
+        setStorageNamespace('');
+        setStorageNamespaceMode('');
+        setStorageNamespaceTouched(false);
+        setMonitoringNamespace('');
+        setMonitoringNamespaceTouched(false);
+        setVllmImage('');
+        setHandoffNamespace('');
+        setHfToken('');
+        setHfTokenSaved(false);
+        setInlineToken('');
+        setInlineTokenError('');
+        setKubeconfigInputKey((current) => current + 1);
+    };
 
     const goNext = async () => {
         setError('');
+        if (busy) return;
         if (stepIndex === 0) {
-            if (!basicsValid || busy) return;
+            if (!canGoNext) return;
+            // A resumed draft already exists; do not create a second one.
+            if (cluster) {
+                setStepIndex(1);
+                saveResumeStep(WIZARD_STEP_IDS[1]);
+                return;
+            }
             setBusy(true);
+            let created = null;
             try {
                 const body = new FormData();
                 body.append('name', name.trim());
@@ -439,248 +1402,400 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                 body.append('file', file);
                 // Created as a draft: hidden from the main cluster list and
                 // excluded from the "has deployments/storage" delete guards
-                // until Finish flips it to a real cluster below. If the
-                // wizard is cancelled first, onClose deletes this draft.
+                // until Execute finalizes it.
                 body.append('draft', 'true');
                 const payload = await requestJson('/api/cluster/clusters', { method: 'POST', body });
-                setCluster(payload.cluster);
+                created = payload.cluster;
+                setCluster(created);
+                saveResumeDraftId(created.id);
                 // Verify the uploaded kubeconfig reaches the cluster and its
                 // Kubernetes version meets the stack minimum before continuing.
-                const check = await loadClusterKubernetesVersion(payload.cluster.id);
+                // A `forbidden` version read is a warning: the plan-scoped
+                // permission check covers the missing access later.
+                const check = await loadClusterKubernetesVersion(created.id);
                 setK8sCheck(check);
-                if (!check.reachable) {
-                    setError('Could not reach the Kubernetes API with the uploaded kubeconfig.');
+                if (versionCheckBlocks(check)) {
+                    await discardUnusableDraft(created.id);
+                    setK8sWarning('');
+                    setError(versionCheckMessage(check));
                     return;
                 }
-                if (!check.supported) {
-                    setError(`Kubernetes ${check.version} is below the required minimum ${check.min_k8s_version}.`);
-                    return;
-                }
+                setK8sWarning(check?.reason === 'forbidden' ? versionCheckMessage(check) : '');
                 setStepIndex(1);
+                saveResumeStep(WIZARD_STEP_IDS[1]);
             } catch (nextError) {
-                setError(nextError.message);
+                if (created?.id) await discardUnusableDraft(created.id);
+                setK8sWarning('');
+                setError(errorMessage(nextError, 'Could not create the cluster draft'));
             } finally {
                 setBusy(false);
             }
             return;
         }
-        if (stepIndex === 1) {
-            if (!proxyValid || busy) return;
+        if (stepIndex >= 1 && stepIndex <= 6) {
+            if (!canGoNext) return;
             setBusy(true);
             try {
-                const payload = await request(`/api/cluster/clusters/${encodeURIComponent(cluster.id)}`, {
-                    method: 'PATCH',
-                    body: JSON.stringify({
-                        proxy:
-                            proxyMode === 'custom'
-                                ? { mode: 'custom', httpProxy: httpProxy.trim() || null, httpsProxy: httpsProxy.trim() || null, noProxy: noProxy.trim() || null }
-                                : { mode: 'auto' },
-                    }),
-                });
-                setCluster(payload.cluster);
-                setStepIndex(2);
-            } catch (nextError) {
-                setError(nextError.message);
-            } finally {
-                setBusy(false);
-            }
-            return;
-        }
-        if (stepIndex === 2) {
-            if (busy) return;
-            setBusy(true);
-            try {
-                const payload = await request(`/api/cluster/clusters/${encodeURIComponent(cluster.id)}`, {
-                    method: 'PATCH',
-                    body: JSON.stringify({ gatewayProvider: gatewayProvider || null, gatewayPort: gatewayPort.trim() ? Number(gatewayPort.trim()) : null, gatewayPublicUrl: gatewayPublicUrl.trim() || null, gatewayAuthzHost: gatewayAuthzHost.trim() || null, inotifyMaxUserInstances: inotifyMaxUserInstances.trim() ? Number(inotifyMaxUserInstances.trim()) : null }),
-                });
-                setCluster(payload.cluster);
-                setStepIndex(3);
-            } catch (nextError) {
-                setError(nextError.message);
-            } finally {
-                setBusy(false);
-            }
-            return;
-        }
-        if (stepIndex === 3) {
-            // Accelerator: driver/plugin install is handled at Finish.
-            setStepIndex(4);
-            return;
-        }
-        if (stepIndex === 4) {
-            if (busy) return;
-            setBusy(true);
-            setError(null);
-            try {
-                setVersionsDownloading(true);
-                setVersionsDownloadStatus(null);
-                // The backend clones the profile-pinned revisions and reports
-                // progress; advance only once both checkouts are ready. On
-                // failure, stay here and surface the reason.
-                const nextCluster = await downloadClusterSoftware(cluster, { onUpdate: setVersionsDownloadStatus });
-                setCluster(nextCluster);
-                // Pre-pull the router/model-server images for the accelerators
-                // chosen in the previous step, so the first deployment does not
-                // wait on a lazy pull.
-                const accelerators = selectedAcceleratorIds;
-                if (accelerators.length) {
-                    setImagePulling(true);
-                    setImagePullStatus(null);
-                    await startClusterImagePrepull(nextCluster.id, accelerators);
-                    const status = await waitForClusterImagePrepull(nextCluster.id, { onUpdate: setImagePullStatus });
-                    if (status.state === 'failed') {
-                        // Stay on the llm-d stack step; the failing image rows show
-                        // their reason. No global blocking message.
-                        return;
+                if (stepIndex === 1) {
+                    // Proxy is not part of the plan; save it through PATCH.
+                    const payload = await request(`/api/cluster/clusters/${encodeURIComponent(cluster.id)}`, {
+                        method: 'PATCH',
+                        body: JSON.stringify({
+                            proxy:
+                                proxyMode === 'custom'
+                                    ? { mode: 'custom', httpProxy: httpProxy.trim() || null, httpsProxy: httpsProxy.trim() || null, noProxy: noProxy.trim() || null }
+                                    : { mode: 'auto' },
+                        }),
+                    });
+                    setCluster(payload.cluster);
+                }
+                if (stepIndex === 4) {
+                    // Lens-local source download; the CRD/prepull/LWS cluster
+                    // operations moved to Execute.
+                    setVersionsDownloading(true);
+                    setVersionsDownloadStatus(null);
+                    const nextCluster = await downloadClusterSoftware(cluster, { onUpdate: setVersionsDownloadStatus });
+                    setCluster(nextCluster);
+                }
+                if (stepIndex === 5) {
+                    const trimmedToken = hfToken.trim();
+                    if (trimmedToken) {
+                        await saveDraftHfToken(cluster.id, trimmedToken, { executionToken });
+                        setHfTokenSaved(true);
+                        setHfToken('');
+                        setInlineToken('');
+                        setInlineTokenError('');
                     }
                 }
-                // Apply the pinned Gateway API / GIE / llm-d Router CRDs
-                // (idempotent) and stay on this step until all are present.
-                const crds = await applyClusterCrds(nextCluster.id);
-                setCrdStatus({
-                    gateway_api: crds.gateway_api?.ok ? 'ready' : 'missing',
-                    gateway_api_inference_extension: crds.gateway_api_inference_extension?.ok ? 'ready' : 'missing',
-                    llm_d_router: crds.llm_d_router?.ok ? 'ready' : 'missing',
-                });
-                if (!crds.gateway_api?.ok || !crds.gateway_api_inference_extension?.ok || !crds.llm_d_router?.ok) {
-                    return;
+                await savePlan();
+                if (stepIndex === 6) {
+                    setStepIndex(REVIEW_STEP_INDEX);
+                    saveResumeStep(WIZARD_STEP_IDS[REVIEW_STEP_INDEX]);
+                } else {
+                    setStepIndex(stepIndex + 1);
+                    saveResumeStep(WIZARD_STEP_IDS[stepIndex + 1]);
                 }
-                // Install the pinned LeaderWorkerSet controller; llm-d v1.0 P/D
-                // Guides create DisaggregatedSet resources through it.
-                setLwsStatus({ installing: true, ready: false, message: '' });
-                const lws = await installClusterLws(nextCluster.id);
-                setLwsStatus(lws);
-                if (!lws.ok) {
-                    setError(lws.message || 'LeaderWorkerSet installation failed');
-                    return;
-                }
-                setStepIndex(5);
             } catch (nextError) {
-                setError(nextError.message);
+                if (nextError?.code === 'execution_in_progress') {
+                    setExecutionBlocked(true);
+                    setError('Another execution run is active for this cluster, so the plan cannot be changed. Wait for it to finish or cancel it.');
+                } else {
+                    setError(errorMessage(nextError, 'Could not save the plan'));
+                }
             } finally {
                 setVersionsDownloading(false);
-                setImagePulling(false);
                 setBusy(false);
             }
-            return;
-        }
-        if (stepIndex === 5) {
-            if (!hfTokenSecretValid || !modelCacheValid || busy) return;
-            setBusy(true);
-            try {
-                // Create the HF_TOKEN secret now (before advancing), not
-                // deferred to Finish, and record it on the cluster so
-                // Deploy/Evaluate can default to reusing it later -- see
-                // llm_d_lens/cluster/service.py's create_hf_token_secret.
-                if (!secretRef) {
-                    const created = await request(`/api/cluster/clusters/${encodeURIComponent(cluster.id)}/hf-token-secrets`, {
-                        method: 'POST',
-                        body: JSON.stringify({ namespace: secretNamespace.trim(), name: secretName.trim(), token: hfToken.trim() }),
-                    });
-                    setSecretRef(created);
-                }
-                setStepIndex(6);
-            } catch (nextError) {
-                setError(errorMessage(nextError, 'Failed to create the HF_TOKEN secret'));
-            } finally {
-                setBusy(false);
-            }
-            return;
         }
     };
 
     const goBack = () => {
         setError('');
-        if (stepIndex > 0) setStepIndex(stepIndex - 1);
+        if (stepIndex > 0) {
+            setStepIndex(stepIndex - 1);
+            saveResumeStep(WIZARD_STEP_IDS[stepIndex - 1]);
+        }
     };
 
-    // Flips the draft cluster created in Step 1 into a real, listed cluster.
-    // Only called once every remaining wizard step has succeeded.
-    const finalizeDraftCluster = async () => {
-        const payload = await request(`/api/cluster/clusters/${encodeURIComponent(cluster.id)}`, {
-            method: 'PATCH',
-            body: JSON.stringify({ draft: false }),
-        });
-        setCluster(payload.cluster);
-        return payload.cluster;
-    };
+    const cancelRequestedRef = useRef(false);
 
-    const runFinish = async () => {
-        if (finishing || finished) return;
+    // Execute the user operations in dependency order, then let
+    // execution/complete run the Lens operations and finalize the draft.
+    const runExecution = async ({ resume = false } = {}) => {
+        if (finishing || finished || !cluster?.id || !plan || !permissionReport) return;
+        if (permissionBlocked) {
+            setError('Fix the user-owned access listed in the handoff before executing.');
+            return;
+        }
+        if (adminRequired && !adminVerified) {
+            setError('Click Re-check to verify the Orchestration administrator completion marker before running user operations.');
+            return;
+        }
+        if (handoffBusy || resumeBusy) return;
+        if (!resume && !canExecute) return;
+
         setFinishing(true);
         setError('');
-        const steps = [
-            { key: 'storage', label: 'Create storage volume', state: 'pending' },
-            ...(prewarmEnabled ? [{ key: 'model-cache', label: 'Start model cache download', state: 'pending' }] : []),
-        ];
-        setFinishStatus(steps);
+        setPermissionError('');
+        setNotice('');
+        setExecutionFailedKey(null);
+        cancelRequestedRef.current = false;
+
+        let token = executionToken;
+        let refreshedLedger = null;
+        if (adminRequired && adminVerified && !token) {
+            try {
+                const verified = await verifyAdminHandoff(cluster.id);
+                token = verified.token || verified.body?.token || null;
+                setHandoffInfo(verified.body || handoffInfo);
+                if (token) {
+                    refreshedLedger = await refreshOperationLedger(cluster.id, { reportPlanHash: permissionReport?.planHash || null });
+                    setExecutionToken(token);
+                } else {
+                    setError('Orchestration administrator verification did not return an execution token. Click Re-check and try again.');
+                    setFinishing(false);
+                    return;
+                }
+            } catch (nextError) {
+                if (verificationBlocksRun(nextError)) {
+                    setExecutionBlocked(true);
+                    setError('Another execution run is active for this cluster. Wait for it to finish or cancel it.');
+                } else {
+                    setError(errorMessage(nextError, 'Click Re-check to verify the Orchestration administrator handoff and acquire an execution token'));
+                }
+                setFinishing(false);
+                return;
+            }
+        }
+        if (!token) {
+            // A new run starts from a clean ledger; the backend acquire will
+            // clear its ledger as well.
+            setOperationLedger({});
+        }
+        const report = permissionReport;
+        const operations = report.userOperations || [];
+        let ledger = refreshedLedger ?? operationLedgerForRun(operationLedger, { hasToken: Boolean(token) });
+        let statuses = operationProgressForLedger(report, ledger);
+        setFinishStatus(statuses);
         const setStepState = (key, state, detail) =>
             setFinishStatus((current) => current.map((item) => (item.key === key ? { ...item, state, detail } : item)));
+
         try {
-            let volumeId;
-            {
-                setStepState('storage', 'running');
-                const volumePayload = {
-                    clusterId: cluster.id,
-                    name: storageName.trim(),
-                    kind: storageKind,
-                    capacity: storageCapacity.trim(),
-                    readOnly: false,
-                    purposes: ['model-cache'],
-                    ...(storageKind === 'local-disk' ? { localDisk: { hostPath: hostPath.trim() } } : {}),
-                    ...(storageKind === 'nfs' ? { nfs: { server: nfsServer.trim(), path: nfsPath.trim() } } : {}),
-                };
-                const created = await createStorageVolume(volumePayload);
-                volumeId = created.id;
-                const ready = await waitForVolumeReady(volumeId);
-                volumeId = ready.id;
-                setStepState('storage', 'done');
+            for (const operation of operations) {
+                if (operationDone(ledger, operation.id)) continue;
+                if (cancelRequestedRef.current) {
+                    setNotice('Execution run cancelled.');
+                    setFinishStatus([]);
+                    return;
+                }
+                setStepState(operation.id, 'running');
+                const secretValues = secretValuesFor(operation, hfToken, { hfTokenSaved });
+                if (secretValues) {
+                    const missing = Object.entries(secretValues).filter(([, value]) => !value).map(([field]) => field);
+                    if (missing.length) {
+                        throw new Error(`Enter ${missing.join(', ')} before executing ${operation.title || operation.id}.`);
+                    }
+                }
+                let result;
+                try {
+                    result = await executeOperation(cluster.id, operation.id, {
+                        planHash,
+                        token,
+                        secretValues,
+                    });
+                } catch (stepError) {
+                    token = stepError?.executionToken || token;
+                    if (token) setExecutionToken(token);
+                    const action = executionFailureAction(stepError);
+                    if (action.blocked) {
+                        setExecutionBlocked(true);
+                        setError('Another execution run is active for this cluster. Wait for it to finish or cancel it.');
+                        return;
+                    }
+                    if (action.markFailed) {
+                        ledger = { ...ledger, [operation.id]: 'failed' };
+                        setOperationLedger(ledger);
+                        setExecutionFailedKey(operation.id);
+                        setStepState(operation.id, 'failed', errorMessage(stepError));
+                    }
+                    if (action.clearRun) {
+                        setExecutionToken(null);
+                        setOperationLedger({});
+                        clearExecutionToken(cluster.id);
+                    }
+                    if (action.reason === 'secret_required') {
+                        setHfTokenSaved(false);
+                    }
+                    if (action.reclass) {
+                        await applyPermissionError(stepError);
+                    } else if (action.reloadLedger) {
+                        await refreshOperationLedger(cluster.id, { reportPlanHash: permissionReport?.planHash || null });
+                    } else if (action.refreshSplit) {
+                        await runPermissionCheck({ ledgerOverride: {}, tokenOverride: null });
+                    }
+                    if (action.reason === 'unauthorized') {
+                        setError('The kubeconfig credentials are invalid or expired. Update the cluster credential and run the check again.');
+                    } else if (action.reason === 'secret_required') {
+                        setError('The Hugging Face token is missing or could not be read for this draft. Save a token below, then click Resume.');
+                    } else if (action.reason === 'wait') {
+                        setError(
+                            adminRequired
+                                ? 'The operation was applied but did not become ready. Click Re-check and retry after the cluster resources settle.'
+                                : 'The operation was applied but did not become ready. Retry after the cluster resources settle.',
+                        );
+                    } else if (action.reason === 'token') {
+                        setError(
+                            adminRequired
+                                ? 'The execution run expired or was replaced. Click Re-check, then execute.'
+                                : 'The execution run expired or was replaced. Restart execution.',
+                        );
+                    } else if (action.reason === 'stale') {
+                        setError('The plan changed. Review the new operations before executing.');
+                    } else if (action.reason === 'failed') {
+                        setError(errorMessage(stepError, 'The user operation failed'));
+                    }
+                    return;
+                }
+                token = result?.token || token;
+                if (token) setExecutionToken(token);
+                ledger = { ...ledger, [operation.id]: 'user_done' };
+                setOperationLedger(ledger);
+                statuses = statuses.map((item) => (item.key === operation.id ? { ...item, state: 'done' } : item));
+                setFinishStatus(statuses);
             }
 
-            if (prewarmEnabled) {
-                setStepState('model-cache', 'running');
-                await createModelCacheEntry({
-                    clusterId: cluster.id,
-                    storageVolumeId: volumeId,
-                    source: { kind: 'huggingface', huggingface: { repoId: repoId.trim(), revision: revision.trim() } },
-                    tokenSource: { mode: 'existing-secret', namespace: secretRef.namespace, name: secretRef.name },
-                    // Prewarm picks one model for this wizard run; if an existing
-                    // volume already holds it, join/refresh it instead of failing
-                    // the whole cluster setup on a confirmation the wizard cannot ask.
-                    force: true,
-                });
-                setStepState('model-cache', 'done');
-            }
+            await completeExecution(cluster.id, { planHash, token });
+            setExecutionToken(null);
+            clearExecutionToken(cluster.id);
+            const detail = await getCluster(cluster.id);
+            setCluster(detail?.cluster || cluster);
+            setOperationLedger(detail?.executionOperations || ledger);
+            setHfToken('');
+            setHfTokenSaved(false);
+            setInlineToken('');
+            setInlineTokenError('');
+            setExecutionCompleted(true);
             setFinished(true);
-            onCreated?.(await finalizeDraftCluster());
+            clearResumeState();
+            onCreated?.(detail?.cluster || cluster);
         } catch (nextError) {
-            const failingKey = finishStatus.find((item) => item.state === 'running')?.key;
-            if (failingKey) setStepState(failingKey, 'failed', errorMessage(nextError));
-            setError(errorMessage(nextError, 'Failed to finish cluster setup'));
+            const action = completeFailureAction(nextError);
+            if (action.markFailed) {
+                setExecutionFailedKey('complete');
+            }
+            if (action.clearRun) {
+                setExecutionToken(null);
+                setOperationLedger({});
+                clearExecutionToken(cluster.id);
+            } else if (nextError?.executionToken) {
+                setExecutionToken(nextError.executionToken);
+            }
+            if (action.reclass) {
+                const refreshedReport = await applyPermissionError(nextError);
+                if (!permissionPanelVisible(refreshedReport)) {
+                    setError(errorMessage(nextError, 'Kubernetes denied permission while completing cluster setup.'));
+                }
+            } else if (action.refreshSplit) {
+                await runPermissionCheck({ ledgerOverride: {}, tokenOverride: null });
+                setError('The plan changed. Review the new operations before executing.');
+            } else if (action.reason === 'unauthorized') {
+                setError('The kubeconfig credentials are invalid or expired. Update the cluster credential and run the check again.');
+            } else if (action.reason === 'incomplete') {
+                setError('The backend has not recorded every operation. Retry the incomplete operations, then complete again.');
+            } else if (action.reason === 'lens_failed') {
+                setError('A Lens operation did not finish. The execution token is still valid; retry Complete.');
+            } else if (action.reason === 'monitoring_failed') {
+                setError(errorMessage(nextError, 'Prometheus monitoring verification failed. Check connectivity and retry Complete.'));
+            } else if (action.reason === 'token') {
+                setError(
+                    adminRequired
+                        ? 'The execution run expired or was replaced. Click Re-check and restart execution.'
+                        : 'The execution run expired or was replaced. Restart execution.',
+                );
+            } else {
+                setError(errorMessage(nextError, 'Could not complete cluster setup'));
+            }
         } finally {
             setFinishing(false);
         }
     };
 
-    const canGoNext =
-        (stepIndex === 0 && basicsValid) ||
-        (stepIndex === 1 && proxyValid) ||
-        (stepIndex === 2 && (gatewayProvider === 'gke' || Boolean(gatewayAuthzHost))) ||
-        (stepIndex === 3 && (acceleratorPairs.length === 0 || acceleratorReady)) ||
-        stepIndex === 4 ||
-        (stepIndex === 5 && hfTokenSecretValid && modelCacheValid);
-
-    // Best-effort cleanup: the cluster created at Step 1 is a draft (hidden
-    // from the cluster list) until Finish flips it to real. If the wizard
-    // is cancelled/closed before that, delete the leftover draft instead of
-    // letting it linger.
-    const handleClose = () => {
-        if (cluster && !finished) {
-            request(`/api/cluster/clusters/${encodeURIComponent(cluster.id)}`, { method: 'DELETE' }).catch(() => {});
+    // Ask the backend to stop the active run, then drop the local token and
+    // progress so the user can start over.
+    const cancelRun = async () => {
+        if (!cluster?.id || cancelling) return;
+        setCancelling(true);
+        setError('');
+        try {
+            await cancelExecution(cluster.id, { token: executionToken });
+            cancelRequestedRef.current = true;
+            clearExecutionToken(cluster.id);
+            setExecutionToken(null);
+            setOperationLedger({});
+            setFinishStatus([]);
+            setExecutionFailedKey(null);
+            setExecutionBlocked(false);
+            setHandoffError('');
+            setNotice('Execution run cancelled. You can execute again now.');
+        } catch (nextError) {
+            if (nextError?.code === 'execution_not_running') {
+                cancelRequestedRef.current = true;
+                setExecutionToken(null);
+                setOperationLedger({});
+                setFinishStatus([]);
+                setExecutionFailedKey(null);
+                setExecutionBlocked(false);
+                setHandoffError('');
+                setNotice('No execution run is active. You can start Execute again.');
+            } else {
+                setError(errorMessage(nextError, 'Could not cancel the execution run'));
+            }
+        } finally {
+            setCancelling(false);
         }
+    };
+
+    // "Close" keeps the draft so it can be resumed; only an explicit discard
+    // deletes it.
+    const handleClose = () => {
         onClose?.();
     };
+
+    const handleDiscard = async () => {
+        if (cluster && !finished) {
+            try {
+                await requestJson(`/api/cluster/clusters/${encodeURIComponent(cluster.id)}`, { method: 'DELETE' });
+            } catch {
+                // Best-effort: the user is closing anyway.
+            }
+        }
+        setHfToken('');
+        setHfTokenSaved(false);
+        setInlineToken('');
+        setInlineTokenError('');
+        clearResumeState();
+        onClose?.();
+    };
+
+    const canResume = executionFailedKey !== 'finalize_incomplete'
+        && canResumeOperationRun({
+            hasFailedOperation: Boolean(executionFailedKey),
+            executionBlocked,
+            cancelling,
+            permissionsSufficient: !permissionBlocked && (permissionReady || adminVerified),
+            permissionsFresh: !permissionReport?.planHash || permissionReport.planHash === planHash,
+            hasSecretInput: hasHfTokenForRun,
+            hasPermissionError: Boolean(permissionError),
+            finishing,
+            busy: permissionBusy || handoffBusy || resumeBusy,
+        });
+    const executeBlocker = executeDisabledReason({
+        canExecute,
+        finished,
+        finishing,
+        permissionBusy,
+        handoffBusy,
+        resumeBusy,
+        executionBlocked,
+        canResume,
+        hasCluster: Boolean(cluster?.id),
+        hasPlan: Boolean(plan),
+        hasReport: Boolean(permissionReport),
+        reportStatus: permissionReport?.status,
+        hasPermissionError: Boolean(permissionError),
+        permissionsFresh: !permissionReport?.planHash || permissionReport.planHash === planHash,
+        hasHfToken: hasHfTokenForRun,
+        adminVerified,
+        hasToken: Boolean(executionToken),
+        hasAdminOperations: Boolean((permissionReport?.adminOperations || []).length || (handoffInfo?.adminOperations || []).length),
+    });
+    const showSetupProgress = shouldShowSetupProgress({
+        finishing,
+        finished,
+        executionFailedKey,
+        operationLedger,
+        hasExecutionToken: Boolean(executionToken),
+    });
 
     if (dbStatus === null) {
         return (
@@ -692,7 +1807,7 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                         </div>
                     ) : (
                         <>
-                            <Loader2 className="h-6 w-6 animate-spin text-sky-400" />
+                            <Spinner size="md" className="text-sky-600 dark:text-sky-400" />
                             Checking database configuration…
                         </>
                     )}
@@ -727,32 +1842,84 @@ export function CreateClusterWizard({ onClose, onCreated }) {
             closeOnEscape={!finishing}
             footer={
                 <>
-                    <Button variant="outline" onClick={handleClose} disabled={finishing}>Cancel</Button>
-                    {stepIndex > 0 && stepIndex < 6 && (
-                        <Button variant="outline" onClick={goBack} disabled={busy}>Back</Button>
+                    <Button
+                        variant="outline"
+                        onClick={handleClose}
+                        disabled={finishing}
+                        title={cluster && !finished ? 'The draft and its saved plan are kept so you can resume later.' : undefined}
+                    >
+                        {cluster && !finished ? 'Close' : 'Cancel'}
+                    </Button>
+                    {cluster && !finished && (
+                        <Button variant="dangerOutline" onClick={handleDiscard} disabled={finishing}>Discard</Button>
                     )}
-                    {stepIndex === 6 && !finished && (
-                        <Button variant="outline" onClick={() => setStepIndex(5)} disabled={finishing}>Back</Button>
+                    {stepIndex > 0 && stepIndex < REVIEW_STEP_INDEX && (
+                        <Button variant="outline" onClick={goBack} disabled={busy || finishing || executionBlocked}>Back</Button>
                     )}
-                    {stepIndex < 6 && (
-                        <Button variant="sky" onClick={goNext} isLoading={busy} disabled={!canGoNext}>
-                            {stepIndex === 5 ? 'Review' : 'Next'} <ArrowRight className="h-3.5 w-3.5" />
+                    {stepIndex === REVIEW_STEP_INDEX && !finishing && (
+                        <Button variant="outline" onClick={() => { setError(''); setStepIndex(6); saveResumeStep(WIZARD_STEP_IDS[6]); }} disabled={busy || executionBlocked}>Back</Button>
+                    )}
+                    {stepIndex === EXECUTE_STEP_INDEX && !finished && (
+                        <Button
+                            variant="outline"
+                            onClick={() => { setError(''); setStepIndex(REVIEW_STEP_INDEX); saveResumeStep(WIZARD_STEP_IDS[REVIEW_STEP_INDEX]); }}
+                            disabled={!canGoBackFromExecute}
+                        >
+                            Back
                         </Button>
                     )}
-                    {stepIndex === 6 && !finished && (
-                        <Button variant="sky" onClick={runFinish} isLoading={finishing}>
-                            <Rocket className="h-3.5 w-3.5" /> Finish
+                    {stepIndex < REVIEW_STEP_INDEX && (
+                        <Button variant="sky" onClick={goNext} isLoading={busy} disabled={!canGoNext || executionBlocked}>
+                            {stepIndex === 6 ? 'Review' : 'Next'} <ArrowRight className="h-3.5 w-3.5" />
                         </Button>
                     )}
-                    {stepIndex === 6 && finished && (
-                        <Button variant="sky" onClick={onClose}>
+                    {stepIndex === REVIEW_STEP_INDEX && !finished && (
+                        <Button
+                            variant="sky"
+                            onClick={runPreflight}
+                            disabled={!canPreflight}
+                        >
+                            <ListChecks className="h-3.5 w-3.5" /> Preflight
+                        </Button>
+                    )}
+                    {stepIndex === EXECUTE_STEP_INDEX && finished && (
+                        <Button variant="sky" onClick={handleClose}>
                             <Check className="h-3.5 w-3.5" /> Done
+                        </Button>
+                    )}
+                    {!finished && (finishing || executionBlocked) && (
+                        <Button variant="dangerOutline" onClick={cancelRun} isLoading={cancelling} disabled={cancelling}>
+                            <AlertTriangle className="h-3.5 w-3.5" /> Cancel run
+                        </Button>
+                    )}
+                    {stepIndex === EXECUTE_STEP_INDEX && !finished && canResume && (
+                        <Button variant="sky" onClick={() => runExecution({ resume: true })} isLoading={finishing} disabled={!canResume}>
+                            <Rocket className="h-3.5 w-3.5" /> Resume
+                        </Button>
+                    )}
+                    {stepIndex === EXECUTE_STEP_INDEX && !finished && !finishing && !canResume && !executionBlocked && (
+                        <Button variant="sky" onClick={() => runExecution()} disabled={!canExecute}>
+                            <Rocket className="h-3.5 w-3.5" /> Execute
                         </Button>
                     )}
                 </>
             }
         >
             <div className="mx-auto max-w-4xl space-y-6">
+                {resumeBusy && (
+                    <p className="flex items-center gap-2 text-xs text-theme-muted">
+                        <Spinner size="xs" /> Resuming saved draft…
+                    </p>
+                )}
+                {resumeError && (
+                    <div role="alert" className="flex flex-wrap items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-200">
+                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                        <span className="min-w-0 flex-1">{resumeError}</span>
+                        <Button variant="outline" size="sm" onClick={() => setResumeAttempt((current) => current + 1)} disabled={resumeBusy}>
+                            Retry
+                        </Button>
+                    </div>
+                )}
                 <ol className="grid gap-2" style={{ gridTemplateColumns: `repeat(${STEPS.length}, minmax(0, 1fr))` }} aria-label="Cluster creation progress">
                     {STEPS.map((step, index) => (
                         <li key={step.id} className="min-w-0">
@@ -770,17 +1937,40 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                     </div>
                 )}
 
+                {notice && (
+                    <p className="flex items-start gap-2 rounded-lg border border-sky-500/30 bg-sky-500/10 p-3 text-xs text-sky-700 dark:text-sky-200">
+                        <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" /> {notice}
+                    </p>
+                )}
+
+                {executionBlocked && (
+                    <div role="alert" className="flex flex-wrap items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-200">
+                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                        <span className="min-w-0 flex-1">
+                            Another execution run is active for this cluster. Plan changes are disabled until it
+                            finishes; wait, or cancel the run and start again.
+                        </span>
+                        <Button variant="outline" size="sm" onClick={cancelRun} isLoading={cancelling} disabled={cancelling}>
+                            Cancel run
+                        </Button>
+                    </div>
+                )}
+
             {stepIndex === 0 && (
                 <section aria-labelledby="wizard-basics-heading">
                     <h2 id="wizard-basics-heading" className="mb-4 flex items-center gap-2 text-lg font-semibold text-slate-100">
-                        <Server className="h-5 w-5 text-sky-400" /> Basic Info
+                        <Server className="h-5 w-5 text-[var(--brand-accent)] dark:text-sky-400" /> Basic Info
                     </h2>
                 <div className="space-y-4">
-                    {k8sCheck && !k8sCheck.supported && (
+                    {k8sWarning && (
+                        <p role="status" className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-xs text-amber-700 dark:text-amber-200">
+                            <AlertTriangle size={14} className="mt-0.5 shrink-0" aria-hidden="true" />
+                            <span>{k8sWarning} The plan-scoped permission check will cover the required access.</span>
+                        </p>
+                    )}
+                    {k8sCheck && versionCheckBlocks(k8sCheck) && (
                         <p role="alert" className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-xs text-rose-300">
-                            {k8sCheck.reachable
-                                ? `Kubernetes ${k8sCheck.version} is below the required minimum ${k8sCheck.min_k8s_version}.`
-                                : 'The cluster is unreachable with this kubeconfig.'}
+                            {versionCheckMessage(k8sCheck)}
                         </p>
                     )}
                     <div>
@@ -818,7 +2008,7 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                                 <div className="flex items-center gap-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2">
                                     <Upload size={15} className="shrink-0 text-slate-400 dark:text-slate-500" />
                                     <span className="flex-1 truncate text-sm text-theme-muted">{file ? file.name : 'Choose a kubeconfig file'}</span>
-                                    <input type="file" onChange={(event) => setFile(event.target.files?.[0] || null)} className="hidden" id="wizard-kubeconfig-file" />
+                                    <input key={kubeconfigInputKey} type="file" onChange={(event) => { setFile(event.target.files?.[0] || null); setK8sCheck(null); setK8sWarning(''); }} className="hidden" id="wizard-kubeconfig-file" />
                                     <label htmlFor="wizard-kubeconfig-file" className="cursor-pointer rounded-md border border-emerald-500/40 px-2 py-1 text-xs font-medium text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/10">Browse</label>
                                 </div>
                                 <p className="mt-2 flex items-start gap-1.5 text-[11px] leading-4 text-theme-muted">
@@ -828,11 +2018,11 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                                             href={KUBECONFIG_GUIDE_URL}
                                             target="_blank"
                                             rel="noopener noreferrer"
-                                            className="font-medium text-[#037ffc] underline-offset-2 hover:underline focus-visible:rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#037ffc]/50 dark:text-cyan-300"
+                                            className="font-medium text-[var(--brand-accent)] underline-offset-2 hover:underline focus-visible:rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--brand-accent)] dark:text-cyan-300"
                                         >
                                             How to create a kubeconfig for Lens?
                                         </a>{' '}
-                                        Use a cluster-admin identity for the simplest setup, or the least-privilege option in the guide.
+                                        Use an Orchestration administrator identity for the simplest setup, or the least-privilege option in the guide.
                                     </span>
                                 </p>
                             </>
@@ -845,7 +2035,7 @@ export function CreateClusterWizard({ onClose, onCreated }) {
             {stepIndex === 1 && (
                 <section aria-labelledby="wizard-proxy-heading">
                     <h2 id="wizard-proxy-heading" className="mb-4 flex items-center gap-2 text-lg font-semibold text-slate-100">
-                        <Globe className="h-5 w-5 text-sky-400" /> Network Proxy
+                        <Globe className="h-5 w-5 text-[var(--brand-accent)] dark:text-sky-400" /> Network Proxy
                     </h2>
                 <div className="space-y-4">
                     <div className="space-y-2">
@@ -888,7 +2078,7 @@ export function CreateClusterWizard({ onClose, onCreated }) {
             {stepIndex === 2 && (
                 <section aria-labelledby="wizard-gateway-heading">
                     <h2 id="wizard-gateway-heading" className="mb-4 flex items-center gap-2 text-lg font-semibold text-slate-100">
-                        <Waypoints className="h-5 w-5 text-sky-400" /> Model gateway
+                        <Waypoints className="h-5 w-5 text-[var(--brand-accent)] dark:text-sky-400" /> Model gateway
                     </h2>
                     <div className="space-y-4">
                         <div>
@@ -901,7 +2091,7 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                                 <option value="gke" disabled>GKE Gateway (not supported yet)</option>
                             </Select>
                             <p className="mt-1 text-[11px] text-theme-muted">
-                                Installed once for the whole cluster at creation. Deployments keep their own
+                                Installed once for the whole cluster during Execute, after the permission check. Deployments keep their own
                                 InferencePool + EPP (no per-deployment gateway); each model service publishes an
                                 HTTPRoute/IPP against this shared Gateway.
                             </p>
@@ -956,14 +2146,14 @@ export function CreateClusterWizard({ onClose, onCreated }) {
             {stepIndex === 4 && (
                 <section aria-labelledby="wizard-versions-heading">
                     <h2 id="wizard-versions-heading" className="mb-4 flex items-center gap-2 text-lg font-semibold text-slate-100">
-                        <Tag className="h-5 w-5 text-sky-400" /> llm-d stack
+                        <Tag className="h-5 w-5 text-[var(--brand-accent)] dark:text-sky-400" /> llm-d stack
                     </h2>
                 <div className="space-y-4">
                     <p className="text-xs text-theme-muted">
                         These versions are fixed by this Lens release. Clicking Next downloads the llm-d and
-                        llm-d-benchmark sources, pre-pulls the router/model-server images for the accelerators you
-                        selected, and installs the Gateway CRDs plus the LeaderWorkerSet (LWS) controller, which provides the
-                        DisaggregatedSet API required by llm-d v1.0 P/D deployments.
+                        llm-d-benchmark sources on the Lens host so they are ready for later steps. The image
+                        pre-pull, Gateway CRDs and LeaderWorkerSet (LWS) controller are installed during Execute,
+                        after the permission check.
                     </p>
                     <div className="rounded-lg border border-slate-700/70 bg-slate-800/40 px-4 py-3">
                     {(() => {
@@ -971,20 +2161,24 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                         const providerLabels = { istio: 'Istio', 'envoy-ai-gateway': 'Envoy AI Gateway', agentgateway: 'agentgateway', gke: 'GKE Gateway' };
                         const providerLabel = providerLabels[gatewayProvider] || gatewayProvider;
                         const providerVersion = providerKeys[gatewayProvider] ? stackVersions?.gateway_providers?.[providerKeys[gatewayProvider]] : null;
-                        const providerImageMatch = gatewayProvider === 'istio' ? 'istio' : null;
                         // Only show the model-server image for the accelerators the user
-                        // selected in the previous step.
-                        const selectedIds = selectedAcceleratorIds.map((id) => String(id).toLowerCase());
-                        const showNvidia = selectedIds.some((id) => id.includes('nvidia') || id.includes('cuda'));
-                        const showIntel = selectedIds.some((id) => id.includes('intel') || id.includes('xpu'));
+                        // selected in the previous step (derived from hardware profiles).
+                        const selectedModelServerRows = selectedAcceleratorIds.map((vendorId) => {
+                            const vendor = acceleratorVendors.find((entry) => entry.id === vendorId);
+                            const key = String(vendorId).toLowerCase();
+                            return {
+                                label: vendor?.label || vendorId,
+                                value: modelServerImages[key] || modelServerImages[vendorId],
+                            };
+                        });
                         const groups = [
                             {
                                 title: 'llm-d ecosystem',
                                 rows: [
                                     { label: 'llm-d', value: stackVersions?.llm_d, download: 'llmD' },
-                                    { label: 'llm-d-router (chart / EPP / P/D sidecar)', value: stackVersions?.llm_d_router, imageMatch: 'llm-d-router' },
+                                    { label: 'llm-d-router (chart / EPP / P/D sidecar)', value: stackVersions?.llm_d_router },
                                     { label: 'llm-d-benchmark', value: stackVersions?.llm_d_lensmark, download: 'llmDBenchmark' },
-                                    { label: 'Inference Payload Processor', value: stackVersions?.llm_d_inference_payload_processor, imageMatch: 'llm-d-inference-payload-processor' },
+                                    { label: 'Inference Payload Processor', value: stackVersions?.llm_d_inference_payload_processor },
                                 ],
                             },
                             {
@@ -997,23 +2191,21 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                                         label: 'LeaderWorkerSet (LWS) controller',
                                         value: stackVersions?.k8s_lws,
                                         lws: true,
-                                        help: 'Lens installs the Kubernetes SIGs LeaderWorkerSet controller during cluster creation. It provides the DisaggregatedSet API used by llm-d P/D deployments and runs in the lws-system namespace.',
+                                        help: 'Lens installs the Kubernetes SIGs LeaderWorkerSet controller during Execute. It provides the DisaggregatedSet API used by llm-d P/D deployments and runs in the lws-system namespace.',
                                     },
                                 ],
                             },
                             {
                                 title: 'Gateway',
                                 rows: [
-                                    { label: `Provider — ${providerLabel}`, value: providerVersion, imageMatch: providerImageMatch },
+                                    { label: `Provider — ${providerLabel}`, value: providerVersion },
                                 ],
                             },
                             {
-                                title: 'Model server images',
-                                rows: [
-                                    ...(showNvidia ? [{ label: 'NVIDIA', value: modelServerImages.nvidia, imageMatch: modelServerImages.nvidia }] : []),
-                                    ...(showIntel ? [{ label: 'Intel', value: modelServerImages.intel, imageMatch: modelServerImages.intel }] : []),
-                                    ...(!showNvidia && !showIntel ? [{ label: 'Selected accelerators', value: 'None selected' }] : []),
-                                ],
+                                title: 'Model server images (hardware profile defaults)',
+                                rows: selectedModelServerRows.length
+                                    ? selectedModelServerRows
+                                    : [{ label: 'Selected accelerators', value: 'None selected' }],
                             },
                         ];
                         return (
@@ -1028,15 +2220,6 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                                                 if (row.download) {
                                                     if (versionsDownloading || versionsDownloadStatus?.[row.download]) {
                                                         state = versionsDownloadStatus?.[row.download]?.state || 'starting';
-                                                    }
-                                                } else if (row.imageMatch) {
-                                                    const entries = (imagePullStatus?.images || []).filter((entry) => entry.name.includes(row.imageMatch));
-                                                    if (entries.length) {
-                                                        const failed = entries.find((entry) => entry.state === 'failed');
-                                                        state = failed ? 'failed' : entries.every((entry) => entry.state === 'ready') ? 'ready' : 'pulling';
-                                                        message = failed?.message || null;
-                                                    } else if (imagePulling) {
-                                                        state = 'pulling';
                                                     }
                                                 } else if (row.crd) {
                                                     const value = crdStatus?.[row.crd];
@@ -1074,7 +2257,7 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                                                                     ) : state === 'failed' || state === 'missing' ? (
                                                                         <AlertTriangle size={13} className="text-rose-400" />
                                                                     ) : (
-                                                                        <Loader2 size={13} className="animate-spin" />
+                                                                        <Spinner size="xs" />
                                                                     )}
                                                                     <span>{state}</span>
                                                                 </span>
@@ -1090,6 +2273,184 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                         );
                     })()}
                     </div>
+
+                    {(() => {
+                        const selectedDefaultImages = selectedAcceleratorIds
+                            .map((vendorId) => modelServerImages[String(vendorId).toLowerCase()] || modelServerImages[vendorId])
+                            .filter(Boolean);
+                        const allDefaultImages = Object.values(modelServerImages).filter(Boolean);
+                        const vllmPlaceholder = selectedDefaultImages[0]
+                            || allDefaultImages[0]
+                            || 'Hardware profile default (e.g. registry.example.com/vllm:tag)';
+                        const vllmImageError = vllmImageValidationError(wizardState);
+                        const isCustomVllmImage = Boolean(vllmImage.trim());
+                        return (
+                            <Panel padding="sm" tone="soft" className="shadow-none" title="vLLM runtime image">
+                                <div className="space-y-2">
+                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                        <div className="flex flex-wrap items-center gap-2">
+                                            <Label htmlFor="wizard-vllm-image" className="mb-0">
+                                                vLLM image (optional)
+                                            </Label>
+                                            <Badge tone={isCustomVllmImage ? 'info' : 'neutral'} size="xs">
+                                                {isCustomVllmImage ? 'Custom' : 'Default (hardware profile)'}
+                                            </Badge>
+                                        </div>
+                                        {Boolean(vllmImage) && (
+                                            <Button
+                                                type="button"
+                                                variant="ghost"
+                                                size="xs"
+                                                onClick={() => setVllmImage('')}
+                                                disabled={busy}
+                                            >
+                                                Reset to default
+                                            </Button>
+                                        )}
+                                    </div>
+                                    <Input
+                                        id="wizard-vllm-image"
+                                        value={vllmImage}
+                                        onChange={(event) => setVllmImage(event.target.value)}
+                                        placeholder={vllmPlaceholder}
+                                        error={Boolean(vllmImageError)}
+                                        disabled={busy}
+                                    />
+                                    <FormError message={vllmImageError} />
+                                    <p className="text-xs text-theme-muted">
+                                        Leave empty to use the hardware profile default. When set, this image is
+                                        pre-pulled onto worker nodes during Execute and used as the default vLLM
+                                        image for deployments and evaluations on this cluster unless overridden per
+                                        deployment.
+                                    </p>
+                                </div>
+                            </Panel>
+                        );
+                    })()}
+
+                    <Panel padding="sm" tone="soft" className="shadow-none" title="Monitoring & Observability">
+                        <div className="space-y-4">
+                            <p className="text-xs text-theme-muted">
+                                Cluster monitoring is required for every cluster. Choose whether Lens installs the
+                                managed Prometheus/Grafana stack during Execute or connects to an existing Prometheus.
+                            </p>
+                            <div>
+                                <Label>Monitoring mode</Label>
+                                <ToggleGroup
+                                    value={monitoringMode}
+                                    onChange={(nextMode) => setMonitoringMode(nextMode)}
+                                    options={[
+                                        { value: 'managed', label: 'Managed monitoring stack' },
+                                        { value: 'existing', label: 'Use existing monitoring' },
+                                    ]}
+                                />
+                            </div>
+
+                            {monitoringMode === 'managed' ? (
+                                <div className="space-y-3">
+                                    <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                                        <div>
+                                            <Label htmlFor="wizard-monitoring-namespace">Monitoring namespace</Label>
+                                            <Input
+                                                id="wizard-monitoring-namespace"
+                                                value={monitoringNamespace}
+                                                onChange={(event) => {
+                                                    setMonitoringNamespaceTouched(true);
+                                                    setMonitoringNamespace(event.target.value);
+                                                }}
+                                                placeholder={defaultMonitoringNamespace(cluster?.id)}
+                                            />
+                                        </div>
+                                        <div>
+                                            <Label htmlFor="wizard-monitoring-host">Monitoring host / IP (optional)</Label>
+                                            <Input
+                                                id="wizard-monitoring-host"
+                                                value={monitoringHost}
+                                                onChange={(event) => setMonitoringHost(event.target.value)}
+                                                placeholder="Optional, e.g. 10.112.229.74"
+                                            />
+                                        </div>
+                                    </div>
+                                    <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                                        <div>
+                                            <Label htmlFor="wizard-prometheus-node-port">Prometheus NodePort (optional)</Label>
+                                            <Input
+                                                id="wizard-prometheus-node-port"
+                                                type="number"
+                                                min="30000"
+                                                max="32767"
+                                                value={prometheusNodePort}
+                                                onChange={(event) => setPrometheusNodePort(event.target.value)}
+                                                placeholder="Optional, 30000–32767"
+                                            />
+                                        </div>
+                                        <div>
+                                            <Label htmlFor="wizard-grafana-node-port">Grafana NodePort (optional)</Label>
+                                            <Input
+                                                id="wizard-grafana-node-port"
+                                                type="number"
+                                                min="30000"
+                                                max="32767"
+                                                value={grafanaNodePort}
+                                                onChange={(event) => setGrafanaNodePort(event.target.value)}
+                                                placeholder="Optional, 30000–32767"
+                                            />
+                                        </div>
+                                    </div>
+                                    <Checkbox
+                                        id="wizard-install-accelerator-exporters"
+                                        checked={installAcceleratorExporters}
+                                        onChange={(event) => setInstallAcceleratorExporters(event.target.checked)}
+                                        label="Co-install accelerator exporters for selected GPUs"
+                                    />
+                                </div>
+                            ) : (
+                                <div className="space-y-3">
+                                    <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                                        <div>
+                                            <Label htmlFor="wizard-prometheus-url">Prometheus URL</Label>
+                                            <Input
+                                                id="wizard-prometheus-url"
+                                                value={prometheusUrl}
+                                                onChange={(event) => setPrometheusUrl(event.target.value)}
+                                                placeholder="https://prometheus.example.com"
+                                            />
+                                        </div>
+                                        <div>
+                                            <Label htmlFor="wizard-grafana-url">Grafana URL (optional)</Label>
+                                            <Input
+                                                id="wizard-grafana-url"
+                                                value={grafanaUrl}
+                                                onChange={(event) => setGrafanaUrl(event.target.value)}
+                                                placeholder="Optional, e.g. https://grafana.example.com"
+                                            />
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <Label htmlFor="wizard-monitoring-namespace">Monitoring namespace</Label>
+                                        <Input
+                                            id="wizard-monitoring-namespace"
+                                            value={monitoringNamespace}
+                                            onChange={(event) => {
+                                                setMonitoringNamespaceTouched(true);
+                                                setMonitoringNamespace(event.target.value);
+                                            }}
+                                            placeholder={defaultMonitoringNamespace(cluster?.id)}
+                                        />
+                                    </div>
+                                    <Checkbox
+                                        id="wizard-install-accelerator-exporters"
+                                        checked={installAcceleratorExporters}
+                                        onChange={(event) => setInstallAcceleratorExporters(event.target.checked)}
+                                        label="Install missing accelerator exporters and metrics-reader RBAC"
+                                    />
+                                </div>
+                            )}
+
+                            <FormError message={monitoringValidationError(wizardState)} />
+                        </div>
+                    </Panel>
+
                     {error && (
                         <p role="alert" className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-xs text-rose-300">
                             {error}
@@ -1102,14 +2463,13 @@ export function CreateClusterWizard({ onClose, onCreated }) {
             {stepIndex === 3 && (
                 <section aria-labelledby="wizard-accelerator-heading">
                     <h2 id="wizard-accelerator-heading" className="mb-4 flex items-center gap-2 text-lg font-semibold text-slate-100">
-                        <Cpu className="h-5 w-5 text-sky-400" /> Accelerator
+                        <Cpu className="h-5 w-5 text-[var(--brand-accent)] dark:text-sky-400" /> Accelerator
                     </h2>
                 <div className="space-y-4">
                     <p className="text-xs text-theme-muted">
                         Select every accelerator this cluster hosts (a heterogeneous cluster selects several). Candidates
-                        are the accelerators Lens supports through a device plugin/driver. Selecting one checks whether its
-                        driver/plugin is already installed on the cluster and installs it from the vendor's official
-                        upstream manifests when it is missing.
+                        are the accelerators Lens supports through a device plugin/driver. Selection only writes the
+                        provisioning plan; Lens installs the selected drivers and device plugins during Execute.
                     </p>
                     <div className="space-y-3">
                         {acceleratorVendors.map((vendor) => {
@@ -1139,56 +2499,30 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                                     </label>
                                     {included && (
                                         <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1.5 pl-6">
-                                            {modes.map((mode) => {
-                                                const pair = acceleratorPairStatus[`${vendor.id}:${mode}`];
-                                                return (
-                                                    <label key={mode} className="flex items-center gap-1.5 text-xs">
-                                                        <input
-                                                            type="checkbox"
-                                                            checked={selectedModes.includes(mode)}
-                                                            onChange={(event) => setSelectedAccelerators((current) => {
-                                                                const currentModes = current[vendor.id] || [];
-                                                                const nextModes = event.target.checked
-                                                                    ? [...currentModes, mode]
-                                                                    : currentModes.filter((item) => item !== mode);
-                                                                const next = { ...current, [vendor.id]: nextModes };
-                                                                if (!nextModes.length) delete next[vendor.id];
-                                                                return next;
-                                                            })}
-                                                        />
-                                                        {ACCESS_MODE_LABEL[mode]}
-                                                        {pair && (
-                                                            <span className="flex items-center gap-1 text-theme-muted">
-                                                                {pair.state === 'ready'
-                                                                    ? <Check size={12} className="text-emerald-400" />
-                                                                    : pair.state === 'failed'
-                                                                        ? null
-                                                                        : <Loader2 size={12} className="animate-spin" />}
-                                                                {pair.state === 'failed'
-                                                                    ? <span className="text-rose-300">{pair.message || 'failed'}</span>
-                                                                    : <span>{pair.state}</span>}
-                                                            </span>
-                                                        )}
-                                                    </label>
-                                                );
-                                            })}
+                                            {modes.map((mode) => (
+                                                <label key={mode} className="flex items-center gap-1.5 text-xs">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={selectedModes.includes(mode)}
+                                                        onChange={(event) => setSelectedAccelerators((current) => {
+                                                            const currentModes = current[vendor.id] || [];
+                                                            const nextModes = event.target.checked
+                                                                ? [...currentModes, mode]
+                                                                : currentModes.filter((item) => item !== mode);
+                                                            const next = { ...current, [vendor.id]: nextModes };
+                                                            if (!nextModes.length) delete next[vendor.id];
+                                                            return next;
+                                                        })}
+                                                    />
+                                                    {ACCESS_MODE_LABEL[mode]}
+                                                </label>
+                                            ))}
                                         </div>
                                     )}
                                 </div>
                             );
                         })}
                     </div>
-                    {acceleratorPairs.length > 0 && !acceleratorReady && (
-                        <p className="flex items-center gap-2 text-xs text-theme-muted">
-                            <Loader2 size={13} className="animate-spin" /> Checking and installing the selected drivers and device plugins...
-                        </p>
-                    )}
-                    {acceleratorPairs.some((pair) => acceleratorPairStatus[pair.key]?.state === 'failed') && (
-                        <p role="alert" className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-xs text-rose-300">
-                            One or more drivers/device plugins failed to install. Fix the cluster or deselect that
-                            accelerator to continue.
-                        </p>
-                    )}
                 </div>
                 </section>
             )}
@@ -1197,132 +2531,207 @@ export function CreateClusterWizard({ onClose, onCreated }) {
             {stepIndex === 5 && (
                 <section aria-labelledby="wizard-modelcache-heading">
                     <h2 id="wizard-modelcache-heading" className="mb-4 flex items-center gap-2 text-lg font-semibold text-slate-100">
-                        <Database className="h-5 w-5 text-sky-400" /> Model Cache
+                        <Database className="h-5 w-5 text-[var(--brand-accent)] dark:text-sky-400" /> Model Cache
                     </h2>
                 <div className="space-y-4">
+                    <p className="text-xs text-theme-muted">
+                        The HF_TOKEN Secret is required for every cluster. Lens creates it during Execute, and
+                        Deploy/Evaluate reuse it so gated models can be pulled without asking for a token again.
+                    </p>
                     <div className="rounded-lg border border-slate-700/70 bg-slate-800/40 px-4 py-4">
-                        <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-400">HF_TOKEN secret</p>
-                        <p className="mb-3 text-[11px] leading-relaxed text-slate-400">
-                            Required for every cluster -- Deploy/Evaluate default to reusing this secret on this
-                            cluster so gated models can be pulled without asking for a token again. Created as soon
-                            as you click Next.
-                        </p>
                         <div className="space-y-4">
                             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                                 <div>
                                     <Label htmlFor="wizard-secret-namespace">HF_TOKEN secret namespace</Label>
-                                    <Input id="wizard-secret-namespace" value={secretNamespace} onChange={(event) => { setSecretNamespaceTouched(true); setSecretNamespace(event.target.value); }} placeholder="llm-d-bench-storage-<cluster id>" disabled={Boolean(secretRef)} />
+                                    <Input
+                                        id="wizard-secret-namespace"
+                                        value={secretNamespace}
+                                        onChange={(event) => {
+                                            setSecretNamespaceTouched(true);
+                                            setSecretNamespace(event.target.value);
+                                            setSecretNamespaceMode(kubeconfigNamespace ? 'existing' : 'create');
+                                        }}
+                                        placeholder={kubeconfigNamespace || 'llm-d-bench-storage-<cluster id>'}
+                                    />
                                 </div>
                                 <div>
                                     <Label htmlFor="wizard-secret-name">Secret name</Label>
-                                    <Input id="wizard-secret-name" value={secretName} onChange={(event) => setSecretName(event.target.value)} disabled={Boolean(secretRef)} />
+                                    <Input id="wizard-secret-name" value={secretName} onChange={(event) => setSecretName(event.target.value)} />
                                 </div>
                             </div>
                             <div>
-                                <Label htmlFor="wizard-hf-token">HuggingFace token</Label>
-                                <Input id="wizard-hf-token" type="password" value={hfToken} onChange={(event) => setHfToken(event.target.value)} placeholder="hf_..." disabled={Boolean(secretRef)} />
-                            </div>
-                            {secretRef && (
-                                <p className="text-xs text-emerald-300">
-                                    Created {secretRef.namespace}/{secretRef.name}
+                                <div className="mb-1.5 flex items-center gap-2">
+                                    <Label htmlFor="wizard-hf-token" className="mb-0">HuggingFace token</Label>
+                                    {hfTokenSaved && (
+                                        <Badge tone="success" size="xs">Saved for this draft</Badge>
+                                    )}
+                                </div>
+                                <Input
+                                    id="wizard-hf-token"
+                                    type="password"
+                                    autoComplete="new-password"
+                                    value={hfToken}
+                                    onChange={(event) => setHfToken(event.target.value)}
+                                    placeholder={
+                                        hfTokenSaved
+                                            ? 'Leave empty to keep the saved token, or enter a new one to replace'
+                                            : 'hf_...'
+                                    }
+                                />
+                                <p className="mt-1 text-[11px] text-theme-muted">
+                                    Stored encrypted for this draft until Execute creates the Kubernetes Secret,
+                                    deleted when finalized or discarded, and never stored in the plan.
                                 </p>
-                            )}
+                            </div>
                         </div>
                     </div>
-                    <div className="space-y-4 rounded-lg border border-slate-700/70 bg-slate-800/40 px-4 py-4">
-                        <div className="space-y-3">
-                            <Label>Storage volume (required)</Label>
+
+                    <div className="space-y-3 rounded-lg border border-slate-700/70 bg-slate-800/40 px-4 py-4">
+                        <div>
+                            <Label>Pre-download a model (optional)</Label>
                             <p className="text-[11px] leading-relaxed text-slate-400">
-                                A storage volume is created for every cluster using the same fields as the Storage
-                                page's manual "New storage volume" form -- there are no default values, fill in
-                                everything below yourself.
+                                Starts a Model Cache download into the Storage volume configured on the next step
+                                during Execute. Storage is required when prewarm is enabled.
                             </p>
-                            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                                    <div>
-                                        <Label htmlFor="wizard-storage-kind">Type</Label>
-                                        <Select id="wizard-storage-kind" value={storageKind} onChange={(event) => setStorageKind(event.target.value)}>
-                                            <option value="local-disk">hostPath</option>
-                                            <option value="nfs">NFS</option>
-                                        </Select>
-                                    </div>
-                                    <div>
-                                        <Label htmlFor="wizard-storage-capacity">Capacity</Label>
-                                        <Input id="wizard-storage-capacity" value={storageCapacity} onChange={(event) => setStorageCapacity(event.target.value.trim())} placeholder="100Gi" error={Boolean(storageCapacity) && !CAPACITY_PATTERN.test(storageCapacity.trim())} />
-                                    </div>
+                        </div>
+                        <Checkbox
+                            id="wizard-prewarm-enabled"
+                            checked={prewarmEnabled}
+                            onChange={(event) => setPrewarmEnabled(event.target.checked)}
+                            label="Also pre-download (prewarm) a model into this cache now"
+                        />
+                        {prewarmEnabled && (
+                            <div className="grid grid-cols-1 gap-3 pt-2 md:grid-cols-2">
+                                <div>
+                                    <Label htmlFor="wizard-repo-id">Model repo id</Label>
+                                    <Input id="wizard-repo-id" value={repoId} onChange={(event) => setRepoId(event.target.value)} placeholder="meta-llama/Llama-3.1-8B-Instruct" error={Boolean(repoId) && !REPO_ID_PATTERN.test(repoId.trim())} />
                                 </div>
+                                <div>
+                                    <Label htmlFor="wizard-revision">Revision</Label>
+                                    <Input id="wizard-revision" value={revision} onChange={(event) => setRevision(event.target.value)} placeholder="main" />
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+                </section>
+            )}
+
+            {stepIndex === 6 && (
+                <section aria-labelledby="wizard-storage-heading">
+                    <h2 id="wizard-storage-heading" className="mb-4 flex items-center gap-2 text-lg font-semibold text-slate-100">
+                        <HardDrive className="h-5 w-5 text-[var(--brand-accent)] dark:text-sky-400" /> Storage
+                    </h2>
+                    <div className="space-y-4">
+                        <p className="text-xs text-theme-muted">
+                            A storage volume is created for every cluster during Execute, using the same fields as
+                            the Storage page's manual "New storage volume" form. Nothing is created now; fill in the
+                            values below.
+                        </p>
+                        <div className="space-y-4 rounded-lg border border-slate-700/70 bg-slate-800/40 px-4 py-4">
+                            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                                <div>
+                                    <Label htmlFor="wizard-storage-kind">Type</Label>
+                                    <Select id="wizard-storage-kind" value={storageKind} onChange={(event) => setStorageKind(event.target.value)}>
+                                        <option value="local-disk">hostPath</option>
+                                        <option value="nfs">NFS</option>
+                                    </Select>
+                                </div>
+                                <div>
+                                    <Label htmlFor="wizard-storage-capacity">Capacity</Label>
+                                    <Input id="wizard-storage-capacity" value={storageCapacity} onChange={(event) => setStorageCapacity(event.target.value.trim())} placeholder="100Gi" error={Boolean(storageCapacity) && !CAPACITY_PATTERN.test(storageCapacity.trim())} />
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                                 <div>
                                     <Label htmlFor="wizard-storage-name">Name (optional)</Label>
                                     <Input id="wizard-storage-name" value={storageName} onChange={(event) => setStorageName(event.target.value)} placeholder="model-cache" />
                                 </div>
-                                {storageKind === 'local-disk' && (
+                                <div>
+                                    <Label htmlFor="wizard-storage-namespace">PVC namespace</Label>
+                                    <Input
+                                        id="wizard-storage-namespace"
+                                        value={storageNamespace}
+                                        error={!storageNamespaceValid(storageNamespace)}
+                                        onChange={(event) => {
+                                            const next = event.target.value;
+                                            const effective = next.trim() || defaultStorageNamespace(cluster?.id);
+                                            setStorageNamespaceTouched(true);
+                                            setStorageNamespace(next);
+                                            setStorageNamespaceMode(
+                                                kubeconfigNamespace && effective === kubeconfigNamespace
+                                                    ? 'existing'
+                                                    : 'create',
+                                            );
+                                        }}
+                                        placeholder={defaultStorageNamespace(cluster?.id)}
+                                    />
+                                    {!storageNamespaceValid(storageNamespace) ? (
+                                        <p className="mt-1 text-[11px] text-rose-600 dark:text-rose-400">
+                                            Namespace must be a valid DNS-1123 label (lowercase letters, numbers, and hyphens, max 63 characters).
+                                        </p>
+                                    ) : (
+                                        <p className="mt-1 text-[11px] text-theme-muted">
+                                            Namespace where the PVC and Model Cache Jobs run.
+                                        </p>
+                                    )}
+                                </div>
+                            </div>
+                            {storageKind === 'local-disk' && (
+                                <div>
+                                    <Label htmlFor="wizard-host-path">Host path</Label>
+                                    <Input id="wizard-host-path" value={hostPath} onChange={(event) => setHostPath(event.target.value.trim())} placeholder="/data/model-cache" />
+                                    {storageNodes.length > 0 && (
+                                        <div className="mt-1.5 flex flex-wrap gap-1.5">
+                                            {storageNodes.map((node) => (
+                                                <span key={node.name} className="rounded-full border border-slate-700 px-2 py-0.5 text-[11px] text-slate-300">{node.name}</span>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                            {storageKind === 'nfs' && (
+                                <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                                     <div>
-                                        <Label htmlFor="wizard-host-path">Host path</Label>
-                                        <Input id="wizard-host-path" value={hostPath} onChange={(event) => setHostPath(event.target.value.trim())} placeholder="/data/model-cache" />
-                                        {storageNodes.length > 0 && (
-                                            <div className="mt-1.5 flex flex-wrap gap-1.5">
-                                                {storageNodes.map((node) => (
-                                                    <span key={node.name} className="rounded-full border border-slate-700 px-2 py-0.5 text-[11px] text-slate-300">{node.name}</span>
-                                                ))}
-                                            </div>
-                                        )}
+                                        <Label htmlFor="wizard-nfs-server">Server</Label>
+                                        <Input id="wizard-nfs-server" value={nfsServer} onChange={(event) => setNfsServer(event.target.value.trim())} placeholder="nfs.example.com" />
                                     </div>
-                                )}
-                                {storageKind === 'nfs' && (
-                                    <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                                        <div>
-                                            <Label htmlFor="wizard-nfs-server">Server</Label>
-                                            <Input id="wizard-nfs-server" value={nfsServer} onChange={(event) => setNfsServer(event.target.value.trim())} placeholder="nfs.example.com" />
-                                        </div>
-                                        <div>
-                                            <Label htmlFor="wizard-nfs-path">Export path</Label>
-                                            <Input id="wizard-nfs-path" value={nfsPath} onChange={(event) => setNfsPath(event.target.value.trim())} placeholder="/export/models" />
-                                        </div>
+                                    <div>
+                                        <Label htmlFor="wizard-nfs-path">Export path</Label>
+                                        <Input id="wizard-nfs-path" value={nfsPath} onChange={(event) => setNfsPath(event.target.value.trim())} placeholder="/export/models" />
                                     </div>
-                                )}
-                            </div>
-
-                            <div className="border-t border-slate-700/60 pt-4">
-                                <Checkbox
-                                    id="wizard-prewarm-enabled"
-                                    checked={prewarmEnabled}
-                                    onChange={(event) => setPrewarmEnabled(event.target.checked)}
-                                    label="Also pre-download (prewarm) a model into this cache now"
-                                />
-                                {prewarmEnabled && (
-                                    <div className="mt-4 space-y-4">
-                                        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                                            <div>
-                                                <Label htmlFor="wizard-repo-id">Model repo id</Label>
-                                                <Input id="wizard-repo-id" value={repoId} onChange={(event) => setRepoId(event.target.value)} placeholder="meta-llama/Llama-3.1-8B-Instruct" error={Boolean(repoId) && !REPO_ID_PATTERN.test(repoId.trim())} />
-                                            </div>
-                                            <div>
-                                                <Label htmlFor="wizard-revision">Revision</Label>
-                                                <Input id="wizard-revision" value={revision} onChange={(event) => setRevision(event.target.value)} placeholder="main" />
-                                            </div>
-                                        </div>
-                                    </div>
-                                )}
-                            </div>
+                                </div>
+                            )}
                         </div>
                     </div>
                 </section>
             )}
 
-            {stepIndex === 6 && (
-                <section aria-labelledby="wizard-confirm-heading" className="space-y-4">
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                        <div>
-                            <h2 id="wizard-confirm-heading" className="flex items-center gap-2 text-lg font-semibold text-slate-100">
-                                <Rocket className="h-5 w-5 text-sky-400" /> Confirm
-                            </h2>
-                            <p className="mt-1 text-sm text-theme-muted">
-                                Review the configuration. Back returns to any step; Finish applies it.
-                            </p>
-                        </div>
-                        <Badge tone={finished ? 'success' : 'info'} size="sm">
-                            {finished ? 'Complete' : 'Ready to create'}
-                        </Badge>
+            {stepIndex === REVIEW_STEP_INDEX && (
+                <section aria-labelledby="wizard-review-heading" className="space-y-4">
+                    <div>
+                        <h2 id="wizard-review-heading" className="flex items-center gap-2 text-lg font-semibold text-slate-100">
+                            <ListChecks className="h-5 w-5 text-[var(--brand-accent)] dark:text-sky-400" /> Review
+                        </h2>
+                        <p className="mt-1 text-sm text-theme-muted">
+                            Review the saved provisioning plan, then choose Preflight to check cluster permissions on the Execute step.
+                        </p>
                     </div>
+
+                    {!hasHfTokenForRun && (
+                        <InlineHfTokenBanner
+                            message="Enter the Hugging Face token before running Preflight."
+                            token={inlineToken}
+                            onTokenChange={(value) => {
+                                setInlineToken(value);
+                                if (inlineTokenError) setInlineTokenError('');
+                            }}
+                            onSave={handleSaveInlineToken}
+                            busy={inlineTokenBusy}
+                            disabled={!cluster?.id || executionBlocked}
+                            error={inlineTokenError}
+                        />
+                    )}
 
                     <Panel padding="sm" tone="soft" className="shadow-none">
                         <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1351,138 +2760,304 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                                     </div>
                                 </div>
                             </div>
+                            {planVersion != null && (
+                                <Badge tone="neutral" size="xs">Plan v{planVersion}</Badge>
+                            )}
                         </div>
                     </Panel>
 
-                    <div className="grid gap-3 md:grid-cols-2">
-                        <Panel padding="sm" className="h-full shadow-none" title={<PanelHeading icon={<Globe size={14} />}>Network proxy</PanelHeading>}>
-                            <dl className="divide-y divide-theme-border">
-                                <ReviewRow label="Mode">
-                                    {proxyMode === 'custom' ? 'Custom proxy' : 'Auto-detect'}
-                                </ReviewRow>
-                                {proxyMode === 'custom' ? (
+                    <Panel
+                        padding="sm"
+                        className="shadow-none"
+                        title={<PanelHeading icon={<ListChecks size={14} />}>Provisioning plan</PanelHeading>}
+                    >
+                        <dl className="divide-y divide-theme-border">
+                            <ReviewRow label="Network proxy" mono={proxyMode === 'custom'}>
+                                {proxyMode === 'custom'
+                                    ? `HTTP=${httpProxy.trim() || '—'} · HTTPS=${httpsProxy.trim() || '—'} · NO_PROXY=${noProxy.trim() || '—'}`
+                                    : 'Auto-detect (Lens backend environment)'}
+                            </ReviewRow>
+                            <ReviewRow label="Model gateway">
+                                <span className="block">
+                                    {GATEWAY_PROVIDER_LABEL[gatewayProvider] || gatewayProvider}
+                                    {' · '}
+                                    <span className="font-mono text-[11px]">
+                                        {plan?.gateway?.namespace || gatewayNamespace || 'lens-gateway'}/{plan?.gateway?.name || gatewayName || 'lens-inference-gateway'}
+                                    </span>
+                                </span>
+                                <span className="mt-0.5 block text-[11px] text-theme-muted">
+                                    {`NodePort: ${gatewayPort.trim() || 'auto'} · Host/IP: ${gatewayPublicUrl.trim() || 'auto'}${gatewayProvider === 'gke' ? '' : ` · Lens: ${gatewayAuthzHost.trim() || 'auto'}`} · inotify: ${inotifyMaxUserInstances.trim() || '8192'}`}
+                                </span>
+                            </ReviewRow>
+                            <ReviewRow label="Accelerators">
+                                {(() => {
+                                    const customVllmImage = vllmImage.trim() || plan?.stack?.vllmImage || '';
+                                    const runtimeImages = [...new Set(
+                                        selectedAcceleratorIds
+                                            .map((vendorId) => modelServerImages[String(vendorId).toLowerCase()] || modelServerImages[vendorId])
+                                            .filter(Boolean),
+                                    )];
+                                    return (
+                                        <>
+                                            {acceleratorPairs.length > 0 ? (
+                                                <span className="block">
+                                                    {acceleratorPairs.map((pair) => `${pair.label} (${ACCESS_MODE_SHORT[pair.mode] || pair.mode})`).join(', ')}
+                                                </span>
+                                            ) : (
+                                                <span className="text-theme-muted">None selected (drivers and device plugins skipped)</span>
+                                            )}
+                                            {customVllmImage ? (
+                                                <span className="mt-1 flex flex-wrap items-center gap-2 font-mono text-[11px] text-theme-text">
+                                                    <span className="break-all">{customVllmImage}</span>
+                                                    <Badge tone="info" size="xs">Custom</Badge>
+                                                </span>
+                                            ) : (
+                                                acceleratorPairs.length > 0 && runtimeImages.length > 0 && (
+                                                    <span className="mt-0.5 block break-all font-mono text-[11px] text-theme-muted">
+                                                        {runtimeImages.join(' · ')}
+                                                    </span>
+                                                )
+                                            )}
+                                        </>
+                                    );
+                                })()}
+                            </ReviewRow>
+                            <ReviewRow label="llm-d stack" mono>
+                                {(() => {
+                                    const llmDRef = stackVersions?.llm_d || cluster?.llmDRef;
+                                    const routerRef = plan?.stack?.routerVersion || stackVersions?.llm_d_router;
+                                    const gieRef = plan?.stack?.gieVersion || stackVersions?.k8s_gateway_api_inference_extension;
+                                    const ippRef = plan?.stack?.ippVersion || stackVersions?.llm_d_inference_payload_processor;
+                                    const lwsRef = plan?.stack?.lwsVersion || stackVersions?.k8s_lws;
+                                    const parts = [
+                                        llmDRef ? `llm-d ${llmDRef}` : null,
+                                        routerRef ? `router ${routerRef}` : null,
+                                        gieRef ? `GIE ${gieRef}` : null,
+                                        ippRef ? `IPP ${ippRef}` : null,
+                                        plan?.stack?.lwsEnabled !== false ? (lwsRef ? `LWS ${lwsRef}` : 'LWS') : null,
+                                        plan?.stack?.crdsEnabled !== false
+                                            ? (stackVersions?.k8s_gateway_api ? `Gateway CRDs (${stackVersions.k8s_gateway_api})` : 'Gateway CRDs')
+                                            : null,
+                                    ].filter(Boolean);
+                                    return parts.length ? parts.join(' · ') : 'Pinned stack';
+                                })()}
+                            </ReviewRow>
+                            <ReviewRow label="Monitoring">
+                                {(() => {
+                                    const mon = plan?.monitoring || {};
+                                    const mode = mon.mode || monitoringMode || 'managed';
+                                    const ns = mon.namespace || monitoringNamespace.trim() || defaultMonitoringNamespace(cluster?.id);
+                                    const exporters = mon.installAcceleratorExporters ?? installAcceleratorExporters;
+                                    const promUrl = mon.prometheusUrl || (mode === 'existing' ? prometheusUrl.trim() : '');
+                                    const grafUrl = mon.grafanaUrl || (mode === 'existing' ? grafanaUrl.trim() : '');
+                                    const promPort = mon.prometheusNodePort ?? (mode === 'managed' && prometheusNodePort.trim() ? prometheusNodePort.trim() : null);
+                                    const grafPort = mon.grafanaNodePort ?? (mode === 'managed' && grafanaNodePort.trim() ? grafanaNodePort.trim() : null);
+                                    const monHost = mon.host || (mode === 'managed' ? monitoringHost.trim() : '');
+                                    const details = mode === 'existing'
+                                        ? [
+                                            promUrl ? `Prometheus: ${promUrl}` : 'Prometheus URL missing',
+                                            grafUrl ? `Grafana: ${grafUrl}` : null,
+                                            `Exporters & RBAC: ${exporters ? 'on' : 'off'}`,
+                                        ]
+                                        : [
+                                            `Prometheus NodePort: ${promPort || 'auto'}`,
+                                            `Grafana NodePort: ${grafPort || 'auto'}`,
+                                            `Host/IP: ${monHost || 'auto'}`,
+                                            `Accelerator exporters: ${exporters ? 'on' : 'off'}`,
+                                        ];
+                                    return (
+                                        <>
+                                            <span className="block">
+                                                {mode === 'existing' ? 'Existing monitoring' : 'Managed monitoring stack'}
+                                                {' · '}
+                                                <span className="font-mono text-[11px]">{ns}</span>
+                                            </span>
+                                            <span className="mt-0.5 block text-[11px] text-theme-muted">
+                                                {details.filter(Boolean).join(' · ')}
+                                            </span>
+                                        </>
+                                    );
+                                })()}
+                            </ReviewRow>
+                            <ReviewRow label="HF_TOKEN secret">
+                                <span className="break-all font-mono text-[11px]">{`${secretNamespace.trim() || '—'}/${secretName.trim() || '—'}`}</span>
+                                <span className="ml-1.5 text-[11px] text-theme-muted">
+                                    ({hfTokenStatusLabel})
+                                </span>
+                            </ReviewRow>
+                            <ReviewRow label="Storage">
+                                <span>{`${STORAGE_KIND_LABEL[storageKind] || storageKind} · ${storageCapacity.trim() || '—'} · `}</span>
+                                <span className="break-all font-mono text-[11px]">
+                                    {`${plan?.storage?.namespace || storageNamespace.trim() || defaultStorageNamespace(cluster?.id)}/${plannedStorageVolumeName(wizardState) || 'auto-named'}`}
+                                </span>
+                                <span className="ml-1 break-all font-mono text-[11px] text-theme-muted">
+                                    ({storageKind === 'local-disk' ? (hostPath.trim() || '—') : `${nfsServer.trim() || '—'}:${nfsPath.trim() || '—'}`})
+                                </span>
+                            </ReviewRow>
+                            <ReviewRow label="Model cache">
+                                {prewarmEnabled ? (
                                     <>
-                                        <ReviewRow label="HTTP" mono>{httpProxy.trim() || 'Not set'}</ReviewRow>
-                                        <ReviewRow label="HTTPS" mono>{httpsProxy.trim() || 'Not set'}</ReviewRow>
-                                        <ReviewRow label="NO_PROXY" mono>{noProxy.trim() || 'Not set'}</ReviewRow>
+                                        Prewarm{' '}
+                                        <span className="break-all font-mono text-[11px]">
+                                            {`${repoId.trim() || '—'}@${revision.trim() || 'main'}`}
+                                        </span>
                                     </>
                                 ) : (
-                                    <ReviewRow label="Source">Lens backend environment</ReviewRow>
+                                    <span className="text-theme-muted">No prewarm</span>
                                 )}
-                            </dl>
-                        </Panel>
+                            </ReviewRow>
+                        </dl>
+                    </Panel>
+                </section>
+            )}
 
-                        <Panel padding="sm" className="h-full shadow-none" title={<PanelHeading icon={<Waypoints size={14} />}>Model gateway</PanelHeading>}>
-                            <dl className="divide-y divide-theme-border">
-                                <ReviewRow label="Provider">
-                                    {GATEWAY_PROVIDER_LABEL[gatewayProvider] || gatewayProvider}
-                                </ReviewRow>
-                                <ReviewRow label="NodePort">{gatewayPort.trim() || 'Assigned automatically'}</ReviewRow>
-                                <ReviewRow label="Host / IP">{gatewayPublicUrl.trim() || 'Derived automatically'}</ReviewRow>
-                                <ReviewRow label="Lens address">
-                                    {gatewayProvider === 'gke' ? 'Not used' : gatewayAuthzHost.trim() || 'Auto-filled'}
-                                </ReviewRow>
-                                <ReviewRow label="Inotify limit" mono>{inotifyMaxUserInstances.trim() || '8192'}</ReviewRow>
-                            </dl>
-                        </Panel>
-
-                        <Panel
-                            padding="sm"
-                            className="h-full shadow-none"
-                            title={<PanelHeading icon={<Cpu size={14} />}>Accelerators</PanelHeading>}
-                            actions={(
-                                <Badge tone={acceleratorPairs.length ? 'info' : 'neutral'} size="xs">
-                                    {acceleratorPairs.length ? `${acceleratorPairs.length} selected` : 'Skipped'}
-                                </Badge>
-                            )}
-                        >
-                            {acceleratorPairs.length ? (
-                                <ul className="space-y-2">
-                                    {acceleratorPairs.map((pair) => (
-                                        <li key={pair.key} className="rounded-lg border border-theme-border bg-theme-bg/50 px-3 py-2">
-                                            <div className="flex items-center justify-between gap-3">
-                                                <span className="min-w-0 truncate text-xs font-medium text-theme-text">{pair.label}</span>
-                                                <span className="shrink-0 text-[10px] font-bold uppercase tracking-wider text-sky-600 dark:text-sky-300">
-                                                    {ACCESS_MODE_SHORT[pair.mode] || pair.mode}
-                                                </span>
-                                            </div>
-                                            {modelServerImages[pair.vendorId] && (
-                                                <p className="mt-1 break-all font-mono text-[10px] text-theme-muted">
-                                                    {modelServerImages[pair.vendorId]}
-                                                </p>
-                                            )}
-                                        </li>
-                                    ))}
-                                </ul>
-                            ) : (
-                                <p className="text-xs text-theme-muted">No accelerator drivers or device plugins will be installed.</p>
-                            )}
-                        </Panel>
-
-                        <Panel padding="sm" className="h-full shadow-none" title={<PanelHeading icon={<Tag size={14} />}>llm-d stack</PanelHeading>}>
-                            <dl className="divide-y divide-theme-border">
-                                <ReviewRow label="llm-d" mono>{stackVersions?.llm_d || cluster?.llmDRef || 'Pinned'}</ReviewRow>
-                                <ReviewRow label="Router" mono>{stackVersions?.llm_d_router || 'Pinned'}</ReviewRow>
-                                <ReviewRow label="Benchmark" mono>{stackVersions?.llm_d_lensmark || cluster?.llmDBenchmarkRef || 'Pinned'}</ReviewRow>
-                                <ReviewRow label="Payload processor" mono>{stackVersions?.llm_d_inference_payload_processor || 'Pinned'}</ReviewRow>
-                                <ReviewRow label="Gateway API" mono>
-                                    {stackVersions?.k8s_gateway_api
-                                        ? `${stackVersions.k8s_gateway_api} / ${stackVersions.k8s_gateway_api_inference_extension || '—'} / ${stackVersions.llm_d_router || '—'}`
-                                        : 'Pinned'}
-                                </ReviewRow>
-                                <ReviewRow label="LeaderWorkerSet" mono>{stackVersions?.k8s_lws || 'Pinned'}</ReviewRow>
-                                <ReviewRow label="CRDs">
-                                    {crdStatus ? (
-                                        <StatusChip
-                                            status={crdStatus.gateway_api === 'ready' && crdStatus.gateway_api_inference_extension === 'ready' && crdStatus.llm_d_router === 'ready' ? 'ready' : 'missing'}
-                                            size="xs"
-                                        />
-                                    ) : (
-                                        <span className="text-theme-muted">Checking…</span>
-                                    )}
-                                </ReviewRow>
-                                {cluster?.llmDRepoPath && (
-                                    <ReviewRow label="llm-d source" mono>{cluster.llmDRepoPath}</ReviewRow>
-                                )}
-                                {cluster?.llmDBenchmarkRepoPath && (
-                                    <ReviewRow label="Benchmark source" mono>{cluster.llmDBenchmarkRepoPath}</ReviewRow>
-                                )}
-                            </dl>
-                        </Panel>
-
-                        <Panel padding="sm" className="h-full shadow-none" title={<PanelHeading icon={<KeyRound size={14} />}>HF_TOKEN secret</PanelHeading>}>
-                            <dl className="divide-y divide-theme-border">
-                                <ReviewRow label="Namespace" mono>{secretRef?.namespace || secretNamespace.trim() || '—'}</ReviewRow>
-                                <ReviewRow label="Name" mono>{secretRef?.name || secretName.trim() || '—'}</ReviewRow>
-                                <ReviewRow label="Status">
-                                    <StatusChip status={secretRef ? 'ready' : 'missing'} size="xs" />
-                                </ReviewRow>
-                            </dl>
-                        </Panel>
-
-                        <Panel
-                            padding="sm"
-                            className="h-full shadow-none"
-                            title={<PanelHeading icon={<Database size={14} />}>Model cache</PanelHeading>}
-                            actions={<Badge tone="info" size="xs">Required</Badge>}
-                        >
-                            <dl className="divide-y divide-theme-border">
-                                <ReviewRow label="Type">{STORAGE_KIND_LABEL[storageKind] || storageKind}</ReviewRow>
-                                <ReviewRow label="Capacity" mono>{storageCapacity.trim() || '—'}</ReviewRow>
-                                <ReviewRow label="Volume name" mono>{storageName.trim() || 'Auto-named'}</ReviewRow>
-                                <ReviewRow label="Location" mono>
-                                    {storageKind === 'local-disk'
-                                        ? hostPath.trim() || '—'
-                                        : `${nfsServer.trim() || '—'}:${nfsPath.trim() || '—'}`}
-                                </ReviewRow>
-                                <ReviewRow label="Prewarm" mono>
-                                    {prewarmEnabled ? `${repoId.trim()}@${revision.trim()}` : 'No prewarm'}
-                                </ReviewRow>
-                            </dl>
-                        </Panel>
+            {stepIndex === EXECUTE_STEP_INDEX && (
+                <section aria-labelledby="wizard-execute-heading" className="space-y-4">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                            <h2 id="wizard-execute-heading" className="flex items-center gap-2 text-lg font-semibold text-slate-100">
+                                <Rocket className="h-5 w-5 text-[var(--brand-accent)] dark:text-sky-400" /> Execute
+                            </h2>
+                            <p className="mt-1 text-sm text-theme-muted">
+                                Checks cluster permissions for the saved plan first, then runs the user operations in
+                                dependency order and finalizes the cluster. A 403 refreshes the Orchestration administrator handoff
+                                and keeps completed user operations.
+                            </p>
+                        </div>
+                        {(() => {
+                            const executeBadge = finished
+                                ? { tone: 'success', label: 'Complete' }
+                                : finishing
+                                    ? { tone: 'info', label: 'Running' }
+                                    : executionFailedKey
+                                        ? { tone: 'warning', label: 'Paused' }
+                                        : permissionBusy || handoffBusy || resumeBusy
+                                            ? { tone: 'info', label: 'Checking permissions' }
+                                            : permissionError || permissionBlocked
+                                                ? { tone: 'danger', label: permissionBlocked ? 'Blocked' : 'Check failed' }
+                                                : adminRequired && !(adminVerified && executionToken)
+                                                    ? { tone: 'warning', label: 'Permissions needed' }
+                                                    : canExecute
+                                                        ? { tone: 'success', label: 'Ready' }
+                                                        : { tone: 'neutral', label: 'Not ready' };
+                            return <Badge tone={executeBadge.tone} size="sm">{executeBadge.label}</Badge>;
+                        })()}
                     </div>
 
-                    {(finishStatus.length > 0 || finished) && (
+                    {!finished && !hasHfTokenForRun && (
+                        <InlineHfTokenBanner
+                            message="Enter the Hugging Face token before executing."
+                            token={inlineToken}
+                            onTokenChange={(value) => {
+                                setInlineToken(value);
+                                if (inlineTokenError) setInlineTokenError('');
+                            }}
+                            onSave={handleSaveInlineToken}
+                            busy={inlineTokenBusy}
+                            disabled={!cluster?.id || finishing || executionBlocked}
+                            error={inlineTokenError}
+                        />
+                    )}
+
+                    {executionCompleted && !finished && (
+                        <p role="status" className="flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs text-emerald-700 dark:text-emerald-200">
+                            <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                            <span>
+                                User operations for this plan already completed. Once permissions are verified, click Execute to finalize the cluster without re-running completed steps.
+                            </span>
+                        </p>
+                    )}
+
+                    {!finished && permissionBusy && !(permissionReport && (adminRequired || permissionBlocked)) && (
+                        <Panel
+                            padding="sm"
+                            tone="soft"
+                            className="shadow-none"
+                            title={(
+                                <span className="flex items-center gap-2">
+                                    <KeyRound size={15} className="text-sky-600 dark:text-sky-400" aria-hidden="true" />
+                                    Permissions
+                                </span>
+                            )}
+                            actions={<Badge tone="info" size="xs">Checking</Badge>}
+                        >
+                            <p className="flex items-center gap-2 text-xs text-theme-muted">
+                                <Spinner size="xs" className="text-sky-600 dark:text-sky-400" />
+                                <span>Checking permissions…</span>
+                            </p>
+                        </Panel>
+                    )}
+
+                    {!finished && !permissionBusy && permissionError && !(permissionReport && (adminRequired || permissionBlocked)) && (
+                        <div role="alert" className="flex flex-wrap items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-700 dark:text-rose-200">
+                            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                            <span className="min-w-0 flex-1">{permissionError}</span>
+                            <Button variant="outline" size="sm" onClick={recheckPermissions} disabled={permissionBusy || finishing}>
+                                Re-check
+                            </Button>
+                        </div>
+                    )}
+
+                    {!finished && !permissionBusy && permissionReady && (
+                        <Panel
+                            padding="sm"
+                            tone="soft"
+                            className="shadow-none"
+                            title={(
+                                <span className="flex items-center gap-2">
+                                    <KeyRound size={15} className="text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+                                    Permissions
+                                </span>
+                            )}
+                            actions={<Badge tone="success" size="xs">Ready</Badge>}
+                        >
+                            <p className="text-xs leading-relaxed text-theme-muted">
+                                {canExecute && !canResume
+                                    ? 'This identity has every permission the plan needs. Click Execute to run the setup operations.'
+                                    : 'This identity has every permission the plan needs.'}
+                            </p>
+                            {handoffWarning && (
+                                <p role="status" className="mt-2 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-200">
+                                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                                    <span className="min-w-0 flex-1">{handoffWarning}</span>
+                                </p>
+                            )}
+                        </Panel>
+                    )}
+
+                    {!finished
+                        && permissionPanelVisible(permissionReport)
+                        && (
+                            <PermissionHandoffPanel
+                                report={permissionReport}
+                                script={remediationScript}
+                                filename={remediationInfo?.filename}
+                                instructions={remediationInfo?.instructions}
+                                onLoadScript={loadRemediation}
+                                handoff={handoffInfo}
+                                hasToken={Boolean(executionToken)}
+                                canExecute={canExecute && !canResume}
+                                onRecheck={!finishing ? recheckPermissions : undefined}
+                                onEditSecretNamespace={!finishing ? () => { setError(''); setStepIndex(5); saveResumeStep(WIZARD_STEP_IDS[5]); } : undefined}
+                                busy={permissionBusy || handoffBusy || resumeBusy}
+                                error={handoffError || permissionError}
+                                warning={handoffWarning}
+                            />
+                        )}
+
+                    {executeBlocker && (
+                        <div role="status" className="flex flex-wrap items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-200">
+                            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                            <span className="min-w-0 flex-1">{executeBlocker.message}</span>
+                            {executeBlocker.canRecheck && (
+                                <Button variant="outline" size="sm" onClick={recheckPermissions} disabled={permissionBusy || handoffBusy || resumeBusy || finishing}>
+                                    Re-check
+                                </Button>
+                            )}
+                        </div>
+                    )}
+
+                    {showSetupProgress && (
                         <Panel
                             padding="sm"
                             className="shadow-none"
@@ -1490,12 +3065,12 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                             actions={finished ? <Badge tone="success" size="xs">Complete</Badge> : null}
                         >
                             <div role="status" aria-live="polite">
-                                {finishStatus.length > 0 && (
+                                {finishStatus.length > 0 ? (
                                     <ul className="divide-y divide-theme-border">
                                         {finishStatus.map((item) => (
                                             <li key={item.key} className="flex items-start gap-3 py-2.5 first:pt-0 last:pb-0">
                                                 <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center">
-                                                    {item.state === 'running' && <Loader2 size={14} className="animate-spin text-sky-600 dark:text-sky-400" aria-hidden="true" />}
+                                                    {item.state === 'running' && <Spinner size="xs" className="text-sky-600 dark:text-sky-400" />}
                                                     {item.state === 'done' && <Check size={14} className="text-emerald-600 dark:text-emerald-400" aria-hidden="true" />}
                                                     {item.state === 'failed' && <span className="text-rose-600 dark:text-rose-400" aria-hidden="true">&#10007;</span>}
                                                     {item.state === 'pending' && <span className="h-2 w-2 rounded-full bg-slate-600" aria-hidden="true" />}
@@ -1511,7 +3086,15 @@ export function CreateClusterWizard({ onClose, onCreated }) {
                                             </li>
                                         ))}
                                     </ul>
-                                )}
+                                ) : !finished ? (
+                                    <p className="text-xs text-theme-muted">
+                                        {finishing
+                                            ? 'Finalizing cluster setup…'
+                                            : (permissionBusy || handoffBusy || resumeBusy)
+                                                ? 'Checking permissions…'
+                                                : 'Cluster setup paused. Review the error above and retry.'}
+                                    </p>
+                                ) : null}
                                 {finished && (
                                     <p className="flex items-center gap-2 border-t border-theme-border pt-3 text-sm text-emerald-600 first:border-0 first:pt-0 dark:text-emerald-400">
                                         <CheckCircle2 className="h-4 w-4" aria-hidden="true" /> Cluster setup complete.

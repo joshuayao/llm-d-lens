@@ -32,6 +32,7 @@ from llm_d_lens.model_service.contracts import (
     UsageRecordRequest,
     utcnow,
 )
+from llm_d_lens.model_service.gateway_ops import invalidate_gateway_capability_cache
 from llm_d_lens.model_service.gateway_providers import default_pool_name, qualified_pool_name, split_pool_name
 from llm_d_lens.model_service.selection import select_member
 from llm_d_lens.model_service.targets import ExecutionTarget, ExecutionTargetError, resolve_execution_target
@@ -137,9 +138,12 @@ class ModelService:
         )
         member = self._member_for_target(group.id, target, published_by=created_by) if target else None
         try:
-            return self.groups.create(group, member=member) if member else self.groups.create(group)
+            created = self.groups.create(group, member=member) if member else self.groups.create(group)
         except Exception as error:  # noqa: BLE001 - map DAO conflict to domain error
             raise ModelServiceConflictError(str(error)) from error
+        if created.cluster_id:
+            invalidate_gateway_capability_cache(created.cluster_id)
+        return created
 
     def publish_group(
         self, request: GroupPublishRequest, *, created_by: str | None, principal: Principal | None = None
@@ -186,6 +190,7 @@ class ModelService:
             )
         ):
             raise ModelServiceConflictError("remove all providers and access grants before changing a model's cluster")
+        previous_cluster_id = group.cluster_id
         for field in (
             "name",
             "model_ref",
@@ -202,9 +207,13 @@ class ModelService:
                 setattr(group, field, value)
         group.updated_at = utcnow()
         try:
-            return self.groups.save(group)
+            saved = self.groups.save(group)
         except Exception as error:  # noqa: BLE001
             raise ModelServiceConflictError(str(error)) from error
+        for cid in {previous_cluster_id, saved.cluster_id}:
+            if cid:
+                invalidate_gateway_capability_cache(cid)
+        return saved
 
     def require_empty_group(
         self,
@@ -232,11 +241,13 @@ class ModelService:
         required_permission: str = "model-service:group:manage",
     ) -> None:
         """Delete an empty model record; callers must first confirm its route cleanup."""
-        self.require_empty_group(group_id, principal=principal, required_permission=required_permission)
+        group = self.require_empty_group(group_id, principal=principal, required_permission=required_permission)
         try:
             self.groups.delete(group_id)
         except ModelServiceGroupDaoError as error:
             raise ModelServiceConflictError(str(error)) from error
+        if group.cluster_id:
+            invalidate_gateway_capability_cache(group.cluster_id)
         self._auth.revoke_resource_shares(resource_type="model_service_group", resource_ids=[group_id])
 
     def require_group_access(self, group_id: str, principal: Principal, permission: str) -> ModelServiceGroup:
@@ -331,11 +342,14 @@ class ModelService:
                 if target.status != "ready" or target.cluster_id != group.cluster_id:
                     raise ModelServiceConflictError("all providers must be ready in the model's cluster to go online")
         try:
-            return self.members.set_group_status(
+            updated = self.members.set_group_status(
                 group_id, request.status, {member.id: member.status for member in members}
             )
         except ModelServiceMemberDaoError as error:
             raise ModelServiceConflictError(str(error)) from error
+        for cid in {member.cluster_id for member in updated} | ({group.cluster_id} if group.cluster_id else set()):
+            invalidate_gateway_capability_cache(cid)
+        return updated
 
     # --- members -------------------------------------------------------------
     def list_members(self, group_id: str | None = None) -> list[ModelServiceMember]:
@@ -367,9 +381,11 @@ class ModelService:
             request.group_id, target, pool_name=request.pool_name, published_by=published_by
         )
         try:
-            return self.members.create(member)
+            created = self.members.create(member)
         except Exception as error:  # noqa: BLE001
             raise ModelServiceConflictError(str(error)) from error
+        invalidate_gateway_capability_cache(created.cluster_id)
+        return created
 
     @staticmethod
     def _member_for_target(
@@ -448,7 +464,9 @@ class ModelService:
             if value is not None:
                 setattr(member, field, value)
         member.updated_at = utcnow()
-        return self.members.save(member)
+        saved = self.members.save(member)
+        invalidate_gateway_capability_cache(saved.cluster_id)
+        return saved
 
     def update_traffic(
         self, group_id: str, request: TrafficUpdateRequest, *, principal: Principal
@@ -502,18 +520,22 @@ class ModelService:
             pools.add(key)
             members.append(member.model_copy(update={"weight": item.weight}))
         try:
-            return self.members.save_traffic(group_id, members, request.expected_weights)
+            saved = self.members.save_traffic(group_id, members, request.expected_weights)
         except ModelServiceMemberDaoError as error:
             raise ModelServiceConflictError(str(error)) from error
+        for cid in {member.cluster_id for member in saved} | ({group.cluster_id} if group.cluster_id else set()):
+            invalidate_gateway_capability_cache(cid)
+        return saved
 
     def delete_member(self, member_id: str, *, principal: Principal | None = None) -> None:
-        if principal is not None:
+        member = self.members.get(member_id)
+        if principal is not None and member is not None:
             from llm_d_lens.auth.access import require_cluster_access  # noqa: PLC0415
 
-            member = self.members.get(member_id)
-            if member is not None:
-                require_cluster_access(principal, member.cluster_id)
+            require_cluster_access(principal, member.cluster_id)
         self.members.delete(member_id)
+        if member is not None:
+            invalidate_gateway_capability_cache(member.cluster_id)
 
     # --- authorization / routing --------------------------------------------
     def _principal_for_token(self, token: ModelAccessToken):

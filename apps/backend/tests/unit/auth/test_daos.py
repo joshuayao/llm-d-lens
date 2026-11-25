@@ -231,3 +231,136 @@ def test_audit_log_append_list_and_retention():
     deleted = dao.delete_before(dao.retention_cutoff(180))
     assert deleted == 1
     assert dao.list()[0].id != old.id
+
+
+def test_audit_log_dao_append_clamps_all_string_columns_and_preserves_truncated_detail():
+    from sqlalchemy import String
+
+    from llm_d_lens.db.base import audit_string_column_limits
+    from llm_d_lens.db.models.audit_log import AuditLogRow
+
+    dao = AuditLogDao()
+    expected_columns = {
+        column.name: column.type.length
+        for column in AuditLogRow.__table__.columns
+        if isinstance(column.type, String) and column.type.length is not None
+    }
+    assert audit_string_column_limits() == expected_columns
+
+    oversized = {name: f"{name}-" + ("x" * (length + 25)) for name, length in expected_columns.items()}
+    oversized["actor_user_id"] = "external-idp-subject-" + ("z" * 30)
+    saved = dao.append(
+        AuditLogRecord(
+            **oversized,
+            detail={"password": "super-secret-value", "note": "kept"},
+        )
+    )
+
+    for name, max_len in expected_columns.items():
+        value = getattr(saved, name)
+        if name == "actor_user_id":
+            assert value is None
+        else:
+            assert isinstance(value, str)
+            assert len(value) == max_len
+            assert value == oversized[name][:max_len]
+        assert saved.detail["truncatedFields"][name] == oversized[name]
+
+    assert saved.detail["password"] == "[REDACTED]"  # noqa: S105
+    assert saved.detail["note"] == "kept"
+
+    # A valid <=36-char actor_user_id is preserved unchanged.
+    actor = UserDao().create(UserRecord(username="valid-actor"))
+    with_valid_actor = dao.append(
+        AuditLogRecord(event_type="auth.valid", actor_user_id=actor.id, actor_username=actor.username)
+    )
+    assert with_valid_actor.actor_user_id == actor.id
+
+    # When detail is None and truncation occurs, detail is initialized to hold truncatedFields.
+    truncated_without_detail = dao.append(
+        AuditLogRecord(
+            event_type="auth.test",
+            actor_username="alice",
+            permission="p" * 150,
+            detail=None,
+        )
+    )
+    assert len(truncated_without_detail.permission) == 100
+    assert truncated_without_detail.detail == {"truncatedFields": {"permission": "p" * 150}}
+
+    # When detail is None and nothing is truncated, nullable columns stay None and detail stays None.
+    clean = dao.append(AuditLogRecord(event_type="auth.clean", actor_username="bob", detail=None))
+    assert clean.detail is None
+    assert clean.permission is None
+    assert clean.actor_user_id is None
+    assert clean.target_name is None
+    assert clean.user_agent is None
+
+
+def test_automatic_orm_audit_before_flush_clamps_all_fields_and_preserves_target_and_user_agent():
+    from llm_d_lens.auth.context import AuditContext, _audit_context
+    from llm_d_lens.db.base import audit_string_column_limits
+
+    limits = audit_string_column_limits()
+    oversized_actor_user_id = "external-idp-subject-" + ("a" * 30)
+    oversized_target_id = "grp-" + ("i" * (limits["target_id"] + 20))
+    oversized_name = "team-" + ("n" * (limits["target_name"] + 40))
+    oversized_ua = "Mozilla/5.0 " + ("u" * (limits["user_agent"] + 40))
+    oversized_perm = " | ".join(
+        [
+            "model-service:gateway:reconcile",
+            "model-service:gateway:manage",
+            "model-service:member:manage",
+            "model-service:group:manage",
+            "model-service:group:toggle",
+            "model-service:group:remove",
+        ]
+    )
+    assert len(oversized_perm) == 179
+
+    ctx = AuditContext(
+        request_id="req-" + ("r" * 80),
+        trace_id="trc-" + ("t" * 80),
+        parent_request_id="prt-" + ("p" * 80),
+        actor_user_id=oversized_actor_user_id,
+        actor_username="actor-" + ("u" * 170),
+        source="source-" + ("s" * 20),
+        method="PATCH_LONG",
+        path="/api/" + ("x" * 520),
+        ip="127.0.0.1-" + ("0" * 70),
+        user_agent=oversized_ua,
+        permission=oversized_perm,
+        event_type="evt-" + ("e" * 110),
+        action="act-" + ("c" * 20),
+        cluster_id="cls-" + ("k" * 40),
+        required_permissions=tuple(oversized_perm.split(" | ")),
+    )
+    token = _audit_context.set(ctx)
+    try:
+        GroupDao().create(GroupRecord(id=oversized_target_id, name=oversized_name, description="desc"))
+    finally:
+        _audit_context.reset(token)
+
+    rows = AuditLogDao().list(limit=10)
+    assert len(rows) == 1
+    row = rows[0]
+
+    for col_name, max_len in limits.items():
+        val = getattr(row, col_name)
+        if col_name == "actor_user_id":
+            assert val is None
+        else:
+            assert val is not None
+            assert len(val) <= max_len
+
+    assert len(row.permission) == 100
+    assert len(row.target_name) == 256
+    assert len(row.user_agent) == 512
+    assert row.detail["truncatedFields"]["actor_user_id"] == oversized_actor_user_id
+    assert row.detail["truncatedFields"]["permission"] == oversized_perm
+    assert row.detail["truncatedFields"]["target_name"] == oversized_name
+    assert row.detail["truncatedFields"]["target_id"] == oversized_target_id
+    assert row.detail["truncatedFields"]["user_agent"] == oversized_ua
+    assert row.detail["truncatedFields"]["path"] == ctx.path
+    assert row.detail["truncatedFields"]["actor_username"] == ctx.actor_username
+    assert row.detail["requiredPermissions"] == oversized_perm.split(" | ")

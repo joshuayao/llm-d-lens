@@ -132,20 +132,33 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     RoutePermission("GET", "/api/v1/speech-models/{rest}", "playground:chat:use"),
     RoutePermission("GET", "/api/cluster/clusters", "cluster:cluster:read"),
     RoutePermission("POST", "/api/cluster/clusters", "cluster:cluster:create"),
+    RoutePermission("GET", "/api/cluster/clusters/{cluster_id}", "cluster:cluster:read"),
+    RoutePermission("GET", "/api/cluster/clusters/{cluster_id}/plan", "cluster:cluster:read"),
+    RoutePermission("PUT", "/api/cluster/clusters/{cluster_id}/plan", "cluster:cluster:update"),
+    RoutePermission("PUT", "/api/cluster/clusters/{cluster_id}/kubeconfig", "cluster:cluster:update"),
+    RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/permission-check", "cluster:cluster:read"),
+    RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/permission-remediation", "cluster:cluster:update"),
+    RoutePermission("GET", "/api/cluster/clusters/{cluster_id}/admin-handoff/status", "cluster:cluster:read"),
+    RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/admin-handoff/verify", "cluster:cluster:update"),
+    RoutePermission(
+        "POST",
+        "/api/cluster/clusters/{cluster_id}/operations/{operation_id}/execute",
+        "cluster:cluster:update",
+    ),
+    RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/execution/cancel", "cluster:cluster:update"),
+    RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/execution/complete", "cluster:cluster:update"),
+    RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/cleanup", "cluster:cluster:delete"),
     RoutePermission("DELETE", "/api/cluster/clusters/{cluster_id}", "cluster:cluster:delete"),
     RoutePermission("PATCH", "/api/cluster/clusters/{cluster_id}", "cluster:cluster:update"),
-    RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/hf-token-secrets", "cluster:hf-token:create"),
+    RoutePermission("PUT", "/api/cluster/clusters/{cluster_id}/draft-hf-token", "cluster:cluster:update"),
     RoutePermission("PUT", "/api/cluster/clusters/{cluster_id}/hf-token-secret", "cluster:hf-token:update"),
     RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/nodes/cordon", "cluster:node:operate"),
     RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/nodes/uncordon", "cluster:node:operate"),
     RoutePermission("GET", "/api/cluster/clusters/{cluster_id}/software-downloads", "cluster:cluster:read"),
     RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/software-downloads", "cluster:cluster:update"),
     RoutePermission("GET", "/api/cluster/clusters/{cluster_id}/images/prepull", "cluster:cluster:read"),
-    RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/images/prepull", "cluster:cluster:update"),
     RoutePermission("GET", "/api/cluster/clusters/{cluster_id}/crds", "cluster:cluster:read"),
-    RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/crds", "cluster:cluster:update"),
     RoutePermission("GET", "/api/cluster/clusters/{cluster_id}/lws", "cluster:cluster:read"),
-    RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/lws", "cluster:cluster:update"),
     RoutePermission("GET", "/api/cluster/clusters/{cluster_id}/kubernetes-version", "cluster:cluster:read"),
     RoutePermission("GET", "/api/cluster/endpoints", "cluster:endpoint:read"),
     RoutePermission("GET", "/api/cluster/lens-hosts", "cluster:cluster:read"),
@@ -259,6 +272,12 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     RoutePermission("GET", "/api/v1/deployments/runtime-classes", "deployment:run:read"),
     RoutePermission("GET", "/api/v1/deployments/orphans", "deployment:run:read"),
     RoutePermission("POST", "/api/v1/deployments/orphans/clean", "deployment:execution:delete"),
+    RoutePermission("POST", "/api/v1/deployments/permission-check", "deployment:run:create"),
+    RoutePermission("POST", "/api/v1/deployments/permission-remediation", "deployment:run:create"),
+    RoutePermission("POST", "/api/v1/deployments/admin-handoff/verify", "deployment:run:create"),
+    RoutePermission(
+        "POST", "/api/v1/deployments/executions/{execution_id}/cleanup-verify", "deployment:execution:delete"
+    ),
     # --- deployment resource sharing ---
     # --- evaluate ---
     RoutePermission("GET", "/api/v1/evaluate/benchmark-defaults", "evaluate:run:read"),
@@ -296,6 +315,9 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     # --- monitoring: accelerators ---
     RoutePermission("GET", "/api/v1/monitoring/accelerators", "monitoring:accelerator:read"),
     RoutePermission(
+        "GET", "/api/v1/monitoring/accelerators/{accelerator}/admin-script", "monitoring:accelerator:read"
+    ),
+    RoutePermission(
         "POST", "/api/v1/monitoring/accelerators/{accelerator}/installations", "monitoring:accelerator:install"
     ),
     RoutePermission(
@@ -309,14 +331,17 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
         "/api/v1/monitoring/accelerators/{accelerator}/operations/{operation_id}",
         "monitoring:operation:read",
     ),
+    RoutePermission("POST", "/api/v1/monitoring/accelerators/{accelerator}/recheck", "monitoring:accelerator:read"),
     RoutePermission("GET", "/api/v1/monitoring/accelerators/{accelerator}/status", "monitoring:accelerator:read"),
     # --- monitoring: cluster stack ---
+    RoutePermission("GET", "/api/v1/monitoring/cluster-stack/admin-script", "monitoring:cluster-stack:read"),
     RoutePermission("POST", "/api/v1/monitoring/cluster-stack/installations", "monitoring:cluster-stack:install"),
     RoutePermission(
         "POST", "/api/v1/monitoring/cluster-stack/installations/preflight", "monitoring:cluster-stack:install"
     ),
     RoutePermission("GET", "/api/v1/monitoring/cluster-stack/links", "monitoring:cluster-stack:read"),
     RoutePermission("GET", "/api/v1/monitoring/cluster-stack/operations/{operation_id}", "monitoring:operation:read"),
+    RoutePermission("POST", "/api/v1/monitoring/cluster-stack/recheck", "monitoring:cluster-stack:read"),
     RoutePermission("GET", "/api/v1/monitoring/cluster-stack/status", "monitoring:cluster-stack:read"),
     # --- monitoring: deployments / gpu / profiling ---
     RoutePermission("GET", "/api/v1/monitoring/deployments", "monitoring:deployment:read"),
@@ -331,10 +356,14 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     RoutePermission("GET", "/api/v1/storage/volume-resource-status", "storage:volume:read"),
     RoutePermission("GET", "/api/v1/storage/volumes", "storage:volume:read"),
     RoutePermission("POST", "/api/v1/storage/volumes", "storage:volume:create"),
+    RoutePermission("POST", "/api/v1/storage/volumes/preflight", "storage:volume:create"),
+    RoutePermission("POST", "/api/v1/storage/volumes/verify-create", "storage:volume:create"),
     RoutePermission("DELETE", "/api/v1/storage/volumes/{volume_id}", "storage:volume:delete"),
     RoutePermission("GET", "/api/v1/storage/volumes/{volume_id}", "storage:volume:read"),
     RoutePermission("POST", "/api/v1/storage/volumes/{volume_id}/acknowledge-nodes", "storage:volume:acknowledge"),
+    RoutePermission("POST", "/api/v1/storage/volumes/{volume_id}/delete-preflight", "storage:volume:delete"),
     RoutePermission("POST", "/api/v1/storage/volumes/{volume_id}/scan-models", "storage:volume:scan"),
+    RoutePermission("POST", "/api/v1/storage/volumes/{volume_id}/verify-delete", "storage:volume:delete"),
     # --- system ---
     RoutePermission("GET", "/api/v1/system/database", "system:database:read"),
     RoutePermission("POST", "/api/v1/system/database", "system:database:configure"),
@@ -381,6 +410,35 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     RoutePermission("GET", "/api/v1/model-service/admin/gateway/status", "model-service:gateway:read"),
     RoutePermission("POST", "/api/v1/model-service/admin/gateway/reconcile", "model-service:gateway:manage"),
     RoutePermission("POST", "/api/v1/model-service/admin/gateway/reconcile/stream", "model-service:gateway:reconcile"),
+    RoutePermission(
+        "GET",
+        "/api/v1/model-service/admin/gateway/remediation",
+        ("model-service:gateway:read", "model-service:group:read", "model-service:member:manage"),
+    ),
+    RoutePermission(
+        "POST",
+        "/api/v1/model-service/admin/gateway/remediation",
+        (
+            "model-service:gateway:reconcile",
+            "model-service:gateway:manage",
+            "model-service:member:manage",
+            "model-service:group:manage",
+            "model-service:group:toggle",
+            "model-service:group:remove",
+        ),
+    ),
+    RoutePermission(
+        "POST",
+        "/api/v1/model-service/admin/gateway/remediation/verify",
+        (
+            "model-service:gateway:reconcile",
+            "model-service:gateway:manage",
+            "model-service:member:manage",
+            "model-service:group:manage",
+            "model-service:group:toggle",
+            "model-service:group:remove",
+        ),
+    ),
     RoutePermission("POST", "/api/v1/model-service/admin/gateway/probe", "model-service:gateway:manage"),
     RoutePermission("POST", "/api/v1/model-service/admin/gateway/usage/sync", "model-service:gateway:manage"),
     RoutePermission("GET", "/api/v1/model-service/admin/gateway/ipp-config", "model-service:gateway:read"),

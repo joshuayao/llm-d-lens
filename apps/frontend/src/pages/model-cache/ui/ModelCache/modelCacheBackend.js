@@ -1,7 +1,12 @@
 // API client for the Model Cache module (GET/POST/DELETE /api/v1/model-cache/...).
 // Mirrors the fetch/error-handling conventions used by storageManagementBackend.js.
 
-import { requestJson } from '../../../../shared/api/httpClient';
+import {
+    executionHeaders,
+    executionToken,
+    requestJson,
+    requestJsonWithMeta,
+} from '../../../../shared/api/httpClient';
 
 export async function listModelCacheEntries({ clusterId, storageVolumeId, signal } = {}) {
     const params = new URLSearchParams();
@@ -18,13 +23,19 @@ export async function getModelCacheEntry(entryId, { signal } = {}) {
     return payload;
 }
 
-export async function createModelCacheEntry(payload) {
-    const body = await requestJson('/api/v1/model-cache/entries', {
+export async function createModelCacheEntry(payload, execution) {
+    const url = '/api/v1/model-cache/entries';
+    const request = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
+    };
+    if (execution === undefined) return requestJson(url, request);
+    const { body, response } = await requestJsonWithMeta(url, {
+        ...request,
+        headers: executionHeaders(execution, request.headers),
     });
-    return body;
+    return { body, token: executionToken(response) };
 }
 
 export async function retryModelCacheEntry(entryId) {

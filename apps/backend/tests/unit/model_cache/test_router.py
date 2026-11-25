@@ -1,6 +1,7 @@
 """Tests for the Model Cache HTTP API (calls route handlers directly, no TestClient)."""
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -414,3 +415,117 @@ async def test_get_huggingface_model_maps_upstream_error(monkeypatch):
     monkeypatch.setattr(model_cache_router.huggingface_hub, "get_model_detail", fake_detail)
     response = await model_cache_router.get_huggingface_model("org/llama")
     assert response.status_code == 502
+
+
+def _request_for_cluster(cluster_id: str):
+    from llm_d_lens.auth.contracts import Principal, RoleBinding, ScopeType
+
+    principal = Principal(
+        user_id="user-1",
+        username="user-1",
+        bindings=(RoleBinding("maintainer", ScopeType.CLUSTER, scope_cluster_id=cluster_id),),
+    )
+    return SimpleNamespace(state=SimpleNamespace(principal=principal))
+
+
+@pytest.mark.asyncio
+async def test_day2_mutations_reject_a_non_visible_entry_cluster(service, monkeypatch):
+    from llm_d_lens.core.exceptions import ForbiddenError
+
+    entry = _entry(clusterId="cluster-2")
+    service._store.create(entry)
+    request = _request_for_cluster("cluster-1")
+
+    called = []
+
+    def forbidden(*_args, **_kwargs):
+        called.append(True)
+        raise AssertionError("mutation must not run before cluster access")
+
+    monkeypatch.setattr(service, "retry", forbidden)
+    monkeypatch.setattr(service, "sync_nodes", forbidden)
+    monkeypatch.setattr(service, "request_delete", forbidden)
+
+    with pytest.raises(ForbiddenError):
+        await model_cache_router.retry_entry(entry.id, request)
+    with pytest.raises(ForbiddenError):
+        await model_cache_router.sync_entry_nodes(entry.id, request)
+    with pytest.raises(ForbiddenError):
+        await model_cache_router.delete_entry(entry.id, request)
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_day2_mutations_allow_a_visible_entry_cluster(service, monkeypatch):
+    entry = _entry(clusterId="cluster-1")
+    service._store.create(entry)
+    request = _request_for_cluster("cluster-1")
+    calls: list[str] = []
+
+    def retry(entry_id):
+        calls.append("retry")
+        return entry
+
+    async def sync_nodes(entry_id):
+        calls.append("sync")
+        return entry
+
+    async def request_delete(entry_id, *, keep_files=False):
+        calls.append("delete")
+        return entry
+
+    monkeypatch.setattr(service, "retry", retry)
+    monkeypatch.setattr(service, "sync_nodes", sync_nodes)
+    monkeypatch.setattr(service, "request_delete", request_delete)
+
+    await model_cache_router.retry_entry(entry.id, request)
+    await model_cache_router.sync_entry_nodes(entry.id, request)
+    await model_cache_router.delete_entry(entry.id, request)
+    assert calls == ["retry", "sync", "delete"]
+
+
+@pytest.mark.asyncio
+async def test_sync_all_filters_to_visible_clusters(service, monkeypatch):
+    service._store.create(_entry(clusterId="cluster-1", storageVolumeId="vol-1"))
+    service._store.create(_entry(clusterId="cluster-2", storageVolumeId="vol-2"))
+    seen: list[str | None] = []
+
+    async def sync_all_nodes(*, cluster_id=None):
+        seen.append(cluster_id)
+        return []
+
+    monkeypatch.setattr(service, "sync_all_nodes", sync_all_nodes)
+    result = await model_cache_router.sync_all_entry_nodes(_request_for_cluster("cluster-1"))
+
+    assert result == {"items": []}
+    assert seen == ["cluster-1"]
+
+
+@pytest.mark.asyncio
+async def test_sync_all_rejects_an_explicit_non_visible_cluster(service, monkeypatch):
+    from llm_d_lens.core.exceptions import ForbiddenError
+
+    async def sync_all_nodes(*, cluster_id=None):
+        raise AssertionError("must not sync a non-visible cluster")
+
+    monkeypatch.setattr(service, "sync_all_nodes", sync_all_nodes)
+    with pytest.raises(ForbiddenError):
+        await model_cache_router.sync_all_entry_nodes(_request_for_cluster("cluster-1"), cluster_id="cluster-2")
+
+
+@pytest.mark.asyncio
+async def test_create_entry_rejects_a_non_visible_cluster_before_mutation(service, monkeypatch):
+    from llm_d_lens.core.exceptions import ForbiddenError
+
+    request = ModelCacheCreateRequest(
+        clusterId="cluster-2",
+        storageVolumeId="vol-1",
+        source=ModelSource(kind=ModelSourceKind.HUGGINGFACE, huggingface=HuggingFaceSource(repoId="org/model")),
+    )
+
+    async def fail_request(_request):
+        raise AssertionError("create must not run before cluster access")
+
+    monkeypatch.setattr(service, "request_download", fail_request)
+    with pytest.raises(ForbiddenError):
+        await model_cache_router.create_entry(request, _request_for_cluster("cluster-1"))

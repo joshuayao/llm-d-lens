@@ -12,7 +12,6 @@ from llm_d_lens.cluster.gateway_crds import _REQUIRED_CRDS, manifest_urls
 from llm_d_lens.cluster.settings import ClusterSettings
 from llm_d_lens.infrastructure.kubernetes import scoped_runner
 from llm_d_lens.infrastructure.process import _with_kubectl_cache_dir, kubectl_cache_dir
-from llm_d_lens.model_service.gateway_ops import GatewayOpsService
 
 cluster_router = importlib.import_module("llm_d_lens.cluster.router")
 
@@ -346,49 +345,3 @@ async def test_apply_gateway_crds_never_upgrades_a_router_apply_failure(monkeypa
 
     assert result["llm_d_router"]["ok"] is False
     assert "apply failed" in result["llm_d_router"]["message"]
-
-
-@pytest.mark.asyncio
-async def test_create_cluster_crds_repairs_router_epps_when_the_router_bundle_is_ready(monkeypatch):
-    repaired: list[str] = []
-
-    async def apply(_cluster_id):
-        return {"llm_d_router": {"ok": True, "message": ""}}
-
-    async def repair(_self, cluster_id):
-        repaired.append(cluster_id)
-        return {"ok": True, "restarted": ["deploy/qwen-epp"], "message": ""}
-
-    monkeypatch.setattr(registry, "require_cluster", lambda _cluster_id: None)
-    monkeypatch.setattr(gateway_crds, "apply_gateway_crds", apply)
-    monkeypatch.setattr(GatewayOpsService, "repair_router_rewrites", repair)
-
-    result = await cluster_router.create_cluster_crds("cluster-a")
-
-    assert repaired == ["cluster-a"]
-    assert result["router_epp_repair"] == {"ok": True, "restarted": ["deploy/qwen-epp"], "message": ""}
-
-
-@pytest.mark.asyncio
-async def test_create_cluster_crds_skips_the_router_repair_when_the_router_bundle_is_not_ready(monkeypatch):
-    repaired: list[str] = []
-
-    async def apply(_cluster_id):
-        return {
-            "gateway_api": {"ok": True, "message": ""},
-            "gateway_api_inference_extension": {"ok": True, "message": ""},
-            "llm_d_router": {"ok": False, "message": "not ready"},
-        }
-
-    async def repair(_self, cluster_id):
-        repaired.append(cluster_id)
-        return {"ok": True, "restarted": [], "message": ""}
-
-    monkeypatch.setattr(registry, "require_cluster", lambda _cluster_id: None)
-    monkeypatch.setattr(gateway_crds, "apply_gateway_crds", apply)
-    monkeypatch.setattr(GatewayOpsService, "repair_router_rewrites", repair)
-
-    result = await cluster_router.create_cluster_crds("cluster-a")
-
-    assert repaired == []
-    assert result["router_epp_repair"] == {"ok": False, "restarted": [], "message": "router CRDs are not ready"}

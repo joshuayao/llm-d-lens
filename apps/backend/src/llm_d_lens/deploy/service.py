@@ -33,7 +33,7 @@ from llm_d_lens.deploy.contracts import (
 from llm_d_lens.deploy.data_plane import resolve_data_plane
 from llm_d_lens.deploy.providers.guide_adapter import GuideAdapter, GuideDeploymentArtifact
 from llm_d_lens.deploy.providers.guide_catalog import GuideCatalog
-from llm_d_lens.deploy.providers.hardware_profile import pin_runtime_image
+from llm_d_lens.deploy.providers.hardware_profile import pin_runtime_image, resolve_cluster_vllm_image
 from llm_d_lens.infrastructure.artifacts.store import register_artifacts
 from llm_d_lens.infrastructure.storage.paths import storage_path
 from llm_d_lens.versions import router_chart_version
@@ -58,13 +58,37 @@ def _initial_metadata(request: DeploymentCreateRequest) -> DeploymentMetadata:
     return DeploymentMetadata(description=str(request.provenance.get("description") or "").strip())
 
 
+def _apply_runtime_image_policy(overrides: dict[str, Any], request: DeploymentCreateRequest) -> None:
+    """Resolve runtime.image for deploy-time rendered configs without mutating officialGuide manifests."""
+    if isinstance(overrides.get("officialGuide"), dict):
+        return
+    cluster_vllm_image = resolve_cluster_vllm_image(request.provenance.get("cluster_server_id"))
+    runtime = overrides.get("runtime")
+    if runtime is None:
+        if cluster_vllm_image:
+            overrides["runtime"] = {"image": cluster_vllm_image}
+        return
+    if not isinstance(runtime, dict):
+        return
+    explicit_override = bool(runtime.get("imageOverride") or runtime.get("runtimeImageOverride"))
+    current = runtime.get("image")
+    if isinstance(current, str) and current.strip():
+        runtime["image"] = pin_runtime_image(
+            current,
+            accelerator=overrides.get("hardware_profile"),
+            cluster_vllm_image=cluster_vllm_image,
+            explicit_override=explicit_override,
+        )
+    elif cluster_vllm_image:
+        runtime["image"] = cluster_vllm_image
+
+
 def _with_default_model_secret(
     deployment_policy: dict[str, Any] | None, model_token: str | None, cluster_id: object
 ) -> dict[str, Any] | None:
-    """Fall back to the cluster's wizard-created HF_TOKEN secret when the
-    configuration didn't request one explicitly (see the wizard's mandatory
-    HF_TOKEN secret step in CreateClusterWizard.jsx and
-    llm_d_lens.cluster.service.create_hf_token_secret). Without this, guides
+    """Fall back to the plan's HF_TOKEN Secret when the configuration didn't
+    request one explicitly (see the ``cache.hf-secret`` operation and the
+    cluster's recorded secret coordinates). Without this, guides
     whose ``HF_TOKEN`` env is ``optional: true`` deploy successfully but
     later fail at inference/benchmark time for gated models -- see the
     "warm-up run failed ... llm-d-hf-token" class of bug this fixes.
@@ -394,9 +418,7 @@ class GuideAdapterDeploymentService:
             raise ValueError("Deployment provider does not support prepared plans")
         definition = adapter.discover()
         overrides = self._compatibility_overrides(artifact_input)
-        runtime = overrides.get("runtime")
-        if isinstance(runtime, dict) and isinstance(runtime.get("image"), str):
-            runtime["image"] = pin_runtime_image(runtime["image"])
+        _apply_runtime_image_policy(overrides, request)
         validation = adapter.validate_inputs(
             definition, request.cluster_snapshot.value if request.cluster_snapshot else {}, overrides
         )
@@ -482,15 +504,10 @@ class GuideAdapterDeploymentService:
 
         definition = None if prepared_artifact else adapter.discover()
         overrides = self._compatibility_overrides(artifact_input)
-        # The llm-d model-server image always follows the pinned stack version,
-        # whatever tag a stored configuration carries (custom images are left as-is).
-        runtime_overrides = overrides.get("runtime")
-        if (
-            not prepared_artifact
-            and isinstance(runtime_overrides, dict)
-            and isinstance(runtime_overrides.get("image"), str)
-        ):
-            runtime_overrides["image"] = pin_runtime_image(runtime_overrides["image"])
+        # Apply cluster/profile image policy for deploy-time rendered configs;
+        # immutable pre-rendered officialGuide manifests keep their embedded image.
+        if not prepared_artifact:
+            _apply_runtime_image_policy(overrides, request)
         cluster_snapshot = request.cluster_snapshot.value if request.cluster_snapshot else {}
         validation = None if prepared_artifact else adapter.validate_inputs(definition, cluster_snapshot, overrides)
         if validation is not None and not validation.accepted:
@@ -577,11 +594,45 @@ class GuideAdapterDeploymentService:
                 else:
                     router_crds = await ensure_router_crds(cluster_id)
                     if not router_crds.get("ok"):
-                        raise RuntimeError(
-                            "llm-d router CRDs are not ready "
-                            f"({router_crds.get('message') or 'unknown error'}); "
-                            "install them from the cluster's CRDs action before deploying"
-                        )
+                        from llm_d_lens.cluster.service import _is_forbidden_output, _is_unauthorized_output
+                        from llm_d_lens.deploy.capabilities import redact_kubectl_error
+                        from llm_d_lens.infrastructure.kubernetes import scoped_runner
+                        from llm_d_lens.infrastructure.process import CommandResult
+
+                        crd_msg = redact_kubectl_error(str(router_crds.get("message") or "unknown error"))
+
+                        crd_res = CommandResult(argv=("kubectl",), returncode=1, stdout="", stderr=crd_msg)
+                        if _is_unauthorized_output(crd_res):
+                            raise RuntimeError(
+                                "llm-d router CRDs check failed due to unauthorized kubeconfig credentials"
+                            )
+                        router_served = False
+                        if _is_forbidden_output(crd_res):
+                            try:
+                                probe = await scoped_runner(cluster_id).run(
+                                    ["kubectl", "get", "--raw", "/apis/llm-d.ai/v1alpha2"],
+                                    timeout=30,
+                                )
+                                if _is_unauthorized_output(probe):
+                                    raise RuntimeError(
+                                        "Kubernetes cluster rejected kubeconfig credentials (401 Unauthorized)"
+                                    )
+                                if probe.returncode == 0 and probe.stdout:
+                                    resources = json.loads(probe.stdout).get("resources") or []
+                                    router_served = any(
+                                        isinstance(item, dict) and item.get("name") == "inferencemodelrewrites"
+                                        for item in resources
+                                    )
+                            except RuntimeError:
+                                raise
+                            except Exception:
+                                router_served = False
+                        if not router_served:
+                            raise RuntimeError(
+                                "llm-d router CRDs are not ready "
+                                f"({crd_msg}); "
+                                "install them from the cluster's CRDs action before deploying"
+                            )
             if prepared_artifact:
                 provider_execution = {"namespace": namespace, "_artifact": provider_artifact}
             provider_execution = await adapter.deploy(
@@ -807,6 +858,105 @@ class GuideAdapterDeploymentService:
         diagnostics = await adapter.diagnostics(provider_execution)
         self._archive_snapshot(execution.execution_id, "cleanup", diagnostics)
         cleanup = await adapter.cleanup(provider_execution, artifact, force=True)
+        cluster_id = str((execution.provenance or {}).get("cluster_server_id") or "") or None
+        if not cleanup.get("cleaned_up", False):
+            from llm_d_lens.cluster.service import _is_forbidden_output, _is_unauthorized_output
+            from llm_d_lens.deploy.capabilities import DeploymentClusterAuthError, redact_kubectl_error
+            from llm_d_lens.deploy.executions import DeploymentCleanupPermissionDenied
+            from llm_d_lens.deploy.orphans import (
+                is_deletable_deployment_namespace,
+                prepare_deployment_cleanup_handoff,
+            )
+            from llm_d_lens.infrastructure.process import CommandResult
+
+            error_text = str(cleanup.get("error") or cleanup.get("output") or "")
+            error_res = CommandResult(argv=("kubectl",), returncode=1, stdout="", stderr=error_text)
+            if _is_unauthorized_output(error_res):
+                raise DeploymentClusterAuthError(
+                    "Kubernetes cluster rejected kubeconfig credentials (401 Unauthorized)."
+                )
+            sanitized_cleanup = {
+                **cleanup,
+                **(
+                    {"error": redact_kubectl_error(str(cleanup["error"]))}
+                    if isinstance(cleanup.get("error"), str)
+                    else {}
+                ),
+                **(
+                    {"output": redact_kubectl_error(str(cleanup["output"]))}
+                    if isinstance(cleanup.get("output"), str)
+                    else {}
+                ),
+            }
+            if (
+                _is_forbidden_output(error_res)
+                and cluster_id
+                and execution.namespace
+                and is_deletable_deployment_namespace(execution.namespace, cluster_id=cluster_id)
+            ):
+                storage_volume_id: str | None = None
+                if execution.configuration_artifacts:
+                    try:
+                        content = json.loads(execution.configuration_artifacts[0].content or "{}")
+                        runtime = content.get("runtime") if isinstance(content, dict) else None
+                        if isinstance(runtime, dict) and isinstance(runtime.get("storageVolumeId"), str):
+                            storage_volume_id = runtime["storageVolumeId"]
+                    except ValueError:
+                        storage_volume_id = None
+                router_rbac = (artifact.deployment_contract or {}).get("routerRbac") or ()
+                handoff = await prepare_deployment_cleanup_handoff(
+                    execution_id=execution.execution_id,
+                    cluster_id=cluster_id,
+                    namespace=execution.namespace,
+                    router_rbac=router_rbac,
+                    storage_volume_id=storage_volume_id,
+                )
+                self._store(
+                    execution.model_copy(
+                        update={
+                            "diagnostics": VersionedPayload(
+                                schema_version="deploy-diagnostics.v1",
+                                value={"snapshot": diagnostics, "cleanup": {**sanitized_cleanup, "phase1": handoff}},
+                            ),
+                            "updated_at": datetime.now(UTC),
+                        }
+                    )
+                )
+                raise DeploymentCleanupPermissionDenied(
+                    handoff["adminCleanup"]["detail"],
+                    payload=handoff,
+                )
+        elif cluster_id and execution.namespace:
+            from llm_d_lens.cluster.service import _is_unauthorized_output
+            from llm_d_lens.deploy.capabilities import DeploymentClusterAuthError, redact_kubectl_error
+            from llm_d_lens.deploy.orphans import is_deletable_deployment_namespace
+            from llm_d_lens.infrastructure.kubernetes import scoped_runner
+            from llm_d_lens.monitoring.deployment.service import _epp_auth_delegator_binding_name
+
+            if is_deletable_deployment_namespace(execution.namespace, cluster_id=cluster_id):
+                try:
+                    crb_res = await scoped_runner(cluster_id).run(
+                        [
+                            "kubectl",
+                            "delete",
+                            "clusterrolebinding",
+                            _epp_auth_delegator_binding_name(execution.namespace),
+                            "--ignore-not-found=true",
+                        ],
+                        timeout=30,
+                    )
+                    if _is_unauthorized_output(crb_res):
+                        raise DeploymentClusterAuthError(
+                            "Kubernetes cluster rejected kubeconfig credentials (401 Unauthorized)."
+                        )
+                except DeploymentClusterAuthError:
+                    raise
+                except Exception as crb_error:
+                    logger.debug(
+                        "Best-effort EPP auth-delegator CRB cleanup failed for %s: %s",
+                        execution.namespace,
+                        redact_kubectl_error(str(crb_error)),
+                    )
         overlay_removed = False
         if cleanup.get("cleaned_up", False) and not preserve_rendered_overlay:
             remove_overlay = getattr(adapter, "remove_rendered_overlay", None)

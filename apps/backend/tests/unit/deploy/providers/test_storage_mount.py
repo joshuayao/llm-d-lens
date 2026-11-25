@@ -400,3 +400,135 @@ async def test_resolve_mount_skips_namespace_resolution_when_namespace_not_given
 
     result = await resolve_mount({"storageVolumeId": volume.id}, cluster_id="cluster-1")
     assert result["volume_source"] == {"persistentVolumeClaim": {"claimName": "prism-storage-def"}}
+
+
+@pytest.mark.asyncio
+async def test_resolve_mount_directly_mounts_home_pvc_when_deployment_namespace_matches_volume_namespace(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from llm_d_lens.deploy.providers import storage_mount
+
+    volume = StorageVolume(
+        clusterId="cluster-1",
+        name="edit-cache",
+        kind=StorageVolumeKind.LOCAL_DISK,
+        status=StorageVolumeStatus.READY,
+        capacity="100Gi",
+        readOnly=True,
+        localDisk=LocalDiskSpec(hostPath="/data/models", namespace="lens-edit"),
+        pvcName="prism-storage-edit1",
+    )
+    monkeypatch.setattr(storage_service, "get_ready_volume", AsyncMock(return_value=volume))
+    monkeypatch.setattr(storage_mount, "is_pvc_bound_in_namespace", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        storage_service,
+        "_ensure_namespace",
+        AsyncMock(side_effect=AssertionError("satellite namespace should not be ensured")),
+    )
+    monkeypatch.setattr(
+        storage_service,
+        "_kubectl_apply_list",
+        AsyncMock(side_effect=AssertionError("satellite PV/PVC should not be created")),
+    )
+
+    mount = await resolve_mount({"storageVolumeId": volume.id}, cluster_id="cluster-1", namespace="lens-edit")
+    assert mount["volume_source"] == {"persistentVolumeClaim": {"claimName": "prism-storage-edit1"}}
+
+
+@pytest.mark.asyncio
+async def test_is_pvc_bound_uses_only_namespace_scoped_pvc_and_skips_satellite_provision(monkeypatch, tmp_path):
+    import json
+
+    import yaml
+
+    from llm_d_lens.deploy.providers import configuration_manifest as cm_module
+
+    volume = StorageVolume(
+        clusterId="cluster-1",
+        name="bootstrapped-cache",
+        kind=StorageVolumeKind.NFS,
+        status=StorageVolumeStatus.READY,
+        capacity="100Gi",
+        readOnly=True,
+        nfs=NfsSpec(server="nfs.example.com", path="/export/models"),
+        pvcName=None,
+    )
+    observed_kubectl_cmds: list[list[str]] = []
+
+    class _NamespaceScopedPvcRunner:
+        async def run(self, argv, timeout=15):
+            observed_kubectl_cmds.append(list(argv))
+            assert "pv" not in argv and "persistentvolumes" not in argv
+            assert argv == [
+                "kubectl",
+                "get",
+                "pvc",
+                f"prism-storage-{volume.id}",
+                "--namespace",
+                "llmd-bootstrapped-1",
+                "--ignore-not-found=true",
+                "-o",
+                "json",
+            ]
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"status": {"phase": "Bound"}}), stderr="")
+
+    monkeypatch.setattr("llm_d_lens.infrastructure.kubernetes.scoped_runner", lambda _cid: _NamespaceScopedPvcRunner())
+    monkeypatch.setattr(storage_service, "get_ready_volume", AsyncMock(return_value=volume))
+    monkeypatch.setattr(
+        storage_service,
+        "ensure_mount_in_namespace",
+        AsyncMock(side_effect=AssertionError("cluster-scoped ensure_mount_in_namespace must not run when PVC is Bound")),
+    )
+
+    mount = await resolve_mount(
+        {"storageVolumeId": volume.id},
+        cluster_id="cluster-1",
+        namespace="llmd-bootstrapped-1",
+    )
+    assert mount["volume_source"] == {"persistentVolumeClaim": {"claimName": f"prism-storage-{volume.id}"}}
+    assert len(observed_kubectl_cmds) == 1
+
+    # Also verify ConfigurationManifestAdapter.deploy reuses the Bound PVC without calling ensure_mount_in_namespace
+    monkeypatch.setattr(cm_module, "get_ready_volume", AsyncMock(return_value=volume))
+    monkeypatch.setattr(
+        cm_module,
+        "ensure_mount_in_namespace",
+        AsyncMock(side_effect=AssertionError("ConfigurationManifestAdapter.deploy must skip ensure_mount_in_namespace")),
+    )
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        yaml.safe_dump({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "modelserver"}}),
+        encoding="utf-8",
+    )
+    artifact = cm_module.GuideDeploymentArtifact(
+        guide_id="optimized-baseline",
+        artifact_hash="hash-1",
+        manifest_ref=str(manifest_path),
+        manifest_checksum="sha256:123",
+        source_ref="a" * 40,
+        deployment_contract={
+            "readinessDeployments": ["modelserver"],
+            "endpoint": {"protocol": "http", "serviceName": "modelserver", "port": 8000},
+        },
+    )
+
+    async def adapter_runner(cmd):
+        if cmd[:3] == ["kubectl", "create", "namespace"]:
+            return 1, "", "is forbidden"
+        if cmd[:3] == ["kubectl", "get", "serviceaccounts"]:
+            return 0, "serviceaccount/default\n", ""
+        if cmd[:2] == ["kubectl", "apply"]:
+            return 0, "applied", ""
+        return 1, "", f"unexpected: {cmd}"
+
+    adapter = cm_module.ConfigurationManifestAdapter(None, adapter_runner, "llmd-", 30, output_root=tmp_path)
+    deployed = await adapter.deploy(
+        artifact,
+        {
+            "namespace": "llmd-bootstrapped-1",
+            "runtime": {"storageVolumeId": volume.id},
+            "provenance": {"cluster_server_id": "cluster-1"},
+        },
+    )
+    assert deployed["namespace"] == "llmd-bootstrapped-1"
+    assert len(observed_kubectl_cmds) == 2

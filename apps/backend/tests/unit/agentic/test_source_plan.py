@@ -542,3 +542,85 @@ def test_managed_artifact_uses_the_selected_service_and_exact_manifest(workflow,
     assert result.content["officialGuide"]["deployment"]["endpoint"]["serviceName"] == "inference"
     assert "--enable-prefix-caching" in result.content["officialGuide"]["renderedManifest"]
     assert result.content["runtime"]["storageVolumeId"] == "volume"
+
+
+def test_source_plan_checksum_matches_non_canonical_yaml_and_threads_namespace_and_guide_error(workflow, monkeypatch):
+    from fastapi import HTTPException
+
+    from llm_d_lens.agentic import router
+    from llm_d_lens.agentic.models import AgenticApprovalRequest
+    from llm_d_lens.deploy.guide_planning import GuideError
+
+    service, run, proposals = workflow
+
+    async def compose_with_comments(_request, _body, **_kwargs):
+        rendered = bundle()
+        # Add comments/blank lines that yaml.safe_dump_all would strip on re-dump.
+        rendered["files"][0]["content"] = "# pinned header comment\n" + rendered["files"][0]["content"] + "\n"
+        return rendered
+
+    monkeypatch.setattr(source, "compose", compose_with_comments)
+    monkeypatch.setattr(
+        source.registry, "require_cluster", lambda _: SimpleNamespace(llm_d_repo_path="/fixture", llm_d_ref="pinned")
+    )
+    import llm_d_lens.configuration.service as configuration_service
+
+    monkeypatch.setattr(configuration_service, "require_active_session", source.require_active_session)
+    monkeypatch.setattr(source, "require_cluster_access", lambda *_args: None)
+    monkeypatch.setattr(source, "current_principal", lambda _req: None)
+    monkeypatch.setattr(router, "current_principal", lambda _req: None)
+    monkeypatch.setattr(router, "owner_for_create", lambda _p: "user-1")
+    monkeypatch.setattr(router, "_optimization_run", lambda _rid, _req: run)
+    monkeypatch.setattr(router, "service", service)
+
+    async def noop_check_target(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(source, "check_target", noop_check_target)
+    captured = {}
+
+    async def fake_start_run(deploy_req, *, owner_user_id=None):
+        captured["request"] = deploy_req
+        captured["owner_user_id"] = owner_user_id
+        return SimpleNamespace(id="deploy-source-1")
+
+    monkeypatch.setattr("llm_d_lens.deploy.application.deployment_run_manager.start_run", fake_start_run)
+
+    reviewed = asyncio.run(
+        source.render_source_plan(service, run.id, source.SourcePlanRequest(revision=1, candidates=proposals[:1]), None)
+    )
+    checksum = reviewed.configuration_plan.configuration["checksum"]
+    endpoint = reviewed.configuration_plan.endpoints[0]["value"]
+
+    approved = asyncio.run(
+        router.approve_agentic_deployment(
+            run.id,
+            request=object(),
+            approval=AgenticApprovalRequest(
+                configuration_checksum=checksum,
+                endpoint=endpoint,
+                namespace="  llmd-bootstrapped-ns  ",
+            ),
+        )
+    )
+    assert approved.deployment_run_id == "deploy-source-1"
+    assert captured["owner_user_id"] == "user-1"
+    assert captured["request"].provenance["target_namespace"] == "llmd-bootstrapped-ns"
+
+    # Reset to awaiting_approval and verify GuideError translates cleanly to HTTPException
+    reviewed.status = source.AgenticDeploymentStatus.AWAITING_APPROVAL
+
+    async def failing_check_target(*_args, **_kwargs):
+        raise GuideError("Target cluster check rejected the composition.", 409)
+
+    monkeypatch.setattr(source, "check_target", failing_check_target)
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            router.approve_agentic_deployment(
+                run.id,
+                request=object(),
+                approval=AgenticApprovalRequest(configuration_checksum=checksum, endpoint=endpoint),
+            )
+        )
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "Target cluster check rejected the composition."

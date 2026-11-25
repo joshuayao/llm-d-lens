@@ -26,14 +26,16 @@ class StrictModel(BaseModel):
 
 
 class ClusterStackInstallRequest(StrictModel):
-    namespace: str = "llm-d-monitoring"
+    namespace: str | None = None
     mode: MonitoringMode = "central"
     enable_tls: bool = False
     reinstall: bool = False
 
     @field_validator("namespace")
     @classmethod
-    def validate_namespace(cls, value: str) -> str:
+    def validate_namespace(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
         from .service import validate_namespace
 
         return validate_namespace(value)
@@ -79,6 +81,32 @@ class ClusterStackStatusResponse(StrictModel):
     active_operation_id: str | None = None
     observed_at: datetime
     stale: bool = False
+    access_mode: Literal["admin", "non_admin"] | None = "admin"
+    can_manage: bool = True
+    monitoring_mode: Literal["managed", "existing"] | None = None
+    prometheus_url: str | None = None
+    grafana_url: str | None = None
+    prometheus_node_port: int | None = None
+    grafana_node_port: int | None = None
+
+
+class AdminScriptResponse(StrictModel):
+    filename: str
+    script: str
+    instructions: str
+    namespace: str
+    mode: Literal["managed", "existing"]
+    marker_namespace: str | None = None
+    marker_name: str | None = None
+    accelerator_targets: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+ClusterStackAdminScriptResponse = AdminScriptResponse
+
+
+class ClusterStackRecheckResponse(ClusterStackStatusResponse):
+    marker_found: bool = False
 
 
 class ObservabilityLink(StrictModel):

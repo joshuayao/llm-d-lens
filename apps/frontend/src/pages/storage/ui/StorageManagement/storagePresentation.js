@@ -58,19 +58,43 @@ function resourcePhaseHealth(phase) {
     return 'failed';
 }
 
+export function resourceStatusSource(entry) {
+    if (entry?.statusSource === 'prometheus') return 'prometheus';
+    if (entry?.statusSource === 'unverified') return 'unverified';
+    return 'kubernetes';
+}
+
+export function formatMissingPermissionRule(rule = {}) {
+    const verb = rule.verb || 'use';
+    const resource = rule.resource || 'resource';
+    const target = rule.apiGroup ? `${resource}.${rule.apiGroup}` : resource;
+    const scope = rule.namespace ? `in ${rule.namespace}` : (rule.scope === 'cluster' ? '(cluster-scoped)' : '');
+    return `${verb} ${target}${scope ? ` ${scope}` : ''}`.trim();
+}
+
 // The volume's own `status` field (pending/ready/failed/deleting) only
 // reflects whether the backend *finished creating* the PV/PVC objects — it
 // is never updated afterwards. If those objects later become unhealthy in
 // Kubernetes (PV released/lost, PVC unbound, ...) a volume can still say
 // "ready" while actually broken. This combines both so the status dot shown
 // to users reflects the live state, not just the one-time creation result.
-export function effectiveStorageStatus(item, pvc, pv) {
+export function effectiveStorageStatus(item, pvc, pv, statusSource) {
     if (!item) return 'deleting';
     if (item.status !== 'ready') return item.status;
-    if (!pvc) return 'failed';
+    if (!pvc) {
+        if (statusSource === 'unverified') {
+            return hasNodeDrift(item) ? 'attention' : 'ready';
+        }
+        return 'failed';
+    }
     const pvcHealth = resourcePhaseHealth(pvc.phase);
     if (pvcHealth !== 'ready') return pvcHealth;
-    if (!pv) return 'failed';
+    if (!pv) {
+        if (statusSource === 'unverified') {
+            return hasNodeDrift(item) ? 'attention' : 'ready';
+        }
+        return 'failed';
+    }
     const pvHealth = resourcePhaseHealth(pv.phase);
     if (pvHealth !== 'ready') return pvHealth;
     if (hasNodeDrift(item)) return 'attention';
@@ -102,6 +126,11 @@ export function statusTone(status) {
 
 export function volumeTitle(item) {
     return item?.name || item?.id || 'Storage volume';
+}
+
+export function volumeNamespace(item) {
+    if (!item) return 'llm-d-bench-storage';
+    return item.dynamicPvc?.namespace || item.localDisk?.namespace || item.nfs?.namespace || 'llm-d-bench-storage';
 }
 
 export function shortId(id) {
@@ -150,10 +179,11 @@ export function deletionBlockedReason(item) {
 export function summarizeStatuses(items, resourceStatuses = {}) {
     const summary = { total: items.length, ready: 0, pending: 0, failed: 0, deleting: 0, attention: 0 };
     for (const item of items) {
-        const claims = (resourceStatuses[item?.id] || {}).persistentVolumeClaims || [];
+        const entry = resourceStatuses[item?.id] || {};
+        const claims = entry.persistentVolumeClaims || [];
         const pvc = claims.length ? claims[0] : null;
         const pv = pvc ? pvc.persistentVolume : null;
-        const status = effectiveStorageStatus(item, pvc, pv);
+        const status = effectiveStorageStatus(item, pvc, pv, resourceStatusSource(entry));
         if (status && Object.prototype.hasOwnProperty.call(summary, status)) {
             summary[status] += 1;
         } else if (status) {

@@ -22,9 +22,11 @@ List Lens-managed clusters and optionally include draft records that have not be
 
     - `includeDrafts` (`boolean`, query, default `false`): include draft cluster records.
 
-    Response: `ClustersResponse` with one `ClusterRecord` per visible cluster.
+    Response: `ClustersResponse` with one `ClusterRecord` per visible cluster. `ready` validates cluster connectivity, including namespace-scoped (`edit`) kubeconfigs.
 
 `hfTokenSecret` reports the namespace and name of the cluster's HF_TOKEN Secret, or `null` when the cluster has none. Only the location is returned; the token value stays on the target cluster and is never served by the API.
+
+`ClusterRecord` also includes `vllmImage` (`string | null`, custom OCI image reference or `null` when using the selected hardware profile's `runtime_image` default) and monitoring configuration fields: `monitoringMode` (`"managed"` or `"existing"`), `monitoringNamespace` (default `"llm-d-monitoring"`), `prometheusUrl`, `grafanaUrl`, `prometheusNodePort`, and `grafanaNodePort`.
 
     ```json
     {
@@ -68,6 +70,44 @@ List Lens-managed clusters and optionally include draft records that have not be
             print(cluster.id, cluster.name, ready)
 
     asyncio.run(main())
+    ```
+  </TabItem>
+</Tabs>
+
+### Get a cluster detail
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`GET /api/cluster/clusters/{cluster_id}`**
+
+    Returns `ClusterDetailResponse`:
+    `{cluster, plan, planHash, planVersion, draftHfTokenSaved, executionOperations, executionCompletedAt, executionCompletedPlanHash}`.
+
+    - `draftHfTokenSaved`: `boolean` indicating whether the caller has an
+      encrypted draft Hugging Face token saved for this draft cluster (always
+      `false` for active clusters or when saved by a different user; the token
+      itself is never returned).
+    - `executionOperations`: operation id → `user_done` / `admin_done` /
+      `lens_done` / `failed`.
+    - `executionCompletedAt`: timestamp of the most recent completed run, or
+      `null`.
+    - `executionCompletedPlanHash`: plan hash recorded by that run, or `null`.
+
+    A non-null `executionCompletedAt` is not enough to treat an older draft as
+    complete. If `executionCompletedPlanHash` is `null` or differs from the
+    current `planHash`, re-check permissions and re-run the operation list.
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.cluster import execution, guard, registry
+
+    cluster = registry.require_cluster("cluster-a")
+    state = guard.load_plan(cluster.id)
+    ledger = execution.operations(cluster.id)
+    completed_at = execution.completed_at(cluster.id)
+    completed_hash = execution.completed_plan_hash(cluster.id)
+    current_hash = state.plan_hash if state else None
+    print(ledger, completed_at, completed_hash, current_hash)
     ```
   </TabItem>
 </Tabs>
@@ -161,7 +201,8 @@ llm-d component versions are fixed by the Lens stack profile (see [Get supported
     - `gatewayPort` (`integer`, form, optional): NodePort the shared Gateway is exposed on (30000–32767).
     - `gatewayAuthzHost` (`string`, form): the host/IP this cluster uses to reach Lens (required for providers with a Lens address hook: `envoy-ai-gateway`/`istio`/`agentgateway`). Pick from `GET /api/cluster/lens-hosts`; Lens adds its own serving port, and when empty Lens fills in this host's address.
     - `inotifyMaxUserInstances` (`integer`, form, default `8192`): per-uid inotify instance limit Lens applies to every node (`fs.inotify.max_user_instances`). Lift it above kind's 128 default on nodes running many pods.
-    - `draft` (`boolean`, form, default `false`): create as draft.
+    - `vllmImage` (`string`, form, optional): custom OCI container image reference (requiring `:tag` or `@sha256:` digest) for vLLM; when omitted, defaults to the selected hardware profile's `runtime_image`. Invalid references return `422 invalid_vllm_image`.
+    - `draft` (`boolean`, form, optional): clusters are always created as drafts. Explicit `draft=false` returns `400 draft_creation_forbidden`.
 
     Example field values:
 
@@ -224,6 +265,7 @@ llm-d component versions are fixed by the Lens stack profile (see [Get supported
         no_proxy="127.0.0.1,localhost,.svc",
         llm_d_ref="v0.3.0",
         llm_d_lensmark_ref="main",
+        vllm_image="ghcr.io/example/vllm:v0.8.0",
         draft=True,
     )
 
@@ -234,7 +276,7 @@ llm-d component versions are fixed by the Lens stack profile (see [Get supported
 
 ### Update a cluster
 
-Patch a cluster's editable settings, including name, description, proxy settings, and draft status. The kubeconfig itself is not part of this patch contract. Version fields (`llmDRef`, `llmDBenchmarkRef`, `routerVersion`, `gieVersion`, `ippVersion`) are server-managed from the stack profile and ignored on input.
+Patch a cluster's editable settings (name, description, proxy, gateway and inotify settings). The kubeconfig and draft state are not part of this patch contract; finalize with `POST /execution/complete`. Version fields (`llmDRef`, `llmDBenchmarkRef`, `routerVersion`, `gieVersion`, `ippVersion`) are server-managed from the stack profile and ignored on input.
 Gateway namespace prefixes are scoped to the stable Lens cluster-registration
 short ID. For registration `1234abcd`, the default becomes
 `lens-gateway-1234abcd`; `gatewayNamespace: "custom"` resolves to
@@ -258,9 +300,18 @@ of `service.update_cluster_settings(..., gateway_namespace="custom")`.
     - `gatewayNamespace` (`string`, optional): namespace prefix, at most 63 characters; receives the registration's stable short-ID suffix.
     - `gatewayPort` (`integer`, optional)
     - `gatewayPublicUrl` (`string`, optional): externally reachable Gateway host/IP — Lens adds the exposed port; empty derives it.
+    - `draft`: not accepted. Sending it returns `400 draft_update_forbidden`.
     - `gatewayAuthzHost` (`string`): the host/IP this cluster uses to reach Lens (required for providers with a Lens address hook; Lens adds its own serving port; empty fills in this host's address).
     - `inotifyMaxUserInstances` (`integer`, optional): per-uid inotify instance limit applied to every node (default `8192`).
-    - `draft` (`boolean`, optional)
+    - `monitoringMode` (`string`, optional): `"managed"` or `"existing"`.
+    - `monitoringNamespace` (`string`, optional): namespace for the monitoring stack (default `"llm-d-monitoring"`).
+    - `prometheusUrl` (`string`, optional): explicit HTTP/HTTPS Prometheus URL; send `""` or `null` to clear.
+    - `grafanaUrl` (`string`, optional): explicit HTTP/HTTPS Grafana URL; send `""` or `null` to clear.
+    - `prometheusNodePort` (`integer`, optional): Prometheus NodePort (`30000`–`32767`); send `null` to clear.
+    - `grafanaNodePort` (`integer`, optional): Grafana NodePort (`30000`–`32767`); send `null` to clear.
+    - `monitoringHost` (`string`, optional): host/IP used to derive NodePort URLs when explicit URLs are unset; send `""` or `null` to clear.
+    - `installAcceleratorExporters` (`boolean`, optional): whether to install accelerator metric exporters.
+    - `vllmImage` (`string`, optional): custom OCI container image reference (requiring `:tag` or `@sha256:` digest) for vLLM; send `""` or `null` to reset to the selected hardware profile's `runtime_image` default. Invalid references return `422 invalid_vllm_image`; changing it during an active draft execution returns `409 execution_in_progress`.
 
     ```json
     {
@@ -273,8 +324,7 @@ of `service.update_cluster_settings(..., gateway_namespace="custom")`.
         "noProxy": "127.0.0.1,localhost,.svc"
       },
       "llmDRef": "v0.3.0",
-      "llmDBenchmarkRef": "main",
-      "draft": false
+      "llmDBenchmarkRef": "main"
     }
     ```
 
@@ -317,60 +367,10 @@ of `service.update_cluster_settings(..., gateway_namespace="custom")`.
         llm_d_ref="v0.3.0",
         llm_d_lensmark_ref="main",
         gateway_authz_host="10.0.0.5",
-        draft=False,
+        update_vllm_image=True,
+        vllm_image="ghcr.io/example/vllm:v0.8.0",
     )
     print(cluster.id, cluster.name)
-    ```
-  </TabItem>
-</Tabs>
-
-### Create the cluster HF_TOKEN secret
-
-Create a standalone Kubernetes Secret holding a Hugging Face token on the target cluster, and record its coordinates on the Lens cluster record so Deployments and Model Cache downloads default to it. This is the Create cluster wizard's Model cache step. The token value is written to the cluster only; Lens stores just the namespace and name. The request fails with `409 secret_already_exists` when the Secret is already present — use the rotation endpoint below to replace an existing token.
-
-<Tabs>
-  <TabItem value="rest-api" label="REST API">
-    **`POST /api/cluster/clusters/{cluster_id}/hf-token-secrets`**
-
-    Request body (`HfTokenSecretCreateRequest`):
-
-    - `namespace` (`string`, required): namespace to create the Secret in; created when missing.
-    - `name` (`string`, required): Secret name.
-    - `token` (`string`, required): Hugging Face token stored under the `HF_TOKEN` key.
-
-    ```json
-    {
-      "namespace": "llm-d-bench-storage-44395349",
-      "name": "hf-token-c758ced0",
-      "token": "hf_exampleTokenValue"
-    }
-    ```
-
-    Response: `HfTokenSecretRef`.
-
-    ```json
-    {
-      "namespace": "llm-d-bench-storage-44395349",
-      "name": "hf-token-c758ced0"
-    }
-    ```
-  </TabItem>
-  <TabItem value="python-api" label="Python API">
-    ```python
-    import asyncio
-
-    from llm_d_lens.cluster import registry, service
-
-    cluster = registry.get_cluster("cluster-a")
-    ref = asyncio.run(
-        service.create_hf_token_secret(
-            cluster,
-            "llm-d-bench-storage-44395349",
-            "hf-token-c758ced0",
-            "hf_exampleTokenValue",
-        )
-    )
-    print(ref["namespace"], ref["name"])
     ```
   </TabItem>
 </Tabs>
@@ -526,49 +526,275 @@ Return the current in-memory download status for the cluster's pinned `llm-d` an
   </TabItem>
 </Tabs>
 
-### Start cluster image pre-pull
+### Read and save the provisioning plan
 
-Pre-pull the pinned llm-d images for the selected accelerators onto every cluster node. The images are the llm-d-router EPP and P/D sidecar plus the model-server image(s) for the accelerators; versions come from the Lens stack profile, not the request. A privileged DaemonSet runs the host's `crictl` per node; poll the GET below for per-node readiness.
+The plan is Lens state. Saving it never mutates the target cluster.
 
 <Tabs>
   <TabItem value="rest-api" label="REST API">
-    **`POST /api/cluster/clusters/{cluster_id}/images/prepull`**
+    **`GET /api/cluster/clusters/{cluster_id}/plan`**
 
-    Request body:
+    Returns `{plan, planHash, planVersion}`.
 
-    - `accelerators` (`string[]`): accelerator ids whose model-server image should be pulled (e.g. `["nvidia","intel"]`).
+    **`PUT /api/cluster/clusters/{cluster_id}/plan`**
 
-    ```json
-    {
-      "accelerators": ["nvidia", "intel"]
-    }
-    ```
-
-    Response: overall state, `ready`/`desired` node counts, the image list and per-node readiness.
-
-    ```json
-    {
-      "state": "pulling",
-      "desired": 2,
-      "ready": 1,
-      "images": [
-        { "name": "ghcr.io/llm-d/llm-d-router-endpoint-picker:v1.0.0", "ready": 2, "desired": 2, "state": "ready" },
-        { "name": "ghcr.io/llm-d/llm-d-router-disagg-sidecar:v1.0.0", "ready": 2, "desired": 2, "state": "ready" },
-        { "name": "ghcr.io/llm-d/llm-d-cuda:v0.9.0", "ready": 1, "desired": 2, "state": "pulling" }
-      ],
-      "nodes": [{ "node": "worker-1", "phase": "Running", "ready": true, "restarts": 0 }]
-    }
-    ```
-
-    `images[].state` is `ready` when every node pulled that image, `pulling` while in progress and `failed` if a node's pull crash-loops.
+    Accepts a `ProvisioningPlan` JSON body and optional `If-Match: <planHash>`.
+    Draft-only; an active cluster returns `409 cluster_not_draft`. A stale
+    `If-Match` returns `409 plan_conflict`. `plan.stack.vllmImage` (optional OCI container image reference requiring `:tag` or `@sha256:` digest) is preserved if omitted from `stack`, or cleared to `null` (the selected hardware profile's `runtime_image` default) when explicitly set to `null` or `""`. `plan.monitoring.autoDiscovered`
+    tracks runtime-discovered endpoint fields (`prometheusUrl`, `grafanaUrl`,
+    `prometheusNodePort`, `grafanaNodePort`, `host`) without changing `planHash`.
+    When `tokenSource` is `create-secret`
+    with an empty or default `llm-d-bench-storage*` namespace, the route
+    automatically aligns `secretNamespace` onto the edit kubeconfig's
+    SSAR-verified writable namespace (setting `secretNamespaceMode` to `existing`
+    and aligning default `handoff.namespace`), while preserving explicit custom
+    namespaces and `existing-secret:*` and falling back cleanly when Kubernetes
+    is unreachable.
   </TabItem>
   <TabItem value="python-api" label="Python API">
     ```python
-    from llm_d_lens.cluster import images
+    from llm_d_lens.cluster import guard
 
-    status = await images.start_image_prepull("cluster-a", ["nvidia", "intel"])
-    print(status["state"], status["ready"], status["desired"])
+    state = guard.load_plan("cluster-a")
+    if state is not None:
+        print(state.plan_hash, state.plan)
     ```
+
+    `PUT /plan` is REST only: the route normalizes the plan, validates hardware
+    profiles and namespace rules, stores it with optimistic concurrency, and
+    mirrors derived columns on the cluster record. Call the endpoint instead of
+    writing a plan directly.
+  </TabItem>
+</Tabs>
+
+### Check operation permissions
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/cluster/clusters/{cluster_id}/permission-check`**
+
+    Returns `OperationReport`:
+    `{planHash, planVersion, plan, status, sufficient, userOperations, adminOperations, lensOperations, blockedOperations, missing, marker, remediation}`.
+    `status` is `ready`, `admin_required`, or `blocked`. The check never mutates
+    the target Kubernetes cluster; for an idle draft cluster with update
+    permission, it may auto-align an eligible default `create-secret` /
+    `handoff` namespace in Lens state onto the edit kubeconfig's writable
+    namespace and return the updated `plan`, `planHash`, and `planVersion`.
+    The check includes a cluster-wide wildcard SSAR probe (`*/*/*`) for remote
+    overlay operations and applies reverse dependency closure promotion so any
+    unfinished, promotable upstream dependencies of an Orchestration
+    administrator operation are also promoted into `adminOperations`.
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    import asyncio
+
+    from llm_d_lens.cluster import evaluator, guard, operations, registry
+
+    cluster = registry.require_cluster("cluster-a")
+    state = guard.require_plan(cluster.id, None)
+    planned = operations.build_operations(state.plan, cluster_id=cluster.id)
+    report = asyncio.run(
+        evaluator.evaluate_operations(
+            cluster.id,
+            planned,
+            plan_hash=state.plan_hash,
+            handoff_namespace=state.plan.handoff.namespace,
+        )
+    )
+    print(report.status, report.user_operations)
+    ```
+  </TabItem>
+</Tabs>
+
+### Generate the orchestration administrator operation script
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/cluster/clusters/{cluster_id}/permission-remediation`**
+
+    Requires `cluster:cluster:update`. Returns
+    `{filename, script, instructions, planHash, adminOperations, marker, warnings}`.
+    Returns `409 admin_operations_not_required` for a ready plan and
+    `503 admin_script_source_unavailable` when a pinned chart source cannot be
+    resolved.
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    `POST /permission-remediation` is REST only: it resolves pinned chart CRDs
+    through the backend's filesystem cache, renders the script with the exact
+    operation order, records an audit entry, and returns the downloadable file.
+    Use the endpoint so the generated marker and plan hash match the cluster's
+    stored plan.
+  </TabItem>
+</Tabs>
+
+### Read the orchestration administrator handoff status
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`GET /api/cluster/clusters/{cluster_id}/admin-handoff/status`**
+
+    Read-only. Returns `{planHash, status, adminOperations, remainingOperations,
+    marker, warnings, monitoring}` and writes no ledger or audit entry.
+    `monitoring` (when present) includes `prometheusUrl`, `grafanaUrl`,
+    `prometheusNodePort`, `grafanaNodePort`, `host`, `checked`, and `healthy`.
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    `GET /admin-handoff/status` is REST only: it reads the live marker with the
+    cluster credential and combines it with the stored plan, operation catalog and
+    execution ledger. The route is read-only and does not expose a standalone
+    marker reader.
+  </TabItem>
+</Tabs>
+
+### Verify the orchestration administrator completion marker
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/cluster/clusters/{cluster_id}/admin-handoff/verify`**
+
+    Requires `cluster:cluster:update`. Verifies the marker, records the admin
+    operations as `admin_done`, auto-discovers and persists Monitoring endpoints,
+    and returns
+    `{planHash, status, adminOperations, remainingOperations, marker, warnings, monitoring, token}`.
+    `monitoring` (when present) includes `prometheusUrl`, `grafanaUrl`,
+    `prometheusNodePort`, `grafanaNodePort`, `host`, `checked`, and `healthy`.
+    Reuse the returned execution token for user operations. Incomplete markers return
+    `409 admin_handoff_incomplete`, stale markers return `admin_handoff_stale`, and
+    unreadable markers return `admin_handoff_unconfirmed`.
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    `POST /admin-handoff/verify` is REST only: verification must atomically
+    acquire the execution token and record `admin_done` only after the marker is
+    fully validated. The route enforces cluster access and performs that
+    transaction; there is no public Python wrapper.
+  </TabItem>
+</Tabs>
+
+### Save a draft Hugging Face token
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`PUT /api/cluster/clusters/{cluster_id}/draft-hf-token`**
+
+    Requires `cluster:cluster:update` and cluster/owner access. Draft-only;
+    returns `409 cluster_not_draft` for active clusters.
+
+    Request body: `{"token": "..."}` (non-empty, single-line, no NUL
+    characters, max 16,384 characters).
+
+    Optional header: `X-Lens-Execution-Token` when an execution lock is active.
+
+    Returns `204 No Content` with `Cache-Control: no-store`. The token is
+    encrypted at rest and bound to the caller user, `cluster_id`, and
+    `created_at`. It is write-only (never returned by `GET` APIs or stored in
+    the provisioning plan, logs, or orchestration administrator script), automatically used by
+    `POST /operations/{operation_id}/execute` when `secretValues` is omitted
+    for `cache.hf-secret`, and deleted on finalize, draft discard/delete,
+    `update_cluster(draft=False)`, or switching to `existing-secret:`.
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.cluster import registry
+
+    cluster = registry.require_cluster("cluster-a")
+    registry.write_draft_hf_token(cluster, "hf_...", actor_user_id="user-1")
+    ```
+  </TabItem>
+</Tabs>
+
+### Execute a user operation
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/cluster/clusters/{cluster_id}/operations/{operation_id}/execute`**
+
+    Headers: `X-Lens-Plan-Hash`; `X-Lens-Execution-Token` after the first user
+    operation or after handoff verification.
+
+    Optional body: `{"secretValues": {"HF_TOKEN": "..."}}`, only for user-owned
+    secret operations. For `cache.hf-secret`, `secretValues` may be omitted if
+    the same user previously saved a draft Hugging Face token via
+    `PUT /draft-hf-token`; explicit `secretValues` still takes precedence.
+    Returns `{operationId, status, token, result}` and
+    `X-Lens-Execution-Token`. Supports online `manifests_from_chart` execution
+    (`503 admin_script_source_unavailable` when chart CRD resolution or
+    validation fails). A 403 re-splits the operation into the orchestration
+    administrator handoff with upstream dependency closure (preserving
+    already-completed `user_done` prerequisites); 401/504/502 indicate
+    credential, readiness or operation failures.
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    import asyncio
+
+    from llm_d_lens.cluster import execution, guard, operations
+
+    state = guard.require_plan("cluster-a", plan_hash)
+    planned = operations.build_operations(state.plan, cluster_id="cluster-a")
+    operation = next(item for item in planned if item.id == "cache.hf-secret")
+    asyncio.run(
+        execution.execute_user_operation(
+            "cluster-a",
+            operation,
+            secret_values={"HF_TOKEN": "hf_..."},
+        )
+    )
+    ```
+
+    The REST route additionally manages the execution token and records
+    `user_done`/`failed` in the ledger.
+  </TabItem>
+</Tabs>
+
+### Complete the run
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/cluster/clusters/{cluster_id}/execution/complete`**
+
+    Requires the live token. Executes Lens-local operations (including
+    monitoring endpoint discovery and Prometheus readiness verification),
+    verifies every operation is user-done, admin-done or Lens-done, sets
+    `draft=false` with the completion timestamp/plan hash, and releases the
+    token. Returns `204`. Monitoring verification failures return `400` or
+    `502` with `monitoring_*` error codes (`monitoring_prometheus_url_missing`,
+    `monitoring_discovery_failed`, `monitoring_unhealthy`) while preserving the
+    execution token for retry.
+
+    **`POST /api/cluster/clusters/{cluster_id}/execution/cancel`**
+
+    Cancels the active run and releases its lock. Returns `204`.
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.cluster import execution
+
+    # After every non-Lens operation is recorded and Lens-local work is done.
+    execution.finalize("cluster-a", token, plan_hash=plan_hash)
+
+    # Or cancel/request cancellation for the active run.
+    execution.cancel("cluster-a", token)
+    ```
+  </TabItem>
+</Tabs>
+
+### Rotate the cluster credential
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`PUT /api/cluster/clusters/{cluster_id}/kubeconfig`**
+
+    Multipart `file` plus optional `confirm=true` for active clusters. This is
+    credential rotation only: it validates YAML, egress, connectivity and target
+    identity, does not run a permission check, and does not change the plan.
+    Returns `{planHash, targetMatchedBy, endpointChanged, warning}`.
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    `PUT /kubeconfig` is REST only: the route validates the uploaded credential,
+    checks the target identity against the stored record, updates egress/session
+    state and writes the audit entry. No public Python wrapper is exposed for
+    rotation.
   </TabItem>
 </Tabs>
 
@@ -607,35 +833,6 @@ Get the current image pre-pull status for a cluster: overall state, ready/desire
   </TabItem>
 </Tabs>
 
-### Apply pinned Gateway API / Gateway API Inference Extension / llm-d Router CRDs
-
-Apply the Gateway API (`gateway.networking.k8s.io`), Gateway API Inference Extension (`inference.networking.k8s.io`) and llm-d Router (`inferencemodelrewrites.llm-d.ai`) CRD bundles pinned by the Lens stack profile. Idempotent; also applied during cluster creation. The CRDs action also restarts Lens-managed router EPPs whose pod template lacks the marker for the current CRD revision, so they re-register the `InferenceModelRewrite` API and public model aliases work. On first use after upgrading, this restarts every published EPP once. The additive `router_epp_repair` key reports that result.
-
-<Tabs>
-  <TabItem value="rest-api" label="REST API">
-    **`POST /api/cluster/clusters/{cluster_id}/crds`**
-
-    Response: a per-bundle result, plus the additive `router_epp_repair` result.
-
-    ```json
-    {
-      "gateway_api": { "ok": true, "message": "" },
-      "gateway_api_inference_extension": { "ok": true, "message": "" },
-      "llm_d_router": { "ok": true, "message": "" },
-      "router_epp_repair": { "ok": true, "restarted": ["deploy/qwen-epp"], "message": "" }
-    }
-    ```
-  </TabItem>
-  <TabItem value="python-api" label="Python API">
-    ```python
-    from llm_d_lens.cluster import gateway_crds
-
-    result = await gateway_crds.apply_gateway_crds("cluster-a")
-    print(result["gateway_api"]["ok"], result["llm_d_router"]["ok"])
-    ```
-  </TabItem>
-</Tabs>
-
 ### Get Gateway API / GIE / llm-d Router CRD status
 
 Report whether the pinned Gateway API, Gateway API Inference Extension and llm-d Router CRDs are present on the cluster (`ready`/`missing` per bundle). The llm-d Router bundle is ready only when discovery also serves the `inferencemodelrewrites` resource.
@@ -658,36 +855,6 @@ Report whether the pinned Gateway API, Gateway API Inference Extension and llm-d
 
     status = await gateway_crds.gateway_crds_status("cluster-a")
     print(status["gateway_api"], status["llm_d_router"])
-    ```
-  </TabItem>
-</Tabs>
-
-### Install LeaderWorkerSet controller
-
-Install or upgrade the LeaderWorkerSet controller pinned by the Lens stack profile, enabling the `DisaggregatedSet` API used by the llm-d v1.0 P/D Guide. CRDs are applied server-side before the Helm release is upgraded. Idempotent; the create wizard also calls this after installing the Gateway CRDs.
-
-<Tabs>
-  <TabItem value="rest-api" label="REST API">
-    **`POST /api/cluster/clusters/{cluster_id}/lws`**
-
-    ```json
-    {
-      "ok": true,
-      "ready": true,
-      "crd": "ready",
-      "controller": "ready",
-      "version": "v1.0.0",
-      "namespace": "lws-system",
-      "message": ""
-    }
-    ```
-  </TabItem>
-  <TabItem value="python-api" label="Python API">
-    ```python
-    from llm_d_lens.cluster import service
-
-    result = await service.install_lws("cluster-a")
-    print(result["ready"], result["version"])
     ```
   </TabItem>
 </Tabs>
@@ -754,13 +921,15 @@ Probe the cluster's Kubernetes API for reachability and its server version, and 
 
 Delete a Lens-managed cluster record and clean up related state. This should only be used when the cluster should be removed from Lens entirely.
 
-Remote cleanup performed by this endpoint:
+Deletion uses a two-phase cleanup flow so namespace-scoped `edit` kubeconfigs do not get stuck when cluster-scoped or cross-namespace cleanup requires orchestration administrator privileges:
 
-- The registration's isolated Gateway namespace, normally `lens-gateway-<cluster-id>`, is deleted with its Gateway, IPP, authorization resources and routes. A missing namespace is a successful no-op. The old shared `lens-gateway` namespace, other registrations' namespaces and shared Gateway controllers are not deleted.
-- The cluster's `HF_TOKEN` secret recorded in `hfTokenSecret` is deleted, and its namespace is deleted with it when the namespace has no reason to outlive the cluster. That is the case for the Lens-owned `llm-d-bench-storage-{cluster_id}` namespace, for any namespace Lens created for the secret (labelled `app.kubernetes.io/managed-by: llm-d-lens`), and for a namespace that, once the secret is gone, holds nothing but the objects Kubernetes and cluster add-ons inject into every namespace (the `default` service account, its token secret, and CA-bundle config maps such as `kube-root-ca.crt`). A namespace that still holds any other object -- including a custom resource -- is kept, and `default`, `kube-system`, `kube-public` and `kube-node-lease` are never deleted. If the namespace contents cannot be listed, the namespace is kept.
-- For a draft cluster, every Storage volume still attached to it is removed together with its `PersistentVolumeClaim` and `PersistentVolume` objects. Model files on the underlying NFS or host-path storage are kept, because the `PersistentVolume` uses the `Retain` reclaim policy.
+- **Step A (best-effort with stored kubeconfig)**: Lens removes the resources it is permitted to delete in the cluster, including the registration's isolated Gateway namespace (normally `lens-gateway-<cluster-id>`) or, for shared/existing Gateway namespaces (`namespaceMode: "existing"` or a non-deletable namespace), only Lens-owned Gateway resources (`gateway.gateway.networking.k8s.io/<gateway_name>` and best-effort provider/authz/`lens-node-sysctl` companions). For `HF_TOKEN` secrets, `existing-secret:*` and `existing`-mode secret namespaces are never deleted; `create-secret` resources with a `create`-mode namespace are deleted as `hf-secret.namespace` when not protected or shared, post-creation rotated HF Secrets are deleted at the Secret level only, and legacy plan-less external secret namespaces are deleted only when Lens-owned or empty of non-injected objects. Protected namespaces (`default`, `kube-system`, `kube-public`, `kube-node-lease`, `istio-system`, `envoy-gateway-system`, `envoy-ai-gateway-system`, `agentgateway-system`), `lens-gateway`, `llm-d-bench-storage`, and the kubeconfig/handoff namespace are never deleted. For a draft cluster, attached Storage volumes are also removed together with their `PersistentVolumeClaim` and `PersistentVolume` objects (underlying NFS or host-path files are kept because `Retain` is used).
+- **Step B (orchestration administrator handoff)**: If any required cleanup operations fail with `403` / RBAC errors, Lens checks for a completion marker `ConfigMap` (`lens-admin-cleanup-<cluster_id>`) in `marker.namespace` matching the expected `clusterId`, `status: "completed"`, `cleanupDigest`, and all unverified operations. If not yet completed, Lens returns `409` with code `cluster_admin_cleanup_required` (RFC-7807) containing the idempotent `script`, `cleanupDigest`, `operations`, `completedOperations`, `marker`, `canVerifyMarker`, and `confirmRequired` so an orchestration administrator can run the script and the user can retry deletion.
+- **Offline / unreachable fallback**: If the cluster is unreachable during deletion, Lens returns `502` with code `cluster_gateway_cleanup_failed` and includes the idempotent `script` and `cleanupDigest` in the error payload. Passing `confirmAdminCleanup=true` acknowledges manual cleanup and removes the Lens registration record.
 
-Gateway namespace cleanup is required: a failure or timeout returns `502` with code `cluster_gateway_cleanup_failed`, retaining the cluster record and kubeconfig so deletion can be retried. HF-token and draft-storage cleanup remain best-effort. A non-draft cluster that still has available deployments or Storage volumes is rejected with `409`; clean up those resources first.
+A non-draft cluster that still has available deployments or Storage volumes is always rejected with `409` (`cluster_has_available_deployments` or `cluster_has_storage_volumes`), even when `confirmAdminCleanup=true`.
+
+For clusters where a temporary orchestration administrator kubeconfig can be supplied directly, `POST /api/cluster/clusters/{cluster_id}/cleanup` remains available as an alternative.
 
 <Tabs>
   <TabItem value="rest-api" label="REST API">
@@ -769,10 +938,14 @@ Gateway namespace cleanup is required: a failure or timeout returns `502` with c
     Request: no request body.
 
     - `cluster_id` (`string`, path): target cluster id.
+    - `confirmAdminCleanup` (`boolean`, query, default `false`): when `true`, confirms that an orchestration administrator has already run the cleanup script when marker verification is unavailable (`canVerifyMarker: false`) or the cluster is unreachable (`502`).
 
     Response: `204 No Content`. This endpoint does not return a JSON body.
 
-    Failure: `502 cluster_gateway_cleanup_failed` if the isolated Gateway namespace could not be deleted; `409 cluster_has_available_deployments` or `cluster_has_storage_volumes` if a finalized cluster still has those resources.
+    Failure:
+    - `409 cluster_has_available_deployments` or `409 cluster_has_storage_volumes` if a finalized cluster still has those resources.
+    - `409 cluster_admin_cleanup_required` if required remote cleanup needs orchestration administrator privileges (includes `script`, `cleanupDigest`, `operations`, `completedOperations`, `marker`, `canVerifyMarker`, and `confirmRequired`).
+    - `502 cluster_gateway_cleanup_failed` if the cluster is unreachable or required cleanup failed without `confirmAdminCleanup=true` (includes `script` and `cleanupDigest` when available).
   </TabItem>
   <TabItem value="python-api" label="Python API">
     `service.delete_cluster()` raises `ClusterOverviewError` with the same status and code when required cleanup fails.
@@ -783,7 +956,7 @@ Gateway namespace cleanup is required: a failure or timeout returns `502` with c
     from llm_d_lens.cluster import service
 
     async def main() -> None:
-        await service.delete_cluster("cluster-a")
+        await service.delete_cluster("cluster-a", confirm_admin_cleanup=False)
 
     asyncio.run(main())
     ```
@@ -858,7 +1031,7 @@ Profiles declare label names and units in
 
     - `clusterId` (`string`, query): target cluster id.
 
-    Response: `OverviewResponse`.
+    Response: `OverviewResponse`. When Monitoring is configured, Lens fetches live node, CPU, memory, disk, and accelerator telemetry directly from Prometheus over HTTP (supporting restricted namespace-scoped kubeconfigs without cluster-wide `nodes` RBAC). `kubernetes` includes additive metadata fields: `telemetrySource` (`"prometheus"`, `"kubernetes"`, `"hybrid"`, or `"unavailable"`), `prometheusReachable` (`boolean`), `monitoringRequired` (`boolean`), `restrictedResources` (`string[]`), and `notice` (`string | null`).
 
     ```json
     {
@@ -1313,6 +1486,6 @@ Cancel a running bootstrap job so it stops provisioning and does not continue. T
   </TabItem>
 </Tabs>
 
-Additional endpoints exist for the gateway port availability check, HF token secret creation, model secret listing, node cordon/uncordon, and legacy cluster-overview session disconnect routes — see the full OpenAPI reference.
+Additional endpoints exist for the gateway port availability check, HF token secret rotation, model secret listing, node cordon/uncordon, and legacy cluster-overview session disconnect routes — see the full OpenAPI reference.
 
 See the full request/response schemas in the FastAPI OpenAPI schema (regenerate with `npm run docs:api`).

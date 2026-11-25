@@ -790,3 +790,645 @@ def test_prefix_affinity_insertion_preserves_decode_profile():
         {"pluginRef": "prefix-cache-affinity-filter"} in profile["plugins"]
         for profile in updated["schedulingProfiles"][:2]
     )
+
+
+def test_check_target_handles_403_external_refs_prometheus_fallback_and_401(monkeypatch):
+    from llm_d_lens.cluster.service import PrometheusNodeInventory
+    from llm_d_lens.deploy import slice_capacity
+
+    parsed = [
+        workload(replicas=1),
+        {
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": {"name": "route", "namespace": "cache"},
+            "spec": {"parentRefs": [{"kind": "Gateway", "name": "shared-gw", "namespace": "envoy-gateway-system"}]},
+        },
+    ]
+    parsed[0]["spec"]["template"]["spec"]["containers"][0]["resources"] = {"limits": {"nvidia.com/gpu": 2}}
+    parsed[0]["spec"]["template"]["spec"]["nodeSelector"] = {"nvidia.com/gpu.product": "NVIDIA-H100"}
+    body = {"clusterId": "fixture", "clusterSessionId": "session"}
+
+    inv = PrometheusNodeInventory(
+        reachable=True,
+        all_nodes=[
+            {
+                "name": "gpu-1",
+                "role": "worker",
+                "ready": True,
+                "schedulingDisabled": False,
+                "cpu": 16,
+                "memoryBytes": 64 * 1024 * 1024 * 1024,
+                "gpuByProfile": {"nvidia": 4},
+                "gpuModelsByProfile": {"nvidia": ["NVIDIA-H100"]},
+            }
+        ],
+        allocatable_by_node={
+            "gpu-1": {"cpu": 16, "memoryBytes": 64 * 1024 * 1024 * 1024, "gpuByProfile": {"nvidia": 4}}
+        },
+        allocated_gpu_by_node={"gpu-1": 1},
+    )
+
+    async def session(*_):
+        return SimpleNamespace(server_id="fixture")
+
+    async def kubectl_403(args, **kwargs):
+        return SimpleNamespace(ok=False, stdout="", stderr="Error from server (Forbidden): is forbidden")
+
+    monkeypatch.setattr(composition, "validate_planning_session", session)
+    monkeypatch.setattr(composition, "run_kubectl", kubectl_403)
+    monkeypatch.setattr(slice_capacity, "fetch_prometheus_node_inventory", lambda _cid: asyncio.sleep(0, result=inv))
+
+    result = asyncio.run(composition.check_target(None, body, parsed))
+    assert result["available"]["nvidia.com/gpu"] == 3.0
+    assert any("Could not verify external Gateway/shared-gw" in w for w in result["warnings"])
+    assert any("Prometheus metrics" in w for w in result["warnings"])
+    assert any("synthesized from Prometheus" in w for w in result["warnings"])
+
+    async def kubectl_not_found(args, **kwargs):
+        if args[1] == "Gateway":
+            return SimpleNamespace(
+                ok=False, stdout="", stderr='gateways.gateway.networking.k8s.io "shared-gw" not found'
+            )
+        return SimpleNamespace(ok=False, stdout="", stderr="is forbidden")
+
+    monkeypatch.setattr(composition, "run_kubectl", kubectl_not_found)
+    with pytest.raises(GuideError, match="unavailable"):
+        asyncio.run(composition.check_target(None, body, parsed))
+
+    async def kubectl_401(args, **kwargs):
+        return SimpleNamespace(ok=False, stdout="", stderr="error: You must be logged in to the server (Unauthorized)")
+
+    monkeypatch.setattr(composition, "run_kubectl", kubectl_401)
+    with pytest.raises(GuideError) as exc:
+        asyncio.run(composition.check_target(None, body, parsed))
+    assert exc.value.status == 401
+
+
+def test_compose_dry_run_403_warns_without_failing_and_401_raises(source_tree, monkeypatch):
+    async def authorized(request, body):
+        return source_tree, await catalog_module.inventory(source_tree)
+
+    async def binding(request, body):
+        return BINDING
+
+    async def target(request, body, parsed):
+        return {"warnings": [], "level": "device-count", "demand": {}, "available": {}}
+
+    monkeypatch.setattr(composition, "authorized_inventory", authorized)
+    monkeypatch.setattr(composition, "model_binding", binding)
+    monkeypatch.setattr(composition, "check_target", target)
+
+    async def dry_run_403(args, **kwargs):
+        return SimpleNamespace(ok=False, stdout="", stderr="deployments.apps is forbidden")
+
+    monkeypatch.setattr(composition, "run_kubectl", dry_run_403)
+
+    async def run():
+        catalog = await catalog_module.inventory(source_tree)
+        body = {
+            "commit": catalog["commit"],
+            "clusterId": "fixture",
+            "clusterSessionId": "session",
+            "namespace": "cache",
+            "units": [{"path": "guides/optimized-baseline/modelserver/overlay"}],
+            "validateCluster": True,
+        }
+        result = await composition.compose(None, body)
+        assert result["validation"]["clusterValidated"] is False
+        assert any("dry-run skipped" in w for w in result["validation"]["warnings"])
+
+        async def dry_run_401(args, **kwargs):
+            return SimpleNamespace(ok=False, stdout="", stderr="Unauthorized")
+
+        monkeypatch.setattr(composition, "run_kubectl", dry_run_401)
+        with pytest.raises(GuideError) as exc:
+            await composition.compose(None, body)
+        assert exc.value.status == 401
+
+    asyncio.run(run())
+
+
+def test_discover_local_cluster_falls_back_to_prometheus_on_403_and_raises_401(monkeypatch):
+    from llm_d_lens.cluster.service import PrometheusNodeInventory
+    from llm_d_lens.deploy import guide_sources, slice_capacity
+
+    inv = PrometheusNodeInventory(
+        reachable=True,
+        all_nodes=[
+            {
+                "name": "worker-1",
+                "role": "worker",
+                "version": "v1.32.0",
+                "ready": True,
+                "schedulingDisabled": False,
+                "cpu": 16,
+                "memoryBytes": 64 * 1024 * 1024 * 1024,
+                "gpuByProfile": {"nvidia": 2},
+                "gpuModelsByProfile": {},
+            }
+        ],
+        allocatable_by_node={
+            "worker-1": {"cpu": 16, "memoryBytes": 64 * 1024 * 1024 * 1024, "gpuByProfile": {"nvidia": 2}}
+        },
+        allocated_gpu_by_node={},
+    )
+
+    monkeypatch.setattr(guide_sources, "require_active_session", lambda _sid: SimpleNamespace(server_id="cluster-1"))
+    monkeypatch.setattr(guide_sources, "current_principal", lambda _req: None)
+    monkeypatch.setattr(guide_sources, "require_cluster_access", lambda _p, _c: None)
+    monkeypatch.setattr(guide_sources, "require_internal_permission", lambda _req, _path: asyncio.sleep(0))
+    monkeypatch.setattr(slice_capacity, "fetch_prometheus_node_inventory", lambda _cid: asyncio.sleep(0, result=inv))
+
+    async def kubectl_403(argv, **kwargs):
+        return SimpleNamespace(ok=False, stdout="", stderr="is forbidden")
+
+    monkeypatch.setattr(guide_sources, "run_kubectl", kubectl_403)
+    profile = asyncio.run(guide_sources.discover_local_cluster(None, "session-1"))
+    assert profile is not None
+    assert profile["version"] == "v1.32.0"
+    assert profile["allocatable"]["accelerators"] == {"nvidia.com/gpu": 2}
+    assert profile["allocatable"]["memoryGiB"] == 64
+
+    async def kubectl_401(argv, **kwargs):
+        return SimpleNamespace(ok=False, stdout="", stderr="Unauthorized")
+
+    monkeypatch.setattr(guide_sources, "run_kubectl", kubectl_401)
+    with pytest.raises(GuideError) as exc:
+        asyncio.run(guide_sources.discover_local_cluster(None, "session-1"))
+    assert exc.value.status == 401
+
+
+@pytest.mark.asyncio
+async def test_model_binding_resolves_local_disk_and_nfs_namespace(monkeypatch):
+    from llm_d_lens.model_cache import router as model_cache_router
+    from llm_d_lens.storage import router as storage_router
+
+    async def fake_require_internal(_request, _path):
+        return None
+
+    async def fake_get_entry(entry_id, _request):
+        return {
+            "id": entry_id,
+            "clusterId": "cluster-1",
+            "storageVolumeId": "vol-1",
+            "status": "ready",
+            "nodeProgress": [{"node": "*", "status": "ready"}],
+            "source": {"kind": "huggingface", "huggingface": {"repoId": "org/model", "revision": "main"}},
+        }
+
+    monkeypatch.setattr(composition, "require_internal_permission", fake_require_internal)
+    monkeypatch.setattr(model_cache_router, "get_entry", fake_get_entry)
+
+    for volume_payload in (
+        {
+            "id": "vol-1",
+            "clusterId": "cluster-1",
+            "status": "ready",
+            "pvcName": "prism-storage-vol-1",
+            "localDisk": {"hostPath": "/data/models", "namespace": "lens-edit"},
+        },
+        {
+            "id": "vol-1",
+            "clusterId": "cluster-1",
+            "status": "ready",
+            "pvcName": "prism-storage-vol-1",
+            "nfs": {"server": "nfs.example.com", "path": "/exports", "namespace": "lens-edit"},
+        },
+    ):
+        async def fake_get_volume(_volume_id, _request, _payload=volume_payload):
+            return _payload
+
+        monkeypatch.setattr(storage_router, "get_volume", fake_get_volume)
+        binding = await composition.model_binding(
+            None,
+            {"clusterId": "cluster-1", "namespace": "lens-edit", "modelCacheEntryId": "mc-1"},
+        )
+        assert binding["namespace"] == "lens-edit"
+        assert binding["pvcName"] == "prism-storage-vol-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["standalone", "gateway"])
+async def test_render_router_applies_plaintext_epp_and_respects_overrides(tmp_path, monkeypatch, mode):
+    from llm_d_lens.deploy.data_plane import PLAINTEXT_EPP_VALUES_PATH
+
+    archive = tmp_path / f"llm-d-router-{mode}-1.0.0.tgz"
+    archive.write_bytes(b"tgz")
+    calls = []
+
+    async def fake_chart_archive(chart, version):
+        return archive
+
+    async def fake_command(argv, timeout=90):
+        calls.append(argv)
+        return "kind: Service\nmetadata:\n  name: router\n"
+
+    monkeypatch.setattr(composition, "chart_archive", fake_chart_archive)
+    monkeypatch.setattr(composition, "command", fake_command)
+    catalog = {
+        "assets": [
+            {"path": "router/default.yaml", "kind": "values", "content": "router:\n  replicas: 1\n"},
+            {
+                "path": "router/tls.yaml",
+                "kind": "values",
+                "content": "router:\n  epp:\n    flags:\n      secure-serving: true\n",
+            },
+        ]
+    }
+    base_body = {
+        "namespace": "bench-ns",
+        "router": {"mode": mode, "release": "rel", "values": [{"path": "router/default.yaml"}]},
+    }
+
+    await composition.render_router(catalog, base_body)
+    args_default = calls[-1]
+    assert ["-f", str(PLAINTEXT_EPP_VALUES_PATH)] == args_default[-2:]
+
+    override_values_body = {
+        "namespace": "bench-ns",
+        "router": {"mode": mode, "release": "rel", "values": [{"path": "router/tls.yaml"}]},
+    }
+    await composition.render_router(catalog, override_values_body)
+    assert str(PLAINTEXT_EPP_VALUES_PATH) not in calls[-1]
+
+    override_set_body = {
+        **base_body,
+        "router": {**base_body["router"], "set": ["router.epp.flags.secure-serving=true"]},
+    }
+    await composition.render_router(catalog, override_set_body)
+    assert str(PLAINTEXT_EPP_VALUES_PATH) not in calls[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chart_name", ["llm-d-router-standalone", "llm-d-router-gateway"])
+async def test_render_unit_applies_plaintext_epp_ignoring_chart_defaults(tmp_path, monkeypatch, chart_name):
+    from llm_d_lens.deploy.data_plane import PLAINTEXT_EPP_VALUES_PATH
+
+    archive = tmp_path / f"{chart_name}-1.0.0.tgz"
+    archive.write_bytes(b"tgz")
+    template_calls = []
+
+    async def fake_chart_archive(chart, version):
+        return archive
+
+    async def fake_command(argv, timeout=90):
+        if argv[:3] == ["helm", "show", "values"]:
+            return "router:\n  epp:\n    flags:\n      secure-serving: true\n"
+        template_calls.append(argv)
+        return composition.dump(
+            [
+                {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {"name": "rel-epp", "namespace": "ns"},
+                    "spec": {
+                        "template": {
+                            "spec": {
+                                "volumes": [{"name": "envoy-cfg", "configMap": {"name": "envoy"}}],
+                                "containers": [
+                                    {"name": "epp", "args": ["--pool-name=p", "--secure-serving=false"]},
+                                    {
+                                        "name": "envoy-proxy",
+                                        "volumeMounts": [{"name": "envoy-cfg", "mountPath": "/etc/envoy"}],
+                                    },
+                                ],
+                            }
+                        }
+                    },
+                },
+                {
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "envoy", "namespace": "ns"},
+                    "data": {
+                        "envoy.yaml": yaml.safe_dump(
+                            {
+                                "static_resources": {
+                                    "clusters": [
+                                        {
+                                            "name": "ext_proc",
+                                            "transport_socket": {"name": "envoy.transport_sockets.tls"},
+                                        }
+                                    ]
+                                }
+                            },
+                            sort_keys=False,
+                        )
+                    },
+                },
+            ]
+        )
+
+    monkeypatch.setattr(composition, "chart_archive", fake_chart_archive)
+    monkeypatch.setattr(composition, "command", fake_command)
+    catalog = {
+        "commit": "a" * 40,
+        "guides": [],
+        "assets": [
+            {
+                "path": f"charts/{chart_name}",
+                "kind": "chart",
+                "guide": "router",
+                "chart": f"oci://ghcr.io/llm-d/charts/{chart_name}",
+                "release": "rel",
+                "version": "v1.0.0",
+                "checksum": "chk",
+            },
+            {
+                "path": "values/tls.yaml",
+                "kind": "values",
+                "content": "router:\n  epp:\n    flags:\n      secure-serving: true\n",
+            },
+        ],
+    }
+
+    # Chart defaults (helm show values) must NOT suppress PLAINTEXT_EPP_VALUES_PATH,
+    # and Envoy ext_proc TLS must be reconciled to plaintext when EPP uses --secure-serving=false.
+    unit = await composition.render_unit(tmp_path, catalog, {"path": f"charts/{chart_name}", "namespace": "ns"})
+    assert str(PLAINTEXT_EPP_VALUES_PATH) in template_calls[-1]
+    envoy_cfg = yaml.safe_load(next(d for d in unit["documents"] if d["kind"] == "ConfigMap")["data"]["envoy.yaml"])
+    assert "transport_socket" not in envoy_cfg["static_resources"]["clusters"][0]
+
+    # Explicit selection["values"], chartValues, or chartSet overrides MUST be respected.
+    await composition.render_unit(
+        tmp_path,
+        catalog,
+        {
+            "path": f"charts/{chart_name}",
+            "namespace": "ns",
+            "values": "router:\n  epp:\n    flags:\n      secure-serving: true\n",
+        },
+    )
+    assert str(PLAINTEXT_EPP_VALUES_PATH) not in template_calls[-1]
+
+    await composition.render_unit(
+        tmp_path,
+        catalog,
+        {"path": f"charts/{chart_name}", "namespace": "ns", "chartValues": ["values/tls.yaml"]},
+    )
+    assert str(PLAINTEXT_EPP_VALUES_PATH) not in template_calls[-1]
+
+    await composition.render_unit(
+        tmp_path,
+        catalog,
+        {"path": f"charts/{chart_name}", "namespace": "ns", "chartSet": ["router.epp.flags.secure-serving=true"]},
+    )
+    assert str(PLAINTEXT_EPP_VALUES_PATH) not in template_calls[-1]
+
+
+@pytest.mark.asyncio
+async def test_render_router_reconciles_envoy_ext_proc_tls_only_when_epp_plaintext(tmp_path, monkeypatch):
+    archive = tmp_path / "llm-d-router-standalone-0.9.0.tgz"
+    archive.write_bytes(b"tgz")
+
+    def make_rendered_manifest(*, epp_flag: str, with_tls: bool) -> str:
+        ext_proc_cluster = {"name": "ext_proc", "type": "STRICT_DNS"}
+        if with_tls:
+            ext_proc_cluster["transport_socket"] = {
+                "name": "envoy.transport_sockets.tls",
+                "typed_config": {
+                    "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext"
+                },
+            }
+            ext_proc_cluster["health_checks"] = [{"timeout": "1s", "tls_options": {"alpn_protocols": ["h2"]}}]
+        other_cluster = {
+            "name": "upstream_tls",
+            "transport_socket": {"name": "envoy.transport_sockets.tls"},
+        }
+        envoy_yaml = yaml.safe_dump(
+            {"static_resources": {"clusters": [ext_proc_cluster, other_cluster]}}, sort_keys=False
+        )
+        docs = [
+            {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "rel-epp", "namespace": "ns"},
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "volumes": [{"name": "envoy-cfg", "configMap": {"name": "envoy"}}],
+                            "containers": [
+                                {"name": "epp", "args": ["--pool-name=p", epp_flag]},
+                                {
+                                    "name": "envoy-proxy",
+                                    "volumeMounts": [{"name": "envoy-cfg", "mountPath": "/etc/envoy"}],
+                                },
+                            ],
+                        }
+                    }
+                },
+            },
+            {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "envoy", "namespace": "ns"},
+                "data": {"envoy.yaml": envoy_yaml},
+            },
+        ]
+        return composition.dump(docs)
+
+    rendered_text = make_rendered_manifest(epp_flag="--secure-serving=false", with_tls=True)
+
+    async def fake_chart_archive(chart, version):
+        return archive
+
+    async def fake_command(argv, timeout=90):
+        return rendered_text
+
+    monkeypatch.setattr(composition, "chart_archive", fake_chart_archive)
+    monkeypatch.setattr(composition, "command", fake_command)
+    catalog = {"assets": [{"path": "router/default.yaml", "kind": "values", "content": "router: {}\n"}]}
+    body = {
+        "namespace": "ns",
+        "router": {"mode": "standalone", "release": "rel", "values": [{"path": "router/default.yaml"}]},
+    }
+
+    docs = await composition.render_router(catalog, body)
+    envoy_cfg = yaml.safe_load(next(d for d in docs if d["kind"] == "ConfigMap")["data"]["envoy.yaml"])
+    clusters = {c["name"]: c for c in envoy_cfg["static_resources"]["clusters"]}
+    assert "transport_socket" not in clusters["ext_proc"]
+    assert clusters["ext_proc"]["health_checks"] == [{"timeout": "1s"}]
+    assert clusters["upstream_tls"]["transport_socket"] == {"name": "envoy.transport_sockets.tls"}
+
+    # When EPP is explicitly on TLS (--secure-serving=true), Envoy TLS must stay intact.
+    rendered_text = make_rendered_manifest(epp_flag="--secure-serving=true", with_tls=True)
+    docs_tls = await composition.render_router(catalog, body)
+    envoy_tls = yaml.safe_load(next(d for d in docs_tls if d["kind"] == "ConfigMap")["data"]["envoy.yaml"])
+    assert envoy_tls["static_resources"]["clusters"][0]["transport_socket"]["name"] == "envoy.transport_sockets.tls"
+
+    # Already-plaintext Envoy config is a clean no-op preserving raw formatting.
+    rendered_text = make_rendered_manifest(epp_flag="--secure-serving=false", with_tls=False)
+    raw_envoy = yaml.safe_load(rendered_text.split("---\n")[1])["data"]["envoy.yaml"]
+    docs_noop = await composition.render_router(catalog, body)
+    assert next(d for d in docs_noop if d["kind"] == "ConfigMap")["data"]["envoy.yaml"] == raw_envoy
+
+
+def test_guide_planning_image_priority_and_override_preservation():
+    from llm_d_lens.deploy import guide_planning
+    from llm_d_lens.deploy.providers.hardware_profile import runtime_image
+
+    profile_default = runtime_image(accelerator="nvidia")
+    managed_repo = profile_default.rsplit(":", 1)[0]
+    custom_tag = f"{managed_repo}:v0.31.0-custom"
+    cluster_img = "registry.internal:5000/org/vllm:v0.8.5"
+
+    assert (
+        guide_planning.pin_model_server_image(
+            custom_tag,
+            accelerator="nvidia",
+            cluster_vllm_image=cluster_img,
+            explicit_override=True,
+        )
+        == custom_tag
+    )
+
+    doc_override = guide_planning.plan_documents(
+        [workload()],
+        "example/model",
+        {},
+        None,
+        {
+            "accelerator": "nvidia",
+            "runtimeImage": custom_tag,
+            "runtimeImageOverride": True,
+        },
+        cluster_vllm_image=cluster_img,
+    )
+    assert doc_override["documents"][0]["spec"]["template"]["spec"]["containers"][0]["image"] == custom_tag
+
+    doc_cluster = guide_planning.plan_documents(
+        [workload()],
+        "example/model",
+        {},
+        None,
+        {"accelerator": "nvidia"},
+        cluster_vllm_image=cluster_img,
+    )
+    assert doc_cluster["documents"][0]["spec"]["template"]["spec"]["containers"][0]["image"] == cluster_img
+
+    doc_stock_pinned = guide_planning.plan_documents(
+        [workload()],
+        "example/model",
+        {},
+        None,
+        {"accelerator": "nvidia", "runtimeImage": profile_default, "runtimeImageOverride": False},
+        cluster_vllm_image=cluster_img,
+    )
+    assert doc_stock_pinned["documents"][0]["spec"]["template"]["spec"]["containers"][0]["image"] == cluster_img
+
+    doc_profile = guide_planning.plan_documents(
+        [workload()],
+        "example/model",
+        {},
+        None,
+        {"accelerator": "nvidia"},
+    )
+    assert doc_profile["documents"][0]["spec"]["template"]["spec"]["containers"][0]["image"] == profile_default
+
+    with pytest.raises(GuideError):
+        guide_planning.plan_documents(
+            [workload()],
+            "example/model",
+            {},
+            None,
+            {"accelerator": "nvidia", "runtimeImage": "untagged"},
+        )
+
+
+def test_compose_inherits_cluster_vllm_image_and_respects_explicit_override(source_tree, monkeypatch):
+    async def authorized(request, body):
+        return source_tree, await catalog_module.inventory(source_tree)
+
+    async def binding(request, body):
+        return BINDING
+
+    async def target(request, body, parsed):
+        return {"warnings": [], "level": "device-count", "demand": {}, "available": {}}
+
+    monkeypatch.setattr(composition, "authorized_inventory", authorized)
+    monkeypatch.setattr(composition, "model_binding", binding)
+    monkeypatch.setattr(composition, "check_target", target)
+    monkeypatch.setattr(
+        composition,
+        "resolve_cluster_vllm_image",
+        lambda cid: "registry.internal:5000/org/vllm:cluster-1" if cid == "cluster-custom" else None,
+    )
+
+    async def run():
+        catalog = await catalog_module.inventory(source_tree)
+        base_body = {
+            "commit": catalog["commit"],
+            "clusterId": "cluster-custom",
+            "namespace": "cache",
+            "units": [{"path": "guides/optimized-baseline/modelserver/overlay"}],
+            "validateCluster": False,
+        }
+        inherited = await composition.compose(None, base_body)
+        inherited_docs = list(yaml.safe_load_all(inherited["files"][0]["content"]))
+        inherited_deploy = next(d for d in inherited_docs if d["kind"] == "Deployment")
+        assert (
+            inherited_deploy["spec"]["template"]["spec"]["containers"][0]["image"]
+            == "registry.internal:5000/org/vllm:cluster-1"
+        )
+
+        overridden = await composition.compose(
+            None,
+            {
+                **base_body,
+                "runtimeImage": "docker.io/vllm/vllm-openai:v0.31.0-manual",
+                "runtimeImageOverride": True,
+            },
+        )
+        overridden_docs = list(yaml.safe_load_all(overridden["files"][0]["content"]))
+        overridden_deploy = next(d for d in overridden_docs if d["kind"] == "Deployment")
+        assert (
+            overridden_deploy["spec"]["template"]["spec"]["containers"][0]["image"]
+            == "docker.io/vllm/vllm-openai:v0.31.0-manual"
+        )
+
+        with pytest.raises(GuideError):
+            await composition.compose(None, {**base_body, "runtimeImage": "invalid image;id"})
+
+        tampered = inherited["files"][0]["content"].replace(
+            "registry.internal:5000/org/vllm:cluster-1",
+            "registry:5000/untagged",
+        )
+        with pytest.raises(GuideError):
+            await composition.compose(
+                None,
+                {
+                    **base_body,
+                    "finalConfiguration": {
+                        "baseChecksum": inherited["compositionChecksum"],
+                        "content": tampered,
+                    },
+                },
+            )
+
+    asyncio.run(run())
+
+
+def test_plan_documents_ignores_smuggled_cluster_vllm_image_and_validates_kwarg():
+    from llm_d_lens.deploy import guide_planning
+    from llm_d_lens.deploy.providers.hardware_profile import runtime_image
+
+    profile_default = runtime_image(accelerator="nvidia")
+    smuggled = guide_planning.plan_documents(
+        [workload()],
+        "example/model",
+        {},
+        None,
+        {"accelerator": "nvidia", "_clusterVllmImage": "-flag;injection"},
+    )
+    assert smuggled["documents"][0]["spec"]["template"]["spec"]["containers"][0]["image"] == profile_default
+
+    with pytest.raises(GuideError):
+        guide_planning.plan_documents(
+            [workload()],
+            "example/model",
+            {},
+            None,
+            {"accelerator": "nvidia"},
+            cluster_vllm_image="-flag;injection",
+        )

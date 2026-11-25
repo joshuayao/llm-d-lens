@@ -30,7 +30,7 @@ Start with **Optimized Baseline** before testing a more specialized option.
 
 When changing cluster or source version, recheck the available variants. If generation
 reports missing network or storage resources, choose another supported variant or ask
-the cluster administrator to prepare those resources.
+the orchestration administrator to prepare those resources.
 
 ## Test Optimized Baseline
 
@@ -47,7 +47,7 @@ affinity and saturation protection but removes load scoring.
 
 1. Select **pd-disaggregation** and a **P/D Guide variant**.
 2. Set **Prefill replicas**, **Prefill tensor parallel size**, **Decode replicas**, and **Decode tensor parallel size**.
-3. For **vllm-rdma**, check **Cache & network → RDMA NICs per pod** with your cluster administrator.
+3. For **vllm-rdma**, check **Cache & network → RDMA NICs per pod** with your orchestration administrator.
 4. Add an aggregated baseline using the same total number of accelerators.
 5. Use **Add matrix** to test the input/output sizes your application needs (**Fixed input / output lengths** in the full wizard).
 6. Compare TTFT and TPOT as well as throughput. Faster token generation can still come with a longer wait for the first token.

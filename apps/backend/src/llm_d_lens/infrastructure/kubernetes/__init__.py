@@ -315,26 +315,40 @@ async def create_namespace(namespace: str, *, cluster_id: str | None = None) -> 
 
 
 async def delete_namespace(
-    namespace: str, *, cluster_id: str | None = None, timeout: float | None = 60
+    namespace: str,
+    *,
+    cluster_id: str | None = None,
+    timeout: float | None = 60,
+    runner: CommandRunner | None = None,
 ) -> CommandResult:
     """Delete a Kubernetes namespace (and everything in it). Best-effort caller
     should not treat a missing namespace as fatal -- pass ``--ignore-not-found``
-    so a namespace that was never created (or already gone) is a no-op."""
-    return await scoped_runner(cluster_id).run(
-        ["kubectl", "delete", "namespace", namespace, "--ignore-not-found"], timeout=timeout
-    )
+    so a namespace that was never created (or already gone) is a no-op.
+
+    ``runner`` overrides the cluster-scoped runner, e.g. for a temporary admin
+    kubeconfig used only by cleanup.
+    """
+    active = runner if runner is not None else scoped_runner(cluster_id)
+    return await active.run(["kubectl", "delete", "namespace", namespace, "--ignore-not-found"], timeout=timeout)
 
 
 async def delete_secret(
-    name: str, *, namespace: str, cluster_id: str | None = None, timeout: float | None = 30
+    name: str,
+    *,
+    namespace: str,
+    cluster_id: str | None = None,
+    timeout: float | None = 30,
+    runner: CommandRunner | None = None,
 ) -> CommandResult:
     """Delete a single Kubernetes Secret, leaving its namespace in place.
 
     Used when the namespace may be shared with unrelated workloads, so deleting
     the whole namespace would be destructive. Passes ``--ignore-not-found`` so a
-    Secret that was never created (or is already gone) is a no-op.
+    Secret that was never created (or is already gone) is a no-op. ``runner``
+    overrides the cluster-scoped runner for temporary-credential cleanup.
     """
-    return await scoped_runner(cluster_id).run(
+    active = runner if runner is not None else scoped_runner(cluster_id)
+    return await active.run(
         ["kubectl", "delete", "secret", name, "--namespace", namespace, "--ignore-not-found"], timeout=timeout
     )
 

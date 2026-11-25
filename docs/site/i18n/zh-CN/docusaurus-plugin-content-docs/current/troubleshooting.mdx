@@ -27,7 +27,7 @@ Gateway 永远不会为其分配地址。**解决方法：** 在云端集群上�
 ## InferencePool 对应的 HTTPRoute 出现 `ResolvedRefs=False`（`InvalidKind`）
 
 以下修复用于 **Envoy AI Gateway**，不是集群向导中选择的 **Istio**。
-请集群管理员安装带 inference-pool 插件的 Envoy Gateway；缺少该插件时，
+请编排平台管理员安装带 inference-pool 插件的 Envoy Gateway；缺少该插件时，
 指向 `InferencePool` 的路由会返回 500。
 
 使用目标集群的 kubeconfig 执行：

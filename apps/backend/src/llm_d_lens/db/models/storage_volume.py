@@ -117,8 +117,16 @@ class StorageVolumeRow(Base, DeclarativeDtoMixin):
     def to_dto(self) -> StorageVolume:
         values: dict[str, object] = {path: getattr(self, col) for col, path in self.column_map.items()}
         values["id"] = self.id
-        values["local_disk"] = {"host_path": self.local_disk_host_path} if self.kind == "local-disk" else None
-        values["nfs"] = {"server": self.nfs_server, "path": self.nfs_path} if self.kind == "nfs" else None
+        values["local_disk"] = (
+            {"host_path": self.local_disk_host_path, "namespace": self.dynamic_pvc_namespace}
+            if self.kind == "local-disk"
+            else None
+        )
+        values["nfs"] = (
+            {"server": self.nfs_server, "path": self.nfs_path, "namespace": self.dynamic_pvc_namespace}
+            if self.kind == "nfs"
+            else None
+        )
         values["dynamic_pvc"] = (
             {
                 "storage_class": self.dynamic_pvc_storage_class,
@@ -148,11 +156,16 @@ def _spec_columns(dto: StorageVolume) -> dict[str, object]:
     local_disk = dto.local_disk
     nfs = dto.nfs
     dynamic_pvc = dto.dynamic_pvc
+    namespace = (
+        dynamic_pvc.namespace
+        if dynamic_pvc
+        else (local_disk.namespace if local_disk else (nfs.namespace if nfs else None))
+    )
     return {
         "local_disk_host_path": local_disk.host_path if local_disk else None,
         "nfs_server": nfs.server if nfs else None,
         "nfs_path": nfs.path if nfs else None,
         "dynamic_pvc_storage_class": dynamic_pvc.storage_class if dynamic_pvc else None,
-        "dynamic_pvc_namespace": dynamic_pvc.namespace if dynamic_pvc else None,
+        "dynamic_pvc_namespace": namespace,
         "dynamic_pvc_access_mode": dynamic_pvc.access_mode if dynamic_pvc else None,
     }

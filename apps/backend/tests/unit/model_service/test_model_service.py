@@ -837,3 +837,741 @@ def test_gateway_status_reports_components_stopped_when_scaled_to_zero(monkeypat
     assert entry["gatewayState"] == "installed"
     assert entry["gatewayReady"] is True
     assert entry["gatewayRunning"] is False
+
+
+def test_create_publish_and_member_non_admin_return_sync_handoff(monkeypatch):
+    import asyncio
+
+    from fastapi import BackgroundTasks
+
+    from llm_d_lens.model_service import router as router_module
+    from llm_d_lens.model_service.gateway_contracts import GatewayHandoffPayload, GatewayOperation
+
+    _patch_target(monkeypatch, execution_id="exec-1", cluster_id="cluster-a")
+    service = _service()
+    monkeypatch.setattr(router_module, "_service", service)
+    user = _create_user("nonadmin-publisher")
+    principal = _admin_principal(user.id, user.username)
+    handoff = GatewayHandoffPayload(
+        cluster_id="cluster-a",
+        access_mode="non_admin",
+        reconcile_status="admin_handoff_required",
+        desired_hash="a" * 64,
+        marker_namespace="ns",
+        marker_name="lens-ms-handoff-aaaaaaaaaaaaaaaa",
+        filename="remediate.sh",
+        admin_script="#!/usr/bin/env bash\n",
+        instructions="Apply as an Orchestration administrator",
+        pending_operations=[],
+        warnings=[],
+    )
+    probe_calls = []
+
+    async def fake_probe(cluster_id, **_kwargs):
+        probe_calls.append(cluster_id)
+        return SimpleNamespace(can_reconcile_routes=False, access_mode="non_admin", probe_conclusive=True)
+
+    async def fake_reconcile(cluster_id, *, actor=None):
+        return GatewayOperation(
+            kind="reconcile-gateway",
+            cluster_id=cluster_id,
+            status="succeeded",
+            detail_json={"reconcileStatus": "admin_handoff_required", "handoff": handoff.api_payload()},
+        )
+
+    monkeypatch.setattr(router_module._gateway_ops, "probe_capabilities", fake_probe)
+    monkeypatch.setattr(router_module._gateway_ops, "reconcile_cluster", fake_reconcile)
+
+    # Standalone create (execution_id=None) skips reconcile/probe.
+    bg_empty = BackgroundTasks()
+    standalone = asyncio.run(
+        router_module.admin_create_group(
+            _fake_request(principal),
+            GroupCreateRequest(name="standalone", clusterId="cluster-a"),
+            bg_empty,
+        )
+    )
+    assert "reconcileStatus" not in standalone
+    assert probe_calls == []
+    assert len(bg_empty.tasks) == 0
+
+    # Combined create on Non-Admin returns handoff synchronously without BackgroundTasks.
+    bg_create = BackgroundTasks()
+    created = asyncio.run(
+        router_module.admin_create_group(
+            _fake_request(principal),
+            GroupCreateRequest(name="combined-nonadmin", clusterId="cluster-a", executionId="exec-1"),
+            bg_create,
+        )
+    )
+    assert created["reconcileStatus"] == "admin_handoff_required"
+    assert created["handoff"]["desiredHash"] == "a" * 64
+    assert len(bg_create.tasks) == 0
+
+    # Publish on Non-Admin returns handoff synchronously.
+    _patch_target(monkeypatch, execution_id="exec-2", cluster_id="cluster-a")
+    bg_pub = BackgroundTasks()
+    published = asyncio.run(
+        router_module.admin_publish_group(
+            _fake_request(principal),
+            GroupPublishRequest(name="published-nonadmin", clusterId="cluster-a", executionId="exec-2"),
+            bg_pub,
+        )
+    )
+    assert published["reconcileStatus"] == "admin_handoff_required"
+    assert len(bg_pub.tasks) == 0
+
+    # Add member on Non-Admin returns handoff synchronously.
+    _patch_target(monkeypatch, execution_id="exec-3", cluster_id="cluster-a")
+    bg_mem = BackgroundTasks()
+    member = asyncio.run(
+        router_module.admin_create_member(
+            _fake_request(principal),
+            MemberCreateRequest(groupId=standalone["id"], executionId="exec-3"),
+            bg_mem,
+        )
+    )
+    assert member["reconcileStatus"] == "admin_handoff_required"
+    assert len(bg_mem.tasks) == 0
+
+
+def test_gateway_reconcile_filters_visible_clusters_and_splits_admin_vs_non_admin(monkeypatch):
+    import asyncio
+
+    from fastapi import BackgroundTasks
+
+    from llm_d_lens.model_service import router as router_module
+    from llm_d_lens.model_service.gateway_contracts import GatewayHandoffPayload, GatewayOperation
+
+    service = _service()
+    for cid in ("cluster-admin", "cluster-nonadmin", "cluster-hidden"):
+        grp = service.create_group(GroupCreateRequest(name=f"m-{cid}", clusterId=cid), created_by=None)
+        _patch_target(monkeypatch, execution_id=f"exec-{cid}", cluster_id=cid)
+        service.create_member(MemberCreateRequest(groupId=grp.id, executionId=f"exec-{cid}"), published_by=None)
+    monkeypatch.setattr(router_module, "_service", service)
+
+    async def fake_probe(cluster_id, **_kwargs):
+        return SimpleNamespace(
+            can_reconcile_routes=(cluster_id == "cluster-admin"),
+            access_mode=("admin" if cluster_id == "cluster-admin" else "non_admin"),
+            probe_conclusive=True,
+        )
+
+    async def fake_reconcile(cluster_id, *, actor=None):
+        handoff = GatewayHandoffPayload(
+            cluster_id=cluster_id,
+            access_mode="non_admin",
+            reconcile_status="admin_handoff_required",
+            desired_hash="b" * 64,
+            marker_namespace="ns",
+            marker_name="lens-ms-handoff-bbbbbbbbbbbbbbbb",
+            filename="remediate.sh",
+            admin_script="#!/usr/bin/env bash\n",
+            instructions="Apply as an Orchestration administrator",
+            pending_operations=[],
+            warnings=[],
+        )
+        return GatewayOperation(
+            kind="reconcile-gateway",
+            cluster_id=cluster_id,
+            status="succeeded",
+            detail_json={"reconcileStatus": "admin_handoff_required", "handoff": handoff.api_payload()},
+        )
+
+    monkeypatch.setattr(router_module._gateway_ops, "probe_capabilities", fake_probe)
+    monkeypatch.setattr(router_module._gateway_ops, "reconcile_cluster", fake_reconcile)
+
+    principal = Principal(
+        user_id="scoped-maintainer",
+        username="scoped-maintainer",
+        bindings=(
+            RoleBinding("maintainer", ScopeType.CLUSTER, scope_cluster_id="cluster-admin"),
+            RoleBinding("maintainer", ScopeType.CLUSTER, scope_cluster_id="cluster-nonadmin"),
+        ),
+    )
+    background = BackgroundTasks()
+    result = asyncio.run(router_module.admin_gateway_reconcile(_fake_request(principal), background))
+    assert result["scheduled"] is True
+    assert result["clusters"] == ["cluster-admin"]
+    assert result["reconcileStatus"] == "admin_handoff_required"
+    assert [item["clusterId"] for item in result["handoffs"]] == ["cluster-nonadmin"]
+    assert len(background.tasks) == 1
+    assert background.tasks[0].args == (["cluster-admin"],)
+
+
+def test_gateway_ipp_config_and_connection_expose_handoff_and_access_mode(monkeypatch):
+    import asyncio
+
+    from llm_d_lens.model_service import router as router_module
+    from llm_d_lens.model_service.gateway_contracts import (
+        GatewayHandoffPayload,
+        GatewayOperation,
+        GatewayStatus,
+        GatewayStatusCluster,
+        IppConfigRequest,
+    )
+
+    handoff = GatewayHandoffPayload(
+        cluster_id="cluster-a",
+        access_mode="non_admin",
+        reconcile_status="admin_handoff_required",
+        desired_hash="c" * 64,
+        marker_namespace="ns",
+        marker_name="lens-ms-handoff-cccccccccccccccc",
+        filename="remediate.sh",
+        admin_script="#!/usr/bin/env bash\n",
+        instructions="Apply as an Orchestration administrator",
+        pending_operations=[],
+        warnings=[],
+        mode="ipp_config",
+    )
+
+    async def fake_set_ipp(cluster_id, config, *, actor=None):
+        return GatewayOperation(
+            kind="install-ipp",
+            cluster_id=cluster_id,
+            status="succeeded",
+            detail_json={"reconcileStatus": "admin_handoff_required", "handoff": handoff.api_payload()},
+        )
+
+    async def fake_status():
+        return GatewayStatus(
+            clusters=[
+                GatewayStatusCluster(
+                    cluster_id="cluster-a",
+                    cluster_name="Cluster A",
+                    reconcile_status="admin_handoff_required",
+                    access_mode="non_admin",
+                    gateway_ready=True,
+                ),
+                GatewayStatusCluster(
+                    cluster_id="cluster-hidden",
+                    cluster_name="Hidden",
+                    reconcile_status="synced",
+                    access_mode="admin",
+                ),
+            ]
+        )
+
+    monkeypatch.setattr(router_module._gateway_ops, "set_ipp_config", fake_set_ipp)
+    monkeypatch.setattr(router_module._gateway_ops, "status", fake_status)
+
+    principal = _cluster_principal("cluster-a")
+    ipp_result = asyncio.run(
+        router_module.admin_gateway_ipp_config(
+            IppConfigRequest(clusterId="cluster-a", config="plugins: []\n"),
+            _fake_request(principal),
+        )
+    )
+    assert ipp_result["reconcileStatus"] == "admin_handoff_required"
+    assert ipp_result["handoff"]["mode"] == "ipp_config"
+
+    req = _fake_request(principal)
+    conn = asyncio.run(router_module.model_service_connection(req))
+    assert len(conn["clusters"]) == 1
+    assert conn["clusters"][0]["clusterId"] == "cluster-a"
+    assert conn["clusters"][0]["reconcileStatus"] == "admin_handoff_required"
+    assert conn["clusters"][0]["accessMode"] == "non_admin"
+
+
+def test_remediation_endpoints_enforce_rbac_and_map_errors(monkeypatch):
+    import asyncio
+    import json
+
+    from fastapi import HTTPException
+
+    from llm_d_lens.auth.routes import resolve_route_permission
+    from llm_d_lens.core.exceptions import ForbiddenError
+    from llm_d_lens.model_service import router as router_module
+    from llm_d_lens.model_service.gateway_contracts import (
+        GatewayHandoffPayload,
+        GatewayRemediationRequest,
+        GatewayRemediationVerifyRequest,
+        GatewayRemediationVerifyResult,
+    )
+    from llm_d_lens.model_service.gateway_ops import (
+        GatewayClusterNotFoundError,
+        GatewayUnauthenticatedError,
+        GatewayValidationError,
+    )
+
+    assert resolve_route_permission("GET", "/api/v1/model-service/admin/gateway/remediation") == (
+        True,
+        ("model-service:gateway:read", "model-service:group:read", "model-service:member:manage"),
+    )
+    for path in (
+        "/api/v1/model-service/admin/gateway/remediation",
+        "/api/v1/model-service/admin/gateway/remediation/verify",
+    ):
+        assert resolve_route_permission("POST", path) == (
+            True,
+            (
+                "model-service:gateway:reconcile",
+                "model-service:gateway:manage",
+                "model-service:member:manage",
+                "model-service:group:manage",
+                "model-service:group:toggle",
+                "model-service:group:remove",
+            ),
+        )
+
+    handoff = GatewayHandoffPayload(
+        cluster_id="cluster-a",
+        access_mode="non_admin",
+        reconcile_status="admin_handoff_required",
+        desired_hash="e" * 64,
+        marker_namespace="ns",
+        marker_name="lens-ms-handoff-eeeeeeeeeeeeeeee",
+        filename="remediate.sh",
+        admin_script="#!/usr/bin/env bash\n",
+        instructions="Apply as an Orchestration administrator",
+        pending_operations=[],
+        warnings=[],
+    )
+    verify_result = GatewayRemediationVerifyResult(
+        cluster_id="cluster-a",
+        verified=True,
+        reconcile_status="synced",
+        desired_hash="e" * 64,
+        observed_hash="e" * 64,
+        marker_status="complete",
+        marker_namespace="ns",
+        marker_name="lens-ms-handoff-eeeeeeeeeeeeeeee",
+        route_checks=[],
+        gateway_reachable=True,
+        message="Verified",
+    )
+
+    async def fake_get(cluster_id, *, mode="routes", marker_namespace=None):
+        if cluster_id == "missing":
+            raise GatewayClusterNotFoundError("not found")
+        if cluster_id == "invalid":
+            raise GatewayValidationError("bad marker namespace")
+        return handoff
+
+    async def fake_create(cluster_id, *, mode="routes", ipp_config=None, provider=None, marker_namespace=None, actor=None):
+        return handoff.model_copy(update={"mode": mode})
+
+    async def fake_verify(cluster_id, *, expected_hash=None, marker_namespace=None, actor=None):
+        if cluster_id == "unauth":
+            raise GatewayUnauthenticatedError("401 unauthorized")
+        return verify_result
+
+    monkeypatch.setattr(router_module._gateway_ops, "get_remediation", fake_get)
+    monkeypatch.setattr(router_module._gateway_ops, "create_remediation", fake_create)
+    monkeypatch.setattr(router_module._gateway_ops, "verify_remediation", fake_verify)
+
+    # Unreachable cluster rejected on all 3 endpoints.
+    scoped = _cluster_principal("cluster-a", with_permissions=True)
+    with pytest.raises(ForbiddenError):
+        asyncio.run(router_module.admin_gateway_get_remediation(_fake_request(scoped), cluster_id="cluster-b"))
+    with pytest.raises(ForbiddenError):
+        asyncio.run(
+            router_module.admin_gateway_create_remediation(
+                GatewayRemediationRequest(clusterId="cluster-b", mode="routes"), _fake_request(scoped)
+            )
+        )
+    with pytest.raises(ForbiddenError):
+        asyncio.run(
+            router_module.admin_gateway_verify_remediation(
+                GatewayRemediationVerifyRequest(clusterId="cluster-b"), _fake_request(scoped)
+            )
+        )
+
+    # Publisher without gateway:manage/reconcile may read/generate mode="routes", but not mode!="routes".
+    publisher = Principal(
+        user_id="pub",
+        username="pub",
+        bindings=(RoleBinding("pub", ScopeType.CLUSTER, scope_cluster_id="cluster-a"),),
+        role_permissions={"pub": frozenset({"model-service:member:manage", "model-service:group:read"})},
+    )
+    routes_get = asyncio.run(
+        router_module.admin_gateway_get_remediation(_fake_request(publisher), cluster_id="cluster-a", mode="routes")
+    )
+    assert routes_get["mode"] == "routes"
+    with pytest.raises(ForbiddenError):
+        asyncio.run(
+            router_module.admin_gateway_get_remediation(
+                _fake_request(publisher), cluster_id="cluster-a", mode="gateway_repair"
+            )
+        )
+    routes_res = asyncio.run(
+        router_module.admin_gateway_create_remediation(
+            GatewayRemediationRequest(clusterId="cluster-a", mode="routes"), _fake_request(publisher)
+        )
+    )
+    assert routes_res["mode"] == "routes"
+    with pytest.raises(ForbiddenError):
+        asyncio.run(
+            router_module.admin_gateway_create_remediation(
+                GatewayRemediationRequest(clusterId="cluster-a", mode="gateway_repair"), _fake_request(publisher)
+            )
+        )
+
+    # Maintainer with gateway:manage/reconcile can generate non-routes remediation and verify.
+    repair_res = asyncio.run(
+        router_module.admin_gateway_create_remediation(
+            GatewayRemediationRequest(clusterId="cluster-a", mode="gateway_repair"), _fake_request(scoped)
+        )
+    )
+    assert repair_res["mode"] == "gateway_repair"
+    verified = asyncio.run(
+        router_module.admin_gateway_verify_remediation(
+            GatewayRemediationVerifyRequest(clusterId="cluster-a"), _fake_request(scoped)
+        )
+    )
+    assert verified["verified"] is True
+
+    # Publisher without gateway:manage/reconcile may verify mode="routes" (or None), but NOT mode="gateway_repair"/"ipp_config".
+    with pytest.raises(ForbiddenError):
+        asyncio.run(
+            router_module.admin_gateway_verify_remediation(
+                GatewayRemediationVerifyRequest(clusterId="cluster-a", mode="gateway_repair"),
+                _fake_request(publisher),
+            )
+        )
+
+    verify_calls: list[dict] = []
+
+    async def fake_verify_with_mode(cluster_id, *, mode=None, expected_hash=None, marker_namespace=None, actor=None):
+        verify_calls.append({"cluster_id": cluster_id, "mode": mode, "expected_hash": expected_hash})
+        return verify_result
+
+    monkeypatch.setattr(router_module._gateway_ops, "verify_remediation", fake_verify_with_mode)
+    asyncio.run(
+        router_module.admin_gateway_verify_remediation(
+            GatewayRemediationVerifyRequest(clusterId="cluster-a", mode="gateway_repair", expectedHash="e" * 64),
+            _fake_request(scoped),
+        )
+    )
+    assert verify_calls == [{"cluster_id": "cluster-a", "mode": "gateway_repair", "expected_hash": "e" * 64}]
+
+    # Publisher omitting mode (body.mode=None) is pinned to mode="routes" (cannot verify gateway_repair/ipp_config).
+    verify_calls.clear()
+    asyncio.run(
+        router_module.admin_gateway_verify_remediation(
+            GatewayRemediationVerifyRequest(clusterId="cluster-a", expectedHash="e" * 64),
+            _fake_request(publisher),
+        )
+    )
+    assert verify_calls == [{"cluster_id": "cluster-a", "mode": "routes", "expected_hash": "e" * 64}]
+
+    # admin_gateway_install and admin_gateway_scale attach reconcileStatus & handoff when handoff_from_operation returns one.
+    from unittest.mock import AsyncMock
+
+    from llm_d_lens.model_service.gateway_contracts import (
+        ClusterGatewayRequest,
+        ComponentScaleRequest,
+        GatewayOperation,
+    )
+
+    handoff_op = GatewayOperation(
+        kind="install-gateway",
+        cluster_id="cluster-a",
+        status="succeeded",
+        detail_json={"reconcileStatus": "admin_handoff_required", "handoff": handoff.api_payload()},
+    )
+    monkeypatch.setattr(router_module._gateway_ops, "install_cluster_gateway", AsyncMock(return_value=handoff_op))
+    monkeypatch.setattr(router_module._gateway_ops, "scale_component", AsyncMock(return_value=handoff_op))
+
+    install_res = asyncio.run(
+        router_module.admin_gateway_install(ClusterGatewayRequest(clusterId="cluster-a"), _fake_request(scoped))
+    )
+    assert install_res["reconcileStatus"] == "admin_handoff_required"
+    assert install_res["handoff"]["desiredHash"] == "e" * 64
+    scale_res = asyncio.run(
+        router_module.admin_gateway_scale(
+            ComponentScaleRequest(clusterId="cluster-a", namespace="ns", name="lens-ipp", replicas=0),
+            _fake_request(scoped),
+        )
+    )
+    assert scale_res["reconcileStatus"] == "admin_handoff_required"
+    assert scale_res["handoff"]["desiredHash"] == "e" * 64
+    monkeypatch.setattr(router_module._gateway_ops, "verify_remediation", fake_verify)
+
+    # Error mappings (404, 400, 401).
+    global_admin = _admin_principal("admin-1", "admin-1")
+    with pytest.raises(HTTPException) as not_found_exc:
+        asyncio.run(router_module.admin_gateway_get_remediation(_fake_request(global_admin), cluster_id="missing"))
+    assert not_found_exc.value.status_code == 404
+
+    invalid_resp = asyncio.run(
+        router_module.admin_gateway_get_remediation(_fake_request(global_admin), cluster_id="invalid")
+    )
+    assert invalid_resp.status_code == 400
+    assert json.loads(invalid_resp.body)["code"] == "model_gateway_remediation_invalid"
+
+    unauth_resp = asyncio.run(
+        router_module.admin_gateway_verify_remediation(
+            GatewayRemediationVerifyRequest(clusterId="unauth"), _fake_request(global_admin)
+        )
+    )
+    assert unauth_resp.status_code == 401
+    assert json.loads(unauth_resp.body)["code"] == "cluster_unauthenticated"
+
+    async def fake_get_ipp(_cluster_id):
+        raise GatewayUnauthenticatedError("401 unauthorized")
+
+    monkeypatch.setattr(router_module._gateway_ops, "get_ipp_config", fake_get_ipp)
+    ipp_unauth_resp = asyncio.run(
+        router_module.admin_gateway_get_ipp_config(_fake_request(global_admin), cluster_id="cluster-a")
+    )
+    assert ipp_unauth_resp.status_code == 401
+    assert json.loads(ipp_unauth_resp.body)["code"] == "cluster_unauthenticated"
+
+
+def test_gateway_reconcile_excludes_clusters_without_gateway_manage_permission(monkeypatch):
+    import asyncio
+
+    from fastapi import BackgroundTasks
+
+    from llm_d_lens.auth.permissions import BUILTIN_ROLE_END_USER, BUILTIN_ROLE_MAINTAINER, BUILTIN_ROLE_PERMISSIONS
+    from llm_d_lens.model_service import router as router_module
+    from llm_d_lens.model_service.gateway_contracts import GatewayHandoffPayload, GatewayOperation
+
+    service = _service()
+    for cid in ("cluster-managed", "cluster-consumer-only"):
+        grp = service.create_group(GroupCreateRequest(name=f"m-{cid}", clusterId=cid), created_by=None)
+        _patch_target(monkeypatch, execution_id=f"exec-{cid}", cluster_id=cid)
+        service.create_member(MemberCreateRequest(groupId=grp.id, executionId=f"exec-{cid}"), published_by=None)
+    monkeypatch.setattr(router_module, "_service", service)
+
+    probed = []
+
+    async def fake_probe(cluster_id, **_kwargs):
+        probed.append(cluster_id)
+        return SimpleNamespace(can_reconcile_routes=False, access_mode="non_admin", probe_conclusive=True)
+
+    async def fake_reconcile(cluster_id, *, actor=None):
+        handoff = GatewayHandoffPayload(
+            cluster_id=cluster_id,
+            access_mode="non_admin",
+            reconcile_status="admin_handoff_required",
+            desired_hash="f" * 64,
+            marker_namespace="ns",
+            marker_name="lens-ms-handoff-ffffffffffffffff",
+            filename="remediate.sh",
+            admin_script="#!/usr/bin/env bash\n",
+            instructions="Apply as an Orchestration administrator",
+            pending_operations=[],
+            warnings=[],
+        )
+        return GatewayOperation(
+            kind="reconcile-gateway",
+            cluster_id=cluster_id,
+            status="succeeded",
+            detail_json={"reconcileStatus": "admin_handoff_required", "handoff": handoff.api_payload()},
+        )
+
+    monkeypatch.setattr(router_module._gateway_ops, "probe_capabilities", fake_probe)
+    monkeypatch.setattr(router_module._gateway_ops, "reconcile_cluster", fake_reconcile)
+
+    principal = Principal(
+        user_id="mixed-user",
+        username="mixed-user",
+        bindings=(
+            RoleBinding("maintainer", ScopeType.CLUSTER, scope_cluster_id="cluster-managed"),
+            RoleBinding("end-user", ScopeType.CLUSTER, scope_cluster_id="cluster-consumer-only"),
+        ),
+        role_permissions={
+            "maintainer": BUILTIN_ROLE_PERMISSIONS[BUILTIN_ROLE_MAINTAINER],
+            "end-user": BUILTIN_ROLE_PERMISSIONS[BUILTIN_ROLE_END_USER],
+        },
+    )
+    background = BackgroundTasks()
+    result = asyncio.run(router_module.admin_gateway_reconcile(_fake_request(principal), background))
+    assert probed == ["cluster-managed"]
+    assert result["clusters"] == []
+    assert [item["clusterId"] for item in result["handoffs"]] == ["cluster-managed"]
+
+
+def test_non_admin_delete_member_returns_204_when_handoff_already_synced(monkeypatch):
+    import asyncio
+
+    from fastapi import BackgroundTasks
+
+    from llm_d_lens.model_service import router as router_module
+    from llm_d_lens.model_service.gateway_contracts import GatewayHandoffPayload
+
+    _patch_target(monkeypatch, execution_id="exec-sync-del", cluster_id="cluster-a")
+    service = _service()
+    group = service.create_group(GroupCreateRequest(name="sync-del-group", clusterId="cluster-a"), created_by=None)
+    member = service.create_member(MemberCreateRequest(groupId=group.id, executionId="exec-sync-del"), published_by=None)
+    monkeypatch.setattr(router_module, "_service", service)
+    principal = _admin_principal("u-del", "u-del")
+
+    synced_payload = GatewayHandoffPayload(
+        cluster_id="cluster-a",
+        access_mode="non_admin",
+        reconcile_status="synced",
+        desired_hash="0" * 64,
+        marker_namespace="ns",
+        marker_name="lens-ms-handoff-0000000000000000",
+        filename="remediate.sh",
+        admin_script="#!/usr/bin/env bash\n",
+        instructions="Apply as an Orchestration administrator",
+        pending_operations=[],
+        warnings=[],
+    )
+
+    async def fake_record_del(*_args, **_kwargs):
+        return synced_payload
+
+    monkeypatch.setattr(router_module._gateway_ops, "record_member_deletion", fake_record_del)
+    bg = BackgroundTasks()
+    resp = asyncio.run(router_module.admin_delete_member(member.id, bg, _fake_request(principal)))
+    assert resp.status_code == 204
+    assert len(bg.tasks) == 0
+
+
+def test_model_service_connection_uses_discovered_node_address_and_port(monkeypatch):
+    import asyncio
+
+    from llm_d_lens.model_service import router as router_module
+    from llm_d_lens.model_service.gateway_contracts import GatewayStatus, GatewayStatusCluster
+
+    async def fake_status():
+        return GatewayStatus(
+            clusters=[
+                GatewayStatusCluster(
+                    cluster_id="sprocean-min",
+                    cluster_name="sprocean-min",
+                    gateway_provider="istio",
+                    gateway_name="lens-inference-gateway",
+                    gateway_address=None,
+                    gateway_node_address="10.239.11.206",
+                    gateway_port=32592,
+                    gateway_ready=True,
+                    reconcile_status="synced",
+                    access_mode="non_admin",
+                )
+            ]
+        )
+
+    monkeypatch.setattr(router_module._gateway_ops, "status", fake_status)
+    monkeypatch.delenv("LENS_MODEL_GATEWAY_PUBLIC_URL", raising=False)
+    monkeypatch.delenv("LENS_PUBLIC_HOST", raising=False)
+
+    principal = _cluster_principal("sprocean-min")
+    conn = asyncio.run(router_module.model_service_connection(_fake_request(principal)))
+    assert len(conn["clusters"]) == 1
+    entry = conn["clusters"][0]
+    assert entry["address"] == "10.239.11.206"
+    assert entry["port"] == 32592
+    assert entry["baseUrl"] == "http://10.239.11.206:32592/v1"
+    assert entry["ready"] is True
+    assert entry["reconcileStatus"] == "synced"
+    assert entry["accessMode"] == "non_admin"
+
+    # Without gateway_port, address does NOT fall back to gateway_node_address
+    async def fake_status_no_port():
+        return GatewayStatus(
+            clusters=[
+                GatewayStatusCluster(
+                    cluster_id="sprocean-min",
+                    cluster_name="sprocean-min",
+                    gateway_provider="istio",
+                    gateway_name="lens-inference-gateway",
+                    gateway_address=None,
+                    gateway_node_address="10.239.11.206",
+                    gateway_port=None,
+                    gateway_ready=True,
+                    reconcile_status="synced",
+                    access_mode="non_admin",
+                )
+            ]
+        )
+
+    monkeypatch.setattr(router_module._gateway_ops, "status", fake_status_no_port)
+    conn_no_port = asyncio.run(router_module.model_service_connection(_fake_request(principal)))
+    assert conn_no_port["clusters"][0]["address"] is None
+    assert conn_no_port["clusters"][0]["port"] is None
+
+
+def test_model_service_connection_uses_public_url_with_discovered_port(monkeypatch):
+    import asyncio
+
+    from llm_d_lens.model_service import router as router_module
+    from llm_d_lens.model_service.gateway_contracts import GatewayStatus, GatewayStatusCluster
+
+    async def fake_status():
+        return GatewayStatus(
+            clusters=[
+                GatewayStatusCluster(
+                    cluster_id="sprocean-min",
+                    cluster_name="sprocean-min",
+                    gateway_provider="istio",
+                    gateway_name="lens-inference-gateway",
+                    gateway_public_url="10.112.228.229",
+                    gateway_address=None,
+                    gateway_node_address="10.239.11.206",
+                    gateway_port=32592,
+                    gateway_ready=True,
+                    reconcile_status="synced",
+                    access_mode="non_admin",
+                ),
+                GatewayStatusCluster(
+                    cluster_id="https-cluster",
+                    cluster_name="https-cluster",
+                    gateway_provider="istio",
+                    gateway_name="lens-inference-gateway",
+                    gateway_public_url="https://gw.example.com",
+                    gateway_address=None,
+                    gateway_node_address=None,
+                    gateway_port=None,
+                    gateway_ready=True,
+                    reconcile_status="synced",
+                    access_mode="admin",
+                ),
+            ]
+        )
+
+    monkeypatch.setattr(router_module._gateway_ops, "status", fake_status)
+    monkeypatch.delenv("LENS_MODEL_GATEWAY_PUBLIC_URL", raising=False)
+    monkeypatch.delenv("LENS_PUBLIC_HOST", raising=False)
+
+    conn = asyncio.run(router_module.model_service_connection(_fake_request(_cluster_principal("sprocean-min"))))
+    sprocean = conn["clusters"][0]
+    assert sprocean["clusterId"] == "sprocean-min"
+    assert sprocean["baseUrl"] == "http://10.112.228.229:32592/v1"
+    assert sprocean["address"] == "10.112.228.229"
+    assert sprocean["publicUrl"] == "10.112.228.229"
+    assert sprocean["port"] == 32592
+
+    conn_https = asyncio.run(router_module.model_service_connection(_fake_request(_cluster_principal("https-cluster"))))
+    https_c = conn_https["clusters"][0]
+    assert https_c["clusterId"] == "https-cluster"
+    assert https_c["baseUrl"] == "https://gw.example.com/v1"
+    assert https_c["address"] == "gw.example.com"
+    assert https_c["port"] is None
+
+
+def test_model_service_connection_handles_malformed_ipv6_public_url_without_500(monkeypatch):
+    import asyncio
+
+    from llm_d_lens.model_service import router as router_module
+    from llm_d_lens.model_service.gateway_contracts import GatewayStatus, GatewayStatusCluster
+
+    async def fake_status():
+        return GatewayStatus(
+            clusters=[
+                GatewayStatusCluster(
+                    cluster_id="bad-ipv6-cluster",
+                    cluster_name="Bad IPv6",
+                    gateway_provider="istio",
+                    gateway_name="lens-inference-gateway",
+                    gateway_public_url="http://[2001:db8::1",
+                    gateway_port=32592,
+                    gateway_ready=True,
+                ),
+            ]
+        )
+
+    monkeypatch.setattr(router_module._gateway_ops, "status", fake_status)
+    monkeypatch.delenv("LENS_MODEL_GATEWAY_PUBLIC_URL", raising=False)
+    monkeypatch.delenv("LENS_PUBLIC_HOST", raising=False)
+
+    conn = asyncio.run(router_module.model_service_connection(_fake_request(_cluster_principal("bad-ipv6-cluster"))))
+    entry = conn["clusters"][0]
+    assert entry["address"] is None
+    assert entry["baseUrl"] == ""

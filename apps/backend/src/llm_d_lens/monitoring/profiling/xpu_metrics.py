@@ -34,12 +34,15 @@ def device_allocations(pods, claims, slices, namespace, profile=None):
     """Return exclusive (node, PCI) -> consumer and allocation start mappings."""
     if not profile or not profile.telemetry:
         return {}
+    safe_pods = [p for p in (pods or []) if isinstance(p, dict)]
+    safe_claims = [c for c in (claims or []) if isinstance(c, dict)]
+    safe_slices = [s for s in (slices or []) if isinstance(s, dict)]
     settings = profile.telemetry.allocation
     if profile.telemetry.allocation_join == "pod-status":
-        return plugin_device_allocations(pods, namespace, profile)
+        return plugin_device_allocations(safe_pods, namespace, profile)
     drivers = settings.get("drivers", profile.device_classes)
     devices = {}
-    for item in slices:
+    for item in safe_slices:
         spec = item.get("spec") or {}
         if spec.get("driver") not in drivers:
             continue
@@ -52,11 +55,11 @@ def device_allocations(pods, claims, slices, namespace, profile=None):
                 devices[(pool, device.get("name"))] = (node, pci.lower())
     by_uid = {
         p.get("metadata", {}).get("uid"): p
-        for p in pods
+        for p in safe_pods
         if p.get("metadata", {}).get("uid") and p.get("metadata", {}).get("namespace") == namespace
     }
     owners = defaultdict(list)
-    for claim in claims:
+    for claim in safe_claims:
         if claim.get("metadata", {}).get("namespace") != namespace:
             continue
         status = claim.get("status") or {}
@@ -67,6 +70,7 @@ def device_allocations(pods, claims, slices, namespace, profile=None):
         pod = by_uid.get(consumers[0].get("uid"))
         if not pod or pod.get("metadata", {}).get("name") != consumers[0].get("name"):
             continue
+        pod_node = pod.get("spec", {}).get("nodeName")
         allocation = status.get("allocation") or {}
         since = max(
             _timestamp(allocation.get("allocationTimestamp")),
@@ -77,21 +81,20 @@ def device_allocations(pods, claims, slices, namespace, profile=None):
             if result.get("driver") not in drivers or result.get("adminAccess") or result.get("shareID"):
                 continue
             identity = devices.get((result.get("pool"), result.get("device")))
-            # Intel DRA encodes PCI BDF in its device ID. A driver refresh can
-            # temporarily remove ResourceSlices while allocated claims survive.
-            if (
-                identity is None
-                and settings.get("device_id_pattern")
-                and result.get("pool") == pod.get("spec", {}).get("nodeName")
-            ):
-                pci_id = re.fullmatch(
-                    settings["device_id_pattern"],
-                    str(result.get("device") or "").lower(),
-                )
-                if pci_id:
-                    domain, bus, slot, function = pci_id.groups()
-                    identity = (result["pool"], f"{domain}:{bus}:{slot}.{function}")
-            if identity and identity[0] == pod.get("spec", {}).get("nodeName"):
+            # DRA drivers can encode PCI BDF in device IDs. A driver refresh or
+            # non-admin 403 on cluster-scoped ResourceSlices leaves claims intact.
+            if identity is None and pod_node and result.get("pool") == pod_node:
+                raw_device = str(result.get("device") or "").lower()
+                if settings.get("device_id_pattern"):
+                    pci_id = re.fullmatch(settings["device_id_pattern"], raw_device)
+                    if pci_id:
+                        domain, bus, slot, function = pci_id.groups()
+                        identity = (pod_node, f"{domain}:{bus}:{slot}.{function}")
+                if identity is None and settings.get("resource_id_pattern"):
+                    res_match = re.fullmatch(settings["resource_id_pattern"], raw_device)
+                    if res_match and res_match.groupdict().get("pci"):
+                        identity = (pod_node, res_match.group("pci"))
+            if identity and identity[0] == pod_node:
                 owners[identity].append({"pod": consumers[0]["name"], "since": since})
     return {
         identity: entries[0] for identity, entries in owners.items() if len({entry["pod"] for entry in entries}) == 1
@@ -189,7 +192,9 @@ def plugin_device_allocations(pods, namespace, profile):
         return {}
     resources = {name for mode in profile.deployment.modes.values() for name in mode.get("resource_names", [])}
     owners = defaultdict(list)
-    for pod in pods:
+    for pod in pods or []:
+        if not isinstance(pod, dict):
+            continue
         metadata, spec, status = pod.get("metadata", {}), pod.get("spec", {}), pod.get("status", {})
         if metadata.get("namespace") != namespace or not spec.get("nodeName"):
             continue

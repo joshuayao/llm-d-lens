@@ -42,7 +42,7 @@ Slice count and placement start from the Guide defaults; EPP Topology Affinity d
   through DRA claims, which the estimate does not count, domains show free CPU and
   memory instead and a note marks the ceilings as CPU, memory and Pod based only.
   Custom labels are marked because Lens cannot
-  verify that they reflect physical topology; node labels are changed by cluster
+  verify that they reflect physical topology; node labels are changed by orchestration
   administrators, not from this page. A discovered placement is offered as
   **Suggested**.
 - **EPP Topology Affinity** offers **Scorer** and **Filter** only. Scorer adds a
@@ -703,3 +703,24 @@ plan in the same session. This is bounded candidate search, not an unbounded
 self-modifying optimization loop or a claim of global optimality.
 
 The Overview and 3D tabs show each role’s transport and local CPU cache separately. Agentic CPU-cache trials include eligible P/D candidates and compare them with their original configuration using the same workload. The default NIXL-first order prioritizes transport when multiple connectors report a hit; it does not guarantee fewer network transfers. Confirm workload correctness and performance with real measurements.
+
+## Non-Admin (`edit`) cluster deployment planning
+
+When a cluster uses a namespace-scoped Non-Admin (`edit`) kubeconfig, cluster-wide Kubernetes inventory reads (`kubectl get nodes`, `kubectl get pods --all-namespaces`) may return `403 Forbidden`. During deployment planning, slice placement, and target checks, Lens automatically falls back to Prometheus-synthesized node and allocatable accelerator inventory so hardware-profile-driven GPU/XPU scheduling and capacity checks continue without `403` failures. Real `401 Unauthorized` kubeconfig errors are never masked and are surfaced immediately so you can refresh or replace the cluster credentials.
+
+## Per-Namespace Preflight & Orchestration Administrator Namespace Setup
+
+Each deployment targets its own dedicated Kubernetes namespace (`<deployment-ns>`). Before deploying, Lens runs a per-namespace SubjectAccessReview (SSAR) preflight check:
+
+- **Admin kubeconfig**: When all required namespace, workload, and RBAC checks pass, deployment proceeds directly with no extra steps.
+- **Non-Admin (`edit`) kubeconfig**: If `<deployment-ns>` or its namespace-scoped RBAC is missing, Lens pauses at **Orchestration administrator namespace setup** and generates a self-contained, idempotent bash bootstrap script (with zero plaintext secrets).
+  1. Download or copy the bootstrap script and have an orchestration administrator run it. The script creates the `Namespace`, a namespace-scoped `Role` and `RoleBinding` for the detected kubeconfig identity (or an explicit subject override if auto-detection is unavailable), the per-namespace EPP `system:auth-delegator` `ClusterRoleBinding`, an optional static `PersistentVolume` and bound `PersistentVolumeClaim` when storage is configured, and a non-secret `lens-deployment-bootstrap` marker `ConfigMap`.
+  2. Click **Re-check & Deploy** to verify the bootstrap marker and permissions.
+  3. Once verified, Lens deploys the workloads into `<deployment-ns>`, copies `HF_TOKEN` from `hf_token_secret_namespace` if configured, and enables namespace-scoped `ServiceMonitor`/`PodMonitor` resources.
+
+## Two-Phase Deployment Deletion on Non-Admin clusters
+
+Deleting a deployment on a Non-Admin (`edit`) cluster uses a two-phase flow:
+
+1. Lens first deletes all in-namespace workload and configuration resources inside `<deployment-ns>`.
+2. If deleting the `Namespace` or its per-namespace `ClusterRoleBinding` returns `403 Forbidden`, Lens presents the **Orchestration administrator namespace cleanup** handoff. Download or copy the generated cleanup script for an orchestration administrator to run, then click **Re-check & Delete** to confirm removal and delete the Lens deployment record. (If marker verification is unavailable, **Confirm & Delete Record** removes the Lens record after manual cleanup.)

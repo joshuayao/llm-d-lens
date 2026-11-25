@@ -10,6 +10,8 @@ from typing import Any
 
 import yaml
 
+from llm_d_lens.cluster.registry import validate_container_image_ref
+
 from .disaggregated_set import validate_disaggregated_sets
 from .managed_environment import admin_managed_environment_names
 
@@ -523,6 +525,8 @@ def validate_manifest_facts(configuration_content: dict[str, Any], manifest: str
                     )
 
     expected_image = runtime.get("image")
+    if expected_image is not None:
+        expected_image = validate_container_image_ref(expected_image, field="runtime.image", allow_empty=False)
     runtime_environment_value = runtime.get("environment")
     if runtime_environment_value is not None and not isinstance(runtime_environment_value, dict):
         raise ValueError("configuration runtime.environment must be an object")
@@ -554,9 +558,10 @@ def validate_manifest_facts(configuration_content: dict[str, Any], manifest: str
                     f"model server {name} must declare --served-model-name={expected_model} "
                     "when publishing precise routing events from shared-path storage"
                 )
-        if expected_image is not None and container.get("image") != expected_image:
+        actual_image = validate_container_image_ref(container.get("image"), field=f"{name}.image", allow_empty=False)
+        if expected_image is not None and actual_image != expected_image:
             raise ValueError(
-                f"model server {name} image is {container.get('image')!r}; configuration requires {expected_image!r}"
+                f"model server {name} image is {actual_image!r}; configuration requires {expected_image!r}"
             )
         environment = _environment(container, name)
         for variable, expected_value in runtime_environment.items():

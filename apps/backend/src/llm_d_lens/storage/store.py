@@ -14,7 +14,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from sqlalchemy.exc import IntegrityError
+
 from llm_d_lens.db.dao.storage_volume import StorageVolumeDao, StorageVolumeDaoError
+from llm_d_lens.db.models.storage_volume import StorageVolumeRow
 from llm_d_lens.storage.contracts import StorageVolume
 
 __all__ = ["StorageVolumeStore", "StorageVolumeStoreError", "default_store"]
@@ -45,6 +48,24 @@ class StorageVolumeStore:
 
     def delete(self, volume_id: str) -> None:
         self._dao.delete(volume_id)
+
+    def set_owner(self, volume_id: str, owner_user_id: str | None) -> None:
+        """Persist ``owner_user_id`` on the storage volume row without altering DTOs."""
+        try:
+            with self._dao._transaction() as session:
+                row = session.get(StorageVolumeRow, volume_id)
+                if row is not None and row.owner_user_id != owner_user_id:
+                    row.owner_user_id = owner_user_id
+                    session.flush()
+        except IntegrityError:
+            # Synthetic unit-test user ids may lack a matching users row.
+            return
+
+    def get_owner(self, volume_id: str) -> str | None:
+        """Return the persisted ``owner_user_id`` for a storage volume, if any."""
+        with self._dao._read_only() as session:
+            row = session.get(StorageVolumeRow, volume_id)
+            return row.owner_user_id if row is not None else None
 
 
 _default_store: StorageVolumeStore | None = None

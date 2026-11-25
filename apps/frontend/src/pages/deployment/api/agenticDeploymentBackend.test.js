@@ -1,6 +1,22 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { candidateEvidence, defaultRequirements, DEFAULT_REQUIREMENTS, deploymentPlanningRequest, requirementsFromRun, streamAgenticRecommendation, streamAgenticRefinement } from './agenticDeploymentBackend.js';
+import {
+    candidateEvidence,
+    checkDeploymentPermissions,
+    defaultRequirements,
+    DEFAULT_REQUIREMENTS,
+    deploymentPermissionPayload,
+    deploymentPlanningRequest,
+    generateDeploymentBootstrapScript,
+    isDeploymentAdminSetupError,
+    isDeploymentCleanupHandoffError,
+    parseDeploymentCleanupHandoff,
+    requirementsFromRun,
+    streamAgenticRecommendation,
+    streamAgenticRefinement,
+    verifyDeploymentBootstrap,
+    verifyDeploymentCleanup,
+} from './agenticDeploymentBackend.js';
 
 const draft = { model: 'test/model', clusterId: 'cluster-a', deploymentName: 'test', storageVolumeId: 'cache-a', contextLength: 40960 };
 
@@ -195,4 +211,104 @@ test('explicit method and SLOs survive planning and restoration', () => {
     for (const invalid of [{ tpotMs: '0' }, { plannerPrompt: 'x'.repeat(1801) }]) {
         assert.throws(() => deploymentPlanningRequest(draft, { ...values, ...invalid }, 'session-a', 'agentic'));
     }
+});
+
+test('deploymentPermissionPayload builds expected preflight and verify request fields', () => {
+    const payload = deploymentPermissionPayload({
+        clusterId: 'cluster-1',
+        manifest: 'apiVersion: apps/v1\nkind: Deployment',
+        namespaceLabels: { 'aibom.k8saibom.dev/enabled': 'true' },
+        agenticDeploymentRunId: 'run-42',
+        deploymentName: 'qwen-prod',
+        providerRef: 'optimized-baseline',
+        storageVolumeId: 'vol-1',
+        usesStorage: true,
+        subjectOverride: { kind: 'ServiceAccount', name: 'lens-edit', namespace: 'lens-edit' },
+        expectedDigest: 'abc123',
+    });
+    assert.deepEqual(payload, {
+        cluster_id: 'cluster-1',
+        manifest: 'apiVersion: apps/v1\nkind: Deployment',
+        namespace_labels: { 'aibom.k8saibom.dev/enabled': 'true' },
+        agentic_deployment_run_id: 'run-42',
+        deployment_name: 'qwen-prod',
+        provider_ref: 'optimized-baseline',
+        storage_volume_id: 'vol-1',
+        uses_storage: true,
+        subject_override: { kind: 'ServiceAccount', name: 'lens-edit', namespace: 'lens-edit' },
+        expected_digest: 'abc123',
+    });
+});
+
+test('deployment permission and cleanup endpoints POST with CSRF and JSON bodies', async (t) => {
+    const previousDocument = globalThis.document;
+    globalThis.document = { cookie: 'prism_csrf=csrf-token-9' };
+    t.after(() => { globalThis.document = previousDocument; });
+    const calls = [];
+    t.mock.method(globalThis, 'fetch', async (url, options) => {
+        calls.push({ url, method: options.method, headers: Object.fromEntries(new Headers(options.headers).entries()), body: JSON.parse(options.body) });
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    });
+
+    await checkDeploymentPermissions({ cluster_id: 'c1', uses_storage: true });
+    await generateDeploymentBootstrapScript({ cluster_id: 'c1', namespace: 'llmd-demo' });
+    await verifyDeploymentBootstrap({ cluster_id: 'c1', expected_digest: 'd1' });
+    await verifyDeploymentCleanup('exec/1', { cleanupDigest: 'd2', deleteRecordOnVerify: true, forceDeleteRecord: false });
+
+    assert.deepEqual(calls.map((c) => [c.method, c.url]), [
+        ['POST', '/api/v1/deployments/permission-check'],
+        ['POST', '/api/v1/deployments/permission-remediation'],
+        ['POST', '/api/v1/deployments/admin-handoff/verify'],
+        ['POST', '/api/v1/deployments/executions/exec%2F1/cleanup-verify'],
+    ]);
+    for (const call of calls) {
+        assert.equal(call.headers['x-prism-csrf'], 'csrf-token-9');
+    }
+    assert.deepEqual(calls[3].body, { cleanupDigest: 'd2', deleteRecordOnVerify: true, forceDeleteRecord: false });
+});
+
+test('parseDeploymentCleanupHandoff and setup error helpers match exact 403/409 codes', () => {
+    const cleanupErr = Object.assign(new Error('Orchestration administrator cleanup required'), {
+        status: 409,
+        code: 'deployment_cleanup_permission_denied',
+        body: {
+            status: 409,
+            code: 'deployment_cleanup_permission_denied',
+            executionId: 'exec-1',
+            clusterId: 'c1',
+            namespace: 'llmd-qwen',
+            phase1Completed: true,
+            deletedInNamespace: ['Deployment/qwen'],
+            adminCleanup: {
+                cleanupDigest: 'digest-123',
+                operations: [{ id: 'delete-namespace', kind: 'Namespace', name: 'llmd-qwen' }],
+                completedOperations: ['Deployment/qwen'],
+                script: '#!/usr/bin/env bash\nkubectl delete ns llmd-qwen',
+                scriptFilename: 'cleanup-llmd-qwen.sh',
+                instructions: 'Run as an Orchestration administrator.',
+                marker: { namespace: 'lens-edit', name: 'lens-deploy-cleanup-1', status: 'missing', verified: false },
+                canVerifyMarker: true,
+                confirmRequired: false,
+                warnings: ['CRB remains'],
+                detail: 'Namespace deletion requires Orchestration administrator privileges.',
+            },
+        },
+    });
+    assert.equal(isDeploymentCleanupHandoffError(cleanupErr), true);
+    const parsed = parseDeploymentCleanupHandoff(cleanupErr);
+    assert.equal(parsed.executionId, 'exec-1');
+    assert.equal(parsed.namespace, 'llmd-qwen');
+    assert.equal(parsed.cleanupDigest, 'digest-123');
+    assert.equal(parsed.canVerifyMarker, true);
+    assert.equal(parsed.confirmRequired, false);
+    assert.equal(parsed.scriptFilename, 'cleanup-llmd-qwen.sh');
+    assert.equal(parsed.operations.length, 1);
+    assert.deepEqual(parsed.completedOperations, ['Deployment/qwen']);
+    assert.equal(parsed.status, 'pending_admin_cleanup');
+
+    assert.equal(isDeploymentCleanupHandoffError({ status: 409, code: 'busy' }), false);
+    assert.equal(parseDeploymentCleanupHandoff({ status: 500, code: 'deployment_cleanup_permission_denied' }), null);
+    assert.equal(isDeploymentAdminSetupError({ status: 403, code: 'deployment_admin_setup_required' }), true);
+    assert.equal(isDeploymentAdminSetupError({ status: 409, body: { code: 'deployment_admin_setup_required' } }), true);
+    assert.equal(isDeploymentAdminSetupError({ status: 403, code: 'forbidden' }), false);
 });

@@ -8,6 +8,9 @@ test('summary receives only successful results from the currently polled page', 
 });
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { DeleteDeploymentModal, executeDeploymentDeleteAction } from './DeleteDeploymentModal.jsx';
 
 
 test('benchmark requests target the execution with a preset sweep and optional P95 targets', () => {
@@ -125,4 +128,120 @@ test('a P/D deployment is degraded when one of three expected model pods is miss
     assert.equal(expectedModelPodCount({ replicas: 2, scale: { prefillReplicas: 1, decodeReplicas: 2 } }), 3);
     assert.equal(expectedModelPodCount({ replicas: 2, scale: { prefillReplicas: 1, decodeReplicas: 2, slices: 2 } }), 6);
     assert.equal(effectiveStatusGroup({ status: 'ready', replicas: 2, scale: { prefillReplicas: 1, decodeReplicas: 2 } }, pods), 'Degraded');
+});
+
+test('DeleteDeploymentModal intercepts 409 deployment_cleanup_permission_denied and renders cleanup handoff modal', async () => {
+    let capturedHandoff = null;
+    let capturedError = '';
+    const outcome = await executeDeploymentDeleteAction({
+        deleteNamespace: true,
+        onDelete: async () => {
+            throw Object.assign(new Error('Orchestration administrator cleanup required'), {
+                status: 409,
+                code: 'deployment_cleanup_permission_denied',
+                body: {
+                    status: 409,
+                    code: 'deployment_cleanup_permission_denied',
+                    executionId: 'exec-12345678',
+                    clusterId: 'cluster-1',
+                    namespace: 'llmd-qwen-prod',
+                    phase1Completed: true,
+                    deletedInNamespace: ['Deployment/qwen-prod'],
+                    adminCleanup: {
+                        cleanupDigest: 'digest-1',
+                        script: '#!/usr/bin/env bash\nkubectl delete ns llmd-qwen-prod',
+                        scriptFilename: 'cleanup-llmd-qwen-prod.sh',
+                        operations: [{ id: 'delete-ns', kind: 'Namespace', name: 'llmd-qwen-prod' }],
+                        completedOperations: ['Deployment/qwen-prod'],
+                        marker: { namespace: 'lens-edit', name: 'lens-deploy-cleanup-1', status: 'missing' },
+                        canVerifyMarker: true,
+                        confirmRequired: false,
+                    },
+                },
+            });
+        },
+        onCleanupHandoff: (handoff) => { capturedHandoff = handoff; },
+        onError: (msg) => { capturedError = msg; },
+    });
+    assert.equal(outcome.status, 'handoff');
+    assert.equal(capturedError, '');
+    assert.equal(capturedHandoff?.namespace, 'llmd-qwen-prod');
+    assert.equal(capturedHandoff?.canVerifyMarker, true);
+
+    const deployment = {
+        execution_id: 'exec-12345678',
+        display_name: 'qwen-prod',
+        cluster_id: 'cluster-1',
+        namespace: 'llmd-qwen-prod',
+        status: 'ready',
+    };
+    const handoffHtml = renderToStaticMarkup(
+        React.createElement(DeleteDeploymentModal, {
+            deployment,
+            inline: true,
+            onCancel: () => {},
+            onDelete: async () => {},
+            initialCleanupHandoff: capturedHandoff,
+        }),
+    );
+    assert.match(handoffHtml, /Orchestration administrator namespace cleanup/);
+    assert.match(handoffHtml, /Re-check &amp; Delete/);
+    assert.match(handoffHtml, /Download \.sh/);
+    assert.match(handoffHtml, /Copy script/);
+    assert.match(handoffHtml, />Remaining</);
+    assert.doesNotMatch(handoffHtml, />Done</);
+    assert.doesNotMatch(handoffHtml, /Confirm &amp; Delete Record/);
+    assert.match(handoffHtml, /<details class="group\/details[^"]*" open="">/);
+    assert.match(handoffHtml, /<details class="group">/);
+    assert.doesNotMatch(handoffHtml, /<details class="group"[^>]*open/);
+
+    const partialRecheckHtml = renderToStaticMarkup(
+        React.createElement(DeleteDeploymentModal, {
+            deployment,
+            inline: true,
+            onCancel: () => {},
+            onDelete: async () => {},
+            initialCleanupHandoff: {
+                ...capturedHandoff,
+                operations: [
+                    { id: 'delete-crb', kind: 'ClusterRoleBinding', name: 'epp-crb' },
+                    { id: 'delete-ns', kind: 'Namespace', name: 'llmd-qwen-prod' },
+                ],
+                remainingOperations: ['delete-ns'],
+            },
+        }),
+    );
+    assert.match(partialRecheckHtml, />Done</);
+    assert.match(partialRecheckHtml, />Remaining</);
+    assert.match(partialRecheckHtml, /<details class="group\/details[^"]*" open="">/);
+    assert.match(partialRecheckHtml, /<details class="group">/);
+    assert.doesNotMatch(partialRecheckHtml, /<details class="group"[^>]*open/);
+
+    const fallbackHtml = renderToStaticMarkup(
+        React.createElement(DeleteDeploymentModal, {
+            deployment,
+            inline: true,
+            onCancel: () => {},
+            onDelete: async () => {},
+            initialCleanupHandoff: {
+                ...capturedHandoff,
+                canVerifyMarker: false,
+                confirmRequired: true,
+            },
+        }),
+    );
+    assert.match(fallbackHtml, /Confirm &amp; Delete Record/);
+    assert.match(fallbackHtml, /<details class="group\/details[^"]*" open="">/);
+    assert.match(fallbackHtml, /<details class="group">/);
+    assert.doesNotMatch(fallbackHtml, /<details class="group"[^>]*open/);
+
+    let genericError = '';
+    const errOutcome = await executeDeploymentDeleteAction({
+        deleteNamespace: true,
+        onDelete: async () => { throw new Error('Cluster unreachable'); },
+        onCleanupHandoff: () => { throw new Error('should not be called'); },
+        onError: (msg) => { genericError = msg; },
+    });
+    assert.equal(errOutcome.status, 'error');
+    assert.equal(genericError, 'Cluster unreachable');
 });

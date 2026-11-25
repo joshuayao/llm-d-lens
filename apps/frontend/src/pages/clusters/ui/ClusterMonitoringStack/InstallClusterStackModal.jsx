@@ -7,6 +7,7 @@
 //     https://www.apache.org/licenses/LICENSE-2.0
 
 import { checkPassed } from './preflightPresentation';
+import { DEFAULT_MONITORING_NAMESPACE, normalizeMonitoringNamespace } from './monitoringLinks';
 import { useMonitoringInstall } from './useMonitoringInstall';
 import React, { useState } from 'react';
 import { AlertTriangle, CheckCircle2, CircleX } from 'lucide-react';
@@ -17,8 +18,9 @@ export function InstallClusterStackModal(props) {
     return props.isOpen ? <InstallClusterStackModalForm key={JSON.stringify([props.clusterId, props.namespace, props.reinstall])} {...props} /> : null;
 }
 
-function InstallClusterStackModalForm({ isOpen, namespace, clusterId, reinstall = false, onClose, onOperationStarted }) {
-    const [request, setRequest] = useState({ namespace, mode: 'central', enable_tls: false, reinstall });
+function InstallClusterStackModalForm({ isOpen, namespace = DEFAULT_MONITORING_NAMESPACE, clusterId, reinstall = false, onClose, onOperationStarted }) {
+    const initialNamespace = normalizeMonitoringNamespace(namespace);
+    const [request, setRequest] = useState({ namespace: initialNamespace, mode: 'central', enable_tls: false, reinstall });
     const { preflight, error, checking, installing, updateRequest, runPreflight, startInstall } = useMonitoringInstall({
         request, setRequest, preflightRequest: preflightClusterStackInstall, installRequest: installClusterStack,
         clusterId, onOperationStarted, onClose,
@@ -58,6 +60,7 @@ function InstallClusterStackModalForm({ isOpen, namespace, clusterId, reinstall 
                     <Input
                         id="cluster-stack-namespace"
                         value={request.namespace}
+                        placeholder={initialNamespace}
                         onChange={(event) => updateRequest({ namespace: event.target.value })}
                         disabled={checking || installing}
                     />

@@ -182,3 +182,55 @@ async def test_sync_records_counter_reset_as_current_value():
     await sync.sync()  # smaller reading: EPP restarted -> record the new value
     reset = service.recorded[-1]
     assert (reset.input_tokens, reset.output_tokens, reset.cached_input_tokens) == (5, 2, 0)
+
+
+@pytest.mark.asyncio
+async def test_default_fetch_series_prefers_direct_http_without_port_forward(monkeypatch):
+    from llm_d_lens.model_service.usage_sync import _default_fetch_series
+    from llm_d_lens.monitoring import prometheus as prom_module
+
+    calls: list[bool] = []
+    endpoint = prom_module.PrometheusEndpoint(base_url="http://10.0.0.5:30900", source="node_port")
+
+    async def fake_resolve(cluster_id, *, allow_port_forward=True, **_kwargs):
+        calls.append(allow_port_forward)
+        return endpoint if not allow_port_forward else None
+
+    class _DummyClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(prom_module, "resolve_prometheus_endpoint", fake_resolve)
+    monkeypatch.setattr(prom_module, "create_prometheus_client", lambda _ep, **_kw: _DummyClient())
+
+    async def fake_query(_client, promql):
+        return [{"metric": {"model_name": "qwen"}, "value": [0, "42"]}]
+
+    monkeypatch.setattr(prom_module, "query_vector", fake_query)
+
+    rows = await _default_fetch_series("cluster-a", "up")
+    assert calls == [False]
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_default_fetch_series_degrades_cleanly_on_forbidden_port_forward(monkeypatch):
+    from llm_d_lens.model_service.usage_sync import _default_fetch_series
+    from llm_d_lens.monitoring import prometheus as prom_module
+
+    calls: list[bool] = []
+
+    async def fake_resolve(cluster_id, *, allow_port_forward=True, **_kwargs):
+        calls.append(allow_port_forward)
+        if allow_port_forward:
+            raise prom_module.PortForwardError("Error from server (Forbidden): pods/portforward is forbidden")
+        return
+
+    monkeypatch.setattr(prom_module, "resolve_prometheus_endpoint", fake_resolve)
+
+    rows = await _default_fetch_series("cluster-a", "up")
+    assert calls == [False, True]
+    assert rows == []

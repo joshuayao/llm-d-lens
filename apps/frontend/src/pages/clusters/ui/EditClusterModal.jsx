@@ -9,10 +9,60 @@ import { requestJson } from '../../../shared/api/httpClient';
 // CreateClusterWizard's Proxy/Versions steps, so a ref change here actually
 // triggers a real (re-)download instead of just updating the pinned ref.
 import { useEffect, useState } from 'react';
-import { Button, Input, Label, Modal, Textarea } from '../../../shared/ui';
+import { Badge, Button, Input, Label, Modal, Textarea } from '../../../shared/ui';
+import { useHardwareProfiles } from '../../../shared/lib/useHardwareProfiles';
+import { getHardwareProfiles } from './ClusterMonitoringStack/hardwareProfilesBackend';
+import { validateContainerImageRef } from './clusterPlan';
 
 function request(path, options = {}) {
     return requestJson(path, { headers: { 'Content-Type': 'application/json' }, ...options });
+}
+
+function hasControlChar(str) {
+    for (let i = 0; i < str.length; i += 1) {
+        const code = str.charCodeAt(i);
+        if (code < 32 || code === 127) return true;
+    }
+    return false;
+}
+
+function validateMonitoringUrl(raw, label, { required = false } = {}) {
+    const str = String(raw ?? '');
+    if (hasControlChar(str)) {
+        return `${label} must not contain control characters.`;
+    }
+    const trimmed = str.trim();
+    if (!trimmed) {
+        return required ? `${label} is required when using existing monitoring.` : '';
+    }
+    if (/\s/.test(trimmed) || trimmed.includes('\\')) {
+        return `${label} must not contain whitespace or backslashes.`;
+    }
+    if (trimmed.includes('?') || trimmed.includes('#')) {
+        return `${label} must not include query parameters or fragments.`;
+    }
+    let parsed;
+    try {
+        parsed = new URL(trimmed);
+    } catch {
+        return `${label} must be a valid http:// or https:// URL.`;
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return `${label} must use http:// or https://.`;
+    }
+    if (parsed.username || parsed.password) {
+        return `${label} must not include embedded credentials.`;
+    }
+    if (!parsed.hostname) {
+        return `${label} must include a hostname.`;
+    }
+    if (parsed.hostname.includes('%')) {
+        return `${label} must not include a zone ID.`;
+    }
+    if (parsed.port === '0') {
+        return `${label} port must be between 1 and 65535.`;
+    }
+    return '';
 }
 
 // Polls the llm-d versions software-downloads endpoint until both refs that
@@ -27,12 +77,17 @@ export function EditClusterModal({ cluster, onClose, onSaved }) {
     const [httpProxy, setHttpProxy] = useState('');
     const [httpsProxy, setHttpsProxy] = useState('');
     const [noProxy, setNoProxy] = useState('');
+    const [monitoringMode, setMonitoringMode] = useState('managed');
+    const [prometheusUrl, setPrometheusUrl] = useState('');
+    const [grafanaUrl, setGrafanaUrl] = useState('');
     const gatewayProvider = cluster.gatewayProvider || 'istio';
     const [gatewayPort, setGatewayPort] = useState('');
     // Optional externally reachable Gateway host/IP (or full URL); empty = derive.
     const [gatewayPublicUrl, setGatewayPublicUrl] = useState('');
     const [gatewayAuthzHost, setGatewayAuthzHost] = useState('');
     const [inotifyMaxUserInstances, setInotifyMaxUserInstances] = useState('8192');
+    const [vllmImage, setVllmImage] = useState('');
+    const hardwareProfiles = useHardwareProfiles(getHardwareProfiles);
     // Write-only HF_TOKEN rotation: the current token is never read back from
     // the cluster, so an empty field means "leave the existing secret alone".
     const [hfTokenNamespace, setHfTokenNamespace] = useState('');
@@ -53,12 +108,16 @@ export function EditClusterModal({ cluster, onClose, onSaved }) {
         setHttpProxy(cluster.proxy?.httpProxy || '');
         setHttpsProxy(cluster.proxy?.httpsProxy || '');
         setNoProxy(cluster.proxy?.noProxy || '');
+        setMonitoringMode(cluster.monitoringMode === 'existing' ? 'existing' : 'managed');
+        setPrometheusUrl(cluster.prometheusUrl || '');
+        setGrafanaUrl(cluster.grafanaUrl || '');
         setGatewayPort(cluster.gatewayPort ? String(cluster.gatewayPort) : '');
         setGatewayPublicUrl(cluster.gatewayPublicUrl || '');
         setGatewayAuthzHost(cluster.gatewayAuthzHost || '');
         setInotifyMaxUserInstances(
             cluster.inotifyMaxUserInstances != null ? String(cluster.inotifyMaxUserInstances) : '8192',
         );
+        setVllmImage(cluster.vllmImage || '');
         setPortError('');
         setError('');
         setDownloadStatus(null);
@@ -101,13 +160,61 @@ export function EditClusterModal({ cluster, onClose, onSaved }) {
     // An empty token means "keep the current secret"; once one is typed the
     // target coordinates have to be complete.
     const hfTokenValid = !hfToken.trim() || Boolean(hfTokenNamespace.trim() && hfTokenName.trim());
-    const canSave = nameValid && proxyValid && hfTokenValid && !busy && !portError && (gatewayProvider === 'gke' || Boolean(gatewayAuthzHost));
+    const prometheusUrlError = monitoringMode === 'existing'
+        ? validateMonitoringUrl(prometheusUrl, 'Prometheus URL', { required: true })
+        : '';
+    const grafanaUrlError = monitoringMode === 'existing'
+        ? validateMonitoringUrl(grafanaUrl, 'Grafana URL', { required: false })
+        : '';
+    const monitoringValid = !prometheusUrlError && !grafanaUrlError;
+    const vllmImageError = validateContainerImageRef(vllmImage);
+    const vllmImageValid = !vllmImageError;
+    const isCustomVllmImage = Boolean(vllmImage.trim());
+    const profileRuntimeImages = hardwareProfiles
+        .map((profile) => profile?.deployment?.runtime_image)
+        .filter(Boolean);
+    const profileImageHints = hardwareProfiles
+        .filter((profile) => profile?.deployment?.runtime_image)
+        .map((profile) => `${profile.display_name || profile.vendor || profile.id}: ${profile.deployment.runtime_image}`);
+    const vllmImagePlaceholder = profileRuntimeImages[0] || 'Hardware profile default (e.g. registry.example.com/vllm:tag)';
+    const hasDiscoveredManagedSummary = cluster.monitoringMode !== 'existing' && Boolean(
+        cluster.prometheusUrl
+        || cluster.grafanaUrl
+        || cluster.prometheusNodePort
+        || cluster.grafanaNodePort,
+    );
+    const canSave = nameValid && proxyValid && hfTokenValid && monitoringValid && vllmImageValid && !busy && !portError && (gatewayProvider === 'gke' || Boolean(gatewayAuthzHost));
 
     const submit = async () => {
         if (!canSave) return;
         setBusy(true);
         setError('');
         try {
+            const initialMonitoringMode = cluster.monitoringMode === 'existing' ? 'existing' : 'managed';
+            const initialPrometheusUrl = cluster.prometheusUrl || '';
+            const initialGrafanaUrl = cluster.grafanaUrl || '';
+            const monitoringModeChanged = monitoringMode !== initialMonitoringMode;
+            const monitoringPatch = {};
+            if (monitoringModeChanged) {
+                monitoringPatch.monitoringMode = monitoringMode;
+            }
+            if (monitoringMode === 'existing') {
+                const trimmedPromUrl = prometheusUrl.trim();
+                const trimmedGrafanaUrl = grafanaUrl.trim();
+                if (monitoringModeChanged || trimmedPromUrl !== initialPrometheusUrl) {
+                    monitoringPatch.prometheusUrl = trimmedPromUrl;
+                }
+                if (monitoringModeChanged || trimmedGrafanaUrl !== initialGrafanaUrl) {
+                    monitoringPatch.grafanaUrl = trimmedGrafanaUrl || null;
+                }
+            } else if (monitoringModeChanged) {
+                monitoringPatch.prometheusUrl = null;
+                monitoringPatch.grafanaUrl = null;
+            }
+
+            const trimmedVllmImage = vllmImage.trim();
+            const initialVllmImage = cluster.vllmImage || '';
+
             const payload = await request(`/api/cluster/clusters/${encodeURIComponent(cluster.id)}`, {
                 method: 'PATCH',
                 body: JSON.stringify({
@@ -122,6 +229,8 @@ export function EditClusterModal({ cluster, onClose, onSaved }) {
                     ...(gatewayPort.trim() !== (cluster.gatewayPort ? String(cluster.gatewayPort) : '') && { gatewayPort: gatewayPort.trim() ? Number(gatewayPort.trim()) : null }),
                     ...(gatewayPublicUrl.trim() !== (cluster.gatewayPublicUrl || '') && { gatewayPublicUrl: gatewayPublicUrl.trim() || null }),
                     ...(gatewayAuthzHost.trim() !== (cluster.gatewayAuthzHost || '') && { gatewayAuthzHost: gatewayAuthzHost.trim() || null }),
+                    ...(trimmedVllmImage !== initialVllmImage && { vllmImage: trimmedVllmImage || null }),
+                    ...monitoringPatch,
                     // Always sent: applying the node limit is idempotent, so saving
                     // also (re)applies it to an existing cluster.
                     inotifyMaxUserInstances: inotifyMaxUserInstances.trim() ? Number(inotifyMaxUserInstances.trim()) : null,
@@ -207,6 +316,78 @@ export function EditClusterModal({ cluster, onClose, onSaved }) {
                     )}
                 </div>
                 <div className="space-y-2">
+                    <Label>Monitoring</Label>
+                    <label className="flex items-start gap-2 text-sm text-theme-text">
+                        <input type="radio" className="mt-1" name="edit-monitoring-mode" checked={monitoringMode === 'managed'} onChange={() => setMonitoringMode('managed')} disabled={busy} />
+                        Managed (Lens monitoring stack)
+                    </label>
+                    <label className="flex items-start gap-2 text-sm text-theme-text">
+                        <input type="radio" className="mt-1" name="edit-monitoring-mode" checked={monitoringMode === 'existing'} onChange={() => setMonitoringMode('existing')} disabled={busy} />
+                        Existing (External Prometheus / Grafana)
+                    </label>
+                    {monitoringMode === 'managed' ? (
+                        <div className="space-y-2 pl-6">
+                            <p className="text-xs text-theme-muted">
+                                Managed Prometheus and Grafana endpoints and NodePorts are discovered automatically during installation or Re-check on the Observability page.
+                            </p>
+                            {hasDiscoveredManagedSummary && (
+                                <div className="space-y-1.5 rounded-lg border border-theme-border bg-theme-card px-3 py-2 text-xs">
+                                    <div className="flex items-center justify-between gap-2">
+                                        <span className="font-medium text-theme-text">Discovered endpoints</span>
+                                        <Badge tone="info" size="xs">Managed</Badge>
+                                    </div>
+                                    {(cluster.prometheusUrl || cluster.prometheusNodePort) && (
+                                        <div className="flex flex-wrap items-center gap-2">
+                                            <span className="text-theme-muted">Prometheus:</span>
+                                            {cluster.prometheusUrl && <span className="break-all font-mono text-theme-text">{cluster.prometheusUrl}</span>}
+                                            {cluster.prometheusNodePort && <Badge tone="neutral" size="xs">NodePort {cluster.prometheusNodePort}</Badge>}
+                                        </div>
+                                    )}
+                                    {(cluster.grafanaUrl || cluster.grafanaNodePort) && (
+                                        <div className="flex flex-wrap items-center gap-2">
+                                            <span className="text-theme-muted">Grafana:</span>
+                                            {cluster.grafanaUrl && <span className="break-all font-mono text-theme-text">{cluster.grafanaUrl}</span>}
+                                            {cluster.grafanaNodePort && <Badge tone="neutral" size="xs">NodePort {cluster.grafanaNodePort}</Badge>}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    ) : (
+                        <div className="space-y-3 pl-6">
+                            <div className="space-y-1.5">
+                                <Label htmlFor="edit-monitoring-prometheus-url">Prometheus URL</Label>
+                                <Input
+                                    id="edit-monitoring-prometheus-url"
+                                    value={prometheusUrl}
+                                    onChange={(event) => setPrometheusUrl(event.target.value)}
+                                    placeholder="http://prometheus.example.com:9090"
+                                    required
+                                    error={Boolean(prometheusUrlError)}
+                                    disabled={busy}
+                                />
+                                {prometheusUrlError && (
+                                    <p role="alert" className="text-xs text-rose-600 dark:text-rose-300">{prometheusUrlError}</p>
+                                )}
+                            </div>
+                            <div className="space-y-1.5">
+                                <Label htmlFor="edit-monitoring-grafana-url">Grafana URL (optional)</Label>
+                                <Input
+                                    id="edit-monitoring-grafana-url"
+                                    value={grafanaUrl}
+                                    onChange={(event) => setGrafanaUrl(event.target.value)}
+                                    placeholder="http://grafana.example.com:3000"
+                                    error={Boolean(grafanaUrlError)}
+                                    disabled={busy}
+                                />
+                                {grafanaUrlError && (
+                                    <p role="alert" className="text-xs text-rose-600 dark:text-rose-300">{grafanaUrlError}</p>
+                                )}
+                            </div>
+                        </div>
+                    )}
+                </div>
+                <div className="space-y-2">
                     <Label>HF_TOKEN secret</Label>
                     <p className="text-xs text-slate-500">
                         Hugging Face token this cluster uses to pull gated models. The stored value is never shown;
@@ -256,6 +437,42 @@ export function EditClusterModal({ cluster, onClose, onSaved }) {
                     <Label htmlFor="edit-inotify-limit">Node inotify limit (fs.inotify.max_user_instances)</Label>
                     <Input id="edit-inotify-limit" type="number" min="1" value={inotifyMaxUserInstances} onChange={(event) => setInotifyMaxUserInstances(event.target.value)} placeholder="8192" disabled={busy} />
                     <p className="text-xs text-slate-500">Applied to every node so a busy node does not exhaust inotify (kind defaults to 128). 8192 is recommended.</p>
+                    <div className="space-y-1.5 pt-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex flex-wrap items-center gap-2">
+                                <Label htmlFor="edit-vllm-image" className="mb-0">vLLM runtime image (optional)</Label>
+                                <Badge tone={isCustomVllmImage ? 'info' : 'neutral'} size="xs">
+                                    {isCustomVllmImage ? 'Custom' : 'Default'}
+                                </Badge>
+                            </div>
+                            {Boolean(vllmImage) && (
+                                <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="xs"
+                                    onClick={() => setVllmImage('')}
+                                    disabled={busy}
+                                >
+                                    Reset to default
+                                </Button>
+                            )}
+                        </div>
+                        <Input
+                            id="edit-vllm-image"
+                            value={vllmImage}
+                            onChange={(event) => setVllmImage(event.target.value)}
+                            placeholder={vllmImagePlaceholder}
+                            error={Boolean(vllmImageError)}
+                            disabled={busy}
+                        />
+                        {vllmImageError && (
+                            <p role="alert" className="text-xs text-rose-600 dark:text-rose-300">{vllmImageError}</p>
+                        )}
+                        <p className="text-xs text-theme-muted">
+                            Leave empty to use the hardware profile default. When set, deployments and evaluations on this cluster inherit this image unless overridden per deployment.
+                            {profileImageHints.length > 0 ? ` Profile defaults: ${profileImageHints.join(' · ')}.` : ''}
+                        </p>
+                    </div>
                     <p className="text-xs text-slate-500">
                         llm-d component versions are fixed by this Lens release
                         {cluster.llmDRef ? ` (llm-d ${cluster.llmDRef}${cluster.llmDBenchmarkRef ? `, llm-d-benchmark ${cluster.llmDBenchmarkRef}` : ''})` : ''}.

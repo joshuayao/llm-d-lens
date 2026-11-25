@@ -10,11 +10,14 @@ repeated across 15 tables.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import Enum
+from functools import lru_cache
+from types import MappingProxyType
 from typing import Any, ClassVar, Self
 
-from sqlalchemy import ARRAY, JSON, DateTime, Text, TypeDecorator, event, inspect
+from sqlalchemy import ARRAY, JSON, DateTime, String, Text, TypeDecorator, event, inspect
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Session
 
@@ -204,6 +207,86 @@ def redact_audit_detail(value: Any) -> Any:
     return value
 
 
+@lru_cache(maxsize=1)
+def audit_string_column_limits() -> Mapping[str, int]:
+    """Return ``{column_name: max_length}`` for every ``String(N)`` column on ``AuditLogRow``."""
+    from llm_d_lens.db.models.audit_log import AuditLogRow  # noqa: PLC0415
+
+    return MappingProxyType(
+        {
+            column.name: column.type.length
+            for column in AuditLogRow.__table__.columns
+            if isinstance(column.type, String) and column.type.length is not None
+        }
+    )
+
+
+@lru_cache(maxsize=1)
+def _audit_non_nullable_string_columns() -> frozenset[str]:
+    from llm_d_lens.db.models.audit_log import AuditLogRow  # noqa: PLC0415
+
+    return frozenset(
+        column.name
+        for column in AuditLogRow.__table__.columns
+        if isinstance(column.type, String) and not column.nullable
+    )
+
+
+@lru_cache(maxsize=1)
+def _audit_nullable_fk_string_columns() -> frozenset[str]:
+    from llm_d_lens.db.models.audit_log import AuditLogRow  # noqa: PLC0415
+
+    return frozenset(
+        column.name
+        for column in AuditLogRow.__table__.columns
+        if isinstance(column.type, String) and column.nullable and bool(column.foreign_keys)
+    )
+
+
+def clamp_audit_log_fields(
+    values: dict[str, Any],
+    detail: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Clamp every ``String(N)`` column on ``AuditLogRow`` and preserve untruncated values in ``detail``."""
+    limits = audit_string_column_limits()
+    non_nullable = _audit_non_nullable_string_columns()
+    nullable_fk = _audit_nullable_fk_string_columns()
+    clamped = dict(values)
+    truncated: dict[str, Any] = {}
+    for column_name, max_len in limits.items():
+        if column_name not in clamped:
+            continue
+        value = clamped[column_name]
+        if value is None:
+            if column_name in non_nullable:
+                clamped[column_name] = str(uuid.uuid4()) if column_name == "id" else ""
+            continue
+        text = value if isinstance(value, str) else str(value)
+        if len(text) > max_len:
+            truncated[column_name] = _audit_json_value(text)
+            # Slicing a foreign-key ID to max_len would fail FK integrity or
+            # misattribute the row; clear the FK column and keep the full ID in detail.
+            clamped[column_name] = None if column_name in nullable_fk else text[:max_len]
+        elif not isinstance(value, str):
+            clamped[column_name] = text
+
+    merged_detail: dict[str, Any] | None
+    if truncated:
+        merged_detail = dict(detail) if detail is not None else {}
+        existing = merged_detail.get("truncatedFields")
+        truncated_fields = dict(existing) if isinstance(existing, dict) else {}
+        truncated_fields.update(truncated)
+        merged_detail["truncatedFields"] = truncated_fields
+    elif detail is not None:
+        merged_detail = dict(detail)
+    else:
+        merged_detail = None
+
+    if merged_detail is not None:
+        merged_detail = redact_audit_detail(merged_detail)
+    return clamped, merged_detail
+
+
 def _audit_snapshot(obj: Any, column_keys: list[str]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key in column_keys:
@@ -223,7 +306,7 @@ def _audit_target(obj: Any) -> tuple[str | None, str | None]:
     for key in ("name", "display_name", "username", "title", "group_name", "model_ref"):
         value = getattr(obj, key, None)
         if value:
-            target_name = str(value)[:256]
+            target_name = str(value)
             break
     return target_id, target_name
 
@@ -251,28 +334,39 @@ def _audit_row(
         if action != "create":
             actor_user_id = target_id
 
+    merged_detail = dict(detail)
+    required_permissions = getattr(context, "required_permissions", None)
+    if required_permissions and "requiredPermissions" not in merged_detail:
+        merged_detail["requiredPermissions"] = list(required_permissions)
+
+    fields, final_detail = clamp_audit_log_fields(
+        {
+            "id": str(uuid.uuid4()),
+            "actor_user_id": actor_user_id,
+            "actor_username": actor_username,
+            "source": context.source,
+            "event_type": context.event_type or f"{table}.{action}",
+            "action": context.action or action,
+            "permission": context.permission,
+            "method": context.method,
+            "path": context.path,
+            "target_type": table,
+            "target_id": target_id,
+            "target_name": target_name,
+            "cluster_id": context.cluster_id or cluster_id,
+            "result": "success",
+            "request_id": context.request_id,
+            "trace_id": context.trace_id,
+            "parent_request_id": context.parent_request_id,
+            "ip": context.ip,
+            "user_agent": context.user_agent or None,
+        },
+        merged_detail,
+    )
     return AuditLogRow(
-        id=str(uuid.uuid4()),
         created_at=datetime.now(UTC),
-        actor_user_id=actor_user_id,
-        actor_username=actor_username,
-        source=context.source,
-        event_type=context.event_type or f"{table}.{action}",
-        action=context.action or action,
-        permission=context.permission,
-        method=context.method,
-        path=context.path,
-        target_type=table,
-        target_id=target_id,
-        target_name=target_name,
-        cluster_id=context.cluster_id or cluster_id,
-        result="success",
-        request_id=context.request_id,
-        trace_id=context.trace_id,
-        parent_request_id=context.parent_request_id,
-        ip=context.ip,
-        user_agent=(context.user_agent or "")[:512] or None,
-        detail=redact_audit_detail(detail),
+        detail=final_detail,
+        **fields,
     )
 
 

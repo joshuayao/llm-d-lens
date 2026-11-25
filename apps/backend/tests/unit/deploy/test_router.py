@@ -875,3 +875,556 @@ def test_execution_readable_rejects_a_retired_execution_share():
     assert not router._execution_readable(principal, shared, None)
     unshared = SimpleNamespace(run_id="run-y", execution_id="exec-y", cluster_id=cluster_id)
     assert not router._execution_readable(principal, unshared, None)
+
+
+@pytest.mark.asyncio
+async def test_start_run_consumes_verified_namespace_for_single_case_only(monkeypatch, tmp_path):
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.deploy import application, capabilities
+    from llm_d_lens.deploy.contracts import DeployableConfiguration, DeploymentRunCreateRequest
+    from llm_d_lens.deploy.run_store import JsonDeploymentRunStore
+
+    monkeypatch.setenv("LLM_D_BENCH_NAMESPACE_PREFIX", "llmd-")
+    monkeypatch.setattr(cluster_registry, "get_cluster", lambda _cid: None)
+    capabilities.clear_verified_namespaces()
+    capabilities.record_verified_namespace(
+        "cluster-a",
+        "llmd-verified-target",
+        agentic_deployment_run_id="agentic-run-9",
+    )
+
+    store = JsonDeploymentRunStore(tmp_path)
+    manager = application.DeploymentRunManager(store=store)
+    monkeypatch.setattr(application, "require_active_session", lambda _sid: SimpleNamespace(id="s1", server_id="cluster-a"))
+    monkeypatch.setattr(application, "cluster_deployment_source", lambda _s, _d: {"resolved_repository": "/tmp/llm-d"})
+    monkeypatch.setattr(manager, "_worker", lambda _run: SimpleNamespace())
+    monkeypatch.setattr(manager, "_schedule_run", lambda _run_id, _worker: None)
+
+    from llm_d_lens.infrastructure.artifacts.manifests import configuration_checksum
+
+    config_content = {"model": {"name": "Qwen/Qwen3-0.6B"}}
+    config = DeployableConfiguration(
+        type="optimized-baseline",
+        format="helm",
+        provider_ref="optimized-baseline",
+        checksum=configuration_checksum(config_content),
+        content=config_content,
+    )
+    req = DeploymentRunCreateRequest(
+        configurations=[config],
+        provenance={
+            "cluster_session_id": "s1",
+            "cluster_server_id": "cluster-a",
+            "agentic_deployment_run_id": "agentic-run-9",
+        },
+    )
+    run = await manager.start_run(req)
+    assert run.provenance["target_namespace"] == "llmd-verified-target"
+    assert run.cases[0].create_request.deployment_policy.value["namespace_policy"] == {"exact": "llmd-verified-target"}
+
+    # Second run with same agentic_deployment_run_id does NOT reuse consumed namespace
+    run2 = await manager.start_run(req)
+    assert "target_namespace" not in run2.provenance
+    assert run2.cases[0].create_request.deployment_policy.value.get("namespace_policy") is None
+
+    # Multi-case run never shares one verified namespace across cases
+    capabilities.record_verified_namespace("cluster-a", "llmd-verified-target", agentic_deployment_run_id="agentic-multi")
+    multi_req = DeploymentRunCreateRequest(
+        configurations=[config, config],
+        provenance={
+            "cluster_session_id": "s1",
+            "cluster_server_id": "cluster-a",
+            "agentic_deployment_run_id": "agentic-multi",
+        },
+    )
+    multi_run = await manager.start_run(multi_req)
+    assert len(multi_run.cases) == 2
+    assert "target_namespace" not in multi_run.provenance
+
+
+@pytest.mark.asyncio
+async def test_topology_and_node_labels_surface_401_and_prometheus_fallback(monkeypatch):
+    from fastapi.responses import JSONResponse
+
+    from llm_d_lens.deploy import slice_capacity
+    from llm_d_lens.deploy.capabilities import DeploymentClusterAuthError
+
+    monkeypatch.setattr(router, "require_cluster_access", lambda _p, _c: None)
+    monkeypatch.setattr(router, "current_principal", lambda _r: None)
+    monkeypatch.setattr(router, "list_resources", lambda *_a, **_kw: asyncio.sleep(0, result=[]))
+
+    async def fake_prom(_cid):
+        return (
+            [
+                {
+                    "metadata": {"name": "node-1", "labels": {"kubernetes.io/hostname": "node-1", "gpu": "xpu"}},
+                    "status": {"allocatable": {"cpu": "16"}, "conditions": []},
+                    "spec": {},
+                }
+            ],
+            [],
+            "prometheus",
+        )
+
+    monkeypatch.setattr(slice_capacity, "fetch_cluster_nodes_and_pods", fake_prom, raising=False)
+    topo = await router.get_deployment_topology("cluster-a", None)
+    assert topo["nodes"][0]["name"] == "node-1"
+    labels = await router.list_deployment_node_labels("cluster-a", None)
+    assert {"key": "gpu", "value": "xpu"} in labels["items"]
+
+    async def fake_401(_cid):
+        raise DeploymentClusterAuthError("Unauthorized")
+
+    monkeypatch.setattr(slice_capacity, "fetch_cluster_nodes_and_pods", fake_401, raising=False)
+    resp_topo = await router.get_deployment_topology("cluster-a", None)
+    assert isinstance(resp_topo, JSONResponse)
+    assert resp_topo.status_code == 401
+    assert json.loads(resp_topo.body)["code"] == "kubeconfig_unauthorized"
+
+    resp_labels = await router.list_deployment_node_labels("cluster-a", None)
+    assert isinstance(resp_labels, JSONResponse)
+    assert resp_labels.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_deployment_permission_routes_delegate_and_map_errors(monkeypatch):
+    from fastapi.responses import JSONResponse
+
+    from llm_d_lens.deploy.capabilities import (
+        DeploymentBootstrapVerifyRequest,
+        DeploymentCapabilityValidationError,
+        DeploymentClusterAuthError,
+        DeploymentPermissionCheckRequest,
+    )
+
+    monkeypatch.setattr(router, "require_cluster_access", lambda _p, _c: None)
+    monkeypatch.setattr(router, "current_principal", lambda _r: None)
+    monkeypatch.setattr(
+        router,
+        "check_deployment_permissions",
+        lambda _body: asyncio.sleep(0, result={"status": "sufficient", "sufficient": True}),
+    )
+    res = await router.check_deployment_permissions_route(
+        DeploymentPermissionCheckRequest(cluster_id="cluster-a", namespace="llmd-test")
+    )
+    assert res["sufficient"] is True
+
+    async def raise_401(_body):
+        raise DeploymentClusterAuthError("Unauthorized")
+
+    monkeypatch.setattr(router, "generate_deployment_bootstrap_script", raise_401)
+    resp_401 = await router.generate_deployment_permission_remediation(
+        DeploymentPermissionCheckRequest(cluster_id="cluster-a", namespace="llmd-test")
+    )
+    assert isinstance(resp_401, JSONResponse)
+    assert resp_401.status_code == 401
+
+    async def raise_422(_body, **_kwargs):
+        raise DeploymentCapabilityValidationError("Protected namespace", code="protected_namespace")
+
+    monkeypatch.setattr(router, "verify_deployment_bootstrap", raise_422)
+    resp_422 = await router.verify_deployment_admin_handoff(
+        DeploymentBootstrapVerifyRequest(cluster_id="cluster-a", namespace="kube-system")
+    )
+    assert isinstance(resp_422, JSONResponse)
+    assert resp_422.status_code == 422
+    assert json.loads(resp_422.body)["code"] == "protected_namespace"
+
+
+@pytest.mark.asyncio
+async def test_router_preserves_401_and_redacts_kubectl_errors(monkeypatch):
+    from fastapi.responses import JSONResponse
+
+    from llm_d_lens.deploy.capabilities import DeploymentClusterAuthError
+    from llm_d_lens.deploy.contracts import DeployableConfiguration, DeploymentRunCreateRequest
+    from llm_d_lens.infrastructure.process import CommandResult
+
+    class _FakeInventoryAuthError(Exception):
+        pass
+
+    monkeypatch.setattr(router, "require_cluster_access", lambda _p, _c: None)
+    monkeypatch.setattr(router, "current_principal", lambda _r: None)
+    monkeypatch.setattr(router, "_require_execution_permission", lambda *_a, **_kw: None)
+    monkeypatch.setattr(router, "_require_run_permission", lambda *_a, **_kw: None)
+
+    exec_ctx = SimpleNamespace(
+        execution_id="exec-401",
+        namespace="llmd-401",
+        cluster_id="cluster-a",
+        run_id="run-1",
+        case_id="case-1",
+        provenance={"cluster_server_id": "cluster-a"},
+    )
+    monkeypatch.setattr(router, "find_execution_context", lambda _eid: exec_ctx)
+    monkeypatch.setattr(router, "_require_execution", lambda _eid: exec_ctx)
+
+    async def fail_401_run(_eid, **_kw):
+        raise DeploymentClusterAuthError("Unauthorized")
+
+    monkeypatch.setattr(router, "delete_execution_record", fail_401_run)
+    del_resp = await router.delete_execution("exec-401")
+    assert isinstance(del_resp, JSONResponse)
+    assert del_resp.status_code == 401
+
+    monkeypatch.setattr(router, "verify_execution_cleanup", fail_401_run)
+    clean_resp = await router.verify_deployment_execution_cleanup("exec-401")
+    assert isinstance(clean_resp, JSONResponse)
+    assert clean_resp.status_code == 401
+
+    async def prepare_401(*_a, **_kw):
+        raise DeploymentClusterAuthError("Unauthorized")
+
+    monkeypatch.setattr("llm_d_lens.deploy.prepared_plans.prepare", prepare_401)
+    plan_req = DeploymentRunCreateRequest(
+        configurations=[
+            DeployableConfiguration(
+                type="deployment",
+                format="helm-values",
+                content={},
+                provider_ref="optimized-baseline",
+                checksum="abc",
+            )
+        ],
+        provenance={"cluster_server_id": "cluster-a"},
+    )
+    plan_resp = await router.prepare_deployment_plan(plan_req, None)
+    assert isinstance(plan_resp, JSONResponse)
+    assert plan_resp.status_code == 401
+
+    fake_run = SimpleNamespace(
+        id="run-1",
+        provenance={"_prepared_plan_id": "plan-1"},
+        cases=[SimpleNamespace(id="case-1")],
+    )
+    monkeypatch.setattr(router._store, "get_run", lambda _rid: fake_run)
+    monkeypatch.setattr("llm_d_lens.db.dao.deployment_plan.DeploymentPlanDao.get", lambda _s, _pid: SimpleNamespace())
+    monkeypatch.setattr("llm_d_lens.deploy.prepared_plans.plan_documents", lambda _p, _i: [])
+
+    async def verify_exec_401(*_a, **_kw):
+        raise DeploymentClusterAuthError("Unauthorized")
+
+    monkeypatch.setattr("llm_d_lens.deploy.runtime_verification.verify_execution", verify_exec_401)
+    ver_resp = await router.verify_deployment_execution(
+        "exec-401",
+        router.RuntimeVerificationRequest(metrics_only=True),
+        None,
+    )
+    assert isinstance(ver_resp, JSONResponse)
+    assert ver_resp.status_code == 401
+
+    async def restart_401(*_a, **_kw):
+        raise _FakeInventoryAuthError("Unauthorized")
+
+    monkeypatch.setattr("llm_d_lens.deploy.slice_capacity.ClusterInventoryAuthError", _FakeInventoryAuthError, raising=False)
+    monkeypatch.setattr(router.deployment_run_manager, "worker_for_run", lambda _rid: SimpleNamespace(restart_case=restart_401))
+    monkeypatch.setattr(router._store, "get_run", lambda _rid: SimpleNamespace(id="run-1", provenance={}))
+    restart_resp = await router.restart_case("run-1", "case-1", router.RestartCaseRequest(), None)
+    assert isinstance(restart_resp, JSONResponse)
+    assert restart_resp.status_code == 401
+
+    # get_execution_pods / get_execution_pod_logs redact tokens & kubeconfig paths and preserve 401
+    async def kubectl_leak(*_a, **_kw):
+        return CommandResult(
+            ("kubectl",),
+            1,
+            "",
+            "error --kubeconfig=/tmp/secret.kubeconfig Bearer secret.tok.123",
+        )
+
+    monkeypatch.setattr("llm_d_lens.infrastructure.kubernetes.run_kubectl", kubectl_leak)
+    pods_err = await router.get_execution_pods("exec-401")
+    assert "secret.kubeconfig" not in pods_err["error"]
+    assert "secret.tok.123" not in pods_err["error"]
+
+    logs_err = await router.get_execution_pod_logs("exec-401", "pod-1")
+    assert "secret.kubeconfig" not in logs_err["logs"]
+    assert "secret.tok.123" not in logs_err["logs"]
+
+    async def kubectl_401(*_a, **_kw):
+        return CommandResult(("kubectl",), 1, "", "You must be logged in to the server (Unauthorized)")
+
+    monkeypatch.setattr("llm_d_lens.infrastructure.kubernetes.run_kubectl", kubectl_401)
+    pods_401 = await router.get_execution_pods("exec-401")
+    assert isinstance(pods_401, JSONResponse)
+    assert pods_401.status_code == 401
+    logs_401 = await router.get_execution_pod_logs("exec-401", "pod-1")
+    assert isinstance(logs_401, JSONResponse)
+    assert logs_401.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_permission_check_records_bootstrapped_namespace_and_start_run_verifies_marker(monkeypatch, tmp_path):
+    from llm_d_lens.deploy import application, capabilities, router
+    from llm_d_lens.deploy.contracts import (
+        DeploymentRunCreateRequest,
+        DeploymentStatus,
+    )
+    from llm_d_lens.deploy.run_store import JsonDeploymentRunStore
+
+    monkeypatch.setenv("LLM_D_BENCH_NAMESPACE_PREFIX", "llmd-")
+    capabilities.clear_verified_namespaces()
+    monkeypatch.setattr(router, "current_principal", lambda _req: SimpleNamespace(user_id="alice"))
+    monkeypatch.setattr(router, "owner_for_create", lambda _p: "alice")
+    monkeypatch.setattr(router, "require_cluster_access", lambda *_args: None)
+
+    # 1. Admin cluster where namespace does NOT exist and marker is absent -> does NOT pin static namespace
+    async def admin_fresh_check(_body):
+        return {
+            "status": "sufficient",
+            "sufficient": True,
+            "clusterId": "cluster-a",
+            "namespace": "llmd-admin-preview-12345678",
+            "namespaceExists": False,
+            "marker": {"present": False, "status": "missing"},
+        }
+
+    monkeypatch.setattr(router, "check_deployment_permissions", admin_fresh_check)
+    await router.check_deployment_permissions_route(
+        capabilities.DeploymentPermissionCheckRequest(
+            cluster_id="cluster-a",
+            agentic_deployment_run_id="agentic-admin-1",
+            deployment_name="admin-deploy",
+        ),
+        None,
+    )
+    assert (
+        capabilities.consume_verified_namespace(
+            "cluster-a",
+            owner_user_id="alice",
+            agentic_deployment_run_id="agentic-admin-1",
+            deployment_name="admin-deploy",
+        )
+        is None
+    )
+
+    # 2. Bootstrapped namespace (sufficient=True + marker.present=True) -> recorded for start_run()
+    async def bootstrapped_check(_body):
+        return {
+            "status": "sufficient",
+            "sufficient": True,
+            "clusterId": "cluster-a",
+            "namespace": "llmd-bootstrapped-ns",
+            "namespaceExists": True,
+            "marker": {"present": True, "status": "completed"},
+        }
+
+    monkeypatch.setattr(router, "check_deployment_permissions", bootstrapped_check)
+    await router.check_deployment_permissions_route(
+        capabilities.DeploymentPermissionCheckRequest(
+            cluster_id="cluster-a",
+            namespace="llmd-bootstrapped-ns",
+            agentic_deployment_run_id="agentic-nonadmin-1",
+            deployment_name="nonadmin-deploy",
+        ),
+        None,
+    )
+    assert (
+        capabilities.consume_verified_namespace(
+            "cluster-a",
+            owner_user_id="alice",
+            agentic_deployment_run_id="agentic-nonadmin-1",
+        )
+        == "llmd-bootstrapped-ns"
+    )
+
+    # 2b. Stale marker (clusterId/namespace mismatch) is NEVER recorded even if namespaceExists=True
+    async def stale_marker_check(_body):
+        return {
+            "status": "sufficient",
+            "sufficient": True,
+            "canCreateNamespaces": False,
+            "clusterId": "cluster-a",
+            "namespace": "llmd-stale-ns",
+            "namespaceExists": True,
+            "marker": {"present": False, "status": "stale"},
+        }
+
+    monkeypatch.setattr(router, "check_deployment_permissions", stale_marker_check)
+    await router.check_deployment_permissions_route(
+        capabilities.DeploymentPermissionCheckRequest(
+            cluster_id="cluster-a",
+            namespace="llmd-stale-ns",
+            agentic_deployment_run_id="agentic-stale-1",
+        ),
+        None,
+    )
+    assert (
+        capabilities.consume_verified_namespace(
+            "cluster-a",
+            owner_user_id="alice",
+            agentic_deployment_run_id="agentic-stale-1",
+        )
+        is None
+    )
+
+    # 2c. Admin cluster (canCreateNamespaces=True) with existing markerless namespace is NEVER recorded
+    async def admin_existing_markerless_check(_body):
+        return {
+            "status": "sufficient",
+            "sufficient": True,
+            "canCreateNamespaces": True,
+            "clusterId": "cluster-a",
+            "namespace": "llmd-existing-unbootstrapped",
+            "namespaceExists": True,
+            "marker": {"present": False, "status": "missing"},
+        }
+
+    monkeypatch.setattr(router, "check_deployment_permissions", admin_existing_markerless_check)
+    await router.check_deployment_permissions_route(
+        capabilities.DeploymentPermissionCheckRequest(
+            cluster_id="cluster-a",
+            namespace="llmd-existing-unbootstrapped",
+            agentic_deployment_run_id="agentic-admin-hijack-1",
+        ),
+        None,
+    )
+    assert (
+        capabilities.consume_verified_namespace(
+            "cluster-a",
+            owner_user_id="alice",
+            agentic_deployment_run_id="agentic-admin-hijack-1",
+        )
+        is None
+    )
+
+    # 3. DeploymentRunManager.start_run falls back to explicit target_namespace when bootstrap marker is present on cluster
+    store = JsonDeploymentRunStore(tmp_path / "runs")
+    manager = application.DeploymentRunManager(store=store)
+    monkeypatch.setattr(
+        application,
+        "require_active_session",
+        lambda sid: SimpleNamespace(id=sid, server_id="cluster-a"),
+    )
+    monkeypatch.setattr(application, "cluster_deployment_source", lambda _session, _source: {"kind": "agentic"})
+    monkeypatch.setattr(manager, "_worker", lambda _run=None: SimpleNamespace())
+    monkeypatch.setattr(manager, "_schedule_run", lambda *_args: None)
+    monkeypatch.setattr(
+        "llm_d_lens.db.dao.deployment_batch.DeploymentBatchDao.set_owner",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "llm_d_lens.cluster.registry.get_cluster",
+        lambda _cid: None,
+    )
+    monkeypatch.setattr(
+        "llm_d_lens.cluster.registry.cluster_kubeconfig_namespace",
+        lambda _cid: None,
+    )
+
+    async def marker_present(cluster_id, namespace, **_kwargs):
+        return cluster_id == "cluster-a" and namespace == "llmd-marker-verified"
+
+    monkeypatch.setattr(capabilities, "is_bootstrap_marker_present", marker_present)
+
+    config = build_standard_kubernetes_service_configuration(
+        StandardKubernetesServiceRequest(
+            model="Qwen/Qwen3-0.6B",
+            deployment_name="qwen-svc",
+            cluster_session_id="a" * 36,
+            replicas=1,
+            tensor_parallel_size=1,
+            storage_volume_id="vol-1",
+        )
+    )
+    created = await manager.start_run(
+        DeploymentRunCreateRequest(
+            configurations=[config],
+            provenance={
+                "cluster_session_id": "s-1",
+                "deployment_name": "qwen-svc",
+                "agentic_deployment_run_id": "agentic-explicit-1",
+                "target_namespace": "llmd-marker-verified",
+            },
+        ),
+        owner_user_id="alice",
+    )
+    assert created.provenance["target_namespace"] == "llmd-marker-verified"
+    assert created.cases[0].create_request.deployment_policy.value["namespace_policy"] == {
+        "exact": "llmd-marker-verified"
+    }
+
+    # Unbootstrapped target_namespace on Admin cluster is stripped rather than pinned
+    unpinned = await manager.start_run(
+        DeploymentRunCreateRequest(
+            configurations=[config],
+            provenance={
+                "cluster_session_id": "s-1",
+                "deployment_name": "qwen-admin",
+                "agentic_deployment_run_id": "agentic-explicit-2",
+                "target_namespace": "llmd-unbootstrapped-preview",
+            },
+        ),
+        owner_user_id="alice",
+    )
+    assert "target_namespace" not in unpinned.provenance
+    assert (unpinned.cases[0].create_request.deployment_policy.value or {}).get("namespace_policy") is None
+
+    # Re-records consumed namespace if active_owner collision raises on same cluster
+    capabilities.record_verified_namespace(
+        "cluster-a",
+        "llmd-collision-ns",
+        owner_user_id="alice",
+        agentic_deployment_run_id="agentic-retry-1",
+    )
+    same_cluster_exec = SimpleNamespace(
+        execution_id="exec-same",
+        namespace="llmd-collision-ns",
+        status=DeploymentStatus.READY,
+        provenance={"cluster_server_id": "cluster-a"},
+    )
+    monkeypatch.setattr(store, "list_executions", lambda: [same_cluster_exec])
+    with pytest.raises(ValueError, match="already used by an active deployment"):
+        await manager.start_run(
+            DeploymentRunCreateRequest(
+                configurations=[config],
+                provenance={
+                    "cluster_session_id": "s-1",
+                    "agentic_deployment_run_id": "agentic-retry-1",
+                },
+            ),
+            owner_user_id="alice",
+        )
+    assert (
+        capabilities.consume_verified_namespace(
+            "cluster-a",
+            owner_user_id="alice",
+            agentic_deployment_run_id="agentic-retry-1",
+        )
+        == "llmd-collision-ns"
+    )
+
+
+def test_standard_kubernetes_service_uses_cluster_vllm_image_when_configured(monkeypatch, standard_cluster_hardware):
+    captured = {}
+
+    async def start_run(request, **_kwargs):
+        captured["request"] = request
+        return request
+
+    monkeypatch.setattr(
+        "llm_d_lens.cluster.registry.require_cluster",
+        lambda _cluster_id: SimpleNamespace(id="cluster-a", vllm_image="registry.internal:5000/org/vllm:cluster"),
+    )
+    monkeypatch.setattr(router.deployment_run_manager, "start_run", start_run)
+
+    request = StandardKubernetesServiceRequest(
+        model="Qwen/Qwen3-0.6B",
+        deployment_name="qwen3-standard-custom-img",
+        cluster_session_id="a" * 36,
+        replicas=1,
+        tensor_parallel_size=1,
+        storage_volume_id="storage-model-cache",
+    )
+
+    asyncio.run(router.create_standard_kubernetes_service_run(request))
+
+    assert (
+        captured["request"].configurations[0].content["runtime"]["image"]
+        == "registry.internal:5000/org/vllm:cluster"
+    )
+    fallback_cfg = build_standard_kubernetes_service_configuration(
+        request,
+        accelerator="nvidia",
+        cluster_vllm_image=None,
+    )
+    assert fallback_cfg.content["runtime"]["image"] == runtime_image(accelerator="nvidia")

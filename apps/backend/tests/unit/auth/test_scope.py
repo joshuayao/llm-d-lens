@@ -1,3 +1,6 @@
+import pytest
+
+from llm_d_lens.auth.access import require_cluster_or_owner_access
 from llm_d_lens.auth.contracts import Principal, ResourceRef, RoleBinding, ScopeType
 from llm_d_lens.auth.scope import (
     binding_applies,
@@ -7,6 +10,7 @@ from llm_d_lens.auth.scope import (
     ownership_covers,
     reachable_clusters,
 )
+from llm_d_lens.core.exceptions import ForbiddenError
 
 
 def _principal(*bindings, groups=frozenset(), user_id="u1"):
@@ -113,3 +117,21 @@ def test_ownership_requires_cluster_reachability():
     resource = _resource(cluster="other", owner="creator")
     creator = _principal(RoleBinding("end-user", ScopeType.CLUSTER, scope_cluster_id="c1"), user_id="creator")
     assert not ownership_covers(creator, resource, "deployment:run:read")
+
+
+def test_cluster_or_owner_access_allows_recording_owner_without_cluster_binding():
+    require_cluster_or_owner_access(_principal(user_id="owner"), "c1", "owner")
+
+
+def test_cluster_or_owner_access_falls_back_to_cluster_scope_for_non_owner():
+    require_cluster_or_owner_access(
+        _principal(RoleBinding("admin", ScopeType.GLOBAL), user_id="other"),
+        "c1",
+        "owner",
+    )
+    with pytest.raises(ForbiddenError):
+        require_cluster_or_owner_access(_principal(user_id="other"), "c1", "owner")
+
+
+def test_cluster_or_owner_access_is_unrestricted_when_auth_is_disabled():
+    require_cluster_or_owner_access(None, "c1", "owner")

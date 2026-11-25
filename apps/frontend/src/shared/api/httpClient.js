@@ -14,6 +14,7 @@ export function problemError(payload, response) {
     error.details = detail ?? payload?.error ?? null;
     error.retryable = Boolean(structured.retryable ?? payload?.retryable);
     error.body = payload;
+    error.executionToken = response?.headers?.get('X-Lens-Execution-Token') || null;
     return error;
 }
 
@@ -30,7 +31,22 @@ function readCookie(name) {
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
-export async function requestJson(url, options = {}, { fallback = {}, errorFactory = problemError, strictJson = false, expectedStatus } = {}) {
+/** Execution headers shared by the guarded provisioning steps. */
+export const PLAN_HASH_HEADER = 'X-Lens-Plan-Hash';
+export const EXECUTION_TOKEN_HEADER = 'X-Lens-Execution-Token';
+
+export function executionHeaders({ planHash, token } = {}, base = undefined) {
+    const headers = new Headers(base);
+    if (planHash) headers.set(PLAN_HASH_HEADER, planHash);
+    if (token) headers.set(EXECUTION_TOKEN_HEADER, token);
+    return headers;
+}
+
+export function executionToken(response) {
+    return response?.headers?.get(EXECUTION_TOKEN_HEADER) || null;
+}
+
+export async function requestJson(url, options = {}, { fallback = {}, errorFactory = problemError, strictJson = false, expectedStatus, returnMeta = false } = {}) {
     const headers = new Headers(options.headers);
     if (!headers.has('Accept')) headers.set('Accept', 'application/json');
     const method = (options.method || 'GET').toUpperCase();
@@ -46,7 +62,14 @@ export async function requestJson(url, options = {}, { fallback = {}, errorFacto
         }
         throw errorFactory(payload, response);
     }
+    // Opt-in metadata keeps every existing caller's return value unchanged.
+    if (returnMeta) return { body: payload, response };
     return payload;
+}
+
+/** JSON request that also returns the raw response for response-header reads. */
+export function requestJsonWithMeta(url, options = {}, config = {}) {
+    return requestJson(url, options, { ...config, returnMeta: true });
 }
 
 export function postJson(url, body, options = {}) {

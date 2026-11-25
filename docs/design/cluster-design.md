@@ -41,6 +41,15 @@ model-service capabilities. Detailed current API/UI contracts live in the
 [Clusters API manual](../site/i18n/en/docusaurus-plugin-content-docs/current/api-reference/modules/clusters.mdx)
 and [user guide](../site/i18n/en/docusaurus-plugin-content-docs/current/user-guide/clusters.mdx).
 
+> **Historical (superseded in M5).** The Step 1-5 provisioning flow, background
+> `provisioning` jobs, substep retry endpoints and `POST /gateway` /
+> `POST /prepare` / `POST /images/prepull` / `POST /crds` / `POST /lws`
+> mutations described in this subsection are pre-M5 design. The current flow is
+> draft registration, plan save, permission check/remediation, operation
+> execution and atomic completion. See
+> [cluster-permission-preflight-design.md](cluster-permission-preflight-design.md)
+> and the [Clusters API manual](../site/i18n/en/docusaurus-plugin-content-docs/current/api-reference/modules/clusters.mdx).
+
 #### Goals
 
 - The create-cluster wizard includes the following steps, in order:
@@ -356,20 +365,6 @@ class ProxyConfigDTO(StrictModel):
     detection_error: str | None = Field(default=None, alias="detectionError")
 
 
-class HfTokenSecretCreateRequest(StrictModel):
-    """Standalone "create HF Token Secret" request, not attached to a specific
-    Model Cache entry."""
-
-    namespace: str = Field(min_length=1, max_length=253)
-    # Default name includes a short UUID suffix to avoid name collisions; users
-    # can also provide their own, in which case it must be unique within the
-    # namespace.
-    name: str = Field(
-        default_factory=lambda: f"hf-token-{uuid4().hex[:8]}", max_length=253
-    )
-    token: str = Field(min_length=1)
-
-
 class HfTokenSecretRef(StrictModel):
     namespace: str
     name: str
@@ -385,7 +380,7 @@ class ModelCacheSeedRequest(StrictModel):
     (exactly the same fields as creating one manually on the Storage page; see 4.4).
     """
 
-    hf_token_secret: HfTokenSecretCreateRequest = Field(alias="hfTokenSecret")
+    hf_token_secret: dict[str, Any] = Field(alias="hfTokenSecret")
     repo_id: str = Field(
         alias="repoId", pattern=_REPO_ID_PATTERN
     )  # reuse model_cache regex
@@ -823,16 +818,11 @@ out everything manually:
 
 **Dependencies and implementation approach:**
 
-- **HF Token Secret is no longer a new `TokenSourceMode` inside Model Cache**.
-  Instead, it is split into an independent, generic action: "create a Secret
-  containing `HF_TOKEN` in the user-specified namespace". Add a new endpoint that
-  is not attached to any specific Model Cache entry:
-
-  ```
-  POST /api/cluster/clusters/{cluster_id}/hf-token-secrets
-  Body: HfTokenSecretCreateRequest { namespace, name?, token }
-  Resp: HfTokenSecretRef { namespace, name }
-  ```
+- **Historical note: HF Token Secret creation moved to the operation flow.**
+  The old `POST /api/cluster/clusters/{cluster_id}/hf-token-secrets` route and
+  `HfTokenSecretCreateRequest` were removed in M5. Creating the plan's HF token
+  Secret is now the `cache.hf-secret` user operation. Credential rotation remains
+  `PUT /api/cluster/clusters/{cluster_id}/hf-token-secret`.
 
   The implementation directly reuses the manifest structure of
   `deploy/runtime/composition.py::create_model_secret_from_token()`
@@ -871,13 +861,18 @@ out everything manually:
   Cache page today. The only difference is that the initiator is the wizard's
   background task rather than a button click by the user.
 
-#### 4.5 Step 5: confirmation
+#### 4.5 Step 5: confirmation (historical)
+
+> Superseded in M5. The current UI is **Review and permissions → Execute →
+> Complete → Done**; completion is `POST /execution/complete`, not a PATCH and
+> not a background provisioning job. The old confirmation/provisioning text
+> below is retained as design history only.
 
 Read-only summary of the choices in Steps 1-4 (skipped steps show as "not
-enabled"), with a "Create cluster" button. If the cluster was already created
-mid-wizard in Step 1 (see §4.1), clicking this step actually sends
-`PATCH /api/cluster/clusters/{id}` (persist Step 2/3 config and start Step 4
-background work), rather than another `POST`.
+enabled"), with a "Create cluster" button. In the pre-M5 design, if the cluster
+was already created mid-wizard in Step 1 (see §4.1), clicking this step sent
+`PATCH /api/cluster/clusters/{id}` to persist Step 2/3 config and start Step 4
+background work, rather than another `POST`.
 
 ---
 

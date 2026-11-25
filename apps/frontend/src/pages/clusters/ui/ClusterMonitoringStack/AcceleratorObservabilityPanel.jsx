@@ -7,8 +7,12 @@
 //     https://www.apache.org/licenses/LICENSE-2.0
 
 import { useMonitoringOperation } from './useMonitoringOperation';
-import { openMonitoringLink } from './monitoringLinks';
-import React, { useCallback, useEffect, useState } from 'react';
+import {
+    DEFAULT_MONITORING_NAMESPACE,
+    normalizeMonitoringNamespace,
+    openMonitoringLink,
+} from './monitoringLinks';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
     AlertOctagon,
     AlertTriangle,
@@ -17,16 +21,19 @@ import {
     RefreshCw,
     X,
 } from 'lucide-react';
-import { Button, EmptyState, LoadingState, SectionLabel, ToggleGroup } from '../../../../shared/ui';
+import { Badge, Button, EmptyState, LoadingState, Modal, SectionLabel, ToggleGroup } from '../../../../shared/ui';
 import { ClusterStackComponentTable } from './ClusterStackComponentTable';
-import { ClusterStackOperationProgress } from './ClusterStackOperationProgress';
+import { ClusterStackOperationProgress, MonitoringAdminScriptPanel } from './ClusterStackOperationProgress';
 import { InstallAcceleratorModal } from './InstallAcceleratorModal';
 import {
+    getAcceleratorAdminScript,
     getAcceleratorCapabilities,
     getAcceleratorLinks,
     getAcceleratorOperation,
+    recheckAccelerator,
 } from './acceleratorObservabilityBackend';
 import { accessModeLabel } from './acceleratorLabels';
+import { getNonAdminAcceleratorAction, summarizeMonitoringComponents } from './preflightPresentation';
 import { useAcceleratorObservability } from './useAcceleratorObservability';
 
 
@@ -42,7 +49,13 @@ function display(value) {
     return String(value || 'unknown').replace(/_/g, ' ');
 }
 
-export function AcceleratorObservabilityPanel({ clusterId }) {
+export function AcceleratorObservabilityPanel({
+    clusterId,
+    monitoringNamespace = DEFAULT_MONITORING_NAMESPACE,
+    enabled = true,
+    onMonitoringUpdated,
+}) {
+    const effectiveMonitoringNamespace = normalizeMonitoringNamespace(monitoringNamespace);
     const [capabilities, setCapabilities] = useState([]);
     const [capabilitiesError, setCapabilitiesError] = useState(null);
     const [capabilitiesLoading, setCapabilitiesLoading] = useState(true);
@@ -58,8 +71,25 @@ export function AcceleratorObservabilityPanel({ clusterId }) {
     const [completedOperationId, setCompletedOperationId] = useState(null);
     const [linksError, setLinksError] = useState(null);
     const [openingLink, setOpeningLink] = useState(null);
+    const [scriptModalOpen, setScriptModalOpen] = useState(false);
+    const [scriptModalAction, setScriptModalAction] = useState('install');
+    const [adminScript, setAdminScript] = useState(null);
+    const [adminScriptMeta, setAdminScriptMeta] = useState(null);
+    const [scriptLoading, setScriptLoading] = useState(false);
+    const [scriptError, setScriptError] = useState(null);
+    const [scriptNotice, setScriptNotice] = useState('');
+    const [rechecking, setRechecking] = useState(false);
+    const [cachedAccessModes, setCachedAccessModes] = useState([]);
+    const scriptAbortRef = useRef(null);
+    const contextEpochRef = useRef(0);
 
-    const status = useAcceleratorObservability(activeType, namespace, accessMode, clusterId);
+    const status = useAcceleratorObservability(
+        activeType,
+        namespace,
+        accessMode,
+        clusterId,
+        { monitoringNamespace: effectiveMonitoringNamespace, enabled },
+    );
     const snapshot = status.data;
     const refreshStatus = status.refresh;
     const snapshotOperationId = snapshot?.active_operation_id;
@@ -99,10 +129,54 @@ export function AcceleratorObservabilityPanel({ clusterId }) {
 
     const loadOperation = useCallback((id, options) => getAcceleratorOperation(activeType, id, options), [activeType]);
     useMonitoringOperation({
-        operationId, operationStatus: operation?.status, completedOperationId, namespace,
-        loadOperation: loadOperation, refreshStatus, setOperation, setOperationError,
-        setCompletedOperationId, setInstallSuccess,
+        operationId,
+        operationStatus: operation?.status,
+        completedOperationId,
+        namespace,
+        loadOperation,
+        refreshStatus,
+        onSucceeded: onMonitoringUpdated,
+        setOperation,
+        setOperationError,
+        setCompletedOperationId,
+        setInstallSuccess,
     });
+
+    useEffect(() => {
+        setAdminScriptMeta(null);
+        setLinksError(null);
+    }, [effectiveMonitoringNamespace]);
+
+    useEffect(() => {
+        contextEpochRef.current += 1;
+        scriptAbortRef.current?.abort();
+        scriptAbortRef.current = null;
+        setOperation(null);
+        setOperationError(null);
+        setInstallSuccess(null);
+        setCompletedOperationId(null);
+        setLinksError(null);
+        setScriptModalOpen(false);
+        setAdminScript(null);
+        setAdminScriptMeta(null);
+        setScriptLoading(false);
+        setScriptError(null);
+        setScriptNotice('');
+        setRechecking(false);
+        setCachedAccessModes([]);
+        setInstallOpen(false);
+    }, [clusterId]);
+
+    useEffect(() => {
+        if (snapshot?.access_modes?.length) {
+            setCachedAccessModes(snapshot.access_modes);
+        }
+    }, [snapshot?.access_modes]);
+
+    useEffect(() => () => {
+        contextEpochRef.current += 1;
+        scriptAbortRef.current?.abort();
+    }, []);
 
     useEffect(() => {
         if (!installSuccess) return undefined;
@@ -112,13 +186,25 @@ export function AcceleratorObservabilityPanel({ clusterId }) {
 
     const selectAccelerator = (type) => {
         const capability = capabilities.find((entry) => entry.type === type);
+        contextEpochRef.current += 1;
+        scriptAbortRef.current?.abort();
+        scriptAbortRef.current = null;
         setActiveType(type);
         setNamespace(capability?.default_namespace || '');
         setAccessMode(null);
+        setCachedAccessModes([]);
         setOperation(null);
         setOperationError(null);
         setInstallSuccess(null);
         setCompletedOperationId(null);
+        setLinksError(null);
+        setScriptModalOpen(false);
+        setAdminScript(null);
+        setAdminScriptMeta(null);
+        setScriptLoading(false);
+        setScriptError(null);
+        setScriptNotice('');
+        setRechecking(false);
     };
 
     const startOperation = (nextOperation) => {
@@ -136,7 +222,10 @@ export function AcceleratorObservabilityPanel({ clusterId }) {
         setOpeningLink(kind);
         setLinksError(null);
         try {
-            const payload = await getAcceleratorLinks(activeType, { clusterId });
+            const payload = await getAcceleratorLinks(activeType, {
+                monitoringNamespace: effectiveMonitoringNamespace,
+                clusterId,
+            });
             openMonitoringLink(payload, kind);
         } catch (error) {
             setLinksError(error.message || `Unable to open ${kind} dashboard`);
@@ -149,7 +238,14 @@ export function AcceleratorObservabilityPanel({ clusterId }) {
     const displayName = capability?.display_name || display(activeType);
     const releaseName = capability?.release_name || displayName;
 
-    const accessModes = (snapshot?.access_modes || []).map((entry) => ({
+    const resolvedAccessModeEntries = snapshot?.access_modes?.length
+        ? snapshot.access_modes
+        : cachedAccessModes.length
+            ? cachedAccessModes
+            : (capability?.access_modes || []).map((entry) => (
+                typeof entry === 'string' ? { mode: entry, available: true } : entry
+            ));
+    const accessModes = resolvedAccessModeEntries.map((entry) => ({
         value: entry.mode,
         label: accessModeLabel(entry.mode),
         disabled: !entry.available,
@@ -157,16 +253,149 @@ export function AcceleratorObservabilityPanel({ clusterId }) {
     // Prefer the mode actually detected on the cluster over a hardcoded default:
     // an accelerator that only ships a device plugin (or only a DRA driver)
     // shouldn't surface the other mode's "deploy it first" hint on open.
-    const firstAvailableMode = (snapshot?.access_modes || []).find((entry) => entry.available)?.mode;
+    const firstAvailableMode = resolvedAccessModeEntries.find((entry) => entry.available)?.mode;
     const effectiveAccessMode = accessMode
         || snapshot?.access_mode
         || firstAvailableMode
-        || snapshot?.access_modes?.[0]?.mode
+        || resolvedAccessModeEntries[0]?.mode
         || 'dra';
-    const unavailableMessages = (snapshot?.access_modes || [])
+    const unavailableMessages = resolvedAccessModeEntries
         .filter((entry) => entry.mode === effectiveAccessMode && !entry.available && entry.message)
         .map((entry) => entry.message);
-    const canInstall = !operationId && ['absent', 'degraded', 'ready'].includes(snapshot?.status);
+    const isNonAdmin = snapshot?.cluster_access_mode === 'non_admin'
+        || (snapshot?.cluster_reachable !== false && snapshot?.can_manage === false);
+    const canManageOnline = Boolean(snapshot)
+        && snapshot.can_manage !== false
+        && !isNonAdmin
+        && snapshot.cluster_reachable !== false;
+    const canInstall = canManageOnline && !operationId && ['absent', 'degraded', 'ready'].includes(snapshot?.status);
+    const nonAdminAction = getNonAdminAcceleratorAction(snapshot);
+    const nonAdminActionLabel = nonAdminAction === 'reinstall' ? 'Reinstall' : 'Install';
+
+    const handleGenerateScript = async ({ modeOverride } = {}) => {
+        if (!activeType || !clusterId) return;
+        scriptAbortRef.current?.abort();
+        const controller = new AbortController();
+        scriptAbortRef.current = controller;
+        const targetMode = modeOverride ?? effectiveAccessMode;
+        setScriptLoading(true);
+        setScriptError(null);
+        try {
+            const payload = await getAcceleratorAdminScript(activeType, {
+                namespace: namespace || undefined,
+                accessMode: targetMode,
+                monitoringNamespace: effectiveMonitoringNamespace,
+                clusterId,
+                signal: controller.signal,
+            });
+            if (controller.signal.aborted) return;
+            setAdminScript(payload);
+            setAdminScriptMeta({
+                activeType,
+                namespace: namespace || '',
+                accessMode: targetMode,
+                monitoringNamespace: effectiveMonitoringNamespace,
+                clusterId,
+            });
+        } catch (error) {
+            if (error?.name === 'AbortError' || controller.signal.aborted) return;
+            setScriptError(error?.message || 'Unable to generate Orchestration administrator exporter script');
+        } finally {
+            if (scriptAbortRef.current === controller) {
+                setScriptLoading(false);
+                scriptAbortRef.current = null;
+            }
+        }
+    };
+
+    const openScriptModal = (action = 'install') => {
+        setScriptModalAction(action);
+        setScriptModalOpen(true);
+        setScriptNotice('');
+        setScriptError(null);
+        const currentNs = namespace || '';
+        const cacheMatches = Boolean(
+            adminScript?.script
+            && adminScriptMeta?.activeType === activeType
+            && adminScriptMeta?.namespace === currentNs
+            && adminScriptMeta?.accessMode === effectiveAccessMode
+            && adminScriptMeta?.monitoringNamespace === effectiveMonitoringNamespace
+            && adminScriptMeta?.clusterId === clusterId,
+        );
+        if (!cacheMatches) {
+            setAdminScript(null);
+            handleGenerateScript({ modeOverride: effectiveAccessMode });
+        }
+    };
+
+    const closeScriptModal = () => {
+        if (rechecking) return;
+        scriptAbortRef.current?.abort();
+        scriptAbortRef.current = null;
+        setScriptLoading(false);
+        setScriptModalOpen(false);
+        setScriptNotice('');
+    };
+
+    const handleAccessModeChange = (mode) => {
+        setAccessMode(mode);
+        setAdminScript(null);
+        setAdminScriptMeta(null);
+        setScriptError(null);
+        setScriptNotice('');
+        if (scriptModalOpen) {
+            handleGenerateScript({ modeOverride: mode });
+        }
+    };
+
+    const handleRecheck = async () => {
+        if (!activeType || !clusterId) return;
+        const requestEpoch = contextEpochRef.current;
+        const targetType = activeType;
+        const targetClusterId = clusterId;
+        const targetNamespace = namespace || undefined;
+        const targetAccessMode = effectiveAccessMode;
+        const targetMonitoringNamespace = effectiveMonitoringNamespace;
+        setRechecking(true);
+        setScriptError(null);
+        setScriptNotice('');
+        try {
+            const recheckSnapshot = await recheckAccelerator(targetType, {
+                namespace: targetNamespace,
+                accessMode: targetAccessMode,
+                monitoringNamespace: targetMonitoringNamespace,
+                clusterId: targetClusterId,
+            });
+            if (contextEpochRef.current !== requestEpoch) return;
+            await onMonitoringUpdated?.();
+            if (contextEpochRef.current !== requestEpoch) return;
+            const refreshedSnapshot = await refreshStatus();
+            if (contextEpochRef.current !== requestEpoch) return;
+            const effectiveSnapshot = refreshedSnapshot || recheckSnapshot;
+            if (effectiveSnapshot?.status === 'ready' && getNonAdminAcceleratorAction(effectiveSnapshot) === null) {
+                setScriptModalOpen(false);
+                setScriptNotice('');
+            } else {
+                const remaining = summarizeMonitoringComponents(effectiveSnapshot?.components)
+                    .affected
+                    .map((component) => String(component.name || '').replace(/_/g, ' ').trim())
+                    .filter(Boolean);
+                const statusText = effectiveSnapshot?.status || 'unknown';
+                setScriptNotice(
+                    remaining.length > 0
+                        ? `${displayName} observability status is still ${statusText} (affected: ${remaining.join(', ')}). Confirm the Orchestration administrator script completed, then click Re-check.`
+                        : `${displayName} observability status is still ${statusText}. Confirm the Orchestration administrator script completed, then click Re-check.`,
+                );
+            }
+        } catch (error) {
+            if (contextEpochRef.current !== requestEpoch) return;
+            setScriptError(error?.message || 'Unable to re-check accelerator observability');
+        } finally {
+            if (contextEpochRef.current === requestEpoch) {
+                setRechecking(false);
+            }
+        }
+    };
 
     // Accelerator tabs come entirely from the backend capabilities registry
     // (which now lists every registered provider); no hardcoded placeholders.
@@ -222,22 +451,43 @@ export function AcceleratorObservabilityPanel({ clusterId }) {
                     <>
                         {snapshot.status !== 'ready' && (
                             <div className="rounded-xl border border-slate-800/80 bg-slate-950/55 p-4">
-                                <p className="text-xs leading-relaxed text-slate-400">
-                                    {snapshot.message || `${displayName} telemetry collected through the ${releaseName} DaemonSet.`}
-                                </p>
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                    <p className="text-xs leading-relaxed text-slate-400">
+                                        {snapshot.message || `${displayName} telemetry collected through the ${releaseName} DaemonSet.`}
+                                    </p>
+                                    {(isNonAdmin || nonAdminAction) && (
+                                        <div className="flex flex-wrap items-center gap-2">
+                                            {nonAdminAction && (
+                                                <Button variant="sky" size="sm" onClick={() => openScriptModal(nonAdminAction)}>
+                                                    {nonAdminActionLabel}
+                                                </Button>
+                                            )}
+                                            {isNonAdmin && (
+                                                <Badge tone="warning" size="xs">Non-admin access</Badge>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+                        {snapshot.status === 'ready' && isNonAdmin && (
+                            <div className="flex justify-end">
+                                <Badge tone="warning" size="xs">Non-admin access</Badge>
                             </div>
                         )}
 
                         <div className="mt-4">
-                            <SectionLabel tone="sky" className="text-[#037ffc]">GPU access mode</SectionLabel>
+                            <SectionLabel tone="sky">GPU access mode</SectionLabel>
                             <p className="mt-1 text-xs text-slate-500">
-                                Detected from the environment. Choose the access mode used to expose {displayName} metrics.
+                                {isNonAdmin
+                                    ? `Choose the access mode to configure in the Orchestration administrator ${displayName} exporter script.`
+                                    : `Detected from the environment. Choose the access mode used to expose ${displayName} metrics.`}
                             </p>
                             <div className="mt-3">
                                 <ToggleGroup
                                     options={accessModes}
                                     value={effectiveAccessMode}
-                                    onChange={(mode) => setAccessMode(mode)}
+                                    onChange={handleAccessModeChange}
                                     fullWidth
                                     activeClassName="accelerator-tab-active bg-sky-500/20 dark:bg-sky-500/20 text-white ring-1 ring-sky-400/30 shadow-none"
                                 />
@@ -255,7 +505,7 @@ export function AcceleratorObservabilityPanel({ clusterId }) {
                         </div>
 
                         <div className="accelerator-observability-ui relative mt-4 rounded-xl border border-slate-800/80 bg-slate-950/55 p-4 shadow-inner">
-                            <SectionLabel tone="sky" className="text-[#037ffc]">Observability UI</SectionLabel>
+                            <SectionLabel tone="sky">Observability UI</SectionLabel>
                             {snapshot.cluster_reachable !== false && (
                                 <div className="mt-3 flex flex-wrap items-center gap-2">
                                     <Button
@@ -265,7 +515,7 @@ export function AcceleratorObservabilityPanel({ clusterId }) {
                                         isLoading={openingLink === 'prometheus'}
                                         disabled={openingLink !== null}
                                     >
-                                        <PrometheusLogo className="h-3.5 w-3.5 text-[#E6522C]" /> Prometheus
+                                        <PrometheusLogo className="h-3.5 w-3.5 text-orange-600 dark:text-orange-400" /> Prometheus
                                     </Button>
                                     <Button
                                         variant="outline"
@@ -274,7 +524,7 @@ export function AcceleratorObservabilityPanel({ clusterId }) {
                                         isLoading={openingLink === 'grafana'}
                                         disabled={openingLink !== null}
                                     >
-                                        <GrafanaLogo className="h-3.5 w-3.5 text-[#F46800]" /> Grafana
+                                        <GrafanaLogo className="h-3.5 w-3.5 text-amber-500 dark:text-amber-400" /> Grafana
                                     </Button>
                                     {linksError && (
                                         <span className="flex items-center gap-1.5 text-[11px] text-red-300/90">
@@ -303,43 +553,49 @@ export function AcceleratorObservabilityPanel({ clusterId }) {
                             </div>
                         )}
 
-                        <div className="mt-4">
-                            <ClusterStackOperationProgress
-                                operation={operation}
-                                error={operationError}
-                                onRetryPreflight={canInstall ? () => setInstallOpen(true) : null}
-                            />
-                        </div>
+                        {canManageOnline && (
+                            <div className="mt-4">
+                                <ClusterStackOperationProgress
+                                    operation={operation}
+                                    error={operationError}
+                                    onRetryPreflight={canInstall ? () => setInstallOpen(true) : null}
+                                />
+                            </div>
+                        )}
 
                         <div className="mt-4">
                             <ClusterStackComponentTable
                                 components={snapshot.components}
-                                actions={snapshot.status === 'ready' && !operationId ? (
+                                actions={canManageOnline && snapshot.status === 'ready' && !operationId ? (
                                     <Button variant="sky" size="sm" onClick={() => setInstallOpen(true)}>
                                         <RefreshCw className="h-3.5 w-3.5" /> Reinstall
+                                    </Button>
+                                ) : snapshot.status === 'ready' && nonAdminAction ? (
+                                    <Button variant="sky" size="sm" onClick={() => openScriptModal(nonAdminAction)}>
+                                        <RefreshCw className="h-3.5 w-3.5" /> {nonAdminActionLabel}
                                     </Button>
                                 ) : null}
                             />
                         </div>
 
-                        {snapshot.status === 'absent' && !operationId && (
+                        {canManageOnline && snapshot.status === 'absent' && !operationId && (
                             <div className="accelerator-empty-panel mt-4 rounded-xl border border-emerald-500/20 bg-emerald-950/30 p-2">
                                 <EmptyState
                                     icon={<Gauge className="h-10 w-10" />}
                                     iconClassName="accelerator-empty-icon"
                                     title={`${displayName} observability is not installed`}
-                                    message={`Run preflight checks, pick a detected GPU access mode, then install the ${releaseName} chart. Prometheus and Grafana reuse the existing Cluster infrastructure stack.`}
+                                    message={`Run preflight checks, pick a detected GPU access mode, then install the ${releaseName} chart. Prometheus and Grafana reuse the existing Cluster infrastructure stack in ${effectiveMonitoringNamespace}.`}
                                     action={<Button onClick={() => setInstallOpen(true)}>Install accelerator observability</Button>}
                                 />
                             </div>
                         )}
 
-                        {snapshot.status === 'degraded' && (
+                        {canManageOnline && snapshot.status === 'degraded' && (
                             <div className="mt-4 rounded-xl border border-amber-500/20 bg-amber-950/30 p-2">
                                 <EmptyState
                                     icon={<AlertTriangle className="h-10 w-10" />}
                                     title={`${displayName} observability is incomplete`}
-                                    message={`Some ${releaseName} resources are missing. Run preflight and reinstall to reconcile the chart; Prometheus and Grafana reuse the existing Cluster infrastructure stack.`}
+                                    message={`Some ${releaseName} resources are missing. Run preflight and reinstall to reconcile the chart; Prometheus and Grafana reuse the existing Cluster infrastructure stack in ${effectiveMonitoringNamespace}.`}
                                     action={(
                                         <div className="flex items-center justify-center gap-2">
                                             <Button onClick={() => setInstallOpen(true)}>Repair / reinstall</Button>
@@ -358,17 +614,66 @@ export function AcceleratorObservabilityPanel({ clusterId }) {
                     />
                 )}
 
-            <InstallAcceleratorModal
-                isOpen={installOpen}
-                accelerator={activeType}
-                defaultNamespace={namespace}
-                status={snapshot}
-                supportedAccessModes={capability?.access_modes || []}
-                initialAccessMode={accessMode}
-                clusterId={clusterId}
-                onClose={() => setInstallOpen(false)}
-                onOperationStarted={startOperation}
-            />
+            {canManageOnline && (
+                <InstallAcceleratorModal
+                    isOpen={installOpen}
+                    accelerator={activeType}
+                    defaultNamespace={namespace}
+                    monitoringNamespace={effectiveMonitoringNamespace}
+                    status={snapshot}
+                    supportedAccessModes={capability?.access_modes || []}
+                    initialAccessMode={accessMode}
+                    clusterId={clusterId}
+                    onClose={() => setInstallOpen(false)}
+                    onOperationStarted={startOperation}
+                />
+            )}
+
+            <Modal
+                isOpen={scriptModalOpen && (!snapshot || isNonAdmin)}
+                onClose={rechecking ? undefined : closeScriptModal}
+                title={scriptModalAction === 'reinstall'
+                    ? `Reinstall ${displayName} observability (Orchestration administrator)`
+                    : `Install ${displayName} observability (Orchestration administrator)`}
+                subtitle={`Run the idempotent Orchestration administrator script for namespace ${namespace || capability?.default_namespace || ''}, then click Re-check.`}
+                size="lg"
+                closeOnBackdrop={!rechecking}
+                closeOnEscape={!rechecking}
+                footer={(
+                    <Button variant="secondary" size="sm" onClick={closeScriptModal} disabled={rechecking}>
+                        Close
+                    </Button>
+                )}
+            >
+                {accessModes.length > 0 && (
+                    <div className="mb-4 space-y-2">
+                        <SectionLabel tone="sky">GPU access mode</SectionLabel>
+                        <ToggleGroup
+                            options={accessModes}
+                            value={effectiveAccessMode}
+                            onChange={handleAccessModeChange}
+                            fullWidth
+                        />
+                    </div>
+                )}
+                <MonitoringAdminScriptPanel
+                    embedded
+                    title={`Orchestration administrator ${displayName} exporter script`}
+                    description={`Orchestration administrator permissions are required to install or update the ${releaseName} exporter DaemonSet. Choose a GPU access mode above, run the generated script with Orchestration administrator privileges, then click Re-check.`}
+                    script={adminScript?.script || ''}
+                    filename={adminScript?.filename || `lens-${activeType}-exporter-install.sh`}
+                    instructions={adminScript?.instructions}
+                    warnings={adminScript?.warnings}
+                    loading={scriptLoading}
+                    rechecking={rechecking}
+                    error={scriptError}
+                    notice={scriptNotice}
+                    onGenerate={() => handleGenerateScript({ modeOverride: effectiveAccessMode })}
+                    onRecheck={handleRecheck}
+                    generateLabel="Generate Orchestration administrator exporter script"
+                    recheckLabel="Re-check"
+                />
+            </Modal>
         </div>
     );
 }

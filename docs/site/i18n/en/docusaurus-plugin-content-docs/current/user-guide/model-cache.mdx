@@ -13,11 +13,15 @@ If **Storage volume** is empty, first [create a model-cache volume](/user-guide/
 3. Leave **Model source** set to **Hugging Face**.
 4. Either type a **HuggingFace repo id** and **Revision** manually, or click **Browse Hugging Face Hub**.
 5. If you opened **Browse HuggingFace Hub**, use **Search models…**, select a result from the left-hand list, then click **Use this model**.
-6. For a private or gated model, ask the cluster administrator to save a Hugging Face token with access to that model in the cluster settings.
+6. For a private or gated model, ask the **Orchestration administrator** to save a Hugging Face token with access to that model in the cluster settings.
 7. Click **Start download**.
 
 The model card shows download progress. Wait for the cache to be ready before deploying.
 Downloads use the token saved with the cluster; public models can download without one.
+Model Cache auto-scan, manual scan, download, and delete Jobs run in the volume's
+PVC namespace (such as `lens-storage-283db094`) using the bootstrapped
+`lens-storage-operator` permissions without further **Orchestration administrator**
+intervention.
 
 ## Download a model the volume already has
 

@@ -1449,3 +1449,196 @@ async def test_native_cpu_cache_composition_renders_before_deploy(monkeypatch, t
     kv_config = json.loads(container["args"][container["args"].index("--kv-transfer-config") + 1])
     assert kv_config["kv_load_failure_policy"] == "recompute"
     runner.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_readiness_derives_baseline_endpoint_url_excluding_epp_and_shadow_ports(tmp_path: Path):
+    docs = [
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "optimized-baseline-decode"},
+            "spec": {
+                "template": {
+                    "metadata": {"labels": {"llm-d.ai/role": "decode", "app": "vllm"}},
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "modelserver",
+                                "image": "vllm:1",
+                                "ports": [{"name": "http", "containerPort": 8000, "protocol": "TCP"}],
+                            }
+                        ]
+                    },
+                }
+            },
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "optimized-baseline-epp"},
+            "spec": {
+                "selector": {"llm-d.ai/role": "decode"},
+                "ports": [{"port": 80, "targetPort": 8000}],
+            },
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "optimized-baseline-ip-5790737e"},
+            "spec": {
+                "selector": {"llm-d.ai/role": "decode"},
+                "ports": [{"port": 54321, "targetPort": 54321}],
+            },
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "epp-grpc"},
+            "spec": {
+                "selector": {"llm-d.ai/role": "decode"},
+                "ports": [{"port": 9002, "targetPort": 9002}, {"port": 9090, "targetPort": 9090}],
+            },
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "optimized-baseline-epp-model-servers"},
+            "spec": {
+                "clusterIP": "None",
+                "selector": {"llm-d.ai/role": "decode"},
+                "ports": [{"port": 8000, "targetPort": 8000}],
+            },
+        },
+    ]
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text(yaml.safe_dump_all(docs, sort_keys=False), encoding="utf-8")
+    artifact = GuideDeploymentArtifact(
+        guide_id="source-composition",
+        artifact_hash="hash",
+        manifest_ref=str(manifest),
+        deployment_contract={
+            "readinessDeployments": ["optimized-baseline-decode"],
+            "endpoint": {"protocol": "http", "serviceName": "optimized-baseline-epp", "port": 80},
+        },
+    )
+    adapter = ConfigurationManifestAdapter(AsyncMock(), _Runner(), "llm-d-bench-", 30, tmp_path)
+
+    execution = {"namespace": "llm-d-bench-ns", "_artifact": artifact}
+    result = await adapter.readiness(execution)
+
+    assert result.accepted
+    assert execution["endpoint_url"] == "http://optimized-baseline-epp.llm-d-bench-ns.svc.cluster.local:80"
+    assert (
+        execution["baseline_endpoint_url"]
+        == "http://optimized-baseline-epp-model-servers.llm-d-bench-ns.svc.cluster.local:8000"
+    )
+
+    # Already-populated baseline_endpoint_url is preserved.
+    preserved = {
+        "namespace": "llm-d-bench-ns",
+        "_artifact": artifact,
+        "baseline_endpoint_url": "http://explicit-baseline.llm-d-bench-ns.svc.cluster.local:8000",
+    }
+    await adapter.readiness(preserved)
+    assert preserved["baseline_endpoint_url"] == "http://explicit-baseline.llm-d-bench-ns.svc.cluster.local:8000"
+
+
+def test_manifest_baseline_endpoint_port_resolution_and_ranking():
+    # 1. Omitted targetPort defaults to port; named targetPort resolves container.ports[*].name.
+    named_manifest = yaml.safe_dump_all(
+        [
+            {
+                "kind": "Deployment",
+                "metadata": {"name": "decode"},
+                "spec": {
+                    "template": {
+                        "metadata": {"labels": {"app": "vllm"}},
+                        "spec": {
+                            "containers": [
+                                {"name": "modelserver", "ports": [{"name": "serving", "containerPort": 8000}]}
+                            ]
+                        },
+                    }
+                },
+            },
+            {
+                "kind": "Service",
+                "metadata": {"name": "headless-model-servers"},
+                "spec": {"clusterIP": "None", "selector": {"app": "vllm"}, "ports": [{"port": 8000}]},
+            },
+            {
+                "kind": "Service",
+                "metadata": {"name": "clusterip-named"},
+                "spec": {"selector": {"app": "vllm"}, "ports": [{"port": 80, "targetPort": "serving"}]},
+            },
+        ],
+        sort_keys=False,
+    )
+    # Non-headless ClusterIP wins over headless even when headless has -model-servers suffix and port 8000.
+    assert (
+        configuration_manifest._manifest_baseline_endpoint(named_manifest, "ns", "router")
+        == "http://clusterip-named.ns.svc.cluster.local:80"
+    )
+
+    # 2. Omitted container.ports infers port from --port (via _invocation_tokens/_option), excluding EPP/shadow ports.
+    inferred_manifest = yaml.safe_dump_all(
+        [
+            {
+                "kind": "Deployment",
+                "metadata": {"name": "decode"},
+                "spec": {
+                    "template": {
+                        "metadata": {"labels": {"app": "vllm"}},
+                        "spec": {
+                            "containers": [
+                                {"name": "modelserver", "command": ["vllm", "serve"], "args": ["org/m", "--port=8080"]}
+                            ]
+                        },
+                    }
+                },
+            },
+            {
+                "kind": "Service",
+                "metadata": {"name": "shadow"},
+                "spec": {"selector": {"app": "vllm"}, "ports": [{"port": 54321}]},
+            },
+            {
+                "kind": "Service",
+                "metadata": {"name": "epp-metrics"},
+                "spec": {"selector": {"app": "vllm"}, "ports": [{"port": 9090}, {"port": 9002}]},
+            },
+            {
+                "kind": "Service",
+                "metadata": {"name": "direct-baseline"},
+                "spec": {"selector": {"app": "vllm"}, "ports": [{"port": 8080}]},
+            },
+        ],
+        sort_keys=False,
+    )
+    assert (
+        configuration_manifest._manifest_baseline_endpoint(inferred_manifest, "ns", "router")
+        == "http://direct-baseline.ns.svc.cluster.local:8080"
+    )
+
+    # 3. DisaggregatedSet decode/prefill workloads default to port 8000 when container.ports and --port are omitted.
+    disagg_manifest = yaml.safe_dump_all(
+        [
+            _disaggregated_set(1),
+            {
+                "kind": "Service",
+                "metadata": {"name": "pd-baseline"},
+                "spec": {"selector": {"llm-d.ai/role": "decode"}, "ports": [{"port": 8000}]},
+            },
+        ],
+        sort_keys=False,
+    )
+    # _disaggregated_set has no role labels on workerTemplate, so add a label on role 1:
+    disagg_docs = list(yaml.safe_load_all(disagg_manifest))
+    disagg_docs[0]["spec"]["roles"][1]["metadata"] = {"labels": {"llm-d.ai/role": "decode"}}
+    assert (
+        configuration_manifest._manifest_baseline_endpoint(
+            yaml.safe_dump_all(disagg_docs, sort_keys=False), "ns", "router"
+        )
+        == "http://pd-baseline.ns.svc.cluster.local:8000"
+    )

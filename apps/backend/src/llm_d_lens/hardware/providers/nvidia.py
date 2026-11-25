@@ -33,6 +33,13 @@ _RELEASE_NAME = "nvidia-device-plugin"
 _DRA_RELEASE_NAME = "nvidia-dra-driver-gpu"
 _DEFAULT_NAMESPACE = "kube-system"
 _DRA_NAMESPACE = "nvidia-dra-driver-gpu"
+#: The chart's concrete DaemonSet names, used by operation readiness waits.
+NVIDIA_PLUGIN_DAEMONSET = "nvidia-device-plugin"
+NVIDIA_DRA_DAEMONSET = "nvidia-dra-driver-gpu-kubelet-plugin"
+NVIDIA_PLUGIN_NAMESPACE = _DEFAULT_NAMESPACE
+NVIDIA_DRA_NAMESPACE = _DRA_NAMESPACE
+NVIDIA_PLUGIN_RELEASE = _RELEASE_NAME
+NVIDIA_DRA_RELEASE = _DRA_RELEASE_NAME
 _APPLY_TIMEOUT_SECONDS = 180.0
 _HARDWARE_CHECK_TIMEOUT_SECONDS = 90.0
 _HARDWARE_CHECK_POLL_INTERVAL_SECONDS = 5.0
@@ -137,7 +144,8 @@ class NvidiaProvider:
             await k8s.cluster_info(cluster_id)
         except FileNotFoundError as error:
             raise GpuDriverError(str(error), status_code=400) from error
-        unsupported = access_mode_version_message(profile(), access_mode, await server_kubernetes_version(cluster_id))
+        version = await server_kubernetes_version(cluster_id)
+        unsupported = access_mode_version_message(profile(), access_mode, version.version)
         if unsupported:
             return GpuDriverStatusResponse(
                 access_mode=access_mode, installed=False, ready=False, cluster_reachable=True, message=unsupported
@@ -176,7 +184,8 @@ class NvidiaProvider:
         driver = profile().driver
         if driver.installer != "helm":
             raise GpuDriverError(f"unsupported installer {driver.installer!r} for NVIDIA")
-        unsupported = access_mode_version_message(profile(), access_mode, await server_kubernetes_version(cluster_id))
+        version = await server_kubernetes_version(cluster_id)
+        unsupported = access_mode_version_message(profile(), access_mode, version.version)
         if unsupported:
             raise GpuDriverError(unsupported, status_code=422)
         mode = driver.mode(access_mode)

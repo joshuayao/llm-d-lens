@@ -10,6 +10,7 @@ import logging
 import re
 import uuid
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -31,7 +32,7 @@ from llm_d_lens.model_service.gateway_contracts import GatewayStatus, GatewaySta
 from llm_d_lens.model_service.service import default_service as default_model_service
 from llm_d_lens.monitoring.profiling.pressure import collect_pressure
 
-from .collector import DashboardCollector, default_collector
+from .collector import ALL_CLUSTER_OVERVIEW_BUDGET_SECONDS, DashboardCollector, default_collector
 from .contracts import (
     ClusterRow,
     ComponentRow,
@@ -76,6 +77,7 @@ logger = logging.getLogger(__name__)
 
 _pressure_tasks: set[asyncio.Task[Any]] = set()
 _snapshot_tasks: set[asyncio.Task[Any]] = set()
+REFRESH_WAIT_TIMEOUT_SECONDS = 15.0
 DEPLOYMENT_ACTIVE_STATUSES = {"draft", "validated", "rendered", "deploying", "rolling_back"}
 CAPACITY_UNITS = {
     "Mi": 1024**2,
@@ -110,6 +112,7 @@ class DashboardService:
         self._model_service = model_service or default_model_service()
         self._snapshot_dao = snapshot_dao or WelcomeIssueSnapshotDao()
         self._snapshot_lock = asyncio.Lock()
+        self._snapshot_task: asyncio.Task[WelcomeIssueSnapshot | None] | None = None
 
     async def welcome_overview(
         self,
@@ -123,8 +126,14 @@ class DashboardService:
         scope_clusters = self._scope_clusters(principal, None) if cluster_id else clusters
         snapshot = self._snapshot_dao.get_current()
         if snapshot is not None:
-            if refresh:
-                self.request_snapshot_check()
+            timed_out = False
+            if refresh and (principal is None or clusters):
+                task = self.request_snapshot_check()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=REFRESH_WAIT_TIMEOUT_SECONDS)
+                except TimeoutError:
+                    timed_out = True
+                snapshot = self._snapshot_dao.get_current() or snapshot
             issues = self._visible_issues(principal, snapshot.issues, cluster_id=cluster_id)
             return WelcomeOverview(
                 generated_at=now,
@@ -133,12 +142,18 @@ class DashboardService:
                     state=snapshot.state,
                     generated_at=snapshot.generated_at,
                     observed_at=snapshot.observed_at,
-                    stale=snapshot.stale,
+                    stale=snapshot.stale or timed_out,
                     coverage=snapshot.coverage,
                     data=issues,
                 ),
             )
-        composition = await self._compose(principal, clusters, cluster_id=cluster_id, refresh=refresh)
+        composition = await self._compose(
+            principal,
+            clusters,
+            cluster_id=cluster_id,
+            refresh=refresh,
+            wait_for_overview=refresh,
+        )
         return WelcomeOverview(
             generated_at=now,
             scope=self._scope(principal, cluster_id, scope_clusters),
@@ -191,8 +206,9 @@ class DashboardService:
 
     async def run_snapshot_check(self) -> WelcomeIssueSnapshot | None:
         """Compose every cluster as the system principal and persist the result."""
-        if self._snapshot_lock.locked():
-            return None
+        return await asyncio.shield(self.request_snapshot_check())
+
+    async def _run_snapshot_check_once(self) -> WelcomeIssueSnapshot | None:
         async with self._snapshot_lock:
             previous = self._snapshot_dao.get_current()
             first_seen = dict(previous.first_seen) if previous is not None else {}
@@ -200,7 +216,13 @@ class DashboardService:
                 for issue in previous.issues:
                     first_seen.setdefault(issue.id, issue.first_seen_at or issue.observed_at or previous.generated_at)
             clusters = self._collector.cluster_list()
-            composition = await self._compose(None, clusters, cluster_id=None, refresh=True)
+            composition = await self._compose(
+                None,
+                clusters,
+                cluster_id=None,
+                refresh=True,
+                wait_for_overview=True,
+            )
             envelope = composition.sections["issues"]
             issues = []
             current_ids = set()
@@ -224,13 +246,15 @@ class DashboardService:
             self._snapshot_dao.put(snapshot)
             return snapshot
 
-    def request_snapshot_check(self) -> None:
-        """Schedule a refresh without blocking the current request."""
-        if self._snapshot_lock.locked():
-            return
-        task = asyncio.create_task(self.run_snapshot_check())
+    def request_snapshot_check(self) -> asyncio.Task[WelcomeIssueSnapshot | None]:
+        """Schedule or return the active coalesced snapshot refresh task."""
+        if self._snapshot_task is not None and not self._snapshot_task.done():
+            return self._snapshot_task
+        task = asyncio.create_task(self._run_snapshot_check_once())
+        self._snapshot_task = task
         _snapshot_tasks.add(task)
         task.add_done_callback(_finish_snapshot_task)
+        return task
 
     # --- composition -----------------------------------------------------
 
@@ -241,6 +265,7 @@ class DashboardService:
         *,
         cluster_id: str | None,
         refresh: bool,
+        wait_for_overview: bool = False,
     ) -> Composition:
         now = datetime.now(UTC)
         allowed = self._allowed_ids(principal)
@@ -256,17 +281,36 @@ class DashboardService:
             for member in group_members
             if member.execution_id and member.status == "active" and member.weight > 0
         }
-        if services_permitted and gateway_permitted:
-            gateway_status, gateway_observed_at, gateway_stale, gateway_reason = await self._collector.gateway_status(
-                force=refresh
-            )
-        else:
-            gateway_status, gateway_observed_at, gateway_stale, gateway_reason = None, None, False, None
         contexts = self._visible_execution_contexts(principal, scope_ids)
         context_by_id = {context.execution_id: context for context in contexts}
-        pressure = await self._collect_pressure(principal, execution_ids, context_by_id)
-        deployment_monitoring_issues = await self._deployment_monitoring_issues(
-            principal, contexts, context_by_id, scope_ids, refresh=refresh
+        cluster_names = {cluster.id: cluster.name for cluster in clusters}
+
+        async def _empty_gateway() -> tuple[GatewayStatus | None, datetime | None, bool, str | None]:
+            return None, None, False, None
+
+        (
+            (gateway_status, gateway_observed_at, gateway_stale, gateway_reason),
+            pressure,
+            deployment_monitoring_statuses,
+            (cluster_rows, cluster_state, cluster_coverage),
+            deployment_pod_issues,
+            supporting_issues,
+        ) = await asyncio.gather(
+            self._collector.gateway_status(force=refresh)
+            if (services_permitted and gateway_permitted)
+            else _empty_gateway(),
+            self._collect_pressure(principal, execution_ids, context_by_id),
+            self._collect_deployment_monitoring_statuses(principal, contexts, scope_ids, refresh=refresh),
+            self._cluster_rows(principal, clusters, refresh=refresh, wait_for_overview=wait_for_overview),
+            self._deployment_pod_issues(contexts, cluster_names),
+            self._supporting_issues(principal, clusters, scope_ids),
+        )
+        cluster_monitoring_ready = _cluster_monitoring_ready_map(cluster_rows)
+        deployment_monitoring_issues = self._evaluate_deployment_monitoring_issues(
+            contexts,
+            context_by_id,
+            deployment_monitoring_statuses,
+            cluster_monitoring_ready=cluster_monitoring_ready,
         )
         service_rows, service_state, service_reason = self._service_rows(
             principal,
@@ -281,7 +325,6 @@ class DashboardService:
         )
         deployment_panel, deployment_state = self._deployment_panel(principal, contexts, clusters)
         service_cluster_ids = {row.cluster_id for row in service_rows}
-        cluster_rows, cluster_state, cluster_coverage = await self._cluster_rows(principal, clusters, refresh=refresh)
 
         issues: list[DashboardIssue] = []
         if not clusters:
@@ -298,9 +341,14 @@ class DashboardService:
             for group in groups:
                 if group.cluster_id:
                     service_names_by_cluster.setdefault(group.cluster_id, []).append(group.name)
-            cluster_names = {cluster.id: cluster.name for cluster in clusters}
             for gateway_cluster in gateway_status.clusters:
                 if gateway_cluster.cluster_id not in scope_ids:
+                    continue
+                target_scope = {gateway_cluster.cluster_id} if gateway_cluster.cluster_id else scope_ids
+                if not (
+                    self._allows_any(principal, "model-service:gateway:read", target_scope)
+                    and self._allows_any(principal, "model-service:group:read", target_scope)
+                ):
                     continue
                 issues.extend(
                     gateway_cluster_issues(
@@ -313,7 +361,7 @@ class DashboardService:
                 )
         if deployment_panel is not None:
             issues.extend(deployment_issues(deployment_panel))
-        issues.extend(await self._deployment_pod_issues(contexts, {cluster.id: cluster.name for cluster in clusters}))
+        issues.extend(deployment_pod_issues)
         issues.extend(deployment_monitoring_issues)
         if services_permitted:
             published_execution_ids = {member.execution_id for member in members if member.execution_id}
@@ -321,10 +369,10 @@ class DashboardService:
                 unpublished_deployment_issues(
                     contexts,
                     published_execution_ids,
-                    {cluster.id: cluster.name for cluster in clusters},
+                    cluster_names,
                 )
             )
-        issues.extend(await self._supporting_issues(principal, clusters, scope_ids))
+        issues.extend(supporting_issues)
         issues = sort_issues(_dedupe_issues(issues))
         issue_by_cluster = Counter(issue.cluster_id for issue in issues if issue.cluster_id)
         for row in cluster_rows:
@@ -404,16 +452,43 @@ class DashboardService:
         clusters: list[registry.Cluster],
         *,
         refresh: bool,
+        wait_for_overview: bool = False,
     ) -> tuple[list[ClusterRow], str, Coverage]:
         rows: list[ClusterRow] = []
         observations: list[tuple[registry.Cluster, dict[str, Any] | None, datetime | None, bool, str | None]] = []
-        for cluster in clusters:
+        pending_indices: list[int] = []
+        for index, cluster in enumerate(clusters):
             overview, observed_at, stale, reason = await self._collector.cluster_overview(cluster, force=refresh)
             observations.append((cluster, overview, observed_at, stale, reason))
-        secret_statuses = await asyncio.gather(
+            if wait_for_overview and (
+                (overview is None and reason == "collecting")
+                or (refresh and stale)
+                or (overview is None and refresh and reason in {"overview_timeout", "overview_unavailable"})
+            ):
+                pending_indices.append(index)
+        secret_coro = asyncio.gather(
             *(self._collector.hf_token_secret_status(cluster, force=refresh) for cluster in clusters),
             return_exceptions=True,
         )
+        if pending_indices:
+            waited_coro = asyncio.gather(
+                *(
+                    self._collector.wait_for_overview(
+                        clusters[index],
+                        timeout=ALL_CLUSTER_OVERVIEW_BUDGET_SECONDS,
+                    )
+                    for index in pending_indices
+                ),
+                return_exceptions=True,
+            )
+            secret_statuses, waited = await asyncio.gather(secret_coro, waited_coro)
+            for index, result in zip(pending_indices, waited, strict=False):
+                if isinstance(result, BaseException):
+                    continue
+                overview, observed_at, stale, reason = result
+                observations[index] = (clusters[index], overview, observed_at, stale, reason)
+        else:
+            secret_statuses = await secret_coro
         for index, (cluster, overview, observed_at, stale, reason) in enumerate(observations):
             secret_status = secret_statuses[index]
             if not isinstance(secret_status, str):
@@ -693,8 +768,10 @@ class DashboardService:
                         observed_at=_as_datetime(volume.updated_at),
                     )
                 )
+        cache_failed = False
         if self._allows_any(principal, "model-cache:entry:read", scope_ids):
             entries = await self._collector.model_cache_entries()
+            cache_failed = bool(getattr(self._collector, "_cache_failed", False))
             entries = filter_by_cluster(entries, lambda entry: entry.cluster_id, principal)
             entries = [entry for entry in entries if entry.cluster_id in scope_ids]
             cache_entries = entries
@@ -740,7 +817,8 @@ class DashboardService:
                     )
                     continue
                 if (
-                    cache_volume_ids
+                    not cache_failed
+                    and cache_volume_ids
                     and self._allows_any(principal, "model-cache:entry:read", {cluster.id})
                     and not any(entry.status.value == "ready" for entry in cluster_entries)
                 ):
@@ -751,7 +829,7 @@ class DashboardService:
                             volume_count=len(cache_volume_ids),
                         )
                     )
-                if self._allows_any(principal, "model-cache:entry:read", {cluster.id}):
+                if not cache_failed and self._allows_any(principal, "model-cache:entry:read", {cluster.id}):
                     for volume in cluster_volumes:
                         if getattr(volume.status, "value", volume.status) != "ready":
                             continue
@@ -792,15 +870,14 @@ class DashboardService:
             issues.append(no_role_groups_issue([group.name for group in role_less_groups]))
         return issues
 
-    async def _deployment_monitoring_issues(
+    async def _collect_deployment_monitoring_statuses(
         self,
         principal: Principal | None,
         contexts: list[Any],
-        context_by_id: dict[str, Any],
         scope_ids: set[str],
         *,
         refresh: bool,
-    ) -> list[DashboardIssue]:
+    ) -> list[tuple[str, Any]]:
         if not self._allows_any(principal, "monitoring:deployment:read", scope_ids):
             return []
         cluster_ids = sorted({context.cluster_id for context in contexts if context.cluster_id})
@@ -810,9 +887,21 @@ class DashboardService:
             *(self._collector.deployment_monitoring_status(cluster_id, force=refresh) for cluster_id in cluster_ids),
             return_exceptions=True,
         )
+        return list(zip(cluster_ids, results, strict=False))
+
+    def _evaluate_deployment_monitoring_issues(
+        self,
+        contexts: list[Any],
+        context_by_id: dict[str, Any],
+        statuses: list[tuple[str, Any]],
+        *,
+        cluster_monitoring_ready: dict[str, bool] | None = None,
+    ) -> list[DashboardIssue]:
+        if not statuses:
+            return []
         cluster_names = {cluster.id: cluster.name for cluster in self._collector.cluster_list()}
         issues: list[DashboardIssue] = []
-        for cluster_id, result in zip(cluster_ids, results, strict=False):
+        for cluster_id, result in statuses:
             if not isinstance(result, dict):
                 continue
             for item in result.get("items") or []:
@@ -828,10 +917,31 @@ class DashboardService:
                     status=str(item.get("status") or "unknown"),
                     stack_ready=item.get("stack_ready"),
                     message=item.get("message"),
+                    cluster_monitoring_ready=(
+                        cluster_monitoring_ready.get(cluster_id) if cluster_monitoring_ready is not None else None
+                    ),
                 )
                 if issue is not None:
                     issues.append(issue)
         return issues
+
+    async def _deployment_monitoring_issues(
+        self,
+        principal: Principal | None,
+        contexts: list[Any],
+        context_by_id: dict[str, Any],
+        scope_ids: set[str],
+        *,
+        refresh: bool,
+        cluster_monitoring_ready: dict[str, bool] | None = None,
+    ) -> list[DashboardIssue]:
+        statuses = await self._collect_deployment_monitoring_statuses(principal, contexts, scope_ids, refresh=refresh)
+        return self._evaluate_deployment_monitoring_issues(
+            contexts,
+            context_by_id,
+            statuses,
+            cluster_monitoring_ready=cluster_monitoring_ready,
+        )
 
     async def _collect_pressure(
         self,
@@ -980,9 +1090,16 @@ class DashboardService:
         permission = _issue_permission(issue)
         if permission is None:
             return False
-        if issue.cluster_id:
-            return self._allows_any(principal, permission, {issue.cluster_id})
-        return self._allows_any(principal, permission, None)
+        target = {issue.cluster_id} if issue.cluster_id else None
+        if not self._allows_any(principal, permission, target):
+            return False
+        if issue.code in {
+            "model.gateway_unavailable",
+            "model.ipp_unavailable",
+            "model.gateway_admin_handoff_required",
+        }:
+            return self._allows_any(principal, "model-service:group:read", target)
+        return True
 
 
 # --- helpers ----------------------------------------------------------------
@@ -1069,7 +1186,14 @@ def _service_availability(
         return "disabled"
     if providers.active == 0:
         return "unavailable"
-    if has_gateway_access and gateway is not None:
+    if (
+        has_gateway_access
+        and gateway is not None
+        and not (
+            getattr(gateway, "access_mode", "admin") == "non_admin"
+            and getattr(gateway, "gateway_probe_source", None) in {None, "none"}
+        )
+    ):
         if gateway.gateway_state == "missing" or gateway.gateway_ready is False or gateway.gateway_running is False:
             return "unavailable"
         if gateway.ipp_state in {"missing", "unreachable"} and gateway.ipp_ready is False:
@@ -1163,6 +1287,17 @@ def _execution_readable(principal: Principal, context: Any, owner: tuple[str | N
     )
 
 
+def _cluster_monitoring_ready_map(cluster_rows: list[ClusterRow]) -> dict[str, bool]:
+    ready_map: dict[str, bool] = {}
+    for row in cluster_rows:
+        if not row.available:
+            continue
+        for component in row.components:
+            if component.name.lower() == "monitoring":
+                ready_map[row.id] = component.status in {"ready", "external"}
+    return ready_map
+
+
 def _cluster_row(
     cluster_id: str,
     name: str,
@@ -1209,29 +1344,65 @@ def _cluster_row(
                 status=str(monitoring.get("status") or ("absent" if not monitoring.get("installed") else "unknown")),
             )
         )
+
     # Only report device plugins for accelerator profiles actually present in
     # the cluster. The component summary deliberately includes every registered
     # vendor profile so the hardware page can show "not installed"; treating
     # those as cluster issues would flag an NVIDIA plugin on an XPU-only
     # cluster.
+    def _positive_int(raw_val: Any) -> int:
+        try:
+            return int(raw_val)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    raw_accelerators = hardware.get("accelerators") if isinstance(hardware, Mapping) else None
     present_profiles = {
         str(item.get("id"))
-        for item in hardware.get("accelerators") or []
-        if str(item.get("id")) and int(item.get("gpuCount") or 0) > 0
+        for item in (raw_accelerators if isinstance(raw_accelerators, (list, tuple)) else ())
+        if isinstance(item, Mapping) and str(item.get("id") or "") and _positive_int(item.get("gpuCount")) > 0
     }
-    accelerator_plugins = components.get("acceleratorDevicePlugins") or {}
-    if accelerator_plugins:
+    for node in nodes if isinstance(nodes, (list, tuple)) else ():
+        if not isinstance(node, Mapping):
+            continue
+        gpu_by_profile = node.get("gpuByProfile")
+        if isinstance(gpu_by_profile, Mapping):
+            for profile_id, count in gpu_by_profile.items():
+                if profile_id and _positive_int(count) > 0:
+                    present_profiles.add(str(profile_id))
+        gpu_models_by_profile = node.get("gpuModelsByProfile")
+        if isinstance(gpu_models_by_profile, Mapping):
+            for profile_id in gpu_models_by_profile:
+                if profile_id:
+                    present_profiles.add(str(profile_id))
+
+    restricted_resources: set[str] = set()
+    for raw_restricted in (kubernetes.get("restrictedResources"), overview.get("restrictedResources")):
+        if isinstance(raw_restricted, (list, tuple, set, frozenset)):
+            restricted_resources.update(str(item) for item in raw_restricted if item)
+        elif isinstance(raw_restricted, str) and raw_restricted.strip():
+            restricted_resources.add(raw_restricted.strip())
+    workloads_restricted = "workloads" in restricted_resources
+
+    def _driver_status(raw_status: Any) -> str:
+        resolved = str(raw_status or "unknown")
+        if workloads_restricted and resolved == "missing":
+            return "unknown"
+        return resolved
+
+    accelerator_plugins = components.get("acceleratorDevicePlugins") if isinstance(components, Mapping) else None
+    if isinstance(accelerator_plugins, Mapping) and accelerator_plugins:
         for key, value in accelerator_plugins.items():
-            if key not in present_profiles or not isinstance(value, dict):
+            if key not in present_profiles or not isinstance(value, Mapping):
                 continue
             component_rows.append(
-                ComponentRow(name=f"{key} accelerator-driver", status=str(value.get("status") or "unknown"))
+                ComponentRow(name=f"{key} accelerator-driver", status=_driver_status(value.get("status")))
             )
     else:
-        intel = components.get("intelDevicePlugin")
-        if isinstance(intel, dict) and intel.get("installed") and "intel-xpu" in present_profiles:
+        intel = components.get("intelDevicePlugin") if isinstance(components, Mapping) else None
+        if isinstance(intel, Mapping) and intel.get("installed") and "intel-xpu" in present_profiles:
             component_rows.append(
-                ComponentRow(name="intel-xpu accelerator-driver", status=str(intel.get("status") or "unknown"))
+                ComponentRow(name="intel-xpu accelerator-driver", status=_driver_status(intel.get("status")))
             )
     return ClusterRow(
         id=cluster_id,
@@ -1389,6 +1560,12 @@ def _finish_snapshot_task(task: asyncio.Task[Any]) -> None:
 
 def _issue_permission(issue: DashboardIssue) -> str | None:
     """Permission a principal needs to see this issue's resource details."""
+    if issue.code in {
+        "model.gateway_unavailable",
+        "model.ipp_unavailable",
+        "model.gateway_admin_handoff_required",
+    }:
+        return "model-service:gateway:read"
     if issue.code == "ai-provider.none_configured":
         return "playground:chat:use"
     if issue.code == "cluster.observation_unavailable":

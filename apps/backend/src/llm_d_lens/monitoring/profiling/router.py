@@ -25,14 +25,21 @@ router = APIRouter(prefix="/api/v1/monitoring/profiling", tags=["deployment-prof
 async def flow_map(
     execution_id: str = Query(max_length=128),
     cluster_id: str | None = Query(default=None, max_length=64),
+    monitoring_namespace: str | None = Query(default=None, max_length=63),
 ) -> FlowMapResponse:
     try:
-        return await build_flow_map(execution_id, cluster_id)
+        return await build_flow_map(
+            execution_id,
+            cluster_id,
+            monitoring_namespace=monitoring_namespace,
+        )
     except DeploymentMonitoringError as error:
         raise HTTPException(
             status_code=error.status_code,
             detail={"code": error.code, "message": error.message},
         ) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     except Exception as error:
         logger.exception("Unable to build deployment flow map")
         raise HTTPException(

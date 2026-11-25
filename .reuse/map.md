@@ -898,5 +898,5 @@ Entry: [hack/check-docs.mjs](../hack/check-docs.mjs) — `checkDocs`
 
 ## cluster-hf-token-secret
 
-Write the cluster-level HF_TOKEN Secret on the target cluster and record its namespace/name on the Lens cluster record so Deploy and Model Cache default to it.
-Entry: [apps/backend/src/llm_d_lens/cluster/service.py](../apps/backend/src/llm_d_lens/cluster/service.py) — `create_hf_token_secret`, `update_hf_token_secret`
+Create the plan's HF_TOKEN Secret through the cache.hf-secret operation, and rotate the cluster-level Secret through PUT /clusters/{id}/hf-token-secret while recording its namespace/name on the Lens cluster record for Deploy and Model Cache defaults.
+Entry: [apps/backend/src/llm_d_lens/cluster/service.py](../apps/backend/src/llm_d_lens/cluster/service.py) — `update_hf_token_secret`

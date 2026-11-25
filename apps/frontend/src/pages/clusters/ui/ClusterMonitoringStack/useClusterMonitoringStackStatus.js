@@ -11,58 +11,86 @@ import { getClusterStackStatus } from './clusterMonitoringStackBackend';
 
 const RETRY_DELAYS = [5000, 10000, 20000, 30000];
 
-export function useClusterMonitoringStackStatus(namespace, clusterId) {
-    const [data, setData] = useState(null);
-    const [error, setError] = useState(null);
-    const [loading, setLoading] = useState(true);
-    const [stale, setStale] = useState(false);
-    const [lastUpdated, setLastUpdated] = useState(null);
+export function useClusterMonitoringStackStatus(namespace, clusterId, { enabled = true } = {}) {
+    const canQuery = Boolean(enabled && clusterId && namespace);
+    const queryKey = canQuery ? `${clusterId}::${namespace}` : '';
+    const [state, setState] = useState({
+        key: '',
+        data: null,
+        error: null,
+        loading: false,
+        stale: false,
+        lastUpdated: null,
+    });
     const controllerRef = useRef(null);
     const failureCountRef = useRef(0);
-    const hasDataRef = useRef(false);
+    const hasDataKeyRef = useRef('');
 
-    const refresh = useCallback(async () => {
-        if (!clusterId) return null;
+    const refresh = useCallback(async (overrideNamespace) => {
+        const targetNamespace = typeof overrideNamespace === 'string' && overrideNamespace.trim()
+            ? overrideNamespace.trim()
+            : namespace;
+        if (!enabled || !clusterId || !targetNamespace) return null;
+        const targetKey = `${clusterId}::${targetNamespace}`;
         controllerRef.current?.abort();
         const controller = new AbortController();
         controllerRef.current = controller;
-        if (!hasDataRef.current) setLoading(true);
+        if (hasDataKeyRef.current !== targetKey) {
+            setState((current) => (
+                current.key === targetKey
+                    ? { ...current, loading: true }
+                    : {
+                        key: targetKey,
+                        data: null,
+                        error: null,
+                        loading: true,
+                        stale: false,
+                        lastUpdated: null,
+                    }
+            ));
+        }
 
         try {
-            const snapshot = await getClusterStackStatus(namespace, {
+            const snapshot = await getClusterStackStatus(targetNamespace, {
                 signal: controller.signal,
                 clusterId,
             });
             if (controller.signal.aborted) return null;
             failureCountRef.current = 0;
-            hasDataRef.current = true;
-            setData(snapshot);
-            setError(null);
-            setStale(Boolean(snapshot?.stale));
-            setLastUpdated(new Date());
+            hasDataKeyRef.current = targetKey;
+            setState({
+                key: targetKey,
+                data: snapshot,
+                error: null,
+                loading: false,
+                stale: Boolean(snapshot?.stale),
+                lastUpdated: new Date(),
+            });
             return snapshot;
         } catch (requestError) {
             if (requestError.name === 'AbortError') return null;
             failureCountRef.current += 1;
-            setError(requestError);
-            setStale(true);
+            setState((current) => ({
+                key: targetKey,
+                data: current.key === targetKey ? current.data : null,
+                error: requestError,
+                loading: false,
+                stale: true,
+                lastUpdated: current.key === targetKey ? current.lastUpdated : null,
+            }));
             return null;
-        } finally {
-            if (!controller.signal.aborted) setLoading(false);
         }
-    }, [namespace, clusterId]);
+    }, [enabled, namespace, clusterId]);
 
     useEffect(() => {
-        setData(null);
-        setError(null);
-        setStale(false);
-        setLoading(Boolean(clusterId));
         failureCountRef.current = 0;
-        hasDataRef.current = false;
-    }, [namespace, clusterId]);
+        if (!canQuery) {
+            hasDataKeyRef.current = '';
+        }
+    }, [canQuery, queryKey]);
 
     useEffect(() => {
-        if (!clusterId) return undefined;
+        if (!canQuery) return undefined;
         let cancelled = false;
         let timer = null;
 
@@ -94,7 +122,15 @@ export function useClusterMonitoringStackStatus(namespace, clusterId) {
             controllerRef.current?.abort();
             document.removeEventListener('visibilitychange', onVisibilityChange);
         };
-    }, [refresh, clusterId]);
+    }, [refresh, canQuery]);
 
-    return { data, error, loading, stale, lastUpdated, refresh };
+    const matchesKey = Boolean(queryKey) && state.key === queryKey;
+    return {
+        data: matchesKey ? state.data : null,
+        error: matchesKey ? state.error : null,
+        loading: canQuery ? (!matchesKey || state.loading) : false,
+        stale: matchesKey ? state.stale : false,
+        lastUpdated: matchesKey ? state.lastUpdated : null,
+        refresh,
+    };
 }

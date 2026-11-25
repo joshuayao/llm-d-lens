@@ -59,7 +59,12 @@
           "type": "object",
           "additionalProperties": { "$ref": "#/$defs/accessModeDriver" }
         },
-        "nfd_manifest_refs": { "$ref": "#/$defs/string_list" }
+        "nfd_manifest_refs": { "$ref": "#/$defs/string_list" },
+        "rbac": {
+          "type": "array",
+          "items": { "enum": ["namespaced", "cluster", "escalation"] },
+          "uniqueItems": true
+        }
       }
     },
     "accessModeDriver": {
@@ -204,6 +209,19 @@
           }
         },
         "model_label_keys": { "$ref": "#/$defs/string_list" },
+        "model_label_patterns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["label_pattern", "model"],
+            "properties": {
+              "label_pattern": { "type": "string", "minLength": 1 },
+              "value": { "type": "string" },
+              "model": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
         "model_family_names": { "$ref": "#/$defs/string_list" },
         "node_memory": {
           "type": "object",

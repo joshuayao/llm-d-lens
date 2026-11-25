@@ -5,6 +5,9 @@
 
 import { requestJson as clusterRequest } from '../../../../shared/api/httpClient';
 
+// Guarded execution calls return `{ body, token }` when the caller supplies
+// `{ planHash, token }`; without those options they keep returning the plain
+// body so existing callers are unchanged.
 export function loadClusters({ signal } = {}) {
     return clusterRequest('/api/cluster/clusters', { signal });
 }
@@ -69,43 +72,8 @@ export function loadClusterCrds(clusterId) {
     return clusterRequest(`/api/cluster/clusters/${encodeURIComponent(clusterId)}/crds`);
 }
 
-export function applyClusterCrds(clusterId) {
-    return clusterRequest(`/api/cluster/clusters/${encodeURIComponent(clusterId)}/crds`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{}',
-    });
-}
-
 export function loadClusterLws(clusterId) {
     return clusterRequest(`/api/cluster/clusters/${encodeURIComponent(clusterId)}/lws`);
-}
-
-export function installClusterLws(clusterId) {
-    return clusterRequest(`/api/cluster/clusters/${encodeURIComponent(clusterId)}/lws`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{}',
-    });
-}
-
-export function startClusterImagePrepull(clusterId, accelerators) {
-    return clusterRequest(`/api/cluster/clusters/${encodeURIComponent(clusterId)}/images/prepull`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accelerators }),
-    });
-}
-
-export async function waitForClusterImagePrepull(clusterId, { onUpdate, timeoutMs = 1800000, intervalMs = 3000 } = {}) {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-        const status = await clusterRequest(`/api/cluster/clusters/${encodeURIComponent(clusterId)}/images/prepull`);
-        onUpdate?.(status);
-        if (['ready', 'idle', 'failed'].includes(status?.state)) return status;
-        if (Date.now() > deadline) throw new Error('Timed out waiting for the image pre-pull to finish');
-        await new Promise((resolve) => setTimeout(resolve, intervalMs));
-    }
 }
 
 export async function downloadClusterSoftware(cluster, options = {}) {

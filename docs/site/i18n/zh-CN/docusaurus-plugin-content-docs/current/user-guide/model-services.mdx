@@ -229,8 +229,34 @@ EPP 和模型服务器故障仍可见，单纯 standby 不会触发 Gateway/IPP 
 但没有运行中的副本时方框显示为灰色而非绿色。绿灯表示该组件确实有正在运行的副本。
 **Uninstall** 则彻底移除组件，方框变为琥珀色（`not installed`）。
 
+## Admin 与 Non-Admin 集群模式
+
+Lens 通过 SubjectAccessReview（SSAR）权限检查（`canManageGatewayInfra`、`canManageGatewayConfig`、`canReconcileRoutes`）探测每个集群的 Kubernetes kubeconfig 能力，并将 `accessMode` 设为 `admin` 或 `non_admin`：
+
+- **Admin（`admin`）**：Lens 可以直接管理 Gateway 基础设施、IPP 配置以及 `HTTPRoute` / `ReferenceGrant` / `InferenceModelRewrite` 资源。
+- **Non-Admin（`non_admin`）**：集群 kubeconfig 权限受限（例如仅限部署命名空间），缺少 Gateway 命名空间或集群级 CRD 的操作权限。
+
+### Non-Admin 集群的状态检查
+
+在 Non-Admin 集群上，Lens 不会对 Gateway 命名空间执行 `kubectl port-forward`，也不会因 `403 Forbidden` 导致页面失败：
+
+- **Gateway 可达性**：Lens 直接探测集群的外部 HTTP Gateway 端点（`gateway_public_url` 或配置的 Gateway 端口/主机），并在配置了 Prometheus 时直接查询 Prometheus 指标。
+- **认证错误与受限状态区分**：真实的 `401 Unauthorized` 或无效 kubeconfig 会明确提示为认证错误；而受限 Gateway 资源上的 `403 Forbidden` 会优雅降级，不影响有权限的部署命名空间检查。
+
+### 编排平台管理员脚本交接（Script Handoff）
+
+当 Non-Admin 集群无法直接应用 Kubernetes 变更时，Lens 会将期望状态保存在数据库中，并为编排平台管理员生成幂等的 `bash` + `kubectl` + `helm` 交接脚本：
+
+1. **触发交接**：在 Non-Admin 集群上发布、更新、流量分配、启停或删除模型服务、修复 Gateway 或更新 IPP 配置时，系统会返回 `admin_handoff_required` 状态，而不是直接抛出 `403` 错误。
+2. **交付脚本**：打开交接抽屉或面板，点击 **Download `.sh`**（下载 `.sh`）、**Copy**（复制）脚本，或 **View operation details**（查看操作详情，包括待执行操作和期望状态哈希）。
+3. **验证完成**：编排平台管理员运行脚本后，点击 **Re-check**（重新检查，或调用验证接口）。Lens 会检查集群可写命名空间中的非涉密完成标记 `ConfigMap`，并结合实时 Gateway HTTP 路由检查确认路由已生效。
+
 ## 看不到操作按钮
 
 请管理员检查你的模型服务权限和集群访问范围。不要使用他人的 API 密钥。
+
+- **查看路由交接详情**：拥有 `model-service:gateway:read`、`model-service:group:read` 或 `model-service:member:manage` 权限的用户可使用。
+- **生成与验证 `routes` 交接脚本**：拥有发布、更新、启停或移除模型服务及成员权限的用户可使用（`model-service:gateway:reconcile`、`model-service:gateway:manage`、`model-service:member:manage`、`model-service:group:manage`、`model-service:group:toggle` 或 `model-service:group:remove`）。
+- **Gateway 修复与 IPP 交接脚本**（`gateway_repair`、`ipp_config`、`all`）：仅限拥有 Gateway 管理或协调权限的用户（`model-service:gateway:manage` 或 `model-service:gateway:reconcile`）。
 
 部署监控见[可观测性](/user-guide/observability)，服务无法访问时见[故障排查](/troubleshooting)。

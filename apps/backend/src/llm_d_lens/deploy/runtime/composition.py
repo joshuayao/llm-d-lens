@@ -513,6 +513,18 @@ class RestrictedKubectlRunner:
         diagnostics_commands = {
             ("kubectl", "get", "pods", "--namespace", namespace, "-o", "wide"),
             ("kubectl", "get", "pods", "--namespace", namespace, "-o", "json"),
+            ("kubectl", "get", "serviceaccounts", "--namespace", namespace, "-o", "name"),
+            (
+                "kubectl",
+                "get",
+                "configmap",
+                "lens-deployment-bootstrap",
+                "--namespace",
+                namespace,
+                "--ignore-not-found=true",
+                "-o",
+                "json",
+            ),
             ("kubectl", "get", "events", "--namespace", namespace, "--sort-by=.lastTimestamp"),
             (
                 "kubectl",
@@ -831,6 +843,18 @@ class RegisteredGuideCommandRunner:
                 "--replicas=0",
             ),
             ("kubectl", "get", "pods", "--namespace", namespace, "-o", "wide"),
+            ("kubectl", "get", "serviceaccounts", "--namespace", namespace, "-o", "name"),
+            (
+                "kubectl",
+                "get",
+                "configmap",
+                "lens-deployment-bootstrap",
+                "--namespace",
+                namespace,
+                "--ignore-not-found=true",
+                "-o",
+                "json",
+            ),
             ("kubectl", "get", "events", "--namespace", namespace, "--sort-by=.lastTimestamp"),
             (
                 "kubectl",
@@ -1179,6 +1203,24 @@ def build_namespace_factory(namespace_prefix: str):
 
     def namespace_factory(request) -> str:
         policy = request.deployment_policy.value.get("namespace_policy") or {}
+        exact_namespace = policy.get("exact") if isinstance(policy, dict) else None
+        if exact_namespace is not None:
+            from llm_d_lens.deploy.capabilities import (
+                DeploymentCapabilityValidationError,
+                validate_deployment_namespace,
+            )
+
+            if not isinstance(exact_namespace, str):
+                raise RuntimeConfigurationError("deployment namespace policy exact value is invalid")
+            cluster_id = (
+                str(request.provenance.get("cluster_server_id") or "")
+                if isinstance(getattr(request, "provenance", None), Mapping)
+                else ""
+            ) or None
+            try:
+                return validate_deployment_namespace(exact_namespace, cluster_id=cluster_id, prefix=namespace_prefix)
+            except DeploymentCapabilityValidationError as error:
+                raise RuntimeConfigurationError(str(error)) from error
         requested_prefix = policy.get("prefix") if isinstance(policy, dict) else None
         artifact = request.configuration_artifacts[0]
         content = json.loads(artifact.content or "{}")

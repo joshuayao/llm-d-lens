@@ -13,7 +13,8 @@
 
 const BASE_PATH = '/api/v1/monitoring/gpu-driver';
 
-import { requestMonitoringJson as requestJson } from '../../../../shared/api/monitoringClient';
+import { requestMonitoringJson as requestJson, requestMonitoringJsonWithMeta as requestJsonWithMeta } from '../../../../shared/api/monitoringClient';
+import { executionHeaders, executionToken } from '../../../../shared/api/httpClient';
 
 
 export function getGpuDriverStatus(accessMode, { clusterId, hardware, signal } = {}) {
@@ -23,17 +24,24 @@ export function getGpuDriverStatus(accessMode, { clusterId, hardware, signal } =
     return requestJson(`${BASE_PATH}/status?${query.toString()}`, { signal });
 }
 
-export function installGpuDriver(accessMode, { clusterId, hardware, signal } = {}) {
+export async function installGpuDriver(accessMode, { clusterId, hardware, signal, planHash, token } = {}) {
     const query = new URLSearchParams();
     if (clusterId) query.set('cluster_id', clusterId);
     if (hardware) query.set('hardware', hardware);
     const suffix = query.toString() ? `?${query.toString()}` : '';
-    return requestJson(`${BASE_PATH}/install${suffix}`, {
+    const request = {
         method: 'POST',
         signal,
-        headers: { 'Content-Type': 'application/json' },
+        headers: executionHeaders({ planHash, token }, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ access_mode: accessMode }),
-    });
+    };
+    // Existing callers pass clusterId/hardware but no execution options and
+    // still expect the plain body; only a guarded call returns the token.
+    if (planHash === undefined && token === undefined) {
+        return requestJson(`${BASE_PATH}/install${suffix}`, request);
+    }
+    const { body, response } = await requestJsonWithMeta(`${BASE_PATH}/install${suffix}`, request);
+    return { body, token: executionToken(response) };
 }
 
 // Polls status until the driver/plugin is ready, or the timeout elapses.

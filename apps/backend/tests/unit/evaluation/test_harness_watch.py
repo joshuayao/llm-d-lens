@@ -138,6 +138,125 @@ class HarnessWatchTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(watch.pod_failure({"status": {"phase": "Succeeded"}}))
 
+    def test_pod_failure_ignores_cleanup_deletion_but_preserves_oom_and_non_deleted_failures(self):
+        for exit_code in (137, 143):
+            self.assertIsNone(
+                watch.pod_failure(
+                    {
+                        "metadata": {"name": "harness", "deletionTimestamp": "2026-11-24T12:12:23Z"},
+                        "status": {
+                            "phase": "Failed",
+                            "containerStatuses": [
+                                {"name": "harness", "state": {"terminated": {"exitCode": exit_code, "reason": "Error"}}}
+                            ],
+                        },
+                    }
+                )
+            )
+            self.assertIn(
+                f"exit {exit_code}",
+                watch.pod_failure(
+                    {
+                        "metadata": {"name": "harness"},
+                        "status": {
+                            "phase": "Failed",
+                            "containerStatuses": [
+                                {"name": "harness", "state": {"terminated": {"exitCode": exit_code, "reason": "Error"}}}
+                            ],
+                        },
+                    }
+                ),
+            )
+        self.assertIn(
+            "exit 1",
+            watch.pod_failure(
+                {
+                    "metadata": {"name": "harness"},
+                    "status": {
+                        "phase": "Failed",
+                        "containerStatuses": [
+                            {"name": "harness", "state": {"terminated": {"exitCode": 1, "reason": "Error"}}}
+                        ],
+                    },
+                }
+            ),
+        )
+        self.assertIn(
+            "OOMKilled",
+            watch.pod_failure(
+                {
+                    "metadata": {"name": "harness", "deletionTimestamp": "2026-11-24T12:12:23Z"},
+                    "status": {
+                        "phase": "Failed",
+                        "containerStatuses": [
+                            {"name": "harness", "state": {"terminated": {"exitCode": 137, "reason": "OOMKilled"}}}
+                        ],
+                    },
+                }
+            ),
+        )
+
+    async def test_no_pvc_pod_deletion_does_not_fail_or_wipe_captured_logs(self):
+        checked_after_delete = asyncio.Event()
+        poll_count = 0
+
+        async def read(env, *args):
+            del env
+            nonlocal poll_count
+            if "get" in args:
+                poll_count += 1
+                if poll_count == 1:
+                    return json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "metadata": {"name": "harness"},
+                                    "status": {"phase": "Running"},
+                                }
+                            ]
+                        }
+                    )
+                return json.dumps(
+                    {
+                        "items": [
+                            {
+                                "metadata": {"name": "harness", "deletionTimestamp": "2026-11-24T12:12:23Z"},
+                                "status": {
+                                    "phase": "Failed",
+                                    "containerStatuses": [
+                                        {
+                                            "name": "harness",
+                                            "state": {"terminated": {"exitCode": 137, "reason": "Error"}},
+                                        }
+                                    ],
+                                },
+                            }
+                        ]
+                    }
+                )
+            if poll_count == 1:
+                return "Harness completed successfully.\n"
+            raise RuntimeError('Error from server (NotFound): pods "harness" not found')
+
+        run = {}
+
+        def save(value):
+            if poll_count >= 2 and value.get("harness_checked_at"):
+                checked_after_delete.set()
+
+        with patch.object(watch, "_read", read), patch.object(watch, "_POLL_SECONDS", 0.02):
+            task = asyncio.create_task(watch._poll_harness(run, "ns", {}, save, lambda: "now"))
+            try:
+                await asyncio.wait_for(checked_after_delete.wait(), 1)
+            finally:
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        self.assertIn("Harness completed successfully.", run["harness_logs"])
+        self.assertNotIn("Log retrieval unavailable", run["harness_logs"])
+        self.assertIsNone(run["harness_warning"])
+
     async def test_watchdog_failure_terminates_runner(self):
         router = importlib.import_module("llm_d_lens.evaluation.router")
 

@@ -13,13 +13,23 @@ Cluster tab. The kube context appears beneath the cluster selector. These groups
 sit side by side on wide screens and stack on narrow screens, followed by
 live-state cards and component details.
 
+## Admin vs Non-Admin views
+
+Observability automatically detects your cluster permissions via Kubernetes `SelfSubjectAccessReview` (`access_mode` on Cluster and Deployments, or `cluster_access_mode` on Accelerators: `admin` or `non_admin`):
+
+- **Admin (`admin`)**: Full cluster-scoped installation, preflight, reinstall, and `port-forward` dashboard access.
+- **Non-Admin (`non_admin`)**: Read-only or namespace-scoped users see Prometheus HTTP health probes, a read-only **Monitoring endpoints** status panel, direct external Prometheus/Grafana URLs (no `port-forward` required), and an on-demand **Orchestration administrator install / repair script** modal dialog (opened when clicking **Install** or **Reinstall** if components need installation or repair, or when triggering a deployment monitoring action) instead of privileged in-cluster install actions. Healthy clusters and accelerators show no **Install**/**Reinstall** button or script panel.
+
 ## Inspect cluster observability status
 
 1. Open **Observability → Cluster**.
 2. Use **Target cluster** to choose the cluster you want to inspect.
 3. In **Namespace**, enter the namespace you want to check and click **Inspect**.
 4. Review **Live state**, **Installation operation**, and **Stack components**.
-5. Use **Refresh**, **Retry**, or **Recheck** when those buttons are shown for the current state.
+   In `non_admin` mode, **Stack components** reflects Prometheus HTTP health probes for Prometheus, `kube-state-metrics`, `node-exporter`, hardware-profile accelerator exporters, and Grafana reachability.
+5. In `non_admin` mode, the **Monitoring endpoints** panel is a read-only status display showing **Monitoring mode** (`Managed` vs `Existing`), **Prometheus endpoint**, **Grafana endpoint**, and discovered NodePorts in `managed` mode (there is no `Save endpoints` form on the Observability page). In `managed` mode, endpoints and NodePorts are discovered automatically during installation or **Re-check**. External (`Existing`) Prometheus and optional Grafana URLs are maintained when creating the cluster or via **Edit cluster** on the **Clusters** page, then verified via **Re-check** on the **Observability** page.
+6. If components are missing or degraded in `non_admin` mode, click **Install** or **Reinstall** to open the **Orchestration administrator install / repair script** modal dialog (no script panel is rendered inline on page load, and healthy clusters show no **Install**/**Reinstall** button). Use **Copy**, **Download `.sh`**, and the auto-expanded operation details to hand off the script to an orchestration administrator, then click **Re-check** after it runs (or **Close** to dismiss).
+7. Use **Refresh**, **Retry**, or **Recheck** when those buttons are shown for the current state.
 
 ## Install the cluster observability stack
 
@@ -46,6 +56,7 @@ a fresh form and requires a new preflight; reinstall consent is not retained.
 
 1. Stay on the **Cluster** tab.
 2. In **GUIs**, click **Prometheus** or **Grafana**.
+   In `non_admin` mode, **Prometheus** and **Grafana** open the configured external URLs directly without starting a `port-forward`.
 3. If the dashboard cannot be opened, read the inline error message shown beside the buttons.
 
 ## Inspect accelerator observability
@@ -54,6 +65,7 @@ a fresh form and requires a new preflight; reinstall consent is not retained.
 2. Choose the cluster and its accelerator under **Accelerator type**.
 3. Review **GPU access mode** and, if needed, switch between the modes that accelerator supports (for example **DRA** and **Device plugin**).
 4. Review **Observability UI** and **Stack components** for the selected accelerator.
+   In `non_admin` mode, exporter health is probed via Prometheus HTTP queries; when exporters need installation or repair, click **Install** or **Reinstall** to open the **Orchestration administrator install / repair script** modal dialog (with **Copy**, **Download `.sh`**, auto-expanded operation details, **Re-check**, and **Close**) to hand off the script to an orchestration administrator. Healthy accelerators show no **Install**/**Reinstall** button or script panel.
 5. Use **Prometheus**, **Grafana**, **Refresh**, or **Retry** when those actions are available.
 
 ## Install or repair accelerator observability
@@ -70,16 +82,19 @@ a fresh form and requires a new preflight; reinstall consent is not retained.
 
 1. Open the **Deployments** tab.
 2. Choose the cluster in **Target cluster**.
+   In `non_admin` mode, stack readiness is verified via Prometheus HTTP probes.
 3. In **Deployment monitoring**, open the **Monitoring** menu for the deployment you want to manage.
 4. Choose **Install** when monitoring is not present, **Enable** when it is disabled, **Disable** when it is enabled, or **Uninstall** to remove it.
    **Install** and **Enable** stay unavailable until the deployment itself is
    ready, because monitoring scrapes that deployment's Pods.
-5. Wait for the **Monitoring** status to update before opening a dashboard.
+5. If **Install**, **Enable**, **Disable**, or **Uninstall** returns an RBAC `403` error (for example, creating `epp-auth-delegator` `ClusterRoleBinding`, `ServiceMonitor`, or `PodMonitor`), the **Orchestration administrator install / repair script** modal dialog opens with **Copy**, **Download `.sh`**, auto-expanded operation details, **Re-check**, and **Close** so you can hand off the script to an orchestration administrator and click **Re-check** after it is applied.
+6. Wait for the **Monitoring** status to update before opening a dashboard.
 
 ## Open deployment dashboards
 
 1. In the **Deployments** tab, open the **Monitoring** menu for a deployment whose monitoring is enabled.
 2. Click **Open Grafana** or **Open Prometheus**.
+   In `non_admin` mode, **Open Grafana** opens the direct external Grafana URL with the deployment namespace dashboard filter (`var-namespace`), and **Open Prometheus** opens the direct external Prometheus URL without `port-forward`.
 
 ## Inspect deployment profiling
 

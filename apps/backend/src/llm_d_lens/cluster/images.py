@@ -13,11 +13,13 @@ profile the accelerator resolves to, never from the caller.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shlex
 from typing import Any
 
+from llm_d_lens.cluster.registry import validate_container_image_ref
 from llm_d_lens.hardware.resolver import resolve_by_accelerator_key
 from llm_d_lens.infrastructure.kubernetes import scoped_runner
 from llm_d_lens.versions import (
@@ -69,7 +71,12 @@ def gateway_provider_images(provider: str | None) -> list[str]:
     return []
 
 
-def prepull_images(accelerators: list[str], provider: str | None = None) -> list[str]:
+def prepull_images(
+    accelerators: list[str],
+    provider: str | None = None,
+    *,
+    vllm_image: str | None = None,
+) -> list[str]:
     """The images to pre-pull: router + IPP + gateway provider + model server(s)."""
     images = [
         router_epp_image(),
@@ -77,15 +84,19 @@ def prepull_images(accelerators: list[str], provider: str | None = None) -> list
         inference_payload_processor_image(),
         *gateway_provider_images(provider),
     ]
-    for accelerator in accelerators:
-        canonical = _canonical_accelerator(accelerator)
-        key = _ACCELERATOR_PROFILE_KEYS.get(canonical) if canonical else None
-        if not key:
-            continue
-        profile = resolve_by_accelerator_key(key)
-        image = profile.deployment.runtime_image if profile else None
-        if image:
-            images.append(image)
+    custom_image = validate_container_image_ref(vllm_image, field="vllmImage")
+    if custom_image:
+        images.append(custom_image)
+    else:
+        for accelerator in accelerators:
+            canonical = _canonical_accelerator(accelerator)
+            key = _ACCELERATOR_PROFILE_KEYS.get(canonical) if canonical else None
+            if not key:
+                continue
+            profile = resolve_by_accelerator_key(key)
+            image = profile.deployment.runtime_image if profile else None
+            if image:
+                images.append(image)
     return list(dict.fromkeys(images))  # de-duplicate, keep order
 
 
@@ -100,8 +111,13 @@ def render_image_puller_daemonset(images: list[str], *, namespace: str, name: st
     container statuses report per-image completion (the pod is Ready only once
     every image is pulled on that node).
     """
+    validated_images = [
+        validate_container_image_ref(item, field="images", allow_empty=False)
+        for item in images
+    ]
     containers = []
-    for index, item in enumerate(images):
+    for index, item in enumerate(validated_images):
+        assert item is not None
         done = _done_file(index)
         command = f"nsenter -t 1 -m -u -i -n -p -- crictl pull {shlex.quote(item)} && touch {done} && sleep infinity"
         containers.append(
@@ -138,9 +154,50 @@ def render_image_puller_daemonset(images: list[str], *, namespace: str, name: st
     return yaml.safe_dump(manifest, sort_keys=False)
 
 
-async def start_image_prepull(cluster_id: str, accelerators: list[str], provider: str | None = None) -> dict[str, Any]:
+def _images_from_stored_plan(cluster_id: str) -> list[str]:
+    try:
+        from llm_d_lens.cluster.guard import load_plan  # noqa: PLC0415
+
+        state = load_plan(cluster_id)
+    except Exception:  # noqa: BLE001 - DB-less unit tests or invalid plan must not break status polling
+        state = None
+    if state is not None:
+        plan = state.plan
+        if plan.stack.images:
+            return list(plan.stack.images)
+        return prepull_images(
+            [accelerator.vendor for accelerator in plan.accelerators],
+            plan.gateway.provider or None,
+            vllm_image=plan.stack.vllm_image,
+        )
+    try:
+        from llm_d_lens.cluster.registry import get_cluster  # noqa: PLC0415
+
+        cluster = get_cluster(cluster_id)
+    except Exception:  # noqa: BLE001
+        cluster = None
+    if cluster is not None and cluster.vllm_image:
+        return prepull_images([], cluster.gateway_provider, vllm_image=cluster.vllm_image)
+    return []
+
+
+async def start_image_prepull(
+    cluster_id: str,
+    accelerators: list[str],
+    provider: str | None = None,
+    *,
+    vllm_image: str | None = None,
+) -> dict[str, Any]:
     """Apply the puller DaemonSet for the selected accelerators/provider."""
-    images = prepull_images(accelerators, provider)
+    effective_vllm_image = vllm_image
+    if effective_vllm_image is None:
+        with contextlib.suppress(Exception):
+            from llm_d_lens.cluster.registry import get_cluster  # noqa: PLC0415
+
+            cluster = get_cluster(cluster_id)
+            if cluster is not None:
+                effective_vllm_image = cluster.vllm_image
+    images = prepull_images(accelerators, provider, vllm_image=effective_vllm_image)
     if not images:
         return {"state": "idle", "desired": 0, "ready": 0, "nodes": [], "images": []}
     _LAST_IMAGES[cluster_id] = images
@@ -155,6 +212,8 @@ async def start_image_prepull(cluster_id: str, accelerators: list[str], provider
 async def image_prepull_status(cluster_id: str, *, images: list[str] | None = None) -> dict[str, Any]:
     """Read the puller DaemonSet's per-node readiness."""
     resolved_images = images if images is not None else _LAST_IMAGES.get(cluster_id, [])
+    if not resolved_images and images is None:
+        resolved_images = _images_from_stored_plan(cluster_id)
     runner = scoped_runner(cluster_id)
     result = await runner.run(
         ["kubectl", "get", "daemonset", IMAGES_NAME, "-n", IMAGES_NAMESPACE, "-o", "json"],

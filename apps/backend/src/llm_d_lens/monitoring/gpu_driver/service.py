@@ -24,7 +24,10 @@ import asyncio
 import time
 from typing import Any
 
+import yaml
+
 from llm_d_lens.hardware.version import access_mode_version_message, server_kubernetes_version
+from llm_d_lens.infrastructure import kubernetes as k8s
 from llm_d_lens.infrastructure.kubernetes import cluster_info, list_resources, run_kubectl
 from llm_d_lens.infrastructure.process import CommandTimeoutError
 
@@ -174,9 +177,8 @@ async def _intel_driver_status(access_mode: GpuAccessMode, *, cluster_id: str | 
             cluster_reachable=False,
             message=reachable.stderr.strip() or "Kubernetes cluster is unreachable",
         )
-    unsupported = access_mode_version_message(
-        _intel_profile(), access_mode, await server_kubernetes_version(cluster_id)
-    )
+    version = await server_kubernetes_version(cluster_id)
+    unsupported = access_mode_version_message(_intel_profile(), access_mode, version.version)
     if unsupported:
         return GpuDriverStatusResponse(
             access_mode=access_mode, installed=False, ready=False, cluster_reachable=True, message=unsupported
@@ -202,6 +204,26 @@ async def _intel_driver_status(access_mode: GpuAccessMode, *, cluster_id: str | 
     return GpuDriverStatusResponse(
         access_mode=access_mode, installed=True, ready=ready, cluster_reachable=True, message=message
     )
+
+
+_INTEL_DRA_RELEASE = "intel-gpu-resource-driver"
+_INTEL_DRA_NAMESPACE = "intel-gpu-resource-driver"
+
+
+def intel_dra_values(mode: object | None) -> str:
+    options = dict(getattr(mode, "options", {}) or {})
+    kubelet_plugin: dict[str, Any] = {}
+    if "privileged" in options:
+        kubelet_plugin["privileged"] = bool(options["privileged"])
+    if "health_monitoring_enabled" in options:
+        kubelet_plugin["healthMonitoring"] = {"enabled": bool(options["health_monitoring_enabled"])}
+    node_selector = options.get("node_selector")
+    if isinstance(node_selector, dict) and node_selector:
+        kubelet_plugin["nodeSelector"] = {str(k): str(v) for k, v in node_selector.items()}
+    values: dict[str, Any] = {}
+    if kubelet_plugin:
+        values["kubeletPlugin"] = kubelet_plugin
+    return yaml.safe_dump(values, sort_keys=False)
 
 
 def _install_commands(access_mode: GpuAccessMode) -> list[list[str]]:
@@ -279,28 +301,65 @@ async def _intel_install_driver(access_mode: GpuAccessMode, *, cluster_id: str |
     happens to share a manifest). Only applies the objects -- does not wait
     for pods to become Ready; callers should poll :func:`get_status`.
     """
-    unsupported = access_mode_version_message(
-        _intel_profile(), access_mode, await server_kubernetes_version(cluster_id)
-    )
+    profile = _intel_profile()
+    version = await server_kubernetes_version(cluster_id)
+    unsupported = access_mode_version_message(profile, access_mode, version.version)
     if unsupported:
         raise GpuDriverError(unsupported, status_code=422)
+    label = _LABEL[access_mode]
+    daemonsets = await list_resources("daemonsets", all_namespaces=True, cluster_id=cluster_id)
+    matcher = _is_dra_driver if access_mode == "dra" else _is_gpu_plugin
+    if any(_daemonset_ready(item) for item in daemonsets if matcher(item)):
+        return GpuDriverInstallResponse(
+            access_mode=access_mode,
+            applied=True,
+            message=f"Intel GPU {label} is already installed and ready.",
+        )
+    driver = profile.driver if profile is not None else None
+    mode = driver.mode(access_mode) if driver is not None else None
     try:
         await _ensure_intel_gpu_hardware_detected(cluster_id)
-        for command in _install_commands(access_mode):
-            result = await run_kubectl(command, timeout=_APPLY_TIMEOUT_SECONDS, cluster_id=cluster_id)
+        if mode is not None and mode.chart_version and mode.manifest_ref:
+            argv = [
+                "helm",
+                "upgrade",
+                "--install",
+                _INTEL_DRA_RELEASE,
+                mode.manifest_ref,
+                "--namespace",
+                _INTEL_DRA_NAMESPACE,
+                "--create-namespace",
+                "--version",
+                mode.chart_version,
+            ]
+            if mode.repo:
+                argv += ["--repo", mode.repo]
+            argv += ["--values", "-"]
+            result = await k8s.scoped_runner(cluster_id).run(
+                argv,
+                input=intel_dra_values(mode),
+                timeout=_APPLY_TIMEOUT_SECONDS,
+            )
             if result.returncode != 0:
                 raise GpuDriverError(
-                    f"kubectl {' '.join(command)} failed: "
+                    f"helm upgrade --install {_INTEL_DRA_RELEASE} failed: "
                     f"{result.stderr.strip() or result.stdout.strip() or 'unknown error'}"
                 )
+        else:
+            for command in _install_commands(access_mode):
+                result = await run_kubectl(command, timeout=_APPLY_TIMEOUT_SECONDS, cluster_id=cluster_id)
+                if result.returncode != 0:
+                    raise GpuDriverError(
+                        f"kubectl {' '.join(command)} failed: "
+                        f"{result.stderr.strip() or result.stdout.strip() or 'unknown error'}"
+                    )
     except FileNotFoundError as error:
         raise GpuDriverError(str(error), status_code=400) from error
-    except CommandTimeoutError as error:
+    except (CommandTimeoutError, TimeoutError) as error:
         raise GpuDriverError(
-            f"Timed out applying Intel GPU {_LABEL[access_mode]} manifests: {error}",
+            f"Timed out applying Intel GPU {label} manifests: {error}",
             status_code=504,
         ) from error
-    label = _LABEL[access_mode]
     return GpuDriverInstallResponse(
         access_mode=access_mode,
         applied=True,

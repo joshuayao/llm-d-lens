@@ -691,3 +691,186 @@ def test_router_ablations_preserve_published_source_and_cluster_for_retry():
     direct = router._baseline_configuration(source, "direct-vllm", ["plan-a"], "artifact-a")
     assert direct.provenance["cluster_ref"]["id"] == "original-cluster"
     assert "officialGuide" not in direct.content
+
+
+@pytest.mark.asyncio
+async def test_execute_owned_e20cf405_fallback_standup_cm_cleanup_and_gaie_presets(monkeypatch, tmp_path):
+    import base64
+    import json
+    from unittest.mock import AsyncMock
+
+    import yaml
+
+    kc = tmp_path / "kubeconfig"
+    kc.write_text("apiVersion: v1\nkind: Config\n", encoding="utf-8")
+    ns = "ns-e20cf405"
+    router._standup_configmap_refs.clear()
+
+    seen_session_ids = []
+    applied = []
+    deleted = []
+
+    def fake_overrides(session_id):
+        seen_session_ids.append(session_id)
+        return {"KUBECONFIG": str(kc)}
+
+    envoy_tls_yaml = (
+        "static_resources:\n  clusters:\n"
+        "  - name: ext_proc\n    transport_socket:\n      name: envoy.transport_sockets.tls\n"
+    )
+    epp_cfg_yaml = "apiVersion: inference.networking.x-k8s.io/v1alpha1\nkind: EndpointPickerConfig\nplugins:\n- type: queue-scorer\n"
+    epp_dep = {
+        "metadata": {"name": "optimized-baseline-epp"},
+        "spec": {
+            "replicas": 1,
+            "template": {
+                "metadata": {"labels": {"app": "optimized-baseline-epp"}},
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "epp",
+                            "args": ["--pool-name=optimized-baseline", "--secure-serving=false", "--config-file=/config/epp.yaml"],
+                            "ports": [{"containerPort": 9002}],
+                            "volumeMounts": [{"name": "epp-cfg", "mountPath": "/config"}],
+                        },
+                        {
+                            "name": "envoy-proxy",
+                            "image": "envoyproxy/envoy:v1.31",
+                            "ports": [{"containerPort": 8081}],
+                            "volumeMounts": [{"name": "envoy-cfg", "mountPath": "/etc/envoy"}],
+                        },
+                    ],
+                    "volumes": [
+                        {"name": "envoy-cfg", "configMap": {"name": "envoy"}},
+                        {"name": "epp-cfg", "configMap": {"name": "epp-presets"}},
+                    ],
+                },
+            },
+        },
+        "status": {"availableReplicas": 1},
+    }
+    ms_dep = {
+        "metadata": {"name": "optimized-baseline-epp-model-servers"},
+        "spec": {
+            "replicas": 1,
+            "template": {
+                "metadata": {"labels": {"llm-d.ai/role": "decode"}},
+                "spec": {"containers": [{"name": "modelserver", "command": ["vllm", "serve"], "args": ["Qwen/Qwen3-0.6B"]}]},
+            },
+        },
+        "status": {"availableReplicas": 1},
+    }
+    services = [
+        {"metadata": {"name": "optimized-baseline-epp"}, "spec": {"selector": {"app": "optimized-baseline-epp"}, "ports": [{"port": 80, "targetPort": 8081}]}},
+        {"metadata": {"name": "optimized-baseline-epp-model-servers"}, "spec": {"selector": {"llm-d.ai/role": "decode"}, "ports": [{"port": 8000}]}},
+    ]
+
+    async def fake_k8s_json(args, _env):
+        if args[:2] == ["get", "services"]:
+            return {"items": services}
+        if args[:2] == ["get", "deployments"]:
+            return {"items": [epp_dep, ms_dep]}
+        if args[:2] == ["get", "pods"]:
+            return {"items": [{"spec": {"nodeName": "smc-22", "containers": [{"name": "modelserver"}]}}]}
+        if args[:3] == ["get", "configmap", "envoy"]:
+            return {"data": {"envoy.yaml": envoy_tls_yaml}}
+        if args[:3] == ["get", "configmap", "epp-presets"]:
+            return {"data": {"epp.yaml": epp_cfg_yaml}}
+        if args[:3] == ["get", "configmap", router._STANDUP_CM_NAME]:
+            return applied[-1] if applied else None
+        return None
+
+    async def fake_k8s_apply(manifest, _env):
+        applied.append(manifest)
+        return True
+
+    async def fake_k8s_delete(resource, name, target_ns, _env):
+        deleted.append((resource, name, target_ns))
+        return True
+
+    bench_root = tmp_path / "bench"
+    (bench_root / "llmdbenchmark/run/steps").mkdir(parents=True)
+    (bench_root / "llmdbenchmark/interface").mkdir(parents=True)
+    (bench_root / "config/templates/jinja").mkdir(parents=True)
+    (bench_root / "llmdbenchmark/cli.py").write_text("--non-admin --no-pvc --no-prism\n", encoding="utf-8")
+    (bench_root / "llmdbenchmark/interface/run.py").write_text("--step\n", encoding="utf-8")
+    (bench_root / "llmdbenchmark/run/steps/step_02b_deploy_prism.py").write_text("", encoding="utf-8")
+    (bench_root / "config/templates/jinja/20_harness_pod.yaml.j2").write_text("no_pvc\n", encoding="utf-8")
+
+    run = {
+        "id": "run-e20cf405",
+        "deployment_execution_id": "exec-1",
+        "specification_file": "guides/optimized-baseline",
+        "harness": "inference-perf",
+        "workload": "sanity_random.yaml",
+        "parallelism": 1,
+        "wait_timeout_seconds": 60,
+        "cluster_session_id": "run-level-should-not-override",
+    }
+    execution = SimpleNamespace(
+        status=router.DeploymentStatus.READY,
+        endpoint=SimpleNamespace(url=f"http://optimized-baseline-epp.{ns}.svc.cluster.local:80", baseline_url=None),
+        namespace=ns,
+        provenance={"cluster_session_id": "prov-session"},
+        configuration_artifacts=[],
+        artifact=None,
+    )
+
+    monkeypatch.setattr(router, "_get", lambda _kind, _id: run)
+    monkeypatch.setattr(router, "_save", lambda _rec: None)
+    monkeypatch.setattr(router, "_results_root", tmp_path / "results")
+    monkeypatch.setattr(router, "_store", SimpleNamespace(get_execution=lambda _id: execution))
+    monkeypatch.setattr(router, "_execution_model", lambda _exec: "Qwen/Qwen3-0.6B")
+    monkeypatch.setattr(router, "_execution_accelerator_profile", lambda _exec, _p: None)
+    monkeypatch.setattr(router, "deployment_runtime_overrides", fake_overrides)
+    monkeypatch.setattr(router, "_eval_k8s_json", fake_k8s_json)
+    monkeypatch.setattr(router, "_eval_k8s_apply", fake_k8s_apply)
+    monkeypatch.setattr(router, "_eval_k8s_delete", fake_k8s_delete)
+    monkeypatch.setattr(router, "_prepare_benchmark_runtime", AsyncMock(return_value=("llmdbenchmark", bench_root)))
+    monkeypatch.setattr(router, "wait_for_deployment_metrics", AsyncMock(return_value=True))
+    monkeypatch.setattr(router, "capture_benchmark_context", AsyncMock(return_value=None))
+    monkeypatch.setattr(router, "verify_benchmark_context", AsyncMock(return_value=None))
+    monkeypatch.setattr(router, "_kubernetes_resource_snapshot", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        router,
+        "collect_benchmark_observability",
+        AsyncMock(return_value={"status": "unavailable", "reason": "test", "window": {}, "summary": {}, "series": []}),
+    )
+    monkeypatch.setattr(router.KVTraceCollector, "discover", AsyncMock(side_effect=ValueError("skip")))
+
+    captured_cmds = []
+
+    class _FakeFailedProcess:
+        returncode = 1
+
+        async def communicate(self):
+            return b"", b"simulated-failure"
+
+        async def wait(self):
+            return 1
+
+    async def fake_exec(*args, **kwargs):
+        del kwargs
+        captured_cmds.append(list(args))
+        return _FakeFailedProcess()
+
+    async def fake_stream(proc, *_args, **_kwargs):
+        return await proc.communicate()
+
+    monkeypatch.setattr(router, "_stream_benchmark_process", fake_stream)
+    monkeypatch.setattr(router.asyncio, "create_subprocess_exec", fake_exec)
+
+    await router._execute_owned(run["id"])
+
+    assert seen_session_ids == ["prov-session"]
+    assert run["endpoint_used"] == f"http://optimized-baseline-epp-model-servers.{ns}.svc.cluster.local:8000"
+    assert run["endpoint_fallback"]["reason"] == "envoy_ext_proc_tls_mismatch_epp_plaintext"
+    assert len(applied) == 1
+    assert applied[0]["metadata"]["labels"][router._STANDUP_CM_MANAGED_LABEL] == "true"
+    assert deleted == [("configmap", router._STANDUP_CM_NAME, ns)]
+    cmd = captured_cmds[0]
+    assert f"http://optimized-baseline-epp-model-servers.{ns}.svc.cluster.local:8000" in cmd
+    override = next(arg for arg in cmd if arg.startswith("harness.extraEnvVars="))
+    env_map = {item["name"]: item["value"] for item in json.loads(override.split("=", 1)[1])}
+    decoded_epp = yaml.safe_load(base64.b64decode(env_map["LLMDBENCH_VLLM_MODELSERVICE_GAIE_PRESETS_CONFIG"]).decode())
+    assert decoded_epp["plugins"] == [{"type": "queue-scorer"}]

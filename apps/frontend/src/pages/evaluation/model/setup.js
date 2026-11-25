@@ -1,10 +1,17 @@
 import { isDefaultRuntimeImage, runtimeImageRepository } from '../ui/benchmark-results/acceleratorDisplay';
 
 // The hardware profile owns the model-server repository and version, so a saved
-// artifact carries the pinned tag while the wizard setup may hold a repo-only
-// default. Compare managed model-server images by repository.
+// artifact carries a pinned tag/digest while a legacy setup may hold a repo-only
+// default. Require exact equality whenever both carry a tag or digest; only
+// fall back to managed-repository matching when at least one side is repo-only.
+function hasImageVersion(image) {
+    return Boolean(image) && image !== runtimeImageRepository(image);
+}
+
 function sameRuntimeImage(artifactImage, setupImage) {
     if (artifactImage === setupImage) return true;
+    if (!artifactImage || !setupImage) return false;
+    if (hasImageVersion(artifactImage) && hasImageVersion(setupImage)) return false;
     return isDefaultRuntimeImage(artifactImage)
         && isDefaultRuntimeImage(setupImage)
         && runtimeImageRepository(artifactImage) === runtimeImageRepository(setupImage);

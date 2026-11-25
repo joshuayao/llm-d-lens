@@ -1,6 +1,6 @@
-"""Deployments without an explicit model_secret should reuse the cluster's
-wizard-created HF_TOKEN secret (see llm_d_lens.cluster.service.create_hf_token_secret
-and CreateClusterWizard.jsx's mandatory HF_TOKEN secret step)."""
+"""Deployments without an explicit model_secret should reuse the plan's
+HF_TOKEN Secret (see the ``cache.hf-secret`` operation and the cluster's
+recorded secret coordinates)."""
 
 from llm_d_lens.cluster import registry
 from llm_d_lens.deploy.service import _with_default_model_secret

@@ -30,9 +30,12 @@ GATEWAY_TTL_SECONDS = 15.0
 CACHE_TTL_SECONDS = 30.0
 SECRET_TTL_SECONDS = 60.0
 DEPLOYMENT_MONITORING_TTL_SECONDS = 60.0
-ALL_CLUSTER_OVERVIEW_BUDGET_SECONDS = 20.0
-GATEWAY_BUDGET_SECONDS = 10.0
-MAX_REMOTE_JOBS = 4
+ALL_CLUSTER_OVERVIEW_BUDGET_SECONDS = 30.0
+GATEWAY_BUDGET_SECONDS = 15.0
+MAX_REMOTE_JOBS = 8
+MAX_OVERVIEW_JOBS = 4
+SECRET_STATUS_TIMEOUT_SECONDS = 8.0
+CONSECUTIVE_OVERVIEW_TIMEOUT_THRESHOLD = 2
 
 
 @dataclass
@@ -52,14 +55,17 @@ class DashboardCollector:
     def __init__(self) -> None:
         self._overview: dict[str, CacheEntry] = {}
         self._overview_errors: dict[str, str] = {}
+        self._overview_timeouts: dict[str, int] = {}
         self._overview_tasks: dict[str, asyncio.Task[None]] = {}
         self._secret_status: dict[str, CacheEntry] = {}
         self._deployment_monitoring: dict[str, CacheEntry] = {}
         self._gateway: CacheEntry | None = None
         self._gateway_task: asyncio.Task[None] | None = None
         self._cache_entries: CacheEntry | None = None
+        self._cache_failed: bool = False
         self._cache_task: asyncio.Task[None] | None = None
         self._remote_jobs = asyncio.Semaphore(MAX_REMOTE_JOBS)
+        self._overview_jobs = asyncio.Semaphore(MAX_OVERVIEW_JOBS)
         self._background: set[asyncio.Task[Any]] = set()
 
     async def cluster_overview(
@@ -71,7 +77,7 @@ class DashboardCollector:
         """Return ``(overview, observedAt, stale, reason)`` without blocking."""
         entry = self._overview.get(cluster.id)
         if entry is not None and not force and entry.age < OVERVIEW_TTL_SECONDS:
-            return entry.value, entry.observed_at, False, None
+            return entry.value, entry.observed_at, entry.stale, None
         self._start_overview_refresh(cluster)
         if entry is not None:
             entry.stale = True
@@ -81,13 +87,20 @@ class DashboardCollector:
     async def wait_for_overview(
         self, cluster: registry.Cluster, *, timeout: float = ALL_CLUSTER_OVERVIEW_BUDGET_SECONDS
     ) -> tuple[dict[str, Any] | None, datetime | None, bool, str | None]:
-        """Test/empty-state helper that waits for one coalesced refresh."""
+        """Wait for one coalesced overview refresh, bounded by ``timeout``."""
         task = self._start_overview_refresh(cluster)
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         except TimeoutError:
+            entry = self._overview.get(cluster.id)
+            if entry is not None:
+                entry.stale = True
+                return entry.value, entry.observed_at, True, None
             return None, None, False, "overview_timeout"
-        return self.cluster_overview(cluster)
+        entry = self._overview.get(cluster.id)
+        if entry is not None:
+            return entry.value, entry.observed_at, entry.stale, None
+        return None, None, False, self._overview_errors.get(cluster.id, "collecting")
 
     def _start_overview_refresh(self, cluster: registry.Cluster) -> asyncio.Task[None]:
         task = self._overview_tasks.get(cluster.id)
@@ -104,18 +117,33 @@ class DashboardCollector:
         if cluster is None:
             return
         try:
-            async with self._remote_jobs:
+            async with self._overview_jobs:
                 overview = await asyncio.wait_for(
                     cluster_service.build_overview(cluster),
                     timeout=ALL_CLUSTER_OVERVIEW_BUDGET_SECONDS,
                 )
+        except TimeoutError:
+            count = self._overview_timeouts.get(cluster_id, 0) + 1
+            self._overview_timeouts[cluster_id] = count
+            logger.info("dashboard cluster overview timed out for %s (consecutive=%d)", cluster_id, count)
+            self._overview_errors[cluster_id] = (
+                "overview_timeout"
+                if count < CONSECUTIVE_OVERVIEW_TIMEOUT_THRESHOLD
+                else "overview_unavailable"
+            )
+            previous = self._overview.get(cluster_id)
+            if previous is not None:
+                previous.stale = True
+            return
         except Exception as error:  # noqa: BLE001 - a remote read failure is section state
+            self._overview_timeouts.pop(cluster_id, None)
             logger.info("dashboard cluster overview failed for %s: %s", cluster_id, type(error).__name__)
             self._overview_errors[cluster_id] = "overview_unavailable"
             previous = self._overview.get(cluster_id)
             if previous is not None:
                 previous.stale = True
             return
+        self._overview_timeouts.pop(cluster_id, None)
         self._overview_errors.pop(cluster_id, None)
         self._overview[cluster_id] = CacheEntry(value=overview)
         self._prune(self._overview, limit=128)
@@ -128,7 +156,7 @@ class DashboardCollector:
             async with self._remote_jobs:
                 status = await asyncio.wait_for(
                     cluster_service.hf_token_secret_status(cluster),
-                    timeout=5.0,
+                    timeout=SECRET_STATUS_TIMEOUT_SECONDS,
                 )
         except Exception:  # noqa: BLE001 - a missing read is not proof the Secret is gone
             status = "unreachable"
@@ -158,7 +186,7 @@ class DashboardCollector:
     ) -> tuple[GatewayStatus | None, datetime | None, bool, str | None]:
         entry = self._gateway
         if entry is not None and not force and entry.age < GATEWAY_TTL_SECONDS:
-            return entry.value, entry.observed_at, False, None
+            return entry.value, entry.observed_at, entry.stale, None
         task = self._start_gateway_refresh()
         if entry is not None:
             entry.stale = True
@@ -201,7 +229,9 @@ class DashboardCollector:
                 entries = await asyncio.wait_for(ModelCacheService().list(), timeout=3.0)
             except Exception:  # noqa: BLE001 - cache state is supporting evidence only
                 logger.info("dashboard model cache read failed", exc_info=True)
+                self._cache_failed = True
                 return []
+            self._cache_failed = False
             self._cache_entries = CacheEntry(value=entries)
             return entries
         if self._cache_task is None or self._cache_task.done():
@@ -218,6 +248,7 @@ class DashboardCollector:
             if self._cache_entries is not None:
                 self._cache_entries.stale = True
             return
+        self._cache_failed = False
         self._cache_entries = CacheEntry(value=entries)
 
     def storage_volumes(self) -> list:

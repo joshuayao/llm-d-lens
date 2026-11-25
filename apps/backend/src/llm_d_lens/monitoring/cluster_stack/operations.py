@@ -69,7 +69,8 @@ class ClusterStackOperationManager(MonitoringOperationManager):
         idempotency_key: str | None,
         cluster_id: str | None = None,
     ) -> ClusterStackOperationResponse:
-        key = (context or "", request.namespace)
+        resolved_ns = request.namespace or "llm-d-monitoring"
+        key = (context or "", resolved_ns)
         return await self.queue_operation(
             key=key,
             idempotency_key=idempotency_key,
@@ -78,7 +79,7 @@ class ClusterStackOperationManager(MonitoringOperationManager):
                 operation_id=uuid.uuid4().hex,
                 status="queued",
                 phase="preflight",
-                namespace=request.namespace,
+                namespace=resolved_ns,
             ),
             run=lambda operation: self._run(operation, request, key, script, verifier, cluster_id),
         )
@@ -92,11 +93,12 @@ class ClusterStackOperationManager(MonitoringOperationManager):
         verifier: Verifier,
         cluster_id: str | None = None,
     ) -> None:
+        resolved_ns = request.namespace or operation.namespace or "llm-d-monitoring"
         operation.status = "running"
         operation.started_at = datetime.now(UTC)
         self.store.save(operation, cluster_id=cluster_id)
 
-        install_args = ["--namespace", request.namespace]
+        install_args = ["--namespace", resolved_ns]
         if request.mode == "individual":
             install_args.append("--individual")
         if request.enable_tls:
@@ -104,7 +106,7 @@ class ClusterStackOperationManager(MonitoringOperationManager):
 
         commands: list[tuple[list[str], str]] = []
         if request.reinstall:
-            commands.append((["--namespace", request.namespace, "--uninstall"], "uninstalling"))
+            commands.append((["--namespace", resolved_ns, "--uninstall"], "uninstalling"))
             self._append(operation, "Reinstalling: removing the existing stack and its metrics data", "warning")
         commands.append((install_args, "invoking_installer"))
 
@@ -117,7 +119,7 @@ class ClusterStackOperationManager(MonitoringOperationManager):
                     raise RuntimeError(f"Installer exited with code {operation.exit_code}")
             operation.phase = "verifying"
             self.store.save(operation, cluster_id=cluster_id)
-            snapshot = await verifier(request.namespace)
+            snapshot = await verifier(resolved_ns)
             if snapshot.status != "ready":
                 raise RuntimeError(f"Installation completed but stack status is {snapshot.status}")
             operation.status = "succeeded"

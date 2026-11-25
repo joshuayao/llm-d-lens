@@ -91,11 +91,15 @@ def placement_preflight(
     complete: bool = True,
     runtime_classes: list[dict] | None = None,
     search_limit: int = 20000,
+    inventory_source: str = "kubernetes",
 ) -> dict[str, Any]:
     errors, warnings, unmodeled = [], [], set()
     report = {"status": "unknown", "errors": errors, "warnings": warnings, "unmodeled": [], "assignments": []}
+    if inventory_source == "prometheus":
+        unmodeled.add("Node inventory synthesized from Prometheus; node taints and custom labels may be incomplete")
     if not complete:
-        report["unmodeled"] = ["Cluster inventory is incomplete or inaccessible"]
+        unmodeled.add("Cluster inventory is incomplete or inaccessible")
+        report["unmodeled"] = sorted(unmodeled)
         return report
     demands = workload_pods(documents)
     classes = {item["metadata"]["name"]: item for item in runtime_classes or []}

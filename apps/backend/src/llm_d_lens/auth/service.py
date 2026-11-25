@@ -367,6 +367,16 @@ class AuthService:
                 action = "deny"
             else:
                 action = "execute"
+        effective_permission = permission or (context.permission if context else None)
+        effective_detail = dict(detail) if detail is not None else None
+        if (
+            not permission
+            and context is not None
+            and context.required_permissions
+            and (effective_detail is None or "requiredPermissions" not in effective_detail)
+        ):
+            effective_detail = effective_detail or {}
+            effective_detail["requiredPermissions"] = list(context.required_permissions)
         try:
             self.audit_dao.append(
                 AuditLogRecord(
@@ -378,14 +388,14 @@ class AuthService:
                     actor_username=actor.username
                     if actor
                     else (actor_username or (context.actor_username if context else "")),
-                    permission=permission or (context.permission if context else None),
+                    permission=effective_permission,
                     method=method or (context.method if context else None),
                     path=path or (context.path if context else None),
                     target_type=target_type,
                     target_id=target_id,
                     target_name=target_name,
                     cluster_id=cluster_id or (context.cluster_id if context else None),
-                    detail=detail,
+                    detail=effective_detail,
                     ip=ip or (context.ip if context else None),
                     source=source or (context.source if context else "system"),
                     action=action,

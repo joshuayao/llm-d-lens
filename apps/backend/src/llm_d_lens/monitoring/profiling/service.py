@@ -13,28 +13,31 @@ import math
 import re
 import statistics
 import time
+from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import httpx
 
-from llm_d_lens.hardware.telemetry import DEVICE_RESULT_KEYS, scoped_device_query
-from llm_d_lens.infrastructure.kubernetes import (
-    PortForwardError,
-    ensure_port_forward,
-    list_resources,
-)
-from llm_d_lens.monitoring.cluster_stack.service import (
-    _PROMETHEUS_PORT,
-    _find_service,
-    _service_name,
-    _service_port,
-)
+from llm_d_lens.hardware.telemetry import DEVICE_RESULT_KEYS, _selector, scoped_device_query
+from llm_d_lens.infrastructure.kubernetes import PortForwardError, list_resources, validate_namespace
 from llm_d_lens.monitoring.deployment.service import (
-    CENTRAL_NAMESPACE,
     _deployment_target,
     _discover_epp_service,
+    _monitoring_namespace_for_cluster,
 )
+from llm_d_lens.monitoring.prometheus import (
+    PrometheusEndpoint,
+    create_prometheus_client,
+    resolve_prometheus_endpoint,
+)
+from llm_d_lens.monitoring.prometheus import query_range as _query_range
 from llm_d_lens.monitoring.prometheus import query_vector as _query
+from llm_d_lens.monitoring.service_links import (
+    is_forbidden_error,
+    probe_monitoring_access,
+    redact_monitoring_error,
+)
 
 from .models import (
     FlowMapComponent,
@@ -78,42 +81,103 @@ _COMPONENT_CACHE_TTL = 15.0
 _components_cache: dict[tuple[str, str | None], tuple[float, dict[str, list[str]]]] = {}
 
 
-async def _prometheus_local_port(cluster_id: str | None) -> int | None:
-    """Open (or reuse) a tunnel to the central Prometheus and return its port."""
-    services = await list_resources("services", namespace=CENTRAL_NAMESPACE, cluster_id=cluster_id)
-    prom = _find_service(services, lambda name: name.endswith("-prometheus"))
-    if prom is None:
-        return None
-    service = _service_name(prom)
-    port = _service_port(prom, _PROMETHEUS_PORT)
-    try:
-        forward = await ensure_port_forward(CENTRAL_NAMESPACE, service, port, cluster_id=cluster_id)
-        return forward.local_port
-    except PortForwardError:
-        logger.warning("Unable to open Prometheus tunnel for flow map", exc_info=True)
-        return None
+def _is_k8s_or_tunnel_restricted(exc: Exception) -> bool:
+    if isinstance(exc, AssertionError):
+        return False
+    if isinstance(exc, PortForwardError | FileNotFoundError | TimeoutError | OSError):
+        return True
+    if getattr(exc, "status", None) == 403 or getattr(exc, "status_code", None) == 403:
+        return True
+    return is_forbidden_error(str(exc))
 
 
-async def _query_range(
-    client: httpx.AsyncClient,
-    promql: str,
-    start: str,
-    end: str,
-    step_seconds: int,
-) -> list[dict]:
-    """Execute a Prometheus range query and return its matrix result."""
+def _safe_promql_namespace(namespace: str) -> str:
     try:
-        response = await client.get(
-            "/api/v1/query_range",
-            params={"query": promql, "start": start, "end": end, "step": step_seconds},
+        return validate_namespace(namespace)
+    except ValueError:
+        escaped = str(namespace or "")
+        return (
+            escaped.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
         )
-        response.raise_for_status()
-        payload = response.json()
-    except (httpx.HTTPError, ValueError):
-        return []
-    if payload.get("status") != "success":
-        return []
-    return (payload.get("data") or {}).get("result") or []
+
+
+async def _prometheus_local_port(
+    cluster_id: str | None, *, namespace: str | None = None
+) -> int | None:
+    """Open (or reuse) a tunnel to the central Prometheus and return its port."""
+    try:
+        if namespace is not None and namespace.strip():
+            endpoint = await resolve_prometheus_endpoint(
+                cluster_id, namespace=namespace, allow_port_forward=True
+            )
+        else:
+            endpoint = await resolve_prometheus_endpoint(cluster_id, allow_port_forward=True)
+    except Exception as exc:
+        if _is_k8s_or_tunnel_restricted(exc):
+            logger.debug(
+                "Prometheus port-forward unavailable for cluster %s: %s",
+                cluster_id,
+                redact_monitoring_error(str(exc)),
+            )
+            return None
+        raise
+    return endpoint.local_port if endpoint is not None else None
+
+
+async def _prometheus_endpoint(
+    cluster_id: str | None, *, namespace: str | None = None
+) -> PrometheusEndpoint | None:
+    """Resolve a direct Prometheus endpoint first, falling back to port-forward."""
+    explicit_ns = (
+        validate_namespace(namespace)
+        if (namespace is not None and namespace.strip())
+        else None
+    )
+    if explicit_ns is not None:
+        endpoint = await resolve_prometheus_endpoint(
+            cluster_id, namespace=explicit_ns, allow_port_forward=False
+        )
+        if endpoint is not None:
+            return endpoint
+        try:
+            local_port = await _prometheus_local_port(cluster_id, namespace=explicit_ns)
+        except Exception as exc:
+            if _is_k8s_or_tunnel_restricted(exc):
+                logger.debug(
+                    "Prometheus tunnel fallback restricted for cluster %s: %s",
+                    cluster_id,
+                    redact_monitoring_error(str(exc)),
+                )
+                return None
+            raise
+        resolved_ns = explicit_ns
+    else:
+        endpoint = await resolve_prometheus_endpoint(cluster_id, allow_port_forward=False)
+        if endpoint is not None:
+            return endpoint
+        try:
+            local_port = await _prometheus_local_port(cluster_id)
+        except Exception as exc:
+            if _is_k8s_or_tunnel_restricted(exc):
+                logger.debug(
+                    "Prometheus tunnel fallback restricted for cluster %s: %s",
+                    cluster_id,
+                    redact_monitoring_error(str(exc)),
+                )
+                return None
+            raise
+        resolved_ns = _monitoring_namespace_for_cluster(cluster_id)
+    if local_port is None:
+        return None
+    return PrometheusEndpoint(
+        base_url=f"http://127.0.0.1:{local_port}",
+        source="port_forward",
+        namespace=resolved_ns,
+        local_port=local_port,
+    )
 
 
 async def _prometheus_clock_offset(client: httpx.AsyncClient) -> float | None:
@@ -136,14 +200,15 @@ async def _prometheus_clock_offset(client: httpx.AsyncClient) -> float | None:
 async def query_prometheus(cluster_id: str | None, promql: str) -> list[dict]:
     """Run an instant PromQL query against the cluster's central Prometheus.
 
-    Opens (or reuses) the port-forward tunnel to the ``*-prometheus`` Service and
-    returns the raw result series; ``[]`` when Prometheus is unreachable or the
-    query fails. Shared by the profiling flow map and the model-service usage sync.
+    Uses direct HTTP connectivity when configured, or opens/reuses the
+    port-forward tunnel to the ``*-prometheus`` Service and returns the raw
+    result series; ``[]`` when Prometheus is unreachable or the query fails.
+    Shared by the profiling flow map and the model-service usage sync.
     """
-    local_port = await _prometheus_local_port(cluster_id)
-    if local_port is None:
+    endpoint = await _prometheus_endpoint(cluster_id)
+    if endpoint is None:
         return []
-    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{local_port}", timeout=15.0) as client:
+    async with create_prometheus_client(endpoint, timeout=15.0) as client:
         return await _query(client, promql)
 
 
@@ -327,6 +392,92 @@ def _pod_role(pod: dict) -> str | None:
     return None
 
 
+def _role_from_prom_labels(
+    labels: Mapping[str, object],
+    pod_name: str,
+    *,
+    is_vllm_metric: bool = False,
+) -> str | None:
+    for key in ("llm_d_ai_role", "llm-d.ai/role", "role", "component"):
+        val = str(labels.get(key) or "").strip().lower()
+        if "epp" in val:
+            return None
+        if val in ("prefill", "decode"):
+            return val
+    lowered = pod_name.lower()
+    if "epp" in lowered:
+        return None
+    if "prefill" in lowered:
+        return "prefill"
+    if "decode" in lowered:
+        return "decode"
+    if is_vllm_metric and pod_name:
+        return "decode"
+    return None
+
+
+async def _discover_components_from_prometheus(
+    namespace: str,
+    cluster_id: str | None,
+) -> dict[str, list[str]]:
+    discovered: dict[str, list[str]] = {"epp": [], "prefill": [], "decode": []}
+    endpoint = await _prometheus_endpoint(cluster_id)
+    if endpoint is None:
+        return discovered
+    safe_ns = _safe_promql_namespace(namespace)
+    try:
+        async with create_prometheus_client(endpoint, timeout=5.0) as client:
+            up_rows, vllm_rows, epp_rows = await asyncio.gather(
+                _query(client, f'up{{namespace="{safe_ns}"}}'),
+                _query(client, f'vllm:num_requests_running{{namespace="{safe_ns}"}}'),
+                _query(client, f'llm_d_epp_request_running{{namespace="{safe_ns}"}}'),
+            )
+    except ValueError:
+        return discovered
+
+    for entry in vllm_rows:
+        labels = entry.get("metric") or {}
+        pod = str(labels.get("pod") or "").strip()
+        if not pod:
+            continue
+        role = _role_from_prom_labels(labels, pod, is_vllm_metric=True)
+        if role in ("prefill", "decode"):
+            discovered[role].append(pod)
+
+    for entry in up_rows:
+        labels = entry.get("metric") or {}
+        pod = str(labels.get("pod") or "").strip()
+        service_lbl = str(labels.get("service") or "").strip()
+        job_lbl = str(labels.get("job") or "").strip()
+        if service_lbl and (service_lbl.endswith("-epp") or "epp" in service_lbl.lower()):
+            discovered["epp"].append(service_lbl)
+            continue
+        if job_lbl and "epp" in job_lbl.lower():
+            discovered["epp"].append(job_lbl.rsplit("/", 1)[-1])
+            continue
+        if pod and "epp" in pod.lower():
+            continue
+        if pod:
+            role = _role_from_prom_labels(labels, pod, is_vllm_metric=False)
+            if role in ("prefill", "decode"):
+                discovered[role].append(pod)
+
+    if not discovered["epp"]:
+        for entry in epp_rows:
+            labels = entry.get("metric") or {}
+            candidate = (
+                str(labels.get("service") or "").strip()
+                or str(labels.get("job") or "").strip().rsplit("/", 1)[-1]
+                or str(labels.get("pod") or "").strip()
+            )
+            if candidate:
+                discovered["epp"].append(candidate)
+
+    for role in FLOW_ORDER:
+        discovered[role] = sorted(set(discovered[role]))
+    return discovered
+
+
 async def _discover_components(namespace: str, cluster_id: str | None) -> dict[str, list[str]]:
     key = (namespace, cluster_id)
     cached = _components_cache.get(key)
@@ -336,21 +487,55 @@ async def _discover_components(namespace: str, cluster_id: str | None) -> dict[s
             return instances
 
     instances = await _discover_components_uncached(namespace, cluster_id)
-    _components_cache[key] = (time.monotonic(), instances)
+    if any(instances.values()):
+        _components_cache[key] = (time.monotonic(), instances)
     return instances
 
 
 async def _discover_components_uncached(namespace: str, cluster_id: str | None) -> dict[str, list[str]]:
     instances: dict[str, list[str]] = {"epp": [], "prefill": [], "decode": []}
-    pods = await list_resources("pods", namespace=namespace, cluster_id=cluster_id)
-    for pod in pods:
-        role = _pod_role(pod)
+    try:
+        pods = await list_resources("pods", namespace=namespace, cluster_id=cluster_id)
+    except Exception as exc:
+        if isinstance(exc, AssertionError):
+            raise
+        logger.debug(
+            "Kubernetes pod discovery unavailable in %s: %s",
+            namespace,
+            redact_monitoring_error(str(exc)),
+        )
+        pods = []
+    for pod in pods or []:
+        if not isinstance(pod, Mapping):
+            continue
+        role = _pod_role(dict(pod))
         name = str((pod.get("metadata") or {}).get("name") or "")
         if role and name:
             instances[role].append(name)
-    epp = await _discover_epp_service(namespace, cluster_id)
+    try:
+        epp = await _discover_epp_service(namespace, cluster_id)
+    except Exception as exc:
+        if isinstance(exc, AssertionError):
+            raise
+        logger.debug(
+            "Kubernetes EPP service discovery unavailable in %s: %s",
+            namespace,
+            redact_monitoring_error(str(exc)),
+        )
+        epp = None
     if epp and epp.get("name"):
         instances["epp"] = [str(epp["name"])]
+
+    need_serving = not (instances["prefill"] or instances["decode"])
+    need_epp = not instances["epp"]
+    if need_serving or need_epp:
+        prom_instances = await _discover_components_from_prometheus(namespace, cluster_id)
+        if need_serving:
+            instances["prefill"].extend(prom_instances["prefill"])
+            instances["decode"].extend(prom_instances["decode"])
+        if need_epp:
+            instances["epp"].extend(prom_instances["epp"])
+
     for role in FLOW_ORDER:
         instances[role] = sorted(set(instances[role]))
     return instances
@@ -407,13 +592,20 @@ def _cache_queries(matcher: str) -> dict[str, str]:
 
 
 # Prometheus matches with RE2, which rejects escapes it has no meaning for
-# (notably "\-", which re.escape emits). Escape only the true metacharacters;
-# "-" is not one outside a character class.
+# (notably "\-", which re.escape emits). Escape only the true metacharacters,
+# then escape for embedding inside a PromQL double-quoted string literal so
+# RE2 receives "\." (written "\\." in PromQL) and quotes/newlines cannot break out.
 _RE2_META = re.compile(r"([\\.+*?()|\[\]{}^$])")
 
 
 def _re2_escape(value: str) -> str:
-    return _RE2_META.sub(r"\\\1", value)
+    re2_pattern = _RE2_META.sub(r"\\\1", value)
+    return (
+        re2_pattern.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
 
 
 def _epp_phase_queries(
@@ -432,13 +624,14 @@ def _epp_phase_queries(
     landing mid-ramp can leave the parts briefly out of step with the total;
     the values are reported as observed rather than rescaled to fit.
     """
+    safe_ns = _safe_promql_namespace(namespace)
     promqls: dict[str, str] = {}
     for role, key in (("prefill", "prefill_inflight"), ("decode", "decode_inflight")):
         pods = role_instances.get(role) or []
         if not pods:
             continue
         pod_re = "|".join(_re2_escape(pod) for pod in pods)
-        matcher = f'{{namespace="{namespace}", pod=~"{pod_re}"}}'
+        matcher = f'{{namespace="{safe_ns}", pod=~"{pod_re}"}}'
         promqls[key] = f"sum(vllm:num_requests_waiting{matcher}) + sum(vllm:num_requests_running{matcher})"
     return promqls
 
@@ -456,8 +649,9 @@ async def _role_queries(
     Each role is queried against its own pods only, so a node's metrics always
     reflect that pod's own observed activity.
     """
+    safe_ns = _safe_promql_namespace(namespace)
     if role == "epp":
-        matcher = f'{{namespace="{namespace}"}}'
+        matcher = f'{{namespace="{safe_ns}"}}'
         _epp_rate = f"sum(irate(llm_d_epp_request_total{matcher}[{RATE_WINDOW}]))"
         promqls = {
             # The EPP is a pass-through router, not a queueing stage: it holds
@@ -494,7 +688,7 @@ async def _role_queries(
         return {name: values}
 
     pod_re = "|".join(_re2_escape(pod) for pod in instance_names)
-    matcher = f'{{namespace="{namespace}", pod=~"{pod_re}"}}'
+    matcher = f'{{namespace="{safe_ns}", pod=~"{pod_re}"}}'
     promqls = {
         "request_rate": (f"sum(irate(vllm:request_success_total{matcher}[{RATE_WINDOW}])) by (pod)"),
         # vLLM only exposes a *completion* counter (request_success_total), not
@@ -510,19 +704,19 @@ async def _role_queries(
             f" + sum by (pod) (deriv(vllm:num_requests_running{matcher}[{RATE_WINDOW}]))"
         ),
         "success_request_rate": (
-            f'sum(irate(vllm:request_success_total{{namespace="{namespace}", '
+            f'sum(irate(vllm:request_success_total{{namespace="{safe_ns}", '
             f'pod=~"{pod_re}", finished_reason=~"{SUCCESS_REASONS}"}}[{RATE_WINDOW}])) by (pod)'
         ),
         "failed_request_rate": (
-            f'sum(rate(vllm:request_success_total{{namespace="{namespace}", '
+            f'sum(rate(vllm:request_success_total{{namespace="{safe_ns}", '
             f'pod=~"{pod_re}", finished_reason=~"{FAIL_REASONS}"}}[{FAIL_RATE_WINDOW}])) by (pod)'
         ),
         "client_timeout_rate": (
-            f'sum(rate(vllm:request_success_total{{namespace="{namespace}", '
+            f'sum(rate(vllm:request_success_total{{namespace="{safe_ns}", '
             f'pod=~"{pod_re}", finished_reason="abort"}}[{FAIL_RATE_WINDOW}])) by (pod)'
         ),
         "backend_error_rate": (
-            f'sum(rate(vllm:request_success_total{{namespace="{namespace}", '
+            f'sum(rate(vllm:request_success_total{{namespace="{safe_ns}", '
             f'pod=~"{pod_re}", finished_reason="error"}}[{FAIL_RATE_WINDOW}])) by (pod)'
         ),
         "queue_length": f"sum(vllm:num_requests_waiting{matcher}) by (pod)",
@@ -578,10 +772,28 @@ async def _component_latency(client: httpx.AsyncClient, matcher: str) -> float |
     return None
 
 
+async def _is_non_admin_cluster(cluster_id: str | None) -> bool:
+    if not cluster_id:
+        return False
+    try:
+        access = await probe_monitoring_access(
+            cluster_id,
+            scope="cluster_stack",
+            namespace=_monitoring_namespace_for_cluster(cluster_id),
+        )
+    except Exception as exc:
+        if isinstance(exc, AssertionError):
+            raise
+        return False
+    return bool(access.reachable and access.access_mode == "non_admin")
+
+
 async def wait_for_deployment_metrics(
     execution_id: str,
     cluster_id: str | None = None,
     timeout_seconds: float = 20.0,
+    *,
+    allow_optional_epp: bool = False,
 ) -> bool:
     """Wait for all serving pods and any EPP to be scraped; zero timeout checks once.
 
@@ -589,11 +801,12 @@ async def wait_for_deployment_metrics(
     end-to-end deadline must also bound this coroutine with asyncio.timeout.
     """
     _context, namespace, cluster_id = _deployment_target(execution_id, cluster_id)
-    local_port = await _prometheus_local_port(cluster_id)
-    if local_port is None:
+    endpoint = await _prometheus_endpoint(cluster_id)
+    if endpoint is None:
         return False
+    safe_ns = _safe_promql_namespace(namespace)
     deadline = time.monotonic() + timeout_seconds
-    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{local_port}", timeout=5.0, trust_env=False) as client:
+    async with create_prometheus_client(endpoint, timeout=5.0) as client:
         while True:
             components = await _discover_components(namespace, cluster_id)
             serving = set(components.get("prefill", []) + components.get("decode", []))
@@ -601,15 +814,29 @@ async def wait_for_deployment_metrics(
             # Two gauge samples also establish that rate queries can span scrapes;
             # request counters can be absent until the first request completes.
             up, samples = await asyncio.gather(
-                _query(client, f'up{{namespace="{namespace}"}}'),
-                _query(client, f'count_over_time(vllm:num_requests_running{{namespace="{namespace}"}}[30s])'),
+                _query(client, f'up{{namespace="{safe_ns}"}}'),
+                _query(client, f'count_over_time(vllm:num_requests_running{{namespace="{safe_ns}"}}[30s])'),
             )
             healthy = {entry.get("metric", {}).get("pod") for entry in up if _scalar([entry]) == 1}
             measured = {entry.get("metric", {}).get("pod") for entry in samples if (_scalar([entry]) or 0) >= 2}
             ready = bool(serving) and serving <= healthy & measured
             if ready and components.get("epp"):
-                services = {entry.get("metric", {}).get("service") for entry in up if _scalar([entry]) == 1}
-                ready = all(service in services for service in components["epp"])
+                services: set[str] = set()
+                for entry in up:
+                    if _scalar([entry]) != 1:
+                        continue
+                    metric = entry.get("metric") or {}
+                    svc = metric.get("service")
+                    if svc:
+                        services.add(str(svc))
+                    job = metric.get("job")
+                    if job:
+                        job_str = str(job)
+                        services.add(job_str)
+                        services.add(job_str.rsplit("/", 1)[-1])
+                epp_ready = all(service in services for service in components["epp"])
+                if not epp_ready and not (allow_optional_epp or await _is_non_admin_cluster(cluster_id)):
+                    ready = False
             if ready:
                 return True
             if time.monotonic() >= deadline:
@@ -634,6 +861,118 @@ _DEVICE_METRIC_QUERIES = (
     ("gpu_utilization_percent", "utilization", "avg"),
     ("gpu_framebuffer_used_bytes", "framebuffer_used", "sum"),
 )
+
+
+def _normalize_prom_resource_name(raw_name: str, all_hw_profiles: list) -> str:
+    cleaned = str(raw_name or "").strip()
+    if not cleaned:
+        return ""
+    sanitized = re.sub(r"[^A-Za-z0-9]", "_", cleaned).lower()
+    for profile in all_hw_profiles:
+        candidates: list[str] = []
+        if profile.deployment.resource_name:
+            candidates.append(profile.deployment.resource_name)
+        for mode in (profile.deployment.modes or {}).values():
+            candidates.extend(mode.get("resource_names") or [])
+        for candidate in candidates:
+            if candidate == cleaned or re.sub(r"[^A-Za-z0-9]", "_", candidate).lower() == sanitized:
+                return candidate
+    return cleaned
+
+
+async def _prometheus_pods_and_direct_profiles(
+    client: httpx.AsyncClient,
+    safe_ns: str,
+    namespace: str,
+    all_hw_profiles: list,
+) -> tuple[list[dict], list]:
+    info_rows, req_rows = await asyncio.gather(
+        _query(client, f'kube_pod_info{{namespace="{safe_ns}"}}'),
+        _query(client, f'kube_pod_container_resource_requests{{namespace="{safe_ns}"}}'),
+    )
+    pods_by_name: dict[str, dict] = {}
+    for entry in info_rows:
+        labels = entry.get("metric") or {}
+        pod_name = str(labels.get("pod") or "").strip()
+        if not pod_name:
+            continue
+        pods_by_name[pod_name] = {
+            "metadata": {
+                "name": pod_name,
+                "namespace": namespace,
+                **({"uid": str(labels["uid"])} if labels.get("uid") else {}),
+            },
+            "spec": {
+                **({"nodeName": str(labels["node"])} if labels.get("node") else {}),
+                "containers": [],
+            },
+            "status": {},
+        }
+    containers_by_pod: dict[str, dict[str, dict]] = {}
+    for entry in req_rows:
+        val = _scalar([entry])
+        if val is None or val <= 0:
+            continue
+        labels = entry.get("metric") or {}
+        pod_name = str(labels.get("pod") or "").strip()
+        raw_res = str(labels.get("resource") or "").strip()
+        if not pod_name or not raw_res:
+            continue
+        container_name = str(labels.get("container") or "modelserver")
+        norm_res = _normalize_prom_resource_name(raw_res, all_hw_profiles)
+        pod_obj = pods_by_name.setdefault(
+            pod_name,
+            {"metadata": {"name": pod_name, "namespace": namespace}, "spec": {"containers": []}, "status": {}},
+        )
+        pod_containers = containers_by_pod.setdefault(pod_name, {})
+        c_entry = pod_containers.setdefault(
+            container_name,
+            {"name": container_name, "resources": {"requests": {}, "limits": {}}},
+        )
+        c_entry["resources"]["requests"][norm_res] = int(val) if float(val).is_integer() else val
+        pod_obj["spec"]["containers"] = list(pod_containers.values())
+
+    exporter_candidates = []
+    probe_coros = []
+    for profile in all_hw_profiles:
+        telemetry = getattr(profile, "telemetry", None)
+        if telemetry is None:
+            continue
+        ns_label = (telemetry.label_schema or {}).get("namespace")
+        pod_label = (telemetry.label_schema or {}).get("pod")
+        if not ns_label or not pod_label:
+            continue
+        direct_join = (
+            telemetry.allocation_join
+            if telemetry.allocation_join not in {"dra", "pod-status", "none"}
+            else None
+        )
+        if direct_join is None:
+            for mode_cfg in (telemetry.modes or {}).values():
+                candidate_join = mode_cfg.get("allocation_join")
+                if candidate_join and candidate_join not in {"dra", "pod-status", "none"}:
+                    direct_join = candidate_join
+                    break
+        if direct_join is None:
+            continue
+        first_source = next(
+            (src for src in (telemetry.device_metric_sources or {}).values() if src.metric),
+            None,
+        )
+        if first_source is None:
+            continue
+        promoted = replace(profile, telemetry=replace(telemetry, allocation_join=direct_join))
+        exporter_candidates.append(promoted)
+        probe_coros.append(_query(client, first_source.metric + _selector(first_source.match, {ns_label: safe_ns})))
+
+    discovered_direct = []
+    if probe_coros:
+        probe_results = await asyncio.gather(*probe_coros)
+        for candidate, rows in zip(exporter_candidates, probe_results, strict=True):
+            if rows:
+                discovered_direct.append(candidate)
+
+    return list(pods_by_name.values()), discovered_direct
 
 
 def _direct_profiles(profiles: list) -> list:
@@ -685,8 +1024,8 @@ async def collect_benchmark_observability(
     finished = _iso_timestamp(end)
     duration_seconds = max(1.0, (finished - started).total_seconds())
     step_seconds = max(5, math.ceil(duration_seconds / 240))
-    local_port = await _prometheus_local_port(cluster_id)
-    if local_port is None:
+    endpoint = await _prometheus_endpoint(cluster_id)
+    if endpoint is None:
         return {
             "status": "unavailable",
             "reason": "Prometheus is not reachable",
@@ -701,13 +1040,33 @@ async def collect_benchmark_observability(
         components = {role: [] for role in FLOW_ORDER}
     role_by_pod = {pod: role for role, pods in components.items() for pod in pods}
 
+    all_hw_profiles = _hardware_profiles()
     profiles = []
     allocation_profiles = {}
     dra_queries = {}
     xpu_allocations = {}
+    pods: list = []
+    claims: list = []
+    slices: list = []
+
+    def _populate_allocations(active_pods: list, active_claims: list, active_slices: list) -> None:
+        nonlocal profiles
+        from llm_d_lens.hardware.telemetry import workload_telemetry_profiles
+
+        profiles = workload_telemetry_profiles(all_hw_profiles, active_pods, active_claims)
+        for profile in profiles:
+            if not profile.telemetry or profile.telemetry.allocation_join not in {"dra", "pod-status", "none"}:
+                continue
+            allocations = device_allocations(active_pods, active_claims, active_slices, namespace, profile)
+            if allocations:
+                allocation_profiles[profile.id] = (profile, allocations)
+                xpu_allocations.update(allocations)
+                for key, query in xpum_queries(profile).items():
+                    dra_queries[(profile.id, key)] = query
+
     try:
-        pods = await list_resources("pods", namespace=namespace, cluster_id=cluster_id)
         inventory = await asyncio.gather(
+            asyncio.wait_for(list_resources("pods", namespace=namespace, cluster_id=cluster_id), timeout=15.0),
             asyncio.wait_for(
                 list_resources("resourceclaims.resource.k8s.io", namespace=namespace, cluster_id=cluster_id),
                 timeout=15.0,
@@ -715,24 +1074,14 @@ async def collect_benchmark_observability(
             asyncio.wait_for(list_resources("resourceslices.resource.k8s.io", cluster_id=cluster_id), timeout=15.0),
             return_exceptions=True,
         )
-        claims, slices = [value if isinstance(value, list) else [] for value in inventory]
-        from llm_d_lens.hardware.telemetry import workload_telemetry_profiles
-
-        profiles = workload_telemetry_profiles(_hardware_profiles(), pods, claims)
-        for profile in profiles:
-            if not profile.telemetry or profile.telemetry.allocation_join not in {"dra", "pod-status", "none"}:
-                continue
-            allocations = device_allocations(pods, claims, slices, namespace, profile)
-            if allocations:
-                allocation_profiles[profile.id] = (profile, allocations)
-                xpu_allocations.update(allocations)
-                for key, query in xpum_queries(profile).items():
-                    dra_queries[(profile.id, key)] = query
+        pods, claims, slices = [value if isinstance(value, list) else [] for value in inventory]
+        _populate_allocations(pods, claims, slices)
     except Exception:
         logger.warning("Unable to map benchmark device allocations", exc_info=True)
         xpu_allocations = {}
 
-    matcher = f'{{namespace="{namespace}"}}'
+    safe_ns = _safe_promql_namespace(namespace)
+    matcher = f'{{namespace="{safe_ns}"}}'
     queries = {
         "request_rate_rps": f"sum(rate(vllm:request_success_total{matcher}[30s]))",
         "input_token_rate_tps": f"sum(rate(vllm:prompt_tokens_total{matcher}[30s]))",
@@ -754,7 +1103,7 @@ async def collect_benchmark_observability(
         ),
         "epp_inflight_requests": f"sum(llm_d_epp_request_running{matcher})",
         "failed_request_rate_rps": (
-            f'sum(rate(vllm:request_success_total{{namespace="{namespace}", finished_reason=~"{FAIL_REASONS}"}}[30s]))'
+            f'sum(rate(vllm:request_success_total{{namespace="{safe_ns}", finished_reason=~"{FAIL_REASONS}"}}[30s]))'
         ),
         "nixl_transfer_rate_rps": f"sum(rate(vllm:nixl_xfer_time_seconds_count{matcher}[30s]))",
         "nixl_failed_transfer_rate_rps": f"sum(rate(vllm:nixl_num_failed_transfers{matcher}[30s]))",
@@ -771,22 +1120,22 @@ async def collect_benchmark_observability(
             f"histogram_quantile(0.99, sum(rate(vllm:nixl_xfer_time_seconds_bucket{matcher}[30s])) by (le)) * 1000"
         ),
         "kv_offload_bytes_per_second": (
-            f'sum(rate(vllm:kv_offload_total_bytes{{namespace="{namespace}", transfer_type=~"GPU_to_.*"}}[30s]))'
+            f'sum(rate(vllm:kv_offload_total_bytes{{namespace="{safe_ns}", transfer_type=~"GPU_to_.*"}}[30s]))'
         ),
         "kv_restore_bytes_per_second": (
-            f'sum(rate(vllm:kv_offload_total_bytes{{namespace="{namespace}", transfer_type=~".*_to_GPU"}}[30s]))'
+            f'sum(rate(vllm:kv_offload_total_bytes{{namespace="{safe_ns}", transfer_type=~".*_to_GPU"}}[30s]))'
         ),
         "kv_offload_time_seconds_per_second": (
-            f'sum(rate(vllm:kv_offload_total_time{{namespace="{namespace}", transfer_type=~"GPU_to_.*"}}[30s]))'
+            f'sum(rate(vllm:kv_offload_total_time{{namespace="{safe_ns}", transfer_type=~"GPU_to_.*"}}[30s]))'
         ),
         "kv_restore_time_seconds_per_second": (
-            f'sum(rate(vllm:kv_offload_total_time{{namespace="{namespace}", transfer_type=~".*_to_GPU"}}[30s]))'
+            f'sum(rate(vllm:kv_offload_total_time{{namespace="{safe_ns}", transfer_type=~".*_to_GPU"}}[30s]))'
         ),
         "network_receive_bytes_per_second": (
-            f'sum(rate(container_network_receive_bytes_total{{namespace="{namespace}", pod!=""}}[30s]))'
+            f'sum(rate(container_network_receive_bytes_total{{namespace="{safe_ns}", pod!=""}}[30s]))'
         ),
         "network_transmit_bytes_per_second": (
-            f'sum(rate(container_network_transmit_bytes_total{{namespace="{namespace}", pod!=""}}[30s]))'
+            f'sum(rate(container_network_transmit_bytes_total{{namespace="{safe_ns}", pod!=""}}[30s]))'
         ),
     }
     # Engine-side token accounting (vLLM v1). Missing exporter series stay
@@ -799,7 +1148,7 @@ async def collect_benchmark_observability(
     }
     queries.update(
         {
-            key: (f'sum(rate(vllm:prompt_tokens_by_source_total{{namespace="{namespace}", source="{source}"}}[30s]))')
+            key: (f'sum(rate(vllm:prompt_tokens_by_source_total{{namespace="{safe_ns}", source="{source}"}}[30s]))')
             for key, source in engine_token_sources.items()
         }
     )
@@ -820,25 +1169,25 @@ async def collect_benchmark_observability(
         "gpu_memory_usage_bytes": f"sum(vllm:gpu_memory_usage_bytes{matcher}) by (pod)",
         "cpu_memory_usage_bytes": f"sum(vllm:cpu_memory_usage_bytes{matcher}) by (pod)",
         "cpu_usage_cores": (
-            f'sum(rate(container_cpu_usage_seconds_total{{namespace="{namespace}", container!="", '
+            f'sum(rate(container_cpu_usage_seconds_total{{namespace="{safe_ns}", container!="", '
             f'image!=""}}[30s])) by (pod)'
         ),
         "memory_working_set_bytes": (
-            f'sum(container_memory_working_set_bytes{{namespace="{namespace}", container!="", image!=""}}) by (pod)'
+            f'sum(container_memory_working_set_bytes{{namespace="{safe_ns}", container!="", image!=""}}) by (pod)'
         ),
         "filesystem_read_bytes_per_second": (
-            f'sum(rate(container_fs_reads_bytes_total{{namespace="{namespace}", container!="", '
+            f'sum(rate(container_fs_reads_bytes_total{{namespace="{safe_ns}", container!="", '
             f'image!=""}}[30s])) by (pod)'
         ),
         "filesystem_write_bytes_per_second": (
-            f'sum(rate(container_fs_writes_bytes_total{{namespace="{namespace}", container!="", '
+            f'sum(rate(container_fs_writes_bytes_total{{namespace="{safe_ns}", container!="", '
             f'image!=""}}[30s])) by (pod)'
         ),
         "network_receive_bytes_per_second": (
-            f'sum(rate(container_network_receive_bytes_total{{namespace="{namespace}", pod!=""}}[30s])) by (pod)'
+            f'sum(rate(container_network_receive_bytes_total{{namespace="{safe_ns}", pod!=""}}[30s])) by (pod)'
         ),
         "network_transmit_bytes_per_second": (
-            f'sum(rate(container_network_transmit_bytes_total{{namespace="{namespace}", pod!=""}}[30s])) by (pod)'
+            f'sum(rate(container_network_transmit_bytes_total{{namespace="{safe_ns}", pod!=""}}[30s])) by (pod)'
         ),
     }
     router_queries = {
@@ -856,7 +1205,7 @@ async def collect_benchmark_observability(
             f"sum(rate(llm_d_epp_plugin_duration_seconds_bucket{matcher}[30s])) by (le)) * 1000"
         ),
         "pd_decision_rate_rps": (
-            f'sum(rate(llm_d_epp_disagg_decision_total{{namespace="{namespace}", '
+            f'sum(rate(llm_d_epp_disagg_decision_total{{namespace="{safe_ns}", '
             f'decision_type=~"prefill-decode|encode-prefill-decode"}}[30s]))'
             f" or sum(rate(llm_d_epp_pd_decision_total{matcher}[30s]))"
             f" or sum(rate(llm_d_inference_scheduler_pd_decision_total{matcher}[30s]))"
@@ -909,9 +1258,24 @@ async def collect_benchmark_observability(
     # (NVIDIA DCGM) are queried directly, and the Intel DRA join replaces them
     # when exclusive allocations exist. A profile that does not configure a
     # metric leaves the key absent, so the panel hides it.
-    device_total_queries = _device_queries(profiles, namespace)
-    device_pod_queries = _device_queries(profiles, namespace, by="pod")
-    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{local_port}", timeout=10.0, trust_env=False) as client:
+    async with create_prometheus_client(endpoint, timeout=10.0) as client:
+        if not pods or not profiles:
+            try:
+                prom_pods, prom_direct = await _prometheus_pods_and_direct_profiles(
+                    client,
+                    safe_ns,
+                    namespace,
+                    all_hw_profiles,
+                )
+                if not pods and prom_pods:
+                    _populate_allocations(prom_pods, claims, slices)
+                if not profiles and prom_direct:
+                    profiles = prom_direct
+            except Exception:
+                logger.debug("Prometheus device profile fallback skipped", exc_info=True)
+
+        device_total_queries = _device_queries(profiles, safe_ns)
+        device_pod_queries = _device_queries(profiles, safe_ns, by="pod")
         clock_offset = await _prometheus_clock_offset(client)
         offset = clock_offset if clock_offset is not None else 0.0
         query_start = (started + timedelta(seconds=offset)).isoformat()
@@ -1447,10 +1811,20 @@ async def collect_benchmark_observability(
     }
 
 
-async def build_flow_map(execution_id: str, cluster_id: str | None = None) -> FlowMapResponse:
+async def build_flow_map(
+    execution_id: str,
+    cluster_id: str | None = None,
+    *,
+    monitoring_namespace: str | None = None,
+) -> FlowMapResponse:
     """Assemble the request-pipeline Flow Map for a deployment execution."""
+    explicit_mon_ns = (
+        validate_namespace(monitoring_namespace)
+        if (monitoring_namespace is not None and monitoring_namespace.strip())
+        else None
+    )
     _context, namespace, cluster_id = _deployment_target(execution_id, cluster_id)
-    local_port = await _prometheus_local_port(cluster_id)
+    endpoint = await _prometheus_endpoint(cluster_id, namespace=explicit_mon_ns)
     instances = await _discover_components(namespace, cluster_id)
 
     components: list[FlowMapComponent] = []
@@ -1459,12 +1833,13 @@ async def build_flow_map(execution_id: str, cluster_id: str | None = None) -> Fl
     present_roles = [role for role in FLOW_ORDER if instances[role]]
     metrics_by_role: dict[str, dict[str, dict[str, float | None]]] = {}
     process_time_by_role: dict[str, float | None] = {}
-    if local_port is not None and present_roles:
+    if endpoint is not None and present_roles:
         # One shared HTTP client (kept-alive connection) issues every PromQL
         # query concurrently, so the whole role set costs a single round-trip
         # rather than ~30 sequential requests.
+        safe_ns = _safe_promql_namespace(namespace)
         latency_roles = [role for role in present_roles if role != "epp" and instances[role]]
-        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{local_port}", timeout=5.0) as client:
+        async with create_prometheus_client(endpoint, timeout=5.0) as client:
             metrics_task = asyncio.gather(
                 *(
                     _role_queries(
@@ -1481,9 +1856,11 @@ async def build_flow_map(execution_id: str, cluster_id: str | None = None) -> Fl
                 *(
                     _component_latency(
                         client,
-                        f'{{namespace="{namespace}", pod=~"{pod_re}"}}',
+                        f'{{namespace="{safe_ns}", pod=~"{pod_re}"}}',
                     )
-                    for pod_re in ("|".join(instances[role]) for role in latency_roles)
+                    for pod_re in (
+                        "|".join(_re2_escape(pod) for pod in instances[role]) for role in latency_roles
+                    )
                 )
             )
             metrics_results, latency_results = await asyncio.gather(metrics_task, latency_task)
@@ -1572,7 +1949,7 @@ async def build_flow_map(execution_id: str, cluster_id: str | None = None) -> Fl
         )
 
     message: str | None = None
-    if local_port is None:
+    if endpoint is None:
         message = "Prometheus is not reachable; rates are unavailable."
     elif not present_roles:
         message = "No EPP, prefill, or decode components found in this namespace."
@@ -1580,7 +1957,7 @@ async def build_flow_map(execution_id: str, cluster_id: str | None = None) -> Fl
     return FlowMapResponse(
         execution_id=execution_id,
         namespace=namespace,
-        prometheus_reachable=local_port is not None,
+        prometheus_reachable=endpoint is not None,
         message=message,
         components=components,
         edges=edges,

@@ -15,6 +15,7 @@ from typing import Any
 
 import yaml
 
+from llm_d_lens.cluster.registry import validate_container_image_ref
 from llm_d_lens.configuration.service import CONFIGURATION_OUTPUT_DIR
 from llm_d_lens.core.hashing import stable_hash
 from llm_d_lens.deploy.data_plane import router_data_plane_args, router_data_plane_effective_values
@@ -244,12 +245,12 @@ class OptimizedBaselineGuideAdapter(GuideAdapter):
             raise RuntimeError((stderr or stdout or "Router deployment failed").strip())
 
     async def deploy(self, artifact: GuideDeploymentArtifact, execution_context: dict[str, Any]) -> dict[str, Any]:
+        from llm_d_lens.deploy.providers.kubernetes import ensure_namespace_accessible
+
         self._validate_artifact(artifact)
         namespace = self._namespace(execution_context)
         rendered_overlay = Path(artifact.manifest_ref or "").resolve()
-        status, stdout, stderr = await self._command_runner(["kubectl", "create", "namespace", namespace])
-        if status != 0 and "alreadyexists" not in (stdout + stderr).lower():
-            raise RuntimeError((stderr or stdout or "registered guide deployment failed").strip())
+        await ensure_namespace_accessible(self._command_runner, namespace)
         deployment_policy = execution_context.get("deployment_policy") or {}
         model_secret = deployment_policy.get("model_secret") or {}
         model_token = execution_context.get("model_token")
@@ -740,7 +741,7 @@ class OptimizedBaselineGuideAdapter(GuideAdapter):
         image_mode = runtime.get("imageMode")
         if not isinstance(image, str) or not image or not isinstance(image_mode, str):
             raise ValueError("runtime.image and runtime.imageMode are required")
-        _image_parts(image)
+        image = validate_container_image_ref(image, field="runtime.image", allow_empty=False) or ""
         build_source_url = runtime.get("buildSourceUrl")
         mount_path = runtime.get("mountPath", "")
         model_source = runtime.get("modelSource") or ("shared-path" if mount_path else "huggingface")
@@ -958,9 +959,12 @@ def _optional_positive_integer(values: dict[str, Any], name: str) -> int | None:
 
 
 def _image_parts(image: str) -> tuple[str, str]:
-    name, separator, tag = image.rpartition(":")
-    if not separator or not name or not tag or "/" in tag or "@" in image:
-        raise ValueError("runtime.image must include a repository and tag")
-    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9./_-]*", name) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]*", tag):
-        raise ValueError("runtime.image contains unsupported characters")
+    normalized = validate_container_image_ref(image, field="runtime.image", allow_empty=False) or ""
+    if "@" in normalized:
+        name_with_tag, _, digest = normalized.partition("@")
+        if ":" in name_with_tag.rsplit("/", 1)[-1]:
+            name, _, tag = name_with_tag.rpartition(":")
+            return name, f"{tag}@{digest}"
+        return name_with_tag, digest
+    name, _, tag = normalized.rpartition(":")
     return name, tag

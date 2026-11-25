@@ -32,7 +32,7 @@ import { validateConfigurationInputs, configurationServerErrors } from '../../ev
 import { TopologyPreview, YamlPreview } from '../../evaluation';
 import { StorageVolumeSelect } from '../../../shared/ui/StorageVolumeSelect';
 import { listDeploymentNodeLabels } from './OptimizationWorkspace/remoteDeployBackend';
-import { acceleratorVariantForHardware, aicSystemNameForHardware, DEFAULT_RUNTIME_IMAGES, isDefaultRuntimeImage } from '../../evaluation';
+import { acceleratorVariantForHardware, aicSystemNameForHardware, DEFAULT_RUNTIME_IMAGES } from '../../evaluation';
 import { RefreshButton, Button } from '../../../shared/ui/Button';
 import { Badge } from '../../../shared/ui/Badge';
 import { FormError } from '../../../shared/ui/FormError';
@@ -140,6 +140,7 @@ async function resolveClusterSession(clusterId) {
         sessionId: payload.sessionId,
         serverId: payload.cluster.id,
         name: payload.cluster.name || payload.cluster.id,
+        vllmImage: payload.cluster.vllmImage || null,
         transport: 'managed-kubeconfig',
     };
     return cluster;
@@ -407,13 +408,14 @@ export default function OptimizationConfiguration({ onNavigate, onCancel, onPubl
     const [clusterError, setClusterError] = useState('');
     const [clusterReloadToken, setClusterReloadToken] = useState(0);
     const [selectedClusterId, setSelectedClusterId] = useState(
-        () => sessionStorage.getItem('prism_cluster_server_id') || '',
+        () => sharedContext?.cluster?.id || sessionStorage.getItem('prism_cluster_server_id') || '',
     );
     const [localConnectedCluster, setConnectedCluster] = useState(null);
     const sharedCluster = sharedContext?.cluster;
     const connectedCluster = useMemo(() => sharedCluster ? (sharedCluster.session_id ? {
         sessionId: sharedCluster.session_id, serverId: sharedCluster.id,
-        name: sharedCluster.name, transport: sharedCluster.transport,
+        name: sharedCluster.name, vllmImage: sharedCluster.vllmImage || null,
+        transport: sharedCluster.transport,
     } : null) : localConnectedCluster, [sharedCluster, localConnectedCluster]);
     const [localClusterHardware, setClusterHardware] = useState(null);
     const clusterHardware = sharedContext?.clusterHardware ?? localClusterHardware;
@@ -494,10 +496,36 @@ export default function OptimizationConfiguration({ onNavigate, onCancel, onPubl
     const [gpuMemoryUtilization, setGpuMemoryUtilization] = useState('');
     const [blockSize, setBlockSize] = useState('');
     const [maxNumBatchedTokens, setMaxNumBatchedTokens] = useState('');
+    const [pendingIntent] = useState(() => {
+        try {
+            return JSON.parse(sessionStorage.getItem(INTENT_KEY) || 'null');
+        } catch {
+            return null;
+        }
+    });
     const [localImageMode, setImageMode] = useState(() => sharedContext?.imageMode || 'use-upstream-image');
     const imageMode = localImageMode;
-    const [localImage, setImage] = useState(() => sharedContext?.image || DEFAULT_RUNTIME_IMAGE);
-    const image = localImage || sharedContext?.image || DEFAULT_RUNTIME_IMAGES[selection.accelerator] || DEFAULT_RUNTIME_IMAGE;
+    const initialArtifactImage = initialArtifact?.deployable_configuration?.content?.runtime?.image || '';
+    const initialArtifactClusterId = initialArtifact?.deployable_configuration?.provenance?.cluster_ref?.id || '';
+    const initialIntentImage = (!embedded && (pendingIntent?.runtime?.image || pendingIntent?.runtime?.build_image_name)) || '';
+    const [localImage, setImage] = useState(() => initialArtifactImage || initialIntentImage || sharedContext?.image || DEFAULT_RUNTIME_IMAGE);
+    const [imageTouched, setImageTouched] = useState(() => Boolean(
+        initialArtifactImage
+        || (initialIntentImage && (pendingIntent?.runtime?.image_override ?? true))
+        || (embedded && sharedContext?.imageTouched),
+    ));
+    const selectedClusterRecord = clusters.find((item) => item.id === selectedClusterId) || null;
+    const clusterVllmImage = (connectedCluster?.serverId === selectedClusterId ? connectedCluster?.vllmImage : null)
+        || (sharedCluster?.id === selectedClusterId ? sharedCluster?.vllmImage : null)
+        || selectedClusterRecord?.vllmImage
+        || null;
+    const hardwareVariant = acceleratorVariantForHardware(clusterHardware);
+    const effectiveDefaultImage = clusterVllmImage
+        || (hardwareVariant ? DEFAULT_RUNTIME_IMAGES[hardwareVariant] || '' : '')
+        || DEFAULT_RUNTIME_IMAGES[selection.accelerator]
+        || DEFAULT_RUNTIME_IMAGE;
+    const image = imageTouched ? localImage : (localImage || sharedContext?.image || effectiveDefaultImage);
+    const runtimeImageOverride = Boolean(imageTouched && image.trim() && image.trim() !== effectiveDefaultImage);
     const [localBuildSourceUrl, setBuildSourceUrl] = useState('');
     const buildSourceUrl = sharedContext?.buildSourceUrl ?? localBuildSourceUrl;
     const [planning, setPlanning] = useState(false);
@@ -536,13 +564,6 @@ export default function OptimizationConfiguration({ onNavigate, onCancel, onPubl
         const timer = window.setInterval(() => setElapsedSeconds(Math.floor((Date.now() - started) / 1000)), 1000);
         return () => window.clearInterval(timer);
     }, [operationBusy]);
-    const [pendingIntent] = useState(() => {
-        try {
-            return JSON.parse(sessionStorage.getItem(INTENT_KEY) || 'null');
-        } catch {
-            return null;
-        }
-    });
     const [initialTarget] = useState(() => ({
         guide: initialGuide || pendingIntent?.workloads?.[0]?.guide,
         variant: initialArtifact?.deployable_configuration?.content?.guideVariant || initialArtifact?.deployable_configuration?.content?.guide_variant,
@@ -599,6 +620,10 @@ export default function OptimizationConfiguration({ onNavigate, onCancel, onPubl
         setCustomRows(configurationCustomRows(content));
         setGuideSettings(content.guideSettings || {});
         setDisaggregatedSet(content.disaggregatedSet || {});
+        if (content.runtime?.image) {
+            setImage(content.runtime.image);
+            setImageTouched(true);
+        }
     }, [initialArtifact]);
 
     useEffect(() => {
@@ -787,7 +812,11 @@ export default function OptimizationConfiguration({ onNavigate, onCancel, onPubl
         setReplicaVariants(String(requested.decode_replicas || requested.replicas || 1));
         setTensorParallelVariants(String(requested.decode_tensor_parallel_size || requested.tensor_parallel_size || 1));
         setImageMode(pendingIntent?.runtime?.image_mode || 'use-upstream-image');
-        setImage((current) => pendingIntent?.runtime?.image || pendingIntent?.runtime?.build_image_name || current);
+        const intentImage = pendingIntent?.runtime?.image || pendingIntent?.runtime?.build_image_name || '';
+        if (intentImage) {
+            setImage(intentImage);
+            setImageTouched(Boolean(pendingIntent?.runtime?.image_override ?? true));
+        }
         setBuildSourceUrl(pendingIntent?.runtime?.build_source_url || '');
         const requestedPath = pendingIntent?.runtime?.mount_path || requested.mount_path || '';
         setModelPath(requestedPath);
@@ -872,17 +901,46 @@ export default function OptimizationConfiguration({ onNavigate, onCancel, onPubl
         }
 
     }, [clusterHardware, selection.accelerator, selection.guide, selection.modelServer, selectedGuide, accelerators, guideVariant, hardwareProfiles]);
-    // Same hardware alignment for the default runtime image: swap only between
-    // the known per-vendor defaults so a user-entered image is never clobbered.
+    // Track explicit user/artifact edits so hardware discovery/polling never
+    // overwrites them, while cluster switches reset to the new cluster's
+    // `vllmImage` or hardware-profile default.
+    const prevClusterIdRef = useRef(selectedClusterId);
+    const seededClusterIdRef = useRef(
+        initialArtifactImage
+            ? (initialArtifactClusterId || selectedClusterId || '')
+            : (!embedded && initialIntentImage)
+                ? (pendingIntent?.cluster_id || selectedClusterId || '')
+                : (embedded && sharedContext?.imageTouched)
+                    ? (sharedContext?.cluster?.id || selectedClusterId || '')
+                    : null,
+    );
     useEffect(() => {
-        const variant = acceleratorVariantForHardware(clusterHardware);
-        if (!variant) return;
-        setImage((current) => (
-            (!current || isDefaultRuntimeImage(current)) && current !== DEFAULT_RUNTIME_IMAGES[variant]
-                ? DEFAULT_RUNTIME_IMAGES[variant]
-                : current
-        ));
-    }, [clusterHardware, hardwareProfiles]);
+        const previousClusterId = prevClusterIdRef.current;
+        if (previousClusterId !== selectedClusterId) {
+            prevClusterIdRef.current = selectedClusterId;
+            const seededClusterId = seededClusterIdRef.current;
+            if (
+                seededClusterId !== null
+                && (
+                    seededClusterId === selectedClusterId
+                    || (previousClusterId === '' && seededClusterId === '')
+                )
+            ) {
+                seededClusterIdRef.current = null;
+                return;
+            }
+            seededClusterIdRef.current = null;
+            setImageTouched(false);
+            setImage(clusterVllmImage || '');
+            return;
+        }
+        if (imageTouched) return;
+        const nextDefault = clusterVllmImage
+            || (hardwareVariant ? DEFAULT_RUNTIME_IMAGES[hardwareVariant] || '' : '')
+            || (embedded ? sharedContext?.image || '' : '');
+        if (!nextDefault) return;
+        setImage((current) => (current === nextDefault ? current : nextDefault));
+    }, [imageTouched, clusterVllmImage, hardwareVariant, hardwareProfiles, selectedClusterId, embedded, sharedContext?.image]);
     // Guide variants available for the selected cluster hardware. PD's variant
     // set depends on the accelerator (NVIDIA GPU: the vLLM infra-provider
     // overlay such as `base`; Intel XPU: `vllm` / `vllm-rdma`).
@@ -1053,6 +1111,7 @@ export default function OptimizationConfiguration({ onNavigate, onCancel, onPubl
         customParameters: customRows,
         gpuMemoryUtilization: (selection.modelServer === 'vllm' && gpuMemoryUtilization !== '' ? Number(gpuMemoryUtilization) : undefined),
         runtimeImage: image.trim(),
+        ...(runtimeImageOverride ? { runtimeImageOverride: true } : {}),
         guideVariant: guideVariant,
         clusterSessionId: current.sessionId,
         environment: { mode: 'current', kubernetesMode: 'required' },
@@ -1230,7 +1289,7 @@ export default function OptimizationConfiguration({ onNavigate, onCancel, onPubl
                     ],
                     guide_variant: guideVariant,
                     runtime: {
-                        image, imageMode, buildSourceUrl, modelServer: selection.modelServer, resourceBasis,
+                        image, ...(runtimeImageOverride ? { imageOverride: true } : {}), imageMode, buildSourceUrl, modelServer: selection.modelServer, resourceBasis,
                         modelPvcClaimName: selectedModelCacheVolume?.pvcName || '',
                         modelSource,
                         mountPath: modelSource === 'huggingface' ? '' : modelPath.trim(),
@@ -1333,7 +1392,7 @@ export default function OptimizationConfiguration({ onNavigate, onCancel, onPubl
                 prefill: isPd ? { replicas: variant.prefillReplicaCount, tensor_parallel_size: variant.prefillTpCount } : null,
                 decode: { replicas: variant.replicaCount, tensor_parallel_size: variant.tpCount, max_model_len: (selection.modelServer === 'vllm' && maxModelLen !== '' ? Number(maxModelLen) : undefined), max_num_seqs: (selection.modelServer === 'vllm' && maxNumSeqs !== '' ? Number(maxNumSeqs) : undefined) },
                 runtime: {
-                    image, imageMode, buildSourceUrl, modelSource, modelServer: selection.modelServer,
+                    image, ...(runtimeImageOverride ? { imageOverride: true } : {}), imageMode, buildSourceUrl, modelSource, modelServer: selection.modelServer,
                     modelPvcClaimName: selectedModelCacheVolume?.pvcName || '',
                     mountPath: modelSource === 'huggingface' ? '' : modelPath.trim(),
                     storageVolumeId: modelSource === 'auto-cache' ? modelCacheVolumeId : '',
@@ -1617,7 +1676,7 @@ export default function OptimizationConfiguration({ onNavigate, onCancel, onPubl
                 </div>
                 <div>
                     <span className={labelClass}>{imageMode === 'build-from-source' ? 'Build image name' : 'Runtime image'}</span>
-                    <input className={inputClass} value={image} onChange={(event) => setImage(event.target.value)} />
+                    <input className={inputClass} value={image} onChange={(event) => { setImageTouched(true); setImage(event.target.value); }} />
                 </div>
                 {imageMode === 'build-from-source' && <div className="sm:col-span-2">
                     <span className={labelClass}>Build source URL</span>
@@ -1647,7 +1706,7 @@ export default function OptimizationConfiguration({ onNavigate, onCancel, onPubl
                                     <ConfigurationField field="modelServer"><span className={labelClass}>Runtime</span><input className={inputClass} value={selection.modelServer} disabled /></ConfigurationField>
                                 </div>
                                 <div className="mt-3 grid gap-3 md:grid-cols-3">
-                                    <ConfigurationField field="image"><span className={labelClass}>Runtime image</span><input className={inputClass} list="runtime-image-suggestions" value={image} onChange={(event) => setImage(event.target.value)} /><datalist id="runtime-image-suggestions">{[...new Set([DEFAULT_RUNTIME_IMAGE, ...(sharedContext?.cachedRuntimeImages || [])])].map((cachedImage) => <option key={cachedImage} value={cachedImage} />)}</datalist></ConfigurationField>
+                                    <ConfigurationField field="image"><span className={labelClass}>Runtime image</span><input className={inputClass} list="runtime-image-suggestions" value={image} onChange={(event) => { setImageTouched(true); setImage(event.target.value); }} /><datalist id="runtime-image-suggestions">{[...new Set([effectiveDefaultImage, ...(sharedContext?.cachedRuntimeImages || [])].filter(Boolean))].map((cachedImage) => <option key={cachedImage} value={cachedImage} />)}</datalist></ConfigurationField>
                                     <ConfigurationField field="replicaVariants"><span className={labelClass}>{selection.guide === 'pd-disaggregation' ? 'Decode replicas' : 'Replicas'}</span><input type="number" min="1" step="1" className={inputClass} value={replicas} onChange={(event) => setReplicas(event.target.value)} /></ConfigurationField>
                                     <ConfigurationField field="tensorParallelVariants"><span className={labelClass}>{selection.guide === 'pd-disaggregation' ? 'Decode TP' : 'TP'}</span><input type="number" min="1" step="1" className={inputClass} value={tensorParallelSize} onChange={(event) => setTensorParallelSize(event.target.value)} /></ConfigurationField>
                                     {selection.guide === 'pd-disaggregation' && <><ConfigurationField field="prefillReplicaVariants"><span className={labelClass}>Prefill replicas</span><input type="number" min="1" step="1" className={inputClass} value={prefillReplicas} onChange={(event) => setPrefillReplicas(event.target.value)} /></ConfigurationField><ConfigurationField field="prefillTensorParallelVariants"><span className={labelClass}>Prefill TP</span><input type="number" min="1" step="1" className={inputClass} value={prefillTensorParallelSize} onChange={(event) => setPrefillTensorParallelSize(event.target.value)} /></ConfigurationField></>}

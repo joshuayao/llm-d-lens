@@ -13,11 +13,24 @@ import { DeploymentPodsLogsModal } from './DeploymentManagement/DeploymentPodsLo
 import { formatTimestamp } from '../../../shared/lib/formatTimestamp';
 import { listAIProviders } from '../../ai-providers';
 import { DeploymentRequirementsForm, PlanningProviderSelect } from './DeploymentRequirementsForm';
-import { DeploymentPlanReview } from './DeploymentPlanReview';
+import { DeploymentPermissionHandoff, DeploymentPlanReview } from './DeploymentPlanReview';
 import { MeasuredOptimizationControls } from './MeasuredOptimizationControls';
 import { OptimizationTable } from './OptimizationTable';
 import { optimizationRows } from '../model/deploymentPlan';
-import { candidateEvidence, candidateLabel, defaultRequirements, deploymentPlanningRequest, OPTIMIZATION_CONTROLS, requirementsFromRun, streamAgenticRecommendation } from '../api/agenticDeploymentBackend';
+import {
+    candidateEvidence,
+    candidateLabel,
+    checkDeploymentPermissions,
+    defaultRequirements,
+    deploymentPermissionPayload,
+    deploymentPlanningRequest,
+    generateDeploymentBootstrapScript,
+    isDeploymentAdminSetupError,
+    OPTIMIZATION_CONTROLS,
+    requirementsFromRun,
+    streamAgenticRecommendation,
+    verifyDeploymentBootstrap,
+} from '../api/agenticDeploymentBackend';
 import { catalogCapability, deploymentEditorSnapshot, deploymentPlanManifest, renderDeploymentPlan, requirementCapability } from '../model/inference-designer/deploymentPlanning';
 import { defaultInferenceEndpoint } from '../model/inference-designer/compositionDeployment';
 import { PLANNING_STEPS, planningTimeline, rememberPlanningDurations } from '../model/planningSteps';
@@ -147,7 +160,28 @@ export function RetrievalEvidenceSources({ run }) {
     });
 }
 
-export function DeploymentSummary({ run, draft, deploymentRun, busy, locked, deployBlocked, editing, cleanupRequired, onDeploy, onCheck, onRequirements, onOpen, endpoint, onEndpointChange, confirmLabel = 'Deploy' }) {
+export function DeploymentSummary({
+    run,
+    draft,
+    deploymentRun,
+    busy,
+    locked,
+    deployBlocked,
+    editing,
+    cleanupRequired,
+    error = '',
+    onDeploy,
+    onCheck,
+    onRequirements,
+    onOpen,
+    endpoint,
+    onEndpointChange,
+    confirmLabel = 'Deploy',
+    adminHandoff = null,
+    onGenerateBootstrapScript,
+    onVerifyBootstrapAndDeploy,
+    onSubjectOverrideChange,
+}) {
     const plan = run.configuration_plan;
     const checked = Boolean(deploymentPlanManifest(plan)) && plan?.validation?.status === 'resources_checked';
     const submitted = Boolean(run.deployment_run_id);
@@ -195,6 +229,28 @@ export function DeploymentSummary({ run, draft, deploymentRun, busy, locked, dep
                 {state ? <CheckCircle2 size={16} aria-hidden="true" /> : state === null ? <Info size={16} aria-hidden="true" /> : <Circle size={16} aria-hidden="true" />}<span>{label}</span>
             </li>)}</ul>
             {plan?.validation?.warnings?.length > 0 && <div className="deployment-check deployment-tone-warning flex-col"><p className="flex items-center gap-2 font-medium"><AlertTriangle size={16} />{plan.validation.warnings.length} configuration warning{plan.validation.warnings.length === 1 ? '' : 's'}</p><ul className="list-disc space-y-1 pl-6 text-theme-muted">{plan.validation.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul></div>}
+            {!submitted && adminHandoff && (
+                <DeploymentPermissionHandoff
+                    mode="bootstrap"
+                    report={adminHandoff.report}
+                    handoff={adminHandoff.verifyResult}
+                    namespace={adminHandoff.namespace}
+                    script={adminHandoff.script}
+                    filename={adminHandoff.filename}
+                    instructions={adminHandoff.instructions}
+                    warnings={adminHandoff.warnings}
+                    error={adminHandoff.error}
+                    busy={busy}
+                    verifying={Boolean(adminHandoff.verifying)}
+                    generating={Boolean(adminHandoff.generating)}
+                    identity={adminHandoff.identity}
+                    subjectOverride={adminHandoff.subjectOverride}
+                    onSubjectOverrideChange={onSubjectOverrideChange}
+                    onGenerateScript={onGenerateBootstrapScript}
+                    onPrimaryAction={onVerifyBootstrapAndDeploy}
+                    primaryActionLabel="Re-check & Deploy"
+                />
+            )}
             {run.error && <p role="alert" className="text-sm">{run.error}</p>}
             {cleanupRequired && <p role="alert" className="text-sm">Clean up interrupted benchmark resources before revising or deploying.</p>}
         </div>
@@ -206,8 +262,9 @@ export function DeploymentSummary({ run, draft, deploymentRun, busy, locked, dep
                     <option value="">Select the traffic entry Service</option>{plan.endpoints?.map(item => <option key={item.value} value={item.value}>{item.value}</option>)}
                 </Select><span className="mt-1 block text-xs font-normal text-theme-muted">The Kubernetes Service that receives requests and is probed for readiness. Lens picks the router entry. The other choices are every port of every generated Service (for example EPP control or metrics ports); picking one can fail the readiness probe or bypass routing.</span>
             </label>)}
+            {error && <FormError message={error} />}
             {submitted ? onOpen && <Button size="md" className="w-full" onClick={onOpen}>Open deployment</Button> : <>
-                <Button size="md" className="w-full" disabled={locked || editing || !plan || endpointMissing || (checked && deployBlocked)} isLoading={busy} onClick={checked ? onDeploy : onCheck}>{checked ? confirmLabel : 'Retry checks'}</Button>
+                <Button size="md" className="w-full" disabled={locked || editing || !plan || endpointMissing || Boolean(adminHandoff) || (checked && deployBlocked)} isLoading={busy} onClick={checked ? onDeploy : onCheck}>{checked ? confirmLabel : 'Retry checks'}</Button>
                 {checked && <Button variant="secondary" className="w-full" disabled={locked || editing || busy} onClick={onCheck}>Recheck resources</Button>}
                 <Button variant="ghost" className="w-full" disabled={locked || editing} onClick={onRequirements}>Change workload &amp; limits</Button>
                 <p className="text-xs leading-relaxed text-theme-muted">Deploys exactly this configuration.</p>
@@ -233,6 +290,7 @@ export function DeploymentWorkflow({ draft, mode = 'agentic', embedded = false, 
     const [changingRequirements, setChangingRequirements] = useState(false);
     const [trialBusy, setTrialBusy] = useState(false);
     const [deploymentRun, setDeploymentRun] = useState(null), [logsDeployment, setLogsDeployment] = useState(null);
+    const [adminHandoff, setAdminHandoff] = useState(null);
     const requestVersion = useRef(0);
     const abort = useRef(null), mounted = useRef(true);
     const autoStarted = useRef(null);
@@ -244,7 +302,7 @@ export function DeploymentWorkflow({ draft, mode = 'agentic', embedded = false, 
     useEffect(() => {
         let active = true;
         requestVersion.current += 1; abort.current?.abort();
-        setRun(null); setDeploymentRun(null); setLogsDeployment(null); setApproval(null); setRestoring(true); setBusy(false); setError(''); setEvents([]); setChangingRequirements(false);
+        setRun(null); setDeploymentRun(null); setLogsDeployment(null); setApproval(null); setAdminHandoff(null); setEndpoint(''); setRestoring(true); setBusy(false); setError(''); setEvents([]); setChangingRequirements(false);
         setRequirements({ ...defaultRequirements(), objective: draft?.initialObjective || 'balanced', ...draft?.initialRequirements }); setProvider(draft?.initialProvider || '');
         const id = draft?.resumeRunId || sessionStorage.getItem(key);
         if (!id) { setRestoring(false); return undefined; }
@@ -253,6 +311,7 @@ export function DeploymentWorkflow({ draft, mode = 'agentic', embedded = false, 
                 setRequirements(requirementsFromRun(value));
                 setProvider(value.request.ai_provider_id || '');
                 setRun(value);
+                setEndpoint(defaultInferenceEndpoint(value.configuration_plan?.endpoints || []));
                 setWorkspaceView(value.deployment_run_id ? 'execution' : value.status === 'optimizing' ? 'trials' : 'review');
             }
         }).catch(failure => { if (active) setError(`Unable to restore the saved plan: ${failure.message}`); })
@@ -268,8 +327,15 @@ export function DeploymentWorkflow({ draft, mode = 'agentic', embedded = false, 
     }, [mode]);
     const accept = (value, keepReview = false) => {
         if (!mounted.current) return;
+        const nextChecksum = value.configuration_plan?.configuration?.checksum;
         setRun(value);
-        setApproval(current => keepReview && current ? { runId: value.id, checksum: value.configuration_plan?.configuration?.checksum } : null);
+        setApproval(current => keepReview && current ? {
+            runId: value.id,
+            checksum: nextChecksum,
+            ...(current.checksum === nextChecksum && current.namespace ? { namespace: current.namespace } : {}),
+            ...(current.checksum === nextChecksum && current.prepared ? { prepared: current.prepared } : {}),
+        } : null);
+        setAdminHandoff(current => (keepReview && current && current.runId === value.id && current.checksum === nextChecksum) ? current : null);
         const endpoints = value.configuration_plan?.endpoints || [];
         setEndpoint(current => endpoints.some(item => item.value === current) ? current : defaultInferenceEndpoint(endpoints));
         sessionStorage.setItem(key, value.id);
@@ -383,27 +449,245 @@ export function DeploymentWorkflow({ draft, mode = 'agentic', embedded = false, 
         max_num_seqs: patch.max_num_seqs, max_num_batched_tokens: patch.max_num_batched_tokens,
         native_cpu_cache_gib: patch.native_cpu_cache_gib,
     }, true);
+    const buildPermissionPayload = (extra = {}) => {
+        const currentPlan = run?.configuration_plan;
+        const runtimeLabels = currentPlan?.source_draft?.runtimeConfiguration?.namespaceLabels;
+        const sourceLabels = currentPlan?.source_draft?.sourcePlan?.namespaceLabels;
+        const rawLabels = (runtimeLabels && Object.keys(runtimeLabels).length ? runtimeLabels : null)
+            || (sourceLabels && Object.keys(sourceLabels).length ? sourceLabels : null);
+        return deploymentPermissionPayload({
+            clusterId: draft.clusterId,
+            manifest: deploymentPlanManifest(currentPlan),
+            namespaceLabels: rawLabels,
+            agenticDeploymentRunId: run?.id,
+            deploymentName: draft.deploymentName,
+            providerRef: run?.selected_candidate?.provider_ref,
+            storageVolumeId: draft.storageVolumeId,
+            usesStorage: Boolean(draft.storageVolumeId),
+            ...extra,
+        });
+    };
+    const generateBootstrapScript = async (overrideArg = null, seed = null) => {
+        const current = seed || adminHandoff;
+        const version = requestVersion.current;
+        const override = overrideArg || current?.subjectOverride || null;
+        const validOverride = override?.name?.trim()
+            ? {
+                kind: override.kind || 'ServiceAccount',
+                name: override.name.trim(),
+                ...(override.kind === 'ServiceAccount' && override.namespace?.trim()
+                    ? { namespace: override.namespace.trim() }
+                    : {}),
+            }
+            : null;
+        setAdminHandoff(prev => (prev ? { ...prev, generating: true, error: '', ...(validOverride ? { subjectOverride: validOverride } : {}) } : prev));
+        try {
+            const remediation = await generateDeploymentBootstrapScript(buildPermissionPayload({
+                namespace: current?.namespace || undefined,
+                subjectOverride: validOverride,
+            }));
+            if (!mounted.current || version !== requestVersion.current) return;
+            setAdminHandoff(prev => (prev ? {
+                ...prev,
+                generating: false,
+                script: remediation.script || '',
+                filename: remediation.scriptFilename || remediation.filename || 'lens-deployment-bootstrap.sh',
+                instructions: remediation.instructions || '',
+                bootstrapDigest: remediation.bootstrapDigest || remediation.digest || null,
+                namespace: remediation.namespace || prev.namespace,
+                identity: remediation.identity || prev.identity,
+                warnings: Array.isArray(remediation.warnings) ? remediation.warnings : prev.warnings,
+            } : prev));
+        } catch (failure) {
+            if (!mounted.current || version !== requestVersion.current) return;
+            setAdminHandoff(prev => (prev ? { ...prev, generating: false, error: failure.message || 'Could not generate Orchestration administrator script.' } : prev));
+        }
+    };
+    const openAdminSetupFromError = (failure, fallbackNamespace = '', showFailureError = false) => {
+        const body = failure?.body && typeof failure.body === 'object' ? failure.body : {};
+        const seed = {
+            runId: run.id,
+            checksum: approval.checksum,
+            report: body,
+            verifyResult: null,
+            namespace: body.namespace || fallbackNamespace || '',
+            identity: body.identity || null,
+            subjectOverride: adminHandoff?.subjectOverride || null,
+            script: typeof body.script === 'string' ? body.script : '',
+            filename: body.scriptFilename || 'lens-deployment-bootstrap.sh',
+            instructions: body.instructions || '',
+            bootstrapDigest: body.bootstrapDigest || body.digest || null,
+            warnings: Array.isArray(body.warnings) ? body.warnings : [],
+            generating: false,
+            verifying: false,
+            error: showFailureError ? (failure.message || body.detail || '') : '',
+        };
+        setError('');
+        setAdminHandoff(seed);
+        setBusy(false);
+        return seed;
+    };
+    const executeApprove = async (targetNamespace = '', activeVersion = requestVersion.current) => {
+        const normalizedNamespace = typeof targetNamespace === 'string' ? targetNamespace.trim() : '';
+        const result = await api(`/api/agentic-deployments/${encodeURIComponent(run.id)}/approve`, {
+            configuration_checksum: approval.checksum,
+            ...(plan?.source_bundle ? { endpoint } : {}),
+            ...(normalizedNamespace ? { namespace: normalizedNamespace } : {}),
+            ...(approval?.prepared ? {
+                prepared_plan_id: approval.prepared.id,
+                expected_plan_digest: approval.prepared.digest,
+                acknowledge_unknown: approval.prepared.preflight.status === 'unknown',
+            } : {}),
+        });
+        if (!mounted.current || activeVersion !== requestVersion.current) return null;
+        const prepared = result?.configuration_plan?.validation?.preparedDeployment;
+        if (prepared && !result?.deployment_run_id) {
+            setRun(result);
+            setApproval(prev => ({
+                runId: result.id,
+                checksum: approval.checksum,
+                prepared,
+                ...(normalizedNamespace || prev?.namespace ? { namespace: normalizedNamespace || prev.namespace } : {}),
+            }));
+            setAdminHandoff(null);
+            return result;
+        }
+        if (!result?.deployment_run_id) {
+            accept(result, true);
+            return result;
+        }
+        accept(result, false);
+        setApproval(null);
+        setAdminHandoff(null);
+        // Execution status lives in the Deployments job list, not inside the plan.
+        if (onDeploymentStarted) onDeploymentStarted(result); else setWorkspaceView('execution');
+        return result;
+    };
     const deploy = async () => {
         if (!approval || approval.runId !== run.id || approval.checksum !== run.configuration_plan?.configuration?.checksum) {
-            setApproval(null); setError('The configuration changed. Review the current plan before deploying.'); return;
+            setApproval(null); setAdminHandoff(null); setError('The configuration changed. Review the current plan before deploying.'); return;
         }
+        const version = ++requestVersion.current;
+        let checkedNamespace = approval.namespace || '';
+        setBusy(true); setError('');
         try {
-            const result = await mutate('approve', { configuration_checksum: approval.checksum, ...(plan.source_bundle ? { endpoint } : {}), ...(approval.prepared ? {
-                prepared_plan_id: approval.prepared.id, expected_plan_digest: approval.prepared.digest, acknowledge_unknown: approval.prepared.preflight.status === 'unknown',
-            } : {}) });
-            const prepared = result?.configuration_plan?.validation?.preparedDeployment;
-            if (prepared && !result.deployment_run_id) {
-                setApproval({ runId: result.id, checksum: approval.checksum, prepared });
+            const checkResult = await checkDeploymentPermissions(buildPermissionPayload(checkedNamespace ? { namespace: checkedNamespace } : {}));
+            if (!mounted.current || version !== requestVersion.current) return;
+            checkedNamespace = checkResult?.namespace || checkedNamespace;
+            if (checkResult?.sufficient || checkResult?.status === 'sufficient') {
+                const approvedRun = await executeApprove(checkedNamespace, version);
+                if (!mounted.current || version !== requestVersion.current) return;
+                if (!approvedRun?.deployment_run_id && !approvedRun?.configuration_plan?.validation?.preparedDeployment) {
+                    setError('Deployment approval did not start an execution run. Try again.');
+                }
                 return;
             }
-            if (!result?.deployment_run_id) return;
-            setApproval(null);
-            // Execution status lives in the Deployments job list, not inside the plan.
-            if (onDeploymentStarted) onDeploymentStarted(result); else setWorkspaceView('execution');
+            const seed = {
+                runId: run.id,
+                checksum: approval.checksum,
+                report: checkResult,
+                verifyResult: null,
+                namespace: checkedNamespace,
+                identity: checkResult?.identity || null,
+                subjectOverride: null,
+                script: '',
+                filename: 'lens-deployment-bootstrap.sh',
+                instructions: '',
+                bootstrapDigest: checkResult?.marker?.bootstrapDigest || null,
+                warnings: Array.isArray(checkResult?.warnings) ? checkResult.warnings : [],
+                generating: false,
+                verifying: false,
+                error: '',
+            };
+            setAdminHandoff(seed);
+            setBusy(false);
+            if (!checkResult?.identity?.overrideRequired && checkResult?.identity?.kind !== 'unknown') {
+                await generateBootstrapScript(null, seed);
+            }
+        } catch (failure) {
+            if (!mounted.current || version !== requestVersion.current) return;
+            if (isDeploymentAdminSetupError(failure)) {
+                const seed = openAdminSetupFromError(failure, checkedNamespace, false);
+                if (!seed.script && !seed.identity?.overrideRequired && !seed.subjectOverride?.name && seed.identity?.kind !== 'unknown') {
+                    await generateBootstrapScript(null, seed);
+                }
+                return;
+            }
+            setError(failure.message || 'Deployment failed.');
+            setBusy(false);
+        } finally {
+            if (mounted.current && version === requestVersion.current) setBusy(false);
         }
-        catch { /* mutate presents the error. */ }
     };
-    const reset = () => { setChangingRequirements(true); setApproval(null); setError(''); setEvents([]); };
+    const verifyBootstrapAndDeploy = async () => {
+        if (!adminHandoff || adminHandoff.verifying) return;
+        if (!approval || approval.runId !== run.id || approval.checksum !== run.configuration_plan?.configuration?.checksum) {
+            setApproval(null); setAdminHandoff(null); setError('The configuration changed. Review the current plan before deploying.'); return;
+        }
+        const version = ++requestVersion.current;
+        const handoffSnapshot = adminHandoff;
+        const override = handoffSnapshot.subjectOverride?.name?.trim()
+            ? {
+                kind: handoffSnapshot.subjectOverride.kind || 'ServiceAccount',
+                name: handoffSnapshot.subjectOverride.name.trim(),
+                ...(handoffSnapshot.subjectOverride.kind === 'ServiceAccount' && handoffSnapshot.subjectOverride.namespace?.trim()
+                    ? { namespace: handoffSnapshot.subjectOverride.namespace.trim() }
+                    : {}),
+            }
+            : null;
+        setBusy(true);
+        setError('');
+        setAdminHandoff(prev => (prev ? { ...prev, verifying: true, error: '' } : prev));
+        let verifyResult = null;
+        try {
+            verifyResult = await verifyDeploymentBootstrap(buildPermissionPayload({
+                namespace: handoffSnapshot.namespace || undefined,
+                subjectOverride: override,
+                expectedDigest: handoffSnapshot.bootstrapDigest || undefined,
+            }));
+            if (!mounted.current || version !== requestVersion.current) return;
+            if (verifyResult?.verified) {
+                const approvedNamespace = verifyResult?.namespace || handoffSnapshot.namespace || '';
+                if (approvedNamespace) setApproval(prev => (prev ? { ...prev, namespace: approvedNamespace } : prev));
+                setAdminHandoff(prev => (prev ? { ...prev, verifyResult, namespace: approvedNamespace || prev.namespace } : prev));
+                const approvedRun = await executeApprove(approvedNamespace, version);
+                if (!mounted.current || version !== requestVersion.current) return;
+                if (!approvedRun?.deployment_run_id && !approvedRun?.configuration_plan?.validation?.preparedDeployment) {
+                    setAdminHandoff(null);
+                    setError('Deployment approval did not start an execution run. Try again.');
+                }
+                return;
+            }
+            setAdminHandoff(prev => (prev ? {
+                ...prev,
+                verifying: false,
+                verifyResult,
+                namespace: verifyResult?.namespace || prev.namespace,
+                identity: verifyResult?.identity || prev.identity,
+                warnings: Array.isArray(verifyResult?.warnings) ? verifyResult.warnings : prev.warnings,
+                error: verifyResult?.message || 'Orchestration administrator namespace setup is not yet verified. Run the script and try again.',
+            } : prev));
+        } catch (failure) {
+            if (!mounted.current || version !== requestVersion.current) return;
+            if (isDeploymentAdminSetupError(failure)) {
+                const fallbackNs = verifyResult?.namespace || handoffSnapshot.namespace || '';
+                const seed = openAdminSetupFromError(failure, fallbackNs, true);
+                if (!seed.script && (override || (!seed.identity?.overrideRequired && seed.identity?.kind !== 'unknown'))) {
+                    await generateBootstrapScript(override, seed);
+                }
+                return;
+            }
+            if (verifyResult?.verified) {
+                setAdminHandoff(null);
+                setError(failure.message || 'Deployment approval failed.');
+                return;
+            }
+            setAdminHandoff(prev => (prev ? { ...prev, verifying: false, error: failure.message || 'Verification failed.' } : prev));
+        } finally {
+            if (mounted.current && version === requestVersion.current) setBusy(false);
+        }
+    };
+    const reset = () => { setChangingRequirements(true); setApproval(null); setAdminHandoff(null); setError(''); setEvents([]); };
     const toggleOptimization = (id, enabled) => generate({
         ...requirements,
         requiredFeatures: requirements.requiredFeatures.filter(item => item !== id),
@@ -438,12 +722,39 @@ export function DeploymentWorkflow({ draft, mode = 'agentic', embedded = false, 
             <details><summary>Frozen resources and placement checks</summary><pre className="max-h-80 overflow-auto">{JSON.stringify({ cases: frozenPlan.cases, preflight: frozenPlan.preflight }, null, 2)}</pre></details>
             {preflightStatus === 'fail' && <ul role="alert" className="list-disc pl-5">{frozenPlan.preflight.errors?.map((error, index) => <li key={index}>{error.message || error.code}</li>)}</ul>}
         </section>}
-        <DeploymentSummary run={run} draft={draft} deploymentRun={deploymentRun} busy={busy} locked={locked || approval?.checksum !== plan?.configuration?.checksum} deployBlocked={Boolean(frozenPlan) && !['unknown', 'pass'].includes(preflightStatus)} editing={editing} cleanupRequired={cleanupRequired} endpoint={endpoint}
-            onEndpointChange={value => { setEndpoint(value); if (frozenPlan) setApproval({ runId: run.id, checksum: approval.checksum }); }} onDeploy={deploy} confirmLabel={preflightStatus === 'unknown' ? 'Accept risks and deploy' : 'Confirm deployment'} onCheck={render} onRequirements={reset} />
-        {error && <p role="alert" className="mt-3 text-sm">{error}</p>}
+        <DeploymentSummary
+            run={run}
+            draft={draft}
+            deploymentRun={deploymentRun}
+            busy={busy}
+            locked={locked || approval?.checksum !== plan?.configuration?.checksum}
+            deployBlocked={Boolean(frozenPlan) && !['unknown', 'pass'].includes(preflightStatus)}
+            editing={editing}
+            cleanupRequired={cleanupRequired}
+            error={error}
+            endpoint={endpoint}
+            onEndpointChange={value => {
+                setEndpoint(value);
+                if (frozenPlan) {
+                    setApproval(prev => ({
+                        runId: run.id,
+                        checksum: approval.checksum,
+                        ...(prev?.namespace ? { namespace: prev.namespace } : {}),
+                    }));
+                }
+            }}
+            onDeploy={deploy}
+            confirmLabel={preflightStatus === 'unknown' ? 'Accept risks and deploy' : 'Confirm deployment'}
+            onCheck={render}
+            onRequirements={reset}
+            adminHandoff={adminHandoff}
+            onSubjectOverrideChange={(next) => setAdminHandoff(prev => (prev ? { ...prev, subjectOverride: next } : prev))}
+            onGenerateBootstrapScript={(overrideArg) => generateBootstrapScript(overrideArg)}
+            onVerifyBootstrapAndDeploy={verifyBootstrapAndDeploy}
+        />
     </>;
     const reviewFooter = <div className="flex w-full flex-wrap justify-between gap-2">
-        <Button variant="ghost" disabled={busy} onClick={() => setApproval(null)}><ArrowLeft size={15} />Back to edit</Button>
+        <Button variant="ghost" disabled={busy || Boolean(adminHandoff?.verifying) || Boolean(adminHandoff?.generating)} onClick={() => { setApproval(null); setAdminHandoff(null); }}><ArrowLeft size={15} />Back to edit</Button>
         {manifest && <Button variant="secondary" onClick={() => downloadBlob(new Blob([manifest], { type: 'text/yaml' }), `${draft.deploymentName}.yaml`)}><Download size={15} />Download YAML</Button>}
     </div>;
     const content = <section className="space-y-5">
@@ -455,7 +766,7 @@ export function DeploymentWorkflow({ draft, mode = 'agentic', embedded = false, 
                 {!building && events.length > 0 && <Button variant="ghost" size="sm" onClick={() => setLogOpen(true)}><ScrollText size={14} />Planning log</Button>}
                 {run?.deployment_run_id ? onDeploymentStarted && <Button onClick={() => onDeploymentStarted(run)}>Open deployment</Button> : run && <>
                     {reviewBlocked && <span className="max-w-xs text-xs text-theme-muted" role="status">{reviewBlocked}{editing && <> <Button size="xs" variant="link" onClick={() => { setPrimaryPanel('flow'); document.getElementById('deployment-unapplied')?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}>Show</Button></>}</span>}
-                    <Button id="deployment-review" size="md" disabled={Boolean(reviewBlocked)} title={reviewBlocked || undefined} onClick={() => { setWorkspaceView('review'); setReviewTab(sourceReview ? 'overview' : 'summary'); setApproval({ runId: run.id, checksum: plan.configuration?.checksum }); }}>Review &amp; deploy<ArrowRight size={15} /></Button></>}</>} />
+                    <Button id="deployment-review" size="md" disabled={Boolean(reviewBlocked)} title={reviewBlocked || undefined} onClick={() => { setWorkspaceView('review'); setReviewTab(sourceReview ? 'overview' : 'summary'); setError(''); setAdminHandoff(null); setApproval({ runId: run.id, checksum: plan.configuration?.checksum }); }}>Review &amp; deploy<ArrowRight size={15} /></Button></>}</>} />
         {run && !building && <SummaryStrip id="deployment-plan-summary" items={[
             { icon: Layers, tone: 'info', label: 'Topology', value: run.selected_candidate?.prefill_replicas ? 'Prefill / Decode' : 'Combined serving', detail: run.selected_candidate?.prefill_replicas
                 ? `Prefill ${run.selected_candidate.prefill_replicas} × TP ${run.selected_candidate.prefill_tensor_parallel_size || 1} · Decode ${run.selected_candidate.replicas || 1} × TP ${run.selected_candidate.tensor_parallel_size || 1}${plan?.source_draft?.runtimeConfiguration?.slices > 1 ? ` · ${plan.source_draft.runtimeConfiguration.slices} slices` : ''}`
@@ -499,7 +810,7 @@ export function DeploymentWorkflow({ draft, mode = 'agentic', embedded = false, 
                         <div className={flowSmall ? 'relative mb-3 h-44 w-72 overflow-hidden rounded-xl border border-theme-border bg-theme-card shadow-lg ring-1 ring-[color-mix(in_srgb,var(--brand-accent)_25%,transparent)] lg:absolute lg:right-0 lg:top-0 lg:z-10 lg:mb-0' : undefined}>
                             <div inert={flowSmall} style={flowSmall ? { width: '400%', transform: 'scale(0.25)', transformOrigin: 'top left' } : undefined}>
                                 <Suspense fallback={<LoadingState label="Loading deployment designer" />}><InferenceDesigner key={`${run.id}:${run.revision}:${plan.configuration?.checksum}`} initialDraft={deploymentEditorSnapshot(run).draft} initialResult={deploymentEditorSnapshot(run).result} clusterName={draft.clusterName || draft.clusterId} disabled={locked} onReview={renderSource} onEditingChange={setEditing} focus={focus} onFocusOpened={() => setFocus('')}
-                                    configuredCount={enabled.length} onToggleRequirement={toggleOptimization} toggleRequest={flowToggle} onToggleHandled={() => setFlowToggle(null)} flowOverlay={pip && !flowSmall ? table(true) : null} review={{ open: Boolean(approval), tab: reviewTab, onTab: setReviewTab, onClose: () => setApproval(null), overview: summary, footer: reviewFooter }} /></Suspense>
+                                    configuredCount={enabled.length} onToggleRequirement={toggleOptimization} toggleRequest={flowToggle} onToggleHandled={() => setFlowToggle(null)} flowOverlay={pip && !flowSmall ? table(true) : null} review={{ open: Boolean(approval), tab: reviewTab, onTab: setReviewTab, onClose: () => { setApproval(null); setAdminHandoff(null); }, overview: summary, footer: reviewFooter }} /></Suspense>
                             </div>
                             {flowSmall && <button type="button" className="group absolute inset-0 flex cursor-zoom-in items-start justify-between bg-gradient-to-b from-[var(--bg-card)] via-transparent to-transparent p-2 text-left" aria-label="Show serving flow in the center" title="Show serving flow" onClick={() => setPrimaryPanel('flow')}>
                                 <span className="inline-flex items-center gap-1.5 rounded-md bg-theme-card/90 px-2 py-1 text-xs font-semibold shadow-sm">Serving flow</span>
@@ -557,7 +868,7 @@ export function DeploymentWorkflow({ draft, mode = 'agentic', embedded = false, 
 
             </div>
         </>}
-        <Modal isOpen={Boolean(approval) && !sourceReview} onClose={() => setApproval(null)} closeOnBackdrop={!busy} closeOnEscape={!busy} title="Review & deploy" size="xxl" footer={reviewFooter}>
+        <Modal isOpen={Boolean(approval) && !sourceReview} onClose={() => { setApproval(null); setAdminHandoff(null); }} closeOnBackdrop={!busy && !adminHandoff?.verifying && !adminHandoff?.generating} closeOnEscape={!busy && !adminHandoff?.verifying && !adminHandoff?.generating} title="Review & deploy" size="xxl" footer={reviewFooter}>
             {run && <div className="space-y-4">
                 <div role="tablist" aria-label="Review views" className="deployment-tabs">
                     {[['summary', 'Overview'], ['yaml', 'YAML']].map(([id, label]) => <Button key={id} role="tab" size="sm" variant="ghost" aria-selected={reviewTab === id} onClick={() => setReviewTab(id)}>{label}</Button>)}

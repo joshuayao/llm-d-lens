@@ -15,34 +15,58 @@ export function getAcceleratorCapabilities({ signal } = {}) {
     return requestJson(BASE_PATH, { signal });
 }
 
-export function getAcceleratorStatus(accelerator, { namespace, accessMode, signal, clusterId } = {}) {
-    const query = new URLSearchParams({ namespace });
-    if (accessMode) query.set('access_mode', accessMode);
-    if (clusterId) query.set('cluster_id', clusterId);
-    return requestJson(`${BASE_PATH}/${encodeURIComponent(accelerator)}/status?${query.toString()}`, { signal });
+function buildAcceleratorInstallPayload(request, monitoringNamespace) {
+    const payload = { ...request };
+    const effectiveMonitoringNs = typeof (monitoringNamespace ?? payload.monitoring_namespace) === 'string'
+        ? (monitoringNamespace ?? payload.monitoring_namespace).trim()
+        : '';
+    if (effectiveMonitoringNs) {
+        payload.monitoring_namespace = effectiveMonitoringNs;
+    } else {
+        delete payload.monitoring_namespace;
+    }
+    return payload;
 }
 
-export function preflightAcceleratorInstall(request, { signal, clusterId } = {}) {
+export function getAcceleratorStatus(
+    accelerator,
+    { namespace, accessMode, monitoringNamespace, signal, clusterId } = {},
+) {
+    const query = new URLSearchParams();
+    if (namespace) query.set('namespace', namespace);
+    if (accessMode) query.set('access_mode', accessMode);
+    if (monitoringNamespace) query.set('monitoring_namespace', monitoringNamespace);
+    if (clusterId) query.set('cluster_id', clusterId);
+    const qs = query.toString();
+    return requestJson(
+        `${BASE_PATH}/${encodeURIComponent(accelerator)}/status${qs ? `?${qs}` : ''}`,
+        { signal },
+    );
+}
+
+export function preflightAcceleratorInstall(request, { monitoringNamespace, signal, clusterId } = {}) {
     const accelerator = request.accelerator;
     const query = clusterId ? `?cluster_id=${encodeURIComponent(clusterId)}` : '';
+    const payload = buildAcceleratorInstallPayload(request, monitoringNamespace);
     return requestJson(`${BASE_PATH}/${encodeURIComponent(accelerator)}/installations/preflight${query}`, {
         method: 'POST',
         signal,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(request),
+        body: JSON.stringify(payload),
     });
 }
 
-export function installAccelerator(request, idempotencyKey, clusterId) {
+export function installAccelerator(request, idempotencyKey, clusterId, { monitoringNamespace } = {}) {
     const accelerator = request.accelerator;
     const query = clusterId ? `?cluster_id=${encodeURIComponent(clusterId)}` : '';
+    const payload = buildAcceleratorInstallPayload(request, monitoringNamespace);
     return requestJson(`${BASE_PATH}/${encodeURIComponent(accelerator)}/installations${query}`, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
             'Idempotency-Key': idempotencyKey,
         },
-        body: JSON.stringify(request),
+        body: JSON.stringify(payload),
     });
 }
 
@@ -53,7 +77,45 @@ export function getAcceleratorOperation(accelerator, operationId, { signal } = {
     );
 }
 
-export function getAcceleratorLinks(accelerator, { signal, clusterId } = {}) {
-    const query = clusterId ? `?cluster_id=${encodeURIComponent(clusterId)}` : '';
-    return requestJson(`${BASE_PATH}/${encodeURIComponent(accelerator)}/links${query}`, { signal });
+export function getAcceleratorLinks(accelerator, { monitoringNamespace, signal, clusterId } = {}) {
+    const query = new URLSearchParams();
+    if (monitoringNamespace) query.set('monitoring_namespace', monitoringNamespace);
+    if (clusterId) query.set('cluster_id', clusterId);
+    const qs = query.toString();
+    return requestJson(
+        `${BASE_PATH}/${encodeURIComponent(accelerator)}/links${qs ? `?${qs}` : ''}`,
+        { signal },
+    );
+}
+
+export function getAcceleratorAdminScript(
+    accelerator,
+    { namespace, accessMode, monitoringNamespace, clusterId, signal } = {},
+) {
+    const query = new URLSearchParams();
+    if (namespace) query.set('namespace', namespace);
+    if (accessMode) query.set('access_mode', accessMode);
+    if (monitoringNamespace) query.set('monitoring_namespace', monitoringNamespace);
+    if (clusterId) query.set('cluster_id', clusterId);
+    const qs = query.toString();
+    return requestJson(
+        `${BASE_PATH}/${encodeURIComponent(accelerator)}/admin-script${qs ? `?${qs}` : ''}`,
+        { signal },
+    );
+}
+
+export function recheckAccelerator(
+    accelerator,
+    { namespace, accessMode, monitoringNamespace, clusterId } = {},
+) {
+    const query = new URLSearchParams();
+    if (namespace) query.set('namespace', namespace);
+    if (accessMode) query.set('access_mode', accessMode);
+    if (monitoringNamespace) query.set('monitoring_namespace', monitoringNamespace);
+    if (clusterId) query.set('cluster_id', clusterId);
+    const qs = query.toString();
+    return requestJson(
+        `${BASE_PATH}/${encodeURIComponent(accelerator)}/recheck${qs ? `?${qs}` : ''}`,
+        { method: 'POST' },
+    );
 }

@@ -31,7 +31,7 @@ Slice 数和放置策略从 Guide 默认值开始；EPP Topology Affinity 默认
 - **Placement（拓扑与放置）**选择放置类型，从已发现的节点标签中选择拓扑键（或填写其他键），
   并展示每个域的节点、空闲加速器及能否容纳一个 Slice。Guide 通过 DRA claim 申请加速器时，估算不计入这部分，
   域改为显示空闲 CPU 和内存，并提示上限只按 CPU、内存和 Pod 数计算。自定义标签会被标注，因为 Lens 无法验证其
-  是否反映物理拓扑；节点标签由集群管理员修改，本页不修改。发现的放置方案以 **Suggested（建议）**提供。
+  是否反映物理拓扑；节点标签由编排平台管理员修改，本页不修改。发现的放置方案以 **Suggested（建议）**提供。
 - **EPP Topology Affinity** 只有 **Scorer** 和 **Filter** 两个选项。Scorer 为同 Slice 候选加分；
   Filter 在存在匹配项时保留同 Slice 候选。缺少对端拓扑或没有匹配候选时会放行全部候选，
   因此 Filter 并不保证严格的同 Slice 路由。生成配置时，未设置或旧的继承设置会转为 Scorer，
@@ -463,3 +463,24 @@ P/D 的 CPU 缓存适配器目前要求两个角色均使用 `NixlConnector` 和
 搜索，不是无限自主调整或全局最优证明。
 
 Overview 和 3D 分别展示每个角色的传输及本地 CPU 缓存。Agentic 的 CPU 缓存试验包含符合条件的 P/D 候选，使用相同负载比较原配置与组合配置。默认 NIXL 优先的顺序在多个连接器均命中时优先传输，不保证减少网络传输；正确性及性能仍需实际测量。
+
+## 非管理员（`edit`）集群部署规划
+
+当集群使用命名空间级非管理员（`edit`）kubeconfig 时，集群范围的 Kubernetes 资源读取（`kubectl get nodes`、`kubectl get pods --all-namespaces`）可能返回 `403 Forbidden`。在部署规划、切片放置和目标检查期间，Lens 会自动回退到基于 Prometheus 合成的节点与可分配加速器库存，从而在不出现 `403` 失败的情况下继续执行硬件配置驱动的 GPU/XPU 调度与容量检查。真实的 `401 Unauthorized` kubeconfig 错误不会被掩盖，会立即向上暴露，以便刷新或更换集群凭据。
+
+## 按命名空间的权限预检与编排平台管理员命名空间初始化
+
+每次部署都会使用独立的 Kubernetes 命名空间（`<deployment-ns>`）。在部署前，Lens 会执行按命名空间的 SubjectAccessReview（SSAR）预检：
+
+- **管理员 kubeconfig**：当所有必需的命名空间、工作负载和 RBAC 检查均通过时，部署直接继续，无需额外步骤。
+- **非管理员（`edit`）kubeconfig**：如果 `<deployment-ns>` 或其命名空间级 RBAC 缺失，Lens 会暂停在**编排平台管理员命名空间初始化**阶段，并生成一份自包含、幂等的 bash 初始化脚本（不包含任何明文密钥）。
+  1. 下载或复制该初始化脚本并交由编排平台管理员运行。脚本会创建 `Namespace`、面向检测到的 kubeconfig 身份（或在无法自动检测时使用显式主体覆盖）的命名空间级 `Role` 与 `RoleBinding`、按命名空间的 EPP `system:auth-delegator` `ClusterRoleBinding`、在配置存储时创建可选的静态 `PersistentVolume` 与绑定的 `PersistentVolumeClaim`，以及非密钥的 `lens-deployment-bootstrap` 标记 `ConfigMap`。
+  2. 点击 **Re-check & Deploy** 验证初始化标记与权限。
+  3. 验证通过后，Lens 会将工作负载部署到 `<deployment-ns>`，在配置了 `hf_token_secret_namespace` 时从中复制 `HF_TOKEN`，并启用命名空间级 `ServiceMonitor`/`PodMonitor` 资源。
+
+## 非管理员集群上的两阶段部署删除
+
+在非管理员（`edit`）集群上删除部署采用两阶段流程：
+
+1. Lens 首先删除 `<deployment-ns>` 内的所有命名空间级工作负载与配置资源。
+2. 如果删除 `Namespace` 或其按命名空间的 `ClusterRoleBinding` 返回 `403 Forbidden`，Lens 会展示**编排平台管理员命名空间清理**交接界面。下载或复制生成的清理脚本交由编排平台管理员运行，然后点击 **Re-check & Delete** 确认移除并删除 Lens 部署记录。（若无法验证标记，可使用 **Confirm & Delete Record** 在手动清理后删除 Lens 记录。）

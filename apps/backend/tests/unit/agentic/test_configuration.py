@@ -179,3 +179,134 @@ def test_agentic_baseline_vllm_propagates_model_secret_policy(model_secret):
         mode="json",
         by_alias=True,
     )
+
+
+@pytest.mark.parametrize("provider_ref", ["baseline-vllm", "optimized-baseline", "pd-disaggregation"])
+def test_agentic_configuration_inherits_cluster_vllm_image_when_set(provider_ref):
+    from llm_d_lens.deploy.providers.hardware_profile import runtime_image
+
+    request = StandardKubernetesServiceRequest(
+        model="Qwen/Qwen3-8B",
+        deployment_name="agentic",
+        cluster_session_id="a" * 36,
+        replicas=1,
+        tensor_parallel_size=1,
+        storage_volume_id="storage-model-cache",
+    )
+    candidate = PlannedCandidate(
+        id=f"{provider_ref}-tp1-r1",
+        provider_ref=provider_ref,
+        replicas=1,
+        tensor_parallel_size=1,
+        prefill_replicas=1,
+        prefill_tensor_parallel_size=1,
+        guide_variant="vllm",
+        max_model_len=4096,
+        gpu_memory_utilization=0.9,
+        required_gpus=2 if provider_ref == "pd-disaggregation" else 1,
+        deployable=True,
+    )
+
+    custom_cfg = build_agentic_configuration(
+        request,
+        candidate,
+        accelerator="nvidia",
+        cluster_vllm_image="registry.internal:5000/org/vllm:cluster-1",
+    )
+    assert custom_cfg.content["runtime"]["image"] == "registry.internal:5000/org/vllm:cluster-1"
+
+    default_cfg = build_agentic_configuration(
+        request,
+        candidate,
+        accelerator="nvidia",
+        cluster_vllm_image=None,
+    )
+    assert default_cfg.content["runtime"]["image"] == runtime_image(accelerator="nvidia")
+
+
+def test_agentic_service_refresh_configuration_plan_uses_cluster_vllm_image(monkeypatch):
+    from types import SimpleNamespace
+
+    from llm_d_lens.agentic.configuration import planning_resource_request
+    from llm_d_lens.agentic.service import AgenticDeploymentService
+
+    monkeypatch.setattr(
+        "llm_d_lens.agentic.service.resolve_cluster_vllm_image",
+        lambda cid: "registry.internal:5000/org/vllm:cluster-2" if cid == "cluster-custom" else None,
+    )
+    candidate = PlannedCandidate(
+        id="optimized-baseline-tp1-r1",
+        provider_ref="optimized-baseline",
+        replicas=1,
+        tensor_parallel_size=1,
+        max_model_len=4096,
+        gpu_memory_utilization=0.9,
+        required_gpus=1,
+        deployable=True,
+    )
+    run = SimpleNamespace(
+        request=SimpleNamespace(
+            model="Qwen/Qwen3-8B",
+            deployment_name="agentic",
+            description="",
+            cluster_session_id="a" * 36,
+            replicas=1,
+            tensor_parallel_size=1,
+            storage_type="model-cache",
+            storage_volume_id="storage-model-cache",
+            model_cache_path="/cache",
+            pvc_name="",
+            max_model_len=4096,
+            gpu_memory_utilization=0.9,
+            max_num_seqs=256,
+            max_num_batched_tokens=8192,
+            enable_prefix_caching=True,
+            enforce_eager=False,
+            vllm_arguments=[],
+            use_cluster_proxy=False,
+            http_proxy="",
+            https_proxy="",
+            no_proxy="",
+            planning_mode="manual",
+            requirements=SimpleNamespace(cluster_id="cluster-custom"),
+            model_copy=lambda update: StandardKubernetesServiceRequest(
+                model="Qwen/Qwen3-8B",
+                deployment_name="agentic",
+                cluster_session_id="a" * 36,
+                replicas=update["replicas"],
+                tensor_parallel_size=update["tensor_parallel_size"],
+                storage_volume_id="storage-model-cache",
+            ),
+        ),
+        candidates=[candidate],
+        selected_candidate=candidate,
+        model_secret=ModelSecretConfiguration(),
+        planning_cluster_snapshot={"hardware": {"accelerators": [{"id": "nvidia", "gpuCount": 2}]}},
+        configuration_plan=None,
+    )
+    monkeypatch.setattr(
+        "llm_d_lens.agentic.service.resolved_plan",
+        lambda _run, cfg: SimpleNamespace(
+            configuration=cfg,
+            requirements=SimpleNamespace(hard_constraints={}, workload={}, forbidden_features=[], required_features=[]),
+        ),
+    )
+
+    AgenticDeploymentService._refresh_configuration_plan(run)
+
+    assert run.configuration_plan.configuration["content"]["runtime"]["image"] == (
+        "registry.internal:5000/org/vllm:cluster-2"
+    )
+    body = planning_resource_request(run)
+    assert body["runtimeImage"] == "registry.internal:5000/org/vllm:cluster-2"
+
+    # Guard optional run.request.requirements=None by falling back to cluster_session_id
+    monkeypatch.setattr(
+        "llm_d_lens.agentic.service.require_active_session",
+        lambda _sid: SimpleNamespace(server_id="cluster-custom"),
+    )
+    run.request.requirements = None
+    AgenticDeploymentService._refresh_configuration_plan(run)
+    assert run.configuration_plan.configuration["content"]["runtime"]["image"] == (
+        "registry.internal:5000/org/vllm:cluster-2"
+    )

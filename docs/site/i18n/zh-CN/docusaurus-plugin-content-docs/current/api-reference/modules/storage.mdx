@@ -162,7 +162,7 @@ import TabItem from '@theme/TabItem';
           "persistentVolumeClaims": [
             {
               "name": "prism-storage-storage-3e9a0f52",
-              "namespace": "llm-d-bench-storage",
+              "namespace": "lens-storage-283db094",
               "phase": "Bound",
               "capacity": "500Gi",
               "accessModes": [
@@ -231,8 +231,8 @@ import TabItem from '@theme/TabItem';
     - `capacity`（`string`）：Kubernetes 数量格式，例如 `500Gi`。
     - `readOnly`（`boolean`，默认 `true`）
     - `purposes`（`StorageVolumePurpose[]`）：例如 `model-cache`。`model-cache` 用途不能与 `kind: "dynamic-pvc"` 组合使用（校验错误）；请改用 `local-disk` 或 `nfs`。
-    - `localDisk`（`LocalDiskSpec`，用于 `local-disk` 时可选）
-    - `nfs`（`NfsSpec`，用于 `nfs` 时可选）
+    - `localDisk`（`LocalDiskSpec`，用于 `local-disk` 时可选）：包含 `hostPath` 与可选的 `namespace`（DNS-1123 标签；UI 默认使用 `lens-storage-<short-id>` 如 `lens-storage-283db094`，直接调用 `POST /api/v1/storage/volumes` 时若省略或针对已有记录则回退到遗留默认值 `llm-d-bench-storage`；需要时，`POST /api/v1/storage/volumes/preflight` 会为非管理员用户包含该命名空间的 `Role` 和 `RoleBinding`（`lens-storage-operator`）RBAC 引导）。
+    - `nfs`（`NfsSpec`，用于 `nfs` 时可选）：包含 `server`、`path` 与可选的 `namespace`（DNS-1123 标签、UI 默认 `lens-storage-<short-id>`、遗留 `llm-d-bench-storage` 省略回退以及预检 `lens-storage-operator` RBAC 引导规则与 `localDisk.namespace` 相同）。
     - `dynamicPvc`（`DynamicPvcSpec`，用于 `dynamic-pvc` 时可选）
 
     `local-disk` 卷示例：

@@ -18,6 +18,59 @@ from llm_d_lens.deploy.providers.guide_adapter import (
 CommandRunner = Callable[[list[str]], Awaitable[tuple[int, str, str]]]
 
 
+async def ensure_namespace_accessible(
+    runner: CommandRunner,
+    namespace: str,
+    *,
+    create_command: list[str] | None = None,
+) -> bool:
+    """Create ``namespace`` or verify pre-bootstrapped Non-Admin access on 403.
+
+    Returns ``True`` when the namespace was already pre-bootstrapped (403 on
+    ``create namespace`` followed by successful namespace-scoped access check),
+    and ``False`` when ``create namespace`` succeeded or returned AlreadyExists.
+    """
+    from llm_d_lens.deploy.slice_capacity import (
+        ClusterInventoryAuthError,
+        is_forbidden_output,
+        is_unauthorized_output,
+        redact_kubectl_error,
+    )
+
+    command = create_command or ["kubectl", "create", "namespace", namespace]
+    status, stdout, stderr = await runner(command)
+    if status == 0:
+        return False
+    combined = f"{stdout}\n{stderr}"
+    if is_unauthorized_output(stdout, stderr):
+        raise ClusterInventoryAuthError(
+            redact_kubectl_error((stderr or stdout or "Kubernetes authentication failed (401)").strip())
+        )
+    if "alreadyexists" in combined.lower() and create_command is None:
+        return False
+    if is_forbidden_output(stdout, stderr):
+        sa_status, sa_stdout, sa_stderr = await runner(
+            ["kubectl", "get", "serviceaccounts", "--namespace", namespace, "-o", "name"]
+        )
+        if sa_status == 0:
+            return True
+        if is_unauthorized_output(sa_stdout, sa_stderr):
+            raise ClusterInventoryAuthError(
+                redact_kubectl_error((sa_stderr or sa_stdout or "Kubernetes authentication failed (401)").strip())
+            )
+        raise RuntimeError(
+            redact_kubectl_error(
+                (
+                    sa_stderr
+                    or sa_stdout
+                    or f"Namespace {namespace} cannot be created or accessed (403 Forbidden); "
+                    "run the Orchestration administrator deployment bootstrap script first."
+                ).strip()
+            )
+        )
+    raise RuntimeError(redact_kubectl_error((stderr or stdout or "kubectl namespace creation failed").strip()))
+
+
 @dataclass(frozen=True)
 class KubernetesExecutionPolicy:
     """Namespace and readiness constraints for one registered guide."""
@@ -88,9 +141,7 @@ class KubernetesGuideAdapter(GuideAdapter):
     async def deploy(self, artifact: GuideDeploymentArtifact, execution_context: dict[str, Any]) -> dict[str, Any]:
         self._validate_artifact(artifact)
         namespace = self._namespace(execution_context)
-        status, stdout, stderr = await self._command_runner(["kubectl", "create", "namespace", namespace])
-        if status != 0:
-            raise RuntimeError((stderr or stdout or "kubectl namespace creation failed").strip())
+        await ensure_namespace_accessible(self._command_runner, namespace)
         status, stdout, stderr = await self._command_runner(
             ["kubectl", "apply", "--namespace", namespace, "--filename", artifact.manifest_ref or ""],
         )

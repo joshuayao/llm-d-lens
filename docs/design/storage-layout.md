@@ -135,6 +135,7 @@ Root directories prefer `LENS_*`; when unset, XDG rules and the defaults above a
 | Simulation tasks and results | `DATA/artifacts/simulations/<taskID>/` | Task records, runner output, and file manifest |
 | Trace datasets | `DATA/datasets/` | Preserve original file names and save download info, indexes, and each file's manifest |
 | Cluster connection configuration | `DATA/credentials/clusters/{clusters,cluster_sessions}/` | Save cluster registration and kubeconfig |
+| Draft Hugging Face token | `DATA/credentials/clusters/draft_hf_tokens/<cluster_id>.enc` | `0700` directory, `0600` Fernet-encrypted JSON envelope using the Lens master key, bound to `cluster_id`, `created_at`, and `user_id`; write-only (never returned in `GET`, never stored in `provisioning_plan`/`planHash`/logs/ledger/remediation script); deleted on draft finalize, draft discard/delete, `update_cluster(draft=False)`, or switching to `existing-secret:` |
 | Cluster installation files | `DATA/credentials/bootstrap/<installationTaskID>/` | Save files required for installation; temporary keys continue to be cleaned up with the installation task |
 | External AI Provider configuration | `DATA/credentials/ai-providers/` | Access-restricted configuration files |
 | Model-cache registration | `DATA/metadata/model-cache/entries/` | Register model information; model weights remain on the cluster volume |

@@ -1,23 +1,78 @@
-import { useSubmission } from '../../../../shared/lib/useSubmission';
 import { useEffect, useRef, useState } from 'react';
 import { AlertTriangle } from 'lucide-react';
+import { Button } from '../../../../shared/ui/Button';
 import { DeleteConfirmation } from '../../../../shared/ui/DeleteConfirmation';
 import { Checkbox, Input, Label } from '../../../../shared/ui/FormControls';
+import { Modal } from '../../../../shared/ui/Modal';
+import { errorMessage } from '../../../../shared/lib/errorMessage';
+import {
+    isDeploymentCleanupHandoffError,
+    parseDeploymentCleanupHandoff,
+    verifyDeploymentCleanup,
+} from '../../api/agenticDeploymentBackend';
+import { DeploymentPermissionHandoff } from '../DeploymentPlanReview';
 import {
     deleteConfirmationPhrase,
     deploymentTitle,
     isDeletionInProgressStatus,
 } from './deploymentPresentation';
 
-export function DeleteDeploymentModal({ deployment, clusterNameById = {}, onCancel, onDelete }) {
+export async function executeDeploymentDeleteAction({
+    onDelete,
+    deleteNamespace,
+    onCleanupHandoff,
+    onError,
+}) {
+    try {
+        await onDelete({ deleteNamespace });
+        return { status: 'deleted' };
+    } catch (failure) {
+        if (isDeploymentCleanupHandoffError(failure)) {
+            onCleanupHandoff?.(parseDeploymentCleanupHandoff(failure));
+            return { status: 'handoff' };
+        }
+        onError?.(errorMessage(failure, 'Failed to delete deployment'));
+        return { status: 'error' };
+    }
+}
+
+export function DeleteDeploymentModal({
+    deployment,
+    clusterNameById = {},
+    onCancel,
+    onDelete,
+    onCleanupComplete,
+    onVerifyCleanup = verifyDeploymentCleanup,
+    initialCleanupHandoff = null,
+    inline = false,
+}) {
     const [confirmation, setConfirmation] = useState('');
     const [deleteNamespace, setDeleteNamespace] = useState(true);
-    const { pending: deleting, error, run } = useSubmission('Failed to delete deployment', { keepPendingOnSuccess: true });
+    const [deleting, setDeleting] = useState(false);
+    const [error, setError] = useState('');
+    const [cleanupHandoff, setCleanupHandoff] = useState(initialCleanupHandoff);
+    const [cleanupBusy, setCleanupBusy] = useState(false);
+    const [cleanupConfirmed, setCleanupConfirmed] = useState(false);
+    const [cleanupError, setCleanupError] = useState('');
     const inputRef = useRef(null);
+    const submittingRef = useRef(false);
+    const mountedRef = useRef(true);
+
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => { mountedRef.current = false; };
+    }, []);
 
     useEffect(() => {
         inputRef.current?.focus();
     }, []);
+
+    useEffect(() => {
+        setCleanupHandoff(initialCleanupHandoff);
+        setCleanupConfirmed(false);
+        setCleanupError('');
+        setError('');
+    }, [deployment?.execution_id, initialCleanupHandoff]);
 
     if (!deployment) return null;
 
@@ -27,9 +82,113 @@ export function DeleteDeploymentModal({ deployment, clusterNameById = {}, onCanc
 
     const submit = async (event) => {
         event.preventDefault();
-        if (!confirmed || deleting) return;
-        await run(() => onDelete({ deleteNamespace }));
+        if (!confirmed || deleting || submittingRef.current) return;
+        submittingRef.current = true;
+        setDeleting(true);
+        setError('');
+        let succeeded = false;
+        try {
+            const outcome = await executeDeploymentDeleteAction({
+                onDelete,
+                deleteNamespace,
+                onCleanupHandoff: (handoff) => {
+                    if (!mountedRef.current) return;
+                    setError('');
+                    setCleanupError('');
+                    setCleanupConfirmed(false);
+                    setCleanupHandoff(handoff);
+                },
+                onError: (message) => {
+                    if (mountedRef.current) setError(message);
+                },
+            });
+            succeeded = outcome.status === 'deleted';
+        } finally {
+            if (!succeeded && mountedRef.current) {
+                submittingRef.current = false;
+                setDeleting(false);
+            }
+        }
     };
+
+    const runCleanupVerify = async ({ forceDeleteRecord = false } = {}) => {
+        if (!cleanupHandoff || cleanupBusy) return;
+        setCleanupBusy(true);
+        setCleanupError('');
+        try {
+            const result = await onVerifyCleanup(deployment.execution_id, {
+                cleanupDigest: cleanupHandoff.cleanupDigest,
+                deleteRecordOnVerify: true,
+                forceDeleteRecord,
+            });
+            if (!mountedRef.current) return;
+            if (result?.deleted) {
+                onCleanupComplete?.(result);
+                return;
+            }
+            setCleanupHandoff((prev) => {
+                if (!prev) return prev;
+                const nextCanVerify = result?.canVerifyMarker ?? prev.canVerifyMarker;
+                const nextRemaining = Array.isArray(result?.remainingOperations)
+                    ? result.remainingOperations
+                    : prev.remainingOperations;
+                return {
+                    ...prev,
+                    status: result?.status || prev.status,
+                    marker: result?.marker || prev.marker,
+                    canVerifyMarker: nextCanVerify,
+                    confirmRequired: nextCanVerify ? Boolean(result?.unreachable) : true,
+                    operations: prev.operations?.length ? prev.operations : (nextRemaining || []),
+                    remainingOperations: nextRemaining,
+                    warnings: Array.isArray(result?.warnings) ? result.warnings : prev.warnings,
+                    verified: Boolean(result?.verified),
+                };
+            });
+            setCleanupError(result?.message || 'Orchestration administrator cleanup is not yet complete. Run the script and try again.');
+        } catch (failure) {
+            if (!mountedRef.current) return;
+            setCleanupError(errorMessage(failure, 'Failed to verify Orchestration administrator cleanup'));
+        } finally {
+            if (mountedRef.current) setCleanupBusy(false);
+        }
+    };
+
+    if (cleanupHandoff) {
+        return (
+            <Modal
+                isOpen
+                inline={inline}
+                onClose={cleanupBusy ? undefined : onCancel}
+                title="Orchestration administrator namespace cleanup"
+                subtitle={deploymentTitle(deployment)}
+                size="lg"
+                closeOnBackdrop={!cleanupBusy}
+                closeOnEscape={!cleanupBusy}
+                footer={(
+                    <Button variant="secondary" onClick={onCancel} disabled={cleanupBusy}>
+                        Close
+                    </Button>
+                )}
+            >
+                <DeploymentPermissionHandoff
+                    mode="cleanup"
+                    handoff={cleanupHandoff}
+                    namespace={cleanupHandoff.namespace || deployment.namespace || ''}
+                    script={cleanupHandoff.script}
+                    filename={cleanupHandoff.scriptFilename}
+                    instructions={cleanupHandoff.instructions}
+                    warnings={cleanupHandoff.warnings}
+                    error={cleanupError}
+                    verifying={cleanupBusy}
+                    onPrimaryAction={() => runCleanupVerify({ forceDeleteRecord: false })}
+                    primaryActionLabel="Re-check & Delete"
+                    confirmed={cleanupConfirmed}
+                    onConfirmChange={setCleanupConfirmed}
+                    onConfirmDelete={() => runCleanupVerify({ forceDeleteRecord: true })}
+                />
+            </Modal>
+        );
+    }
 
     return (
         <DeleteConfirmation

@@ -12,6 +12,7 @@ from typing import Any
 
 import yaml
 
+from llm_d_lens.cluster.registry import validate_container_image_ref
 from llm_d_lens.configuration.manifest_facts import workload_roles
 from llm_d_lens.configuration.router_compatibility import compatible_router_values
 from llm_d_lens.core.hashing import stable_hash
@@ -259,10 +260,10 @@ class PdDisaggregationAdapter:
         )
 
     async def deploy(self, artifact, context):
+        from llm_d_lens.deploy.providers.kubernetes import ensure_namespace_accessible
+
         namespace = context["namespace"]
-        status, stdout, stderr = await self._runner(["kubectl", "create", "namespace", namespace])
-        if status != 0 and "AlreadyExists" not in stderr:
-            raise RuntimeError((stderr or stdout).strip())
+        await ensure_namespace_accessible(self._runner, namespace)
         model_secret = (context.get("deployment_policy") or {}).get("model_secret") or {}
         if "endpoint" not in artifact.deployment_contract and model_secret.get("mode") == "existing-secret":
             await self._runner.copy_model_secret(namespace, model_secret["sourceNamespace"], model_secret["sourceName"])
@@ -573,8 +574,9 @@ class PdDisaggregationAdapter:
 
     def _parameters(self, overrides):
         model, runtime = overrides.get("model") or {}, overrides.get("runtime") or {}
-        if not model.get("name") or not runtime.get("image") or ":" not in runtime["image"]:
+        if not model.get("name"):
             raise ValueError("pd-disaggregation requires model.name and a tagged runtime.image")
+        image = validate_container_image_ref(runtime.get("image"), field="runtime.image", allow_empty=False) or ""
         # The variant id is accelerator-specific (XPU: vllm/vllm-rdma; NVIDIA GPU:
         # the vLLM infra-provider overlay such as base); the adapter validates it
         # against the overlays available for the active accelerator.
@@ -585,7 +587,7 @@ class PdDisaggregationAdapter:
         result: dict[str, Any] = {
             "variant": variant,
             "model": model["name"],
-            "image": runtime["image"],
+            "image": image,
             "mount_path": runtime.get("mountPath") or "",
             "environment": runtime.get("environment") if isinstance(runtime.get("environment"), dict) else {},
             "custom_parameters": overrides.get("customParameters") or [],

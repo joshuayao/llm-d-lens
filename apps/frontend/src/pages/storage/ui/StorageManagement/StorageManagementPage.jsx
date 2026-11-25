@@ -202,8 +202,20 @@ export function StorageManagementPage({ initialClusterId = '', initialVolumeId =
 
     const handleCreate = async (payload) => {
         const created = await createStorageVolume(payload);
-        setItems((current) => [created, ...current]);
+        setItems((current) => [created, ...current.filter((item) => item.id !== created.id)]);
+        setSelectedResourceId(created.id);
         setNotice('Storage volume creation started');
+        closeDialog();
+    };
+
+    const handleCreatedFromHandoff = (volume) => {
+        if (volume?.id) {
+            setItems((current) => [volume, ...current.filter((item) => item.id !== volume.id)]);
+            setSelectedResourceId(volume.id);
+        } else {
+            load({ quiet: true });
+        }
+        setNotice('Storage volume verified and registered');
         closeDialog();
     };
 
@@ -223,6 +235,12 @@ export function StorageManagementPage({ initialClusterId = '', initialVolumeId =
         } finally {
             setMutatingId(null);
         }
+    };
+
+    const handleDeletedFromHandoff = (volumeId) => {
+        setItems((current) => current.filter((item) => item.id !== volumeId));
+        setNotice('Storage volume deleted');
+        closeDialog();
     };
 
     const handleAcknowledgeNodes = async (item) => {
@@ -431,9 +449,17 @@ export function StorageManagementPage({ initialClusterId = '', initialVolumeId =
                     defaultPurpose={createPurpose}
                     onCancel={closeDialog}
                     onCreate={handleCreate}
+                    onCreatedFromHandoff={handleCreatedFromHandoff}
                 />
             )}
-            {dialog === 'delete' && <DeleteStorageVolumeModal volume={selected} onCancel={closeDialog} onDelete={handleDelete} />}
+            {dialog === 'delete' && (
+                <DeleteStorageVolumeModal
+                    volume={selected}
+                    onCancel={closeDialog}
+                    onDelete={handleDelete}
+                    onDeletedFromHandoff={handleDeletedFromHandoff}
+                />
+            )}
         </ModulePage>
     );
 }

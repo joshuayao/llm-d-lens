@@ -136,6 +136,12 @@ class AgenticApprovalRequest(BaseModel):
         default=None,
         description="Required for source compositions: a reviewed Service value from configuration_plan.endpoints.",
     )
+    namespace: str | None = Field(
+        default=None,
+        description=(
+            "Optional verified deployment namespace from permission preflight or Orchestration administrator bootstrap."
+        ),
+    )
 
 
 class AgenticDecisionMetadata(BaseModel):

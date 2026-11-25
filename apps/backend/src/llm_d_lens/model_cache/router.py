@@ -87,7 +87,11 @@ async def get_entry(entry_id: str, request: Request = None) -> dict:
     ),
     operation_id="create_model_cache_entry",
 )
-async def create_entry(request: ModelCacheCreateRequest) -> dict:
+async def create_entry(
+    request: ModelCacheCreateRequest,
+    http_request: Request = None,
+) -> dict:
+    require_cluster_access(current_principal(http_request), request.cluster_id)
     try:
         entry = await _service.request_download(request)
     except ModelCacheEntryExistsError as error:
@@ -133,7 +137,12 @@ async def _provision(entry_id: str) -> None:
     description="Retry a failed or retryable Model Cache entry download.",
     operation_id="retry_model_cache_entry",
 )
-async def retry_entry(entry_id: str) -> dict:
+async def retry_entry(entry_id: str, request: Request = None) -> dict:
+    try:
+        current = await _service.get(entry_id)
+    except ModelCacheNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    require_cluster_access(current_principal(request), current.cluster_id)
     try:
         entry = _service.retry(entry_id)
     except ModelCacheNotFoundError as error:
@@ -163,13 +172,23 @@ async def _provision_new_nodes(entry_id: str) -> None:
     ),
     operation_id="sync_model_cache_nodes",
 )
-async def sync_all_entry_nodes(cluster_id: str = "") -> dict:
+async def sync_all_entry_nodes(request: Request = None, cluster_id: str = "") -> dict:
     """One-click fix: (re)download onto every cluster node any ``local-disk``
     entry hasn't reached yet, across all entries (optionally scoped to a
     cluster). Meant for the Model Cache page's "Sync new nodes" action once
     cluster scale-out leaves some cached models incomplete on new nodes.
     """
-    changed = await _service.sync_all_nodes(cluster_id=cluster_id or None)
+    principal = current_principal(request)
+    if cluster_id:
+        require_cluster_access(principal, cluster_id)
+        clusters = [cluster_id]
+    else:
+        entries = await _service.list()
+        visible = filter_by_cluster(entries, lambda item: item.cluster_id, principal)
+        clusters = sorted({entry.cluster_id for entry in visible})
+    changed = []
+    for visible_cluster_id in clusters:
+        changed.extend(await _service.sync_all_nodes(cluster_id=visible_cluster_id))
     for entry in changed:
         asyncio.create_task(_provision_new_nodes(entry.id))
     if changed:
@@ -187,7 +206,12 @@ async def sync_all_entry_nodes(cluster_id: str = "") -> dict:
     ),
     operation_id="sync_model_cache_entry_nodes",
 )
-async def sync_entry_nodes(entry_id: str) -> dict:
+async def sync_entry_nodes(entry_id: str, request: Request = None) -> dict:
+    try:
+        current = await _service.get(entry_id)
+    except ModelCacheNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    require_cluster_access(current_principal(request), current.cluster_id)
     try:
         entry = await _service.sync_nodes(entry_id)
     except ModelCacheNotFoundError as error:
@@ -208,7 +232,12 @@ async def sync_entry_nodes(entry_id: str) -> dict:
     ),
     operation_id="delete_model_cache_entry",
 )
-async def delete_entry(entry_id: str, keep_files: bool = False) -> dict:
+async def delete_entry(entry_id: str, request: Request = None, keep_files: bool = False) -> dict:
+    try:
+        current = await _service.get(entry_id)
+    except ModelCacheNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    require_cluster_access(current_principal(request), current.cluster_id)
     try:
         entry = await _service.request_delete(entry_id, keep_files=keep_files)
     except ModelCacheNotFoundError as error:

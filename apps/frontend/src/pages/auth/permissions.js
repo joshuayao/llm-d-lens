@@ -6,7 +6,7 @@
  */
 
 export function permissionMatches(bound, required) {
-    if (!bound || !required) return false;
+    if (typeof bound !== 'string' || typeof required !== 'string' || !bound || !required) return false;
     if (bound === required) return true;
     const boundParts = bound.split(':');
     const requiredParts = required.split(':');
@@ -15,7 +15,15 @@ export function permissionMatches(bound, required) {
 }
 
 export function hasPermission(permissions = [], required) {
-    if (!required) return true;
+    if (required === undefined || required === null || required === '') return true;
+    if (Array.isArray(required)) {
+        if (required.length === 0) return true;
+        if (!Array.isArray(permissions)) return false;
+        return required.some(
+            (code) => typeof code === 'string' && code.length > 0 && permissions.some((granted) => permissionMatches(granted, code)),
+        );
+    }
+    if (!Array.isArray(permissions) || typeof required !== 'string') return false;
     return permissions.some((granted) => permissionMatches(granted, required));
 }
 

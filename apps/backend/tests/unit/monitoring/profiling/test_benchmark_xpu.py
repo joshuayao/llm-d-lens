@@ -189,3 +189,42 @@ async def test_intel_pci_device_ids_survive_temporary_resourceslice_unavailabili
     result = await collect(monkeypatch, inventory, [sample(0, [0.4])], [sample(0, [100])])
     assert result["summary"]["gpu_utilization_percent"]["mean"] == 40
     assert result["summary"]["gpu_framebuffer_used_bytes"]["mean"] == 100
+
+
+@pytest.mark.asyncio
+async def test_non_admin_resourceslice_403_preserves_namespace_dra_allocations(monkeypatch, inventory):
+    for claim in inventory["resourceclaims.resource.k8s.io"]:
+        for result in claim["status"]["allocation"]["devices"]["results"]:
+            result["device"] = f"0000-0{result['device'][-1]}-00-0-0xe211"
+
+    monkeypatch.setattr(service, "_deployment_target", lambda *_: (object(), "bench", "cluster"))
+    monkeypatch.setattr(service, "_prometheus_clock_offset", lambda _c: _async_val(0.0))
+    monkeypatch.setattr(service, "_prometheus_local_port", lambda *_: _async_val(19090))
+    monkeypatch.setattr(
+        service,
+        "_discover_components",
+        lambda *_: _async_val({"prefill": ["prefill-0"], "decode": ["decode-0"], "epp": []}),
+    )
+
+    async def _async_val(v):
+        return v
+
+    async def restricted_resources(kind, **_):
+        if kind == "resourceslices.resource.k8s.io":
+            raise RuntimeError("Error from server (Forbidden): resourceslices.resource.k8s.io is forbidden")
+        return inventory.get(kind, [])
+
+    async def query(_client, promql, *_):
+        if "hw_gpu_utilization_ratio" in promql:
+            return [sample(0, [0.6])]
+        if "hw_memory_usage_bytes" in promql:
+            return [sample(0, [512])]
+        return []
+
+    monkeypatch.setattr(service, "list_resources", restricted_resources)
+    monkeypatch.setattr(service, "_query_range", query)
+
+    result = await service.collect_benchmark_observability("execution", "1970-01-01T00:16:40Z", "1970-01-01T00:17:00Z")
+    assert result["status"] == "available"
+    assert result["summary"]["gpu_utilization_percent"]["mean"] == 60
+    assert result["summary"]["gpu_framebuffer_used_bytes"]["mean"] == 512

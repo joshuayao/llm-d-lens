@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
+
+from llm_d_lens.auth.access import current_principal, require_cluster_access
 
 from .errors import GpuDriverError
 from .models import (
@@ -16,6 +19,7 @@ from .models import (
 from .service import get_status, install
 
 router = APIRouter(prefix="/api/v1/monitoring/gpu-driver", tags=["gpu-driver"])
+logger = logging.getLogger(__name__)
 
 
 def _http_error(error: GpuDriverError) -> HTTPException:
@@ -52,7 +56,10 @@ async def create_install(
     payload: GpuDriverInstallRequest,
     cluster_id: str | None = Query(default=None, max_length=64),
     hardware: str | None = Query(default=None, max_length=64),
+    http_request: Request = None,
 ) -> GpuDriverInstallResponse:
+    if cluster_id:
+        require_cluster_access(current_principal(http_request), cluster_id)
     try:
         return await install(payload.access_mode, cluster_id=cluster_id, hardware=hardware)
     except GpuDriverError as error:

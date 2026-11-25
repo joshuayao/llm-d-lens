@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, copyFileSync, symlinkSync, existsSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, copyFileSync, symlinkSync, existsSync, chmodSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 
 test('installer legacy backend port selects the unified port and resolves collisions once', t => {
-  const { root } = setup(t);
+  const { root, storageEnv } = setup(t);
   const result = spawnSync('bash', ['-c', `
     source "$1"
     parse_args --app-port 3000 --backend-port 4100
@@ -16,7 +16,7 @@ test('installer legacy backend port selects the unified port and resolves collis
     resolve_ports_silently
     printf '%s:%s\\n' "$APP_PORT" "$BACKEND_PORT"
   `, 'test', resolve('scripts/LensInstaller-Ubuntu-x86_64-online.sh')], {
-    cwd: root, encoding: 'utf8',
+    cwd: root, encoding: 'utf8', env: { ...process.env, ...storageEnv },
   });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), '4101:4101');
@@ -24,7 +24,7 @@ test('installer legacy backend port selects the unified port and resolves collis
 });
 
 test('installed controller refuses startup when the Python MCP catalog fails', t => {
-  const { root, put } = setup(t);
+  const { root, put, storageEnv } = setup(t);
   execFileSync('bash', ['-c', 'source "$1"; INSTALL_DIR="$2"; write_control_script',
     'test', resolve('scripts/LensInstaller-Ubuntu-x86_64-online.sh'), root]);
   execFileSync('bash', ['-n', join(root, 'lensctl.sh')]);
@@ -44,8 +44,7 @@ exit 1
   chmodSync(join(root, '.venv/bin/python'), 0o755);
   const result = spawnSync('bash', [join(root, 'lensctl.sh'), 'start'], {
     encoding: 'utf8',
-    env: { ...process.env, LENS_DATA_DIR: join(root, 'data'), LENS_CACHE_DIR: join(root, 'cache'),
-      LENS_LOG_DIR: join(root, 'logs'), LENS_SCRATCH_DIR: join(root, 'scratch') },
+    env: { ...process.env, ...storageEnv },
   });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /MCP tool catalog validation failed/);
@@ -56,7 +55,7 @@ exit 1
 });
 
 test('unified HTTPS launcher defaults the MCP trust certificate and preserves explicit overrides', t => {
-  const { root, put } = setup(t);
+  const { root, put, storageEnv } = setup(t);
   copyFileSync('hack/run-backend.sh', join(root, 'hack/run-backend.sh'));
   put('bin/python', `#!/usr/bin/env bash
 if [[ "$1" == -c ]]; then exit 0; fi
@@ -67,11 +66,9 @@ printf '%s\\n' "$PRISM_MCP_URL" "$PRISM_MCP_CA_FILE" "$@"
   for (const customCa of ['', '/custom/ca.pem']) {
     const result = spawnSync('bash', [join(root, 'hack/run-backend.sh')], {
       encoding: 'utf8',
-      env: { ...process.env, PYTHON_BIN: join(root, 'bin/python'), BACKEND_PORT: '4100',
+      env: { ...process.env, ...storageEnv, PYTHON_BIN: join(root, 'bin/python'), BACKEND_PORT: '4100',
         TLS_CERT_FILE: '/cert with spaces.pem', TLS_KEY_FILE: '/key.pem', TLS_CA_FILE: '',
-        PRISM_MCP_URL: '', PRISM_MCP_CA_FILE: customCa,
-        LENS_DATA_DIR: join(root, 'data'), LENS_CACHE_DIR: join(root, 'cache'),
-        LENS_LOG_DIR: join(root, 'logs'), LENS_SCRATCH_DIR: join(root, 'scratch') },
+        PRISM_MCP_URL: '', PRISM_MCP_CA_FILE: customCa },
     });
     assert.equal(result.status, 0, result.stderr);
     const lines = result.stdout.trim().split('\n');
@@ -81,9 +78,7 @@ printf '%s\\n' "$PRISM_MCP_URL" "$PRISM_MCP_CA_FILE" "$@"
   }
   const failed = spawnSync('bash', [join(root, 'hack/run-backend.sh')], {
     encoding: 'utf8',
-    env: { ...process.env, PYTHON_BIN: join(root, 'bin/python'), LENS_TEST_BOOTSTRAP_EXIT: '42',
-      LENS_DATA_DIR: join(root, 'data'), LENS_CACHE_DIR: join(root, 'cache'),
-      LENS_LOG_DIR: join(root, 'logs'), LENS_SCRATCH_DIR: join(root, 'scratch') },
+    env: { ...process.env, ...storageEnv, PYTHON_BIN: join(root, 'bin/python'), LENS_TEST_BOOTSTRAP_EXIT: '42' },
   });
   assert.equal(failed.status, 42);
   assert.equal(failed.stdout, '');
@@ -98,7 +93,7 @@ test('installed controller mirrors HTTPS into the Gateway authz TLS override', t
     ['HTTPS downgraded when no certificate host is detectable', { https: 1, cert: false }, {}, '0'],
   ];
   for (const [name, install, env, expected] of cases) {
-    const { root, put } = setup(t);
+    const { root, put, storageEnv } = setup(t);
     execFileSync('bash', ['-c', 'source "$1"; INSTALL_DIR="$2"; write_control_script',
       'test', resolve('scripts/LensInstaller-Ubuntu-x86_64-online.sh'), root]);
     execFileSync('bash', ['-n', join(root, 'lensctl.sh')]);
@@ -124,10 +119,8 @@ test('installed controller mirrors HTTPS into the Gateway authz TLS override', t
     }
     const result = spawnSync('bash', [join(root, 'lensctl.sh'), 'start'], {
       encoding: 'utf8',
-      env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`,
-        LENS_TEST_MARKER: marker, LENS_DATA_DIR: join(root, 'data'),
-        LENS_CACHE_DIR: join(root, 'cache'), LENS_LOG_DIR: join(root, 'logs'),
-        LENS_SCRATCH_DIR: join(root, 'scratch'),
+      env: { ...process.env, ...storageEnv, PATH: `${join(root, 'bin')}:${process.env.PATH}`,
+        LENS_TEST_MARKER: marker,
         LENS_MODEL_GATEWAY_AUTHZ_TLS_INSECURE: undefined,
         TLS_CERT_FILE: '', TLS_KEY_FILE: '', APP_HOST: undefined, LENS_IN_PLACE: undefined,
         ...env },
@@ -140,6 +133,13 @@ test('installed controller mirrors HTTPS into the Gateway authz TLS override', t
 function setup(t) {
   const root = mkdtempSync(join(tmpdir(), 'reuse-dev-start-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
+  const storageEnv = {
+    LENS_DATA_DIR: join(root, 'data'),
+    LENS_CACHE_DIR: join(root, 'cache'),
+    LENS_LOG_DIR: join(root, 'logs'),
+    LENS_SCRATCH_DIR: join(root, 'scratch'),
+    LENS_RUNTIME_DIR: join(root, 'runtime'),
+  };
   const put = (path, text) => { mkdirSync(resolve(root, path, '..'), { recursive: true }); writeFileSync(join(root, path), text); };
   put('src/a.js', 'export function load() { return 1; }');
   put('.reuse/catalog.json', JSON.stringify({ version: 1, entries: [{ id: 'load', path: 'src/a.js', symbols: ['load'], purpose: 'Load', boundaries: 'Local only', examples: ['src/a.js'], tests: [], testNote: 'None' }] }));
@@ -183,6 +183,7 @@ printf '%s\\n' "$LENS_TEST_NODE_JSON"
     encoding: 'utf8',
     env: {
       ...process.env,
+      ...storageEnv,
       TARGET_NODE: '',
       PRISM_K8S_TARGET_NODE: '',
       PRISM_GPU_PCI_ALLOWLIST: '',
@@ -197,7 +198,7 @@ printf '%s\\n' "$LENS_TEST_NODE_JSON"
       ...env,
     },
   });
-  return { root, put, run };
+  return { root, put, run, storageEnv };
 }
 
 test('restart from hack regenerates the map and validates it before restarting services', t => {
@@ -341,7 +342,7 @@ for (const command of ['start', 'restart']) test(`pending refactor decision warn
 });
 
 for (const target of ['frontend', 'server', 'backend', 'all']) test(`targeted restart limits process and readiness work to ${target}`, t => {
-  const { root } = setup(t);
+  const { root, storageEnv } = setup(t);
   const result = spawnSync('bash', ['-c', `
     source hack/lens-local.sh
     prepare_start() { echo "prepare $1"; }
@@ -355,7 +356,7 @@ for (const target of ['frontend', 'server', 'backend', 'all']) test(`targeted re
     wait_for_http() { echo "wait $1"; }
     print_initial_admin_credentials() { :; }
     lens_local_main restart "$1"
-  `, 'test', target], { cwd: root, encoding: 'utf8' });
+  `, 'test', target], { cwd: root, encoding: 'utf8', env: { ...process.env, ...storageEnv } });
   assert.equal(result.status, 0, result.stdout + result.stderr);
   const lines = result.stdout.split('\n');
   const effectiveTarget = target === 'server' ? 'backend' : target;
@@ -377,8 +378,8 @@ test('MCP catalog failure prevents stopping existing services', t => {
 });
 
 test('unknown restart target fails before touching the environment', t => {
-  const { root } = setup(t);
-  const result = spawnSync('bash', ['-c', 'source hack/lens-local.sh; prepare_start() { echo unexpected; }; lens_local_main restart invalid'], { cwd: root, encoding: 'utf8' });
+  const { root, storageEnv } = setup(t);
+  const result = spawnSync('bash', ['-c', 'source hack/lens-local.sh; prepare_start() { echo unexpected; }; lens_local_main restart invalid'], { cwd: root, encoding: 'utf8', env: { ...process.env, ...storageEnv } });
   assert.equal(result.status, 2);
   assert.ok(!result.stdout.includes('unexpected'));
 });
@@ -391,16 +392,16 @@ test('startup does not parse unrelated unregistered implementations', t => {
 });
 
 test('frontend environment checks do not require a Python venv or Rust', t => {
-  const { root } = setup(t);
+  const { root, storageEnv } = setup(t);
   mkdirSync(join(root, 'node_modules'));
-  const result = spawnSync('bash', ['-c', 'source hack/lens-local.sh; cmd_check frontend'], { cwd: root, encoding: 'utf8' });
+  const result = spawnSync('bash', ['-c', 'source hack/lens-local.sh; cmd_check frontend'], { cwd: root, encoding: 'utf8', env: { ...process.env, ...storageEnv } });
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.ok(!result.stdout.includes('venv:'));
   assert.ok(!result.stdout.includes('rust:'));
 });
 
 test('targeted restart restores the actual ports of running peer services', t => {
-  const { root, put } = setup(t);
+  const { root, put, storageEnv } = setup(t);
   put('.dev-pids/backend.port', '8099\n');
   const result = spawnSync('bash', ['-c', `
     source hack/lens-local.sh
@@ -409,13 +410,13 @@ test('targeted restart restores the actual ports of running peer services', t =>
     cmd_stop() { :; }
     start_services() { echo "backend=$BACKEND_PORT"; }
     cmd_restart server
-  `], { cwd: root, encoding: 'utf8' });
+  `], { cwd: root, encoding: 'utf8', env: { ...process.env, ...storageEnv } });
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /backend=8099/);
 });
 
 test('restart all reloads previously recorded ports', t => {
-  const { root, put } = setup(t);
+  const { root, put, storageEnv } = setup(t);
   put('.dev-pids/backend.port', '8099\n');
   put('.dev-pids/frontend.port', '5199\n');
   const result = spawnSync('bash', ['-c', `
@@ -424,13 +425,13 @@ test('restart all reloads previously recorded ports', t => {
     cmd_stop() { :; }
     start_services() { echo "frontend=$FRONTEND_PORT backend=$BACKEND_PORT"; }
     cmd_restart all
-  `], { cwd: root, encoding: 'utf8' });
+  `], { cwd: root, encoding: 'utf8', env: { ...process.env, ...storageEnv } });
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /frontend=5199 backend=8099/);
 });
 
 test('targeted restart uses the recorded port for a stopped backend', t => {
-  const { root, put } = setup(t);
+  const { root, put, storageEnv } = setup(t);
   put('.dev-pids/backend.port', '8099\n');
   const result = spawnSync('bash', ['-c', `
     source hack/lens-local.sh
@@ -438,27 +439,27 @@ test('targeted restart uses the recorded port for a stopped backend', t => {
     cmd_stop() { :; }
     start_services() { echo "backend=$BACKEND_PORT"; }
     cmd_restart backend
-  `], { cwd: root, encoding: 'utf8' });
+  `], { cwd: root, encoding: 'utf8', env: { ...process.env, ...storageEnv } });
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /backend=8099/);
 });
 
 test('legacy running services without port state fail before stopping anything', t => {
-  const { root } = setup(t);
+  const { root, storageEnv } = setup(t);
   const result = spawnSync('bash', ['-c', `
     source hack/lens-local.sh
     is_running() { [[ "$1" == backend ]]; }
     prepare_start() { echo unexpected; }
     cmd_stop() { echo unexpected; }
     cmd_restart server
-  `], { cwd: root, encoding: 'utf8' });
+  `], { cwd: root, encoding: 'utf8', env: { ...process.env, ...storageEnv } });
   assert.equal(result.status, 1);
   assert.match(result.stdout + result.stderr, /restart all once/);
   assert.ok(!result.stdout.includes('unexpected'));
 });
 
 test('targeted restart refuses to move ports without updating peer proxies', t => {
-  const { root } = setup(t);
+  const { root, storageEnv } = setup(t);
   const result = spawnSync('bash', ['-c', `
     source hack/lens-local.sh
     ensure_tls() { :; }
@@ -466,7 +467,7 @@ test('targeted restart refuses to move ports without updating peer proxies', t =
     cmd_check() { echo unexpected; }
     start_one() { echo unexpected; }
     start_services frontend
-  `], { cwd: root, encoding: 'utf8' });
+  `], { cwd: root, encoding: 'utf8', env: { ...process.env, ...storageEnv } });
   assert.equal(result.status, 1);
   assert.match(result.stdout + result.stderr, /update dependent proxies/);
   assert.ok(!result.stdout.includes('unexpected'));
@@ -488,6 +489,13 @@ test('targeted restart composes with upstream target-node and kubeconfig options
 test('manual full validation runs every check and propagates failures without audit records', t => {
   const root = mkdtempSync(join(tmpdir(), 'reuse-full-check-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
+  const isolatedEnv = {
+    LENS_DATA_DIR: join(root, 'data'),
+    LENS_CACHE_DIR: join(root, 'cache'),
+    LENS_LOG_DIR: join(root, 'logs'),
+    LENS_SCRATCH_DIR: join(root, 'scratch'),
+    LENS_RUNTIME_DIR: join(root, 'runtime'),
+  };
   mkdirSync(join(root, 'bin'));
   const stub = join(root, 'bin/stub');
   writeFileSync(stub, '#!/bin/sh\necho "$*" >> "$CHECK_CALLS"\nif [ "$FAIL_CHECK" = 1 ] && [ "$1 $2" = "run lint" ]; then exit 3; fi\n');
@@ -496,7 +504,7 @@ test('manual full validation runs every check and propagates failures without au
   for (const failure of ['0', '1']) {
     const calls = join(root, `calls-${failure}`);
     const result = spawnSync('make', ['-f', resolve('Makefile'), 'verify-full', `MAKE=${join(root, 'bin/mock-make')}`], {
-      cwd: root, encoding: 'utf8', env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`,
+      cwd: root, encoding: 'utf8', env: { ...process.env, ...isolatedEnv, PATH: `${join(root, 'bin')}:${process.env.PATH}`,
         PRISM_PYTHON_BIN: join(root, 'bin/python3'), CHECK_CALLS: calls, FAIL_CHECK: failure },
     });
     assert.equal(result.status === 0, failure === '0', result.stdout + result.stderr);
@@ -505,4 +513,418 @@ test('manual full validation runs every check and propagates failures without au
     if (failure === '1') assert.match(result.stdout, /FAIL lint/);
     assert.equal(existsSync(join(root, '.cache/reuse/tasks')), false);
   }
+});
+
+function isPidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const rparen = stat.lastIndexOf(')');
+    if (rparen !== -1) {
+      const state = stat.slice(rparen + 1).trimStart()[0];
+      if (state === 'Z' || state === 'X') return false;
+    }
+  } catch (err) {
+    if (err.code === 'ENOENT' || err.code === 'ESRCH') return false;
+  }
+  return true;
+}
+
+async function waitUntil(predicate, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(resolveTimer => setTimeout(resolveTimer, 20));
+  }
+  assert.fail(`Timed out after ${timeoutMs}ms waiting for condition`);
+}
+
+async function spawnMockBackend(t, { cwd, env, port = 4321, app = 'llm_d_lens.api:app' }) {
+  const proc = spawn('python3', [
+    '-c',
+    'import signal, sys, time; signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(60)',
+    '--',
+    '-m',
+    'uvicorn',
+    app,
+    '--port',
+    String(port),
+  ], { cwd, env, stdio: 'ignore' });
+  t.after(() => {
+    try { proc.kill('SIGKILL'); } catch {}
+  });
+  await waitUntil(() => {
+    if (!isPidAlive(proc.pid)) return false;
+    try {
+      const cmdline = readFileSync(`/proc/${proc.pid}/cmdline`, 'utf8');
+      return cmdline.includes('uvicorn') && cmdline.includes(app);
+    } catch {
+      return true;
+    }
+  });
+  return proc;
+}
+
+function runLensLocalLifecycle(root, command, args = [], env = {}, bodySuffix = '') {
+  return spawnSync('bash', ['-c', `
+    source hack/lens-local.sh
+    prepare_start() { :; }
+    ensure_database() { :; }
+    ensure_tls() { :; }
+    resolve_free_port() { echo "$2"; }
+    cmd_check() { :; }
+    start_one() { echo "start:$1" >> "$ROOT_DIR/events"; }
+    wait_for_http() { :; }
+    print_initial_admin_credentials() { :; }
+    ${bodySuffix}
+    lens_local_main "$@"
+  `, 'test', command, ...args], {
+    cwd: root,
+    encoding: 'utf8',
+    env,
+  });
+}
+
+test('backend start writes data-dir owner file and cmd_stop removes it only when matching our PID', async t => {
+  const { root, storageEnv } = setup(t);
+  const env = { ...process.env, ...storageEnv, BACKEND_PORT: '4111' };
+  const startRes = spawnSync('bash', ['-c', `
+    source hack/lens-local.sh
+    start_one backend python3 -c 'import signal, sys, time; signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(60)' -- -m uvicorn llm_d_lens.api:app --port 4111
+  `], { cwd: root, encoding: 'utf8', env });
+  assert.equal(startRes.status, 0, startRes.stdout + startRes.stderr);
+
+  const pidPath = join(root, '.dev-pids/backend.pid');
+  const ourPid = Number(readFileSync(pidPath, 'utf8').trim());
+  t.after(() => { try { process.kill(ourPid, 'SIGKILL'); } catch {} });
+  await waitUntil(() => isPidAlive(ourPid));
+
+  const ownerFile = join(storageEnv.LENS_DATA_DIR, '.runtime/backend.owner');
+  assert.equal(existsSync(ownerFile), true);
+  const ownerText = readFileSync(ownerFile, 'utf8');
+  assert.match(ownerText, new RegExp(`^pid=${ourPid}$`, 'm'));
+  assert.match(ownerText, /^port=4111$/m);
+  assert.match(ownerText, new RegExp(`^root_dir=${realpathSync(root).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+  assert.match(ownerText, new RegExp(`^data_dir=${realpathSync(storageEnv.LENS_DATA_DIR).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+
+  // Overwrite owner file to point to another live Lens backend; cmd_stop must preserve it.
+  const otherCheckout = join(root, 'other-checkout');
+  mkdirSync(otherCheckout, { recursive: true });
+  const otherProc = await spawnMockBackend(t, { cwd: otherCheckout, env, port: 4112 });
+  writeFileSync(ownerFile, `pid=${otherProc.pid}\nport=4112\nroot_dir=${otherCheckout}\ndata_dir=${realpathSync(storageEnv.LENS_DATA_DIR)}\n`);
+
+  const stopOther = spawnSync('bash', ['-c', 'source hack/lens-local.sh; cmd_stop backend'], { cwd: root, encoding: 'utf8', env });
+  assert.equal(stopOther.status, 0, stopOther.stdout + stopOther.stderr);
+  await waitUntil(() => !isPidAlive(ourPid));
+  assert.equal(existsSync(ownerFile), true);
+  assert.match(readFileSync(ownerFile, 'utf8'), new RegExp(`^pid=${otherProc.pid}$`, 'm'));
+
+  // Matching PID (and stale dead PID) removes the owner file.
+  const secondStart = spawnSync('bash', ['-c', `
+    source hack/lens-local.sh
+    start_one backend python3 -c 'import signal, sys, time; signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(60)' -- -m uvicorn llm_d_lens.api:app --port 4113
+  `], { cwd: root, encoding: 'utf8', env });
+  assert.equal(secondStart.status, 0, secondStart.stdout + secondStart.stderr);
+  const secondPid = Number(readFileSync(pidPath, 'utf8').trim());
+  t.after(() => { try { process.kill(secondPid, 'SIGKILL'); } catch {} });
+  assert.match(readFileSync(ownerFile, 'utf8'), new RegExp(`^pid=${secondPid}$`, 'm'));
+
+  const stopOwn = spawnSync('bash', ['-c', 'source hack/lens-local.sh; cmd_stop backend'], { cwd: root, encoding: 'utf8', env });
+  assert.equal(stopOwn.status, 0, stopOwn.stdout + stopOwn.stderr);
+  await waitUntil(() => !isPidAlive(secondPid));
+  assert.equal(existsSync(ownerFile), false);
+});
+
+test('own running backend is excluded from cmd_status conflict warnings', async t => {
+  const { root, storageEnv } = setup(t);
+  const env = { ...process.env, ...storageEnv, BACKEND_PORT: '4114' };
+  const startRes = spawnSync('bash', ['-c', `
+    source hack/lens-local.sh
+    start_one backend python3 -c 'import signal, sys, time; signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(60)' -- -m uvicorn llm_d_lens.api:app --port 4114
+  `], { cwd: root, encoding: 'utf8', env });
+  assert.equal(startRes.status, 0, startRes.stdout + startRes.stderr);
+  const ourPid = Number(readFileSync(join(root, '.dev-pids/backend.pid'), 'utf8').trim());
+  t.after(() => { try { process.kill(ourPid, 'SIGKILL'); } catch {} });
+  await waitUntil(() => isPidAlive(ourPid));
+
+  const statusRes = spawnSync('bash', ['-c', 'source hack/lens-local.sh; lens_local_main status'], {
+    cwd: root, encoding: 'utf8', env,
+  });
+  assert.equal(statusRes.status, 0, statusRes.stdout + statusRes.stderr);
+  assert.match(statusRes.stdout, new RegExp(`backend: running \\(pid ${ourPid}\\)`));
+  assert.doesNotMatch(statusRes.stdout, /conflicting Lens backend/);
+});
+
+test('conflicting same-user backend with XDG_DATA_HOME fallback and run-backend.sh is detected and stopped', async t => {
+  const { root, put, storageEnv } = setup(t);
+  const xdgDataHome = join(root, 'xdg-data');
+  const expectedDataDir = join(xdgDataHome, 'lens');
+  mkdirSync(expectedDataDir, { recursive: true });
+  const otherCheckout = join(root, 'other-checkout');
+  mkdirSync(otherCheckout, { recursive: true });
+
+  put('other-checkout/hack/run-backend.sh', '#!/usr/bin/env bash\ntrap \'kill "$child" 2>/dev/null || true; exit 0\' TERM INT\nsleep 60 &\nchild=$!\nwait "$child"\n');
+  chmodSync(join(otherCheckout, 'hack/run-backend.sh'), 0o755);
+  const runBackendProc = spawn('bash', [join(otherCheckout, 'hack/run-backend.sh')], {
+    cwd: otherCheckout,
+    env: { ...process.env, ...storageEnv, LENS_DATA_DIR: '', XDG_DATA_HOME: xdgDataHome, BACKEND_PORT: '4215' },
+    stdio: 'ignore',
+  });
+  t.after(() => { try { runBackendProc.kill('SIGKILL'); } catch {} });
+  await waitUntil(() => {
+    if (!isPidAlive(runBackendProc.pid)) return false;
+    try {
+      return readFileSync(`/proc/${runBackendProc.pid}/cmdline`, 'utf8').includes('run-backend.sh');
+    } catch {
+      return false;
+    }
+  });
+
+  const startRes = runLensLocalLifecycle(root, 'start', [], {
+    ...process.env,
+    ...storageEnv,
+    LENS_DATA_DIR: expectedDataDir,
+  });
+  assert.equal(startRes.status, 0, startRes.stdout + startRes.stderr);
+  assert.match(startRes.stdout, new RegExp(`pid=${runBackendProc.pid}`));
+  assert.match(startRes.stdout, /port=4215/);
+  await waitUntil(() => !isPidAlive(runBackendProc.pid));
+});
+
+test('conflicting same-user backend with symlinked LENS_DATA_DIR and no owner file is stopped on start and restart backend', async t => {
+  const { root, storageEnv } = setup(t);
+  const realDataDir = join(root, 'real-data');
+  mkdirSync(realDataDir, { recursive: true });
+  const linkDataDir = join(root, 'link-data');
+  symlinkSync(realDataDir, linkDataDir);
+
+  const otherCheckout = join(root, 'other-checkout');
+  mkdirSync(otherCheckout, { recursive: true });
+
+  const conflictProc = await spawnMockBackend(t, {
+    cwd: otherCheckout,
+    env: { ...process.env, ...storageEnv, LENS_DATA_DIR: `${linkDataDir}/` },
+    port: 4210,
+  });
+
+  const startRes = runLensLocalLifecycle(root, 'start', [], {
+    ...process.env,
+    ...storageEnv,
+    LENS_DATA_DIR: realDataDir,
+  });
+  assert.equal(startRes.status, 0, startRes.stdout + startRes.stderr);
+  assert.match(startRes.stdout, new RegExp(`pid=${conflictProc.pid}`));
+  assert.match(startRes.stdout, /port=4210/);
+  assert.match(startRes.stdout, new RegExp(otherCheckout.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(startRes.stdout, new RegExp(realpathSync(realDataDir).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  await waitUntil(() => !isPidAlive(conflictProc.pid));
+
+  // Verify restart backend also stops a conflicting backend and cleans up its stale owner file.
+  const conflictProc2 = await spawnMockBackend(t, {
+    cwd: otherCheckout,
+    env: { ...process.env, ...storageEnv, LENS_DATA_DIR: realDataDir },
+    port: 4211,
+  });
+  const ownerFile = join(realDataDir, '.runtime/backend.owner');
+  mkdirSync(join(realDataDir, '.runtime'), { recursive: true });
+  writeFileSync(ownerFile, `pid=${conflictProc2.pid}\nport=4211\nroot_dir=${otherCheckout}\ndata_dir=${realpathSync(realDataDir)}\n`);
+
+  const restartRes = runLensLocalLifecycle(root, 'restart', ['backend'], {
+    ...process.env,
+    ...storageEnv,
+    LENS_DATA_DIR: `${linkDataDir}/`,
+  });
+  assert.equal(restartRes.status, 0, restartRes.stdout + restartRes.stderr);
+  assert.match(restartRes.stdout, new RegExp(`pid=${conflictProc2.pid}`));
+  await waitUntil(() => !isPidAlive(conflictProc2.pid));
+  assert.equal(existsSync(ownerFile), false);
+});
+
+test('backend with a different LENS_DATA_DIR is not stopped or warned about', async t => {
+  const { root, storageEnv } = setup(t);
+  const otherDataDir = join(root, 'other-data');
+  mkdirSync(otherDataDir, { recursive: true });
+  const otherCheckout = join(root, 'other-checkout');
+  mkdirSync(otherCheckout, { recursive: true });
+
+  const otherProc = await spawnMockBackend(t, {
+    cwd: otherCheckout,
+    env: { ...process.env, ...storageEnv, LENS_DATA_DIR: otherDataDir },
+    port: 4220,
+  });
+
+  const startRes = runLensLocalLifecycle(root, 'start', [], { ...process.env, ...storageEnv });
+  assert.equal(startRes.status, 0, startRes.stdout + startRes.stderr);
+  assert.doesNotMatch(startRes.stdout, new RegExp(`pid=${otherProc.pid}`));
+  assert.equal(isPidAlive(otherProc.pid), true);
+});
+
+test('LENS_ALLOW_SHARED_DATA_DIR_WRITERS=1 warns without stopping conflicting backend', async t => {
+  const { root, storageEnv } = setup(t);
+  const otherCheckout = join(root, 'other-checkout');
+  mkdirSync(otherCheckout, { recursive: true });
+
+  const conflictProc = await spawnMockBackend(t, {
+    cwd: otherCheckout,
+    env: { ...process.env, ...storageEnv },
+    port: 4230,
+  });
+
+  const startRes = runLensLocalLifecycle(root, 'start', [], {
+    ...process.env,
+    ...storageEnv,
+    LENS_ALLOW_SHARED_DATA_DIR_WRITERS: '1',
+  });
+  assert.equal(startRes.status, 0, startRes.stdout + startRes.stderr);
+  assert.match(startRes.stdout, new RegExp(`pid=${conflictProc.pid}`));
+  assert.match(startRes.stdout, /LENS_ALLOW_SHARED_DATA_DIR_WRITERS=1/);
+  assert.equal(isPidAlive(conflictProc.pid), true);
+});
+
+test('cmd_status warns about conflicting backend on same LENS_DATA_DIR without stopping it', async t => {
+  const { root, storageEnv } = setup(t);
+  const otherCheckout = join(root, 'other-checkout');
+  mkdirSync(otherCheckout, { recursive: true });
+
+  const conflictProc = await spawnMockBackend(t, {
+    cwd: otherCheckout,
+    env: { ...process.env, ...storageEnv },
+    port: 4240,
+  });
+
+  const statusRes = spawnSync('bash', ['-c', 'source hack/lens-local.sh; lens_local_main status'], {
+    cwd: root,
+    encoding: 'utf8',
+    env: { ...process.env, ...storageEnv },
+  });
+  assert.equal(statusRes.status, 0, statusRes.stdout + statusRes.stderr);
+  assert.match(statusRes.stdout, /frontend: stopped/);
+  assert.match(statusRes.stdout, /backend: stopped/);
+  assert.match(statusRes.stdout, new RegExp(`pid=${conflictProc.pid}`));
+  assert.match(statusRes.stdout, /port=4240/);
+  assert.match(statusRes.stdout, new RegExp(otherCheckout.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.equal(isPidAlive(conflictProc.pid), true);
+});
+
+test('restart frontend does not touch a conflicting backend on the same LENS_DATA_DIR', async t => {
+  const { root, storageEnv } = setup(t);
+  const otherCheckout = join(root, 'other-checkout');
+  mkdirSync(otherCheckout, { recursive: true });
+
+  const conflictProc = await spawnMockBackend(t, {
+    cwd: otherCheckout,
+    env: { ...process.env, ...storageEnv },
+    port: 4250,
+  });
+
+  const res = runLensLocalLifecycle(root, 'restart', ['frontend'], { ...process.env, ...storageEnv });
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.doesNotMatch(res.stdout, new RegExp(`pid=${conflictProc.pid}`));
+  assert.equal(isPidAlive(conflictProc.pid), true);
+});
+
+test('PID-reuse guard prevents killing unrelated process referenced by stale owner file', async t => {
+  const { root, storageEnv } = setup(t);
+  const otherCheckout = join(root, 'other-checkout');
+  mkdirSync(otherCheckout, { recursive: true });
+  mkdirSync(join(storageEnv.LENS_DATA_DIR, '.runtime'), { recursive: true });
+
+  const unrelated = spawn('sleep', ['60'], { cwd: otherCheckout, env: { ...process.env, ...storageEnv }, stdio: 'ignore' });
+  t.after(() => { try { unrelated.kill('SIGKILL'); } catch {} });
+  await waitUntil(() => isPidAlive(unrelated.pid));
+
+  // Also ensure a python3 -c script body mentioning uvicorn/llm_d_lens.api:app is not falsely matched.
+  const decoy = spawn('python3', ['-c', 'import time; time.sleep(60) # uvicorn llm_d_lens.api:app'], {
+    cwd: otherCheckout,
+    env: { ...process.env, ...storageEnv },
+    stdio: 'ignore',
+  });
+  t.after(() => { try { decoy.kill('SIGKILL'); } catch {} });
+  await waitUntil(() => isPidAlive(decoy.pid));
+
+  const ownerFile = join(storageEnv.LENS_DATA_DIR, '.runtime/backend.owner');
+  writeFileSync(ownerFile, `pid=${unrelated.pid}\nport=4260\nroot_dir=${otherCheckout}\ndata_dir=${realpathSync(storageEnv.LENS_DATA_DIR)}\n`);
+
+  const statusRes = spawnSync('bash', ['-c', 'source hack/lens-local.sh; lens_local_main status'], {
+    cwd: root,
+    encoding: 'utf8',
+    env: { ...process.env, ...storageEnv },
+  });
+  assert.equal(statusRes.status, 0, statusRes.stdout + statusRes.stderr);
+  assert.doesNotMatch(statusRes.stdout, new RegExp(`pid=${unrelated.pid}`));
+  assert.doesNotMatch(statusRes.stdout, new RegExp(`pid=${decoy.pid}`));
+
+  const startRes = runLensLocalLifecycle(root, 'start', [], { ...process.env, ...storageEnv });
+  assert.equal(startRes.status, 0, startRes.stdout + startRes.stderr);
+  assert.doesNotMatch(startRes.stdout, new RegExp(`pid=${unrelated.pid}`));
+  assert.doesNotMatch(startRes.stdout, new RegExp(`pid=${decoy.pid}`));
+  assert.equal(isPidAlive(unrelated.pid), true);
+  assert.equal(isPidAlive(decoy.pid), true);
+});
+
+test('non-shell decoy referencing run-backend.sh is not matched or killed', async t => {
+  const { root, storageEnv } = setup(t);
+  const decoyViewer = spawn('python3', ['-c', 'import sys, time; time.sleep(60)', 'hack/run-backend.sh'], {
+    cwd: root,
+    env: { ...process.env, ...storageEnv },
+    stdio: 'ignore',
+  });
+  t.after(() => { try { decoyViewer.kill('SIGKILL'); } catch {} });
+  await waitUntil(() => isPidAlive(decoyViewer.pid));
+
+  const decoyShellCmd = spawn('bash', ['-c', 'sleep 60 # hack/run-backend.sh'], {
+    cwd: root,
+    env: { ...process.env, ...storageEnv },
+    stdio: 'ignore',
+  });
+  t.after(() => { try { decoyShellCmd.kill('SIGKILL'); } catch {} });
+  await waitUntil(() => isPidAlive(decoyShellCmd.pid));
+
+  const startRes = runLensLocalLifecycle(root, 'start', [], { ...process.env, ...storageEnv });
+  assert.equal(startRes.status, 0, startRes.stdout + startRes.stderr);
+  assert.doesNotMatch(startRes.stdout, new RegExp(`pid=${decoyViewer.pid}`));
+  assert.doesNotMatch(startRes.stdout, new RegExp(`pid=${decoyShellCmd.pid}`));
+  assert.equal(isPidAlive(decoyViewer.pid), true);
+  assert.equal(isPidAlive(decoyShellCmd.pid), true);
+});
+
+test('missing python3 degrades safely without crashing status or deleting live owner file, and is_pid_running rejects 0', async t => {
+  const { root, storageEnv } = setup(t);
+  const liveProc = spawn('sleep', ['60'], { cwd: root, env: { ...process.env, ...storageEnv }, stdio: 'ignore' });
+  t.after(() => { try { liveProc.kill('SIGKILL'); } catch {} });
+  await waitUntil(() => isPidAlive(liveProc.pid));
+
+  mkdirSync(join(storageEnv.LENS_DATA_DIR, '.runtime'), { recursive: true });
+  const ownerFile = join(storageEnv.LENS_DATA_DIR, '.runtime/backend.owner');
+  writeFileSync(ownerFile, `pid=${liveProc.pid}\nport=4300\nroot_dir=${root}\ndata_dir=${realpathSync(storageEnv.LENS_DATA_DIR)}\n`);
+
+  const pidZeroRes = spawnSync('bash', ['-c', 'source hack/lens-local.sh; is_pid_running 0'], {
+    cwd: root, encoding: 'utf8', env: { ...process.env, ...storageEnv },
+  });
+  assert.notEqual(pidZeroRes.status, 0);
+
+  const statusRes = spawnSync('bash', ['-c', `
+    source hack/lens-local.sh
+    resolve_python_bin() { return 1; }
+    lens_local_main status
+  `], { cwd: root, encoding: 'utf8', env: { ...process.env, ...storageEnv } });
+  assert.equal(statusRes.status, 0, statusRes.stdout + statusRes.stderr);
+  assert.match(statusRes.stdout, /Python inspector unavailable/);
+
+  const stopLiveRes = spawnSync('bash', ['-c', `
+    source hack/lens-local.sh
+    resolve_python_bin() { return 1; }
+    cmd_stop backend
+  `], { cwd: root, encoding: 'utf8', env: { ...process.env, ...storageEnv } });
+  assert.equal(stopLiveRes.status, 0, stopLiveRes.stdout + stopLiveRes.stderr);
+  assert.equal(existsSync(ownerFile), true);
+
+  const guardRes = runLensLocalLifecycle(root, 'start', [], { ...process.env, ...storageEnv }, 'resolve_python_bin() { return 1; }');
+  assert.equal(guardRes.status, 0, guardRes.stdout + guardRes.stderr);
+  assert.match(guardRes.stdout, /Python inspector unavailable/);
+  assert.equal(isPidAlive(liveProc.pid), true);
 });

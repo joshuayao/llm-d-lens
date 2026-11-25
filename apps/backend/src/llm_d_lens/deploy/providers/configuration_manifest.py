@@ -17,7 +17,12 @@ from typing import Any
 import yaml
 
 from llm_d_lens.configuration.disaggregated_set import validate_disaggregated_sets
-from llm_d_lens.configuration.manifest_facts import vllm_argument_value
+from llm_d_lens.configuration.manifest_facts import (
+    _invocation_tokens,
+    _option,
+    vllm_argument_value,
+    workload_roles,
+)
 from llm_d_lens.core.hashing import stable_hash
 from llm_d_lens.deploy.providers.deployment_bundle import validate_deployment_bundle
 from llm_d_lens.deploy.providers.guide_adapter import (
@@ -436,6 +441,150 @@ def prepare_graceful_shutdown(artifact: GuideDeploymentArtifact, output_root: Pa
     )
 
 
+_EXCLUDED_BASELINE_PORTS = frozenset({9002, 9090, 54321})
+_PREFERRED_BASELINE_SUFFIXES = ("-baseline", "-model-servers", "-modelserver")
+
+
+def _modelserver_container_ports(container: dict[str, Any], workload_name: str) -> tuple[set[int], dict[str, int]]:
+    numeric_ports: set[int] = set()
+    named_ports: dict[str, int] = {}
+    declared_ports = container.get("ports")
+    if isinstance(declared_ports, list) and declared_ports:
+        for port_entry in declared_ports:
+            if not isinstance(port_entry, dict):
+                continue
+            if str(port_entry.get("protocol") or "TCP").upper() != "TCP":
+                continue
+            container_port = port_entry.get("containerPort")
+            if (
+                isinstance(container_port, int)
+                and not isinstance(container_port, bool)
+                and container_port > 0
+                and container_port not in _EXCLUDED_BASELINE_PORTS
+            ):
+                numeric_ports.add(container_port)
+                port_name = port_entry.get("name")
+                if isinstance(port_name, str) and port_name:
+                    named_ports[port_name] = container_port
+        return numeric_ports, named_ports
+
+    inferred_port = 8000
+    try:
+        tokens = _invocation_tokens(container, workload_name or "modelserver")
+        port_option = _option(tokens, {"--port"}, workload_name or "modelserver")
+        if port_option is not None:
+            parsed_port = int(port_option)
+            if parsed_port > 0:
+                inferred_port = parsed_port
+    except (ValueError, TypeError):
+        inferred_port = 8000
+    if inferred_port not in _EXCLUDED_BASELINE_PORTS:
+        numeric_ports.add(inferred_port)
+    return numeric_ports, named_ports
+
+
+def _manifest_baseline_endpoint(manifest_text: str, namespace: str, primary_service: str) -> str | None:
+    """Derive the direct model-server Service URL from a rendered deployment manifest."""
+    try:
+        raw_docs = list(yaml.safe_load_all(manifest_text))
+    except yaml.YAMLError:
+        return None
+    docs: list[dict[str, Any]] = []
+    for doc in raw_docs:
+        if not isinstance(doc, dict):
+            continue
+        if doc.get("kind") == "List" and isinstance(doc.get("items"), list):
+            docs.extend(item for item in doc["items"] if isinstance(item, dict))
+        else:
+            docs.append(doc)
+
+    workload_entries: list[tuple[dict[str, Any], set[int], dict[str, int]]] = []
+    for workload in workload_roles(docs):
+        pod = workload.get("pod") or {}
+        containers = [
+            container
+            for container in (pod.get("containers") or [])
+            if isinstance(container, dict) and str(container.get("name") or "").lower().startswith(_MODEL_NAME_PREFIXES)
+        ]
+        if not containers:
+            continue
+        numeric_ports: set[int] = set()
+        named_ports: dict[str, int] = {}
+        workload_name = str(workload.get("name") or "modelserver")
+        for container in containers:
+            container_numeric, container_named = _modelserver_container_ports(container, workload_name)
+            numeric_ports.update(container_numeric)
+            named_ports.update(container_named)
+        if numeric_ports:
+            workload_entries.append((workload.get("pod_labels") or {}, numeric_ports, named_ports))
+    if not workload_entries:
+        return None
+
+    candidates: list[tuple[tuple[bool, bool, bool, int], str]] = []
+    for doc_index, doc in enumerate(docs):
+        if doc.get("kind") != "Service":
+            continue
+        svc_name = str((doc.get("metadata") or {}).get("name") or "")
+        if not svc_name or svc_name == primary_service:
+            continue
+        spec = doc.get("spec") or {}
+        if not isinstance(spec, dict):
+            continue
+        selector = spec.get("selector")
+        if not isinstance(selector, dict) or not selector:
+            continue
+        matched = [
+            (nports, nmports)
+            for labels, nports, nmports in workload_entries
+            if all(labels.get(key) == value for key, value in selector.items())
+        ]
+        if not matched:
+            continue
+        matched_numeric = set().union(*(nports for nports, _ in matched))
+        matched_named = {key: value for _, nmports in matched for key, value in nmports.items()}
+        is_non_headless = str(spec.get("clusterIP") or "").strip().lower() != "none"
+        has_preferred_suffix = svc_name.endswith(_PREFERRED_BASELINE_SUFFIXES)
+        for port_index, port_entry in enumerate(spec.get("ports") or []):
+            if not isinstance(port_entry, dict):
+                continue
+            if str(port_entry.get("protocol") or "TCP").upper() != "TCP":
+                continue
+            svc_port = port_entry.get("port")
+            if (
+                not isinstance(svc_port, int)
+                or isinstance(svc_port, bool)
+                or svc_port <= 0
+                or svc_port in _EXCLUDED_BASELINE_PORTS
+            ):
+                continue
+            target_port = port_entry.get("targetPort")
+            resolved_target: int | None
+            if target_port is None:
+                resolved_target = svc_port
+            elif isinstance(target_port, int) and not isinstance(target_port, bool):
+                resolved_target = target_port
+            elif isinstance(target_port, str) and target_port:
+                resolved_target = matched_named.get(target_port)
+            else:
+                resolved_target = None
+            if (
+                resolved_target is None
+                or resolved_target in _EXCLUDED_BASELINE_PORTS
+                or resolved_target not in matched_numeric
+            ):
+                continue
+            app_protocol = str(port_entry.get("appProtocol") or "").strip().lower()
+            port_name = str(port_entry.get("name") or "").strip().lower()
+            scheme = "https" if (app_protocol == "https" or port_name == "https" or svc_port == 443) else "http"
+            url = f"{scheme}://{svc_name}.{namespace}.svc.cluster.local:{svc_port}"
+            rank = (is_non_headless, has_preferred_suffix, svc_port == 8000, -(doc_index * 1000 + port_index))
+            candidates.append((rank, url))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
 class ConfigurationManifestAdapter:
     """Use Configuration's manifest when present, otherwise retain legacy behavior."""
 
@@ -780,13 +929,30 @@ class ConfigurationManifestAdapter:
     async def _create_namespace(self, artifact, namespace):
         prepared_namespace = artifact.deployment_contract.get("preparedNamespace")
         if prepared_namespace:
+            from llm_d_lens.deploy.slice_capacity import (
+                ClusterInventoryAuthError,
+                is_forbidden_output,
+                is_unauthorized_output,
+                redact_kubectl_error,
+            )
+
             namespace_path = Path(artifact.manifest_ref).parent / "namespace.yaml"
             namespace_path.write_text(yaml.safe_dump(prepared_namespace, sort_keys=False), encoding="utf-8")
             status, stdout, stderr = await self._runner(["kubectl", "create", "--filename", str(namespace_path)])
+            if status != 0:
+                if is_unauthorized_output(stdout, stderr):
+                    raise ClusterInventoryAuthError(
+                        redact_kubectl_error((stderr or stdout or "Kubernetes authentication failed (401)").strip())
+                    )
+                is_bootstrapped = (
+                    is_forbidden_output(stdout, stderr) or "alreadyexists" in (stdout + stderr).lower()
+                ) and await self._verify_prepared_bootstrap_marker(namespace, prepared_namespace)
+                if not is_bootstrapped:
+                    raise RuntimeError(redact_kubectl_error((stderr or stdout or "namespace creation failed").strip()))
         else:
-            status, stdout, stderr = await self._runner(["kubectl", "create", "namespace", namespace])
-        if status != 0 and (prepared_namespace or "alreadyexists" not in (stdout + stderr).lower()):
-            raise RuntimeError((stderr or stdout or "namespace creation failed").strip())
+            from llm_d_lens.deploy.providers.kubernetes import ensure_namespace_accessible
+
+            await ensure_namespace_accessible(self._runner, namespace)
 
     async def deploy(
         self, artifact: GuideDeploymentArtifact, execution_context: dict[str, Any], *, namespace_created=False
@@ -854,7 +1020,20 @@ class ConfigurationManifestAdapter:
                 ]
                 if current != artifact.deployment_contract["preparedStorage"]:
                     raise ValueError("Storage resources changed after plan review")
-            await ensure_mount_in_namespace(volume, namespace=namespace, cluster_id=cluster_id)
+            from llm_d_lens.deploy.providers.storage_mount import is_pvc_bound_in_namespace
+
+            pvc_name = getattr(volume, "pvc_name", None)
+            if not pvc_name and isinstance(getattr(volume, "id", None), str):
+                from llm_d_lens.storage.service import _pvc_name
+
+                pvc_name = _pvc_name(volume)
+            if not (
+                isinstance(pvc_name, str)
+                and pvc_name
+                and cluster_id
+                and await is_pvc_bound_in_namespace(pvc_name, namespace=namespace, cluster_id=cluster_id)
+            ):
+                await ensure_mount_in_namespace(volume, namespace=namespace, cluster_id=cluster_id)
         if callable(install_router):
             await install_router(artifact, execution_context)
         elif self._uses_delegate_lifecycle(artifact):
@@ -920,6 +1099,16 @@ class ConfigurationManifestAdapter:
         execution["endpoint_url"] = (
             f"{endpoint['protocol']}://{endpoint['serviceName']}.{namespace}.svc.cluster.local:{endpoint['port']}"
         )
+        if not execution.get("baseline_endpoint_url") and artifact.manifest_ref:
+            manifest_path = Path(artifact.manifest_ref)
+            if manifest_path.is_file():
+                baseline_url = _manifest_baseline_endpoint(
+                    manifest_path.read_text(encoding="utf-8"),
+                    namespace,
+                    endpoint["serviceName"],
+                )
+                if baseline_url:
+                    execution["baseline_endpoint_url"] = baseline_url
         return ValidationResult(True)
 
     @staticmethod
@@ -1017,7 +1206,76 @@ class ConfigurationManifestAdapter:
         )
         return {"cleaned_up": status == 0, "output": stdout, "error": stderr or None}
 
+    async def _read_bootstrap_marker_via_runner(self, namespace: str) -> dict[str, Any] | None:
+        from llm_d_lens.deploy.slice_capacity import (
+            ClusterInventoryAuthError,
+            is_unauthorized_output,
+            redact_kubectl_error,
+        )
+
+        status, stdout, stderr = await self._runner(
+            [
+                "kubectl",
+                "get",
+                "configmap",
+                "lens-deployment-bootstrap",
+                "--namespace",
+                namespace,
+                "--ignore-not-found=true",
+                "-o",
+                "json",
+            ]
+        )
+        if status and is_unauthorized_output(stdout, stderr):
+            raise ClusterInventoryAuthError(
+                redact_kubectl_error((stderr or stdout or "Kubernetes authentication failed (401)").strip())
+            )
+        if status != 0 or not stdout.strip():
+            return None
+        try:
+            payload = json.loads(stdout)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        data = payload.get("data")
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _marker_matches_target(
+        marker: dict[str, Any] | None, *, namespace: str, cluster_id: str | None = None
+    ) -> bool:
+        if marker is None or marker.get("status") != "completed":
+            return False
+        marker_ns = marker.get("namespace")
+        if marker_ns is not None and (
+            not isinstance(marker_ns, str) or (bool(marker_ns.strip()) and marker_ns.strip() != namespace)
+        ):
+            return False
+        clean_cluster = (cluster_id or "").strip()
+        marker_cluster = marker.get("clusterId")
+        return marker_cluster is None or (
+            isinstance(marker_cluster, str)
+            and (not marker_cluster.strip() or not clean_cluster or marker_cluster.strip() == clean_cluster)
+        )
+
+    async def _verify_prepared_bootstrap_marker(
+        self, namespace: str, expected: dict[str, Any], *, cluster_id: str | None = None
+    ) -> bool:
+        data = await self._read_bootstrap_marker_via_runner(namespace)
+        if not self._marker_matches_target(data, namespace=namespace, cluster_id=cluster_id):
+            return False
+        expected_req = (expected.get("metadata") or {}).get("labels", {}).get("lens.io/prepared-request")
+        return expected_req is None or data.get("preparedRequest") == expected_req
+
     async def _check_prepared_namespace(self, execution, artifact):
+        from llm_d_lens.deploy.slice_capacity import (
+            ClusterInventoryAuthError,
+            is_forbidden_output,
+            is_unauthorized_output,
+            redact_kubectl_error,
+        )
+
         expected = artifact.deployment_contract.get("preparedNamespace")
         if expected is None:
             return
@@ -1026,6 +1284,14 @@ class ConfigurationManifestAdapter:
             ["kubectl", "get", "namespace", namespace, "--ignore-not-found=true", "-o", "json"]
         )
         if status:
+            if is_unauthorized_output(stdout, stderr):
+                raise ClusterInventoryAuthError(
+                    redact_kubectl_error((stderr or stdout or "Kubernetes authentication failed (401)").strip())
+                )
+            if is_forbidden_output(stdout, stderr):
+                if await self._verify_prepared_bootstrap_marker(namespace, expected):
+                    return
+                raise ValueError("Namespace is not owned by this prepared execution; cleanup was not attempted")
             raise ValueError("Cannot verify prepared namespace ownership; cleanup was not attempted")
         if not stdout.strip():
             return
@@ -1281,7 +1547,19 @@ class SourceCompositionAdapter(ConfigurationManifestAdapter):
         )
 
     async def deploy(self, artifact, execution_context):
+        from llm_d_lens.deploy.slice_capacity import (
+            ClusterInventoryAuthError,
+            is_forbidden_output,
+            is_unauthorized_output,
+            redact_kubectl_error,
+        )
+
         namespace = self._namespace(execution_context)
+        exec_cluster_id = str(
+            (execution_context.get("provenance") or {}).get("cluster_server_id")
+            or execution_context.get("cluster_id")
+            or ""
+        )
         documents = list(yaml.safe_load_all(Path(artifact.manifest_ref).read_text(encoding="utf-8")))
         if artifact.deployment_contract.get("preparedNamespace"):
             content = Path(artifact.manifest_ref).read_text(encoding="utf-8")
@@ -1293,58 +1571,114 @@ class SourceCompositionAdapter(ConfigurationManifestAdapter):
             path.write_text(content, encoding="utf-8")
             artifact = replace(artifact, manifest_ref=str(path))
         rbac = self.router_rbac(documents, namespace)
-        if rbac:
-            await self._create_namespace(artifact, namespace)
-            status, stdout, stderr = await self._runner(
-                ["kubectl", "get", "namespace", namespace, "--namespace", namespace, "-o", "json"]
+        bootstrapped_via_admin = False
+
+        async def _confirm_epp_bootstrap() -> bool:
+            marker = await self._read_bootstrap_marker_via_runner(namespace)
+            return (
+                self._marker_matches_target(marker, namespace=namespace, cluster_id=exec_cluster_id)
+                and marker.get("eppAuthDelegator") == "applied"
             )
-            if status:
-                raise RuntimeError(stderr or stdout or "Cannot establish the Router RBAC namespace owner")
-            uid = json.loads(stdout).get("metadata", {}).get("uid")
-            if not isinstance(uid, str) or not uid:
-                raise ValueError("Namespace UID is required for Router RBAC ownership.")
-            owner = {"apiVersion": "v1", "kind": "Namespace", "name": namespace, "uid": uid}
-            for doc in rbac:
-                resource = f"{doc['kind'].lower()}/{doc['metadata']['name']}"
+
+        if rbac:
+            try:
+                await self._create_namespace(artifact, namespace)
+            except RuntimeError as error:
+                if await _confirm_epp_bootstrap():
+                    bootstrapped_via_admin = True
+                elif is_forbidden_output("", str(error)):
+                    raise RuntimeError(
+                        f"Namespace {namespace} requires Orchestration administrator "
+                        "bootstrap with EPP RBAC before deploying."
+                    ) from error
+                else:
+                    raise
+            if not bootstrapped_via_admin:
                 status, stdout, stderr = await self._runner(
-                    ["kubectl", "get", resource, "--namespace", namespace, "--ignore-not-found=true", "-o", "json"]
+                    ["kubectl", "get", "namespace", namespace, "--namespace", namespace, "-o", "json"]
                 )
                 if status:
-                    raise RuntimeError(stderr or stdout or f"Could not inspect {resource}")
-                if stdout.strip():
-                    existing = json.loads(stdout)
-                    try:
-                        self.router_rbac([existing], namespace, standalone=True)
-                    except ValueError as error:
-                        raise ValueError(f"Refusing to overwrite changed Router RBAC: {resource}") from error
-                    fields = ("rules",) if doc["kind"] == "ClusterRole" else ("roleRef",)
-                    owners = existing.get("metadata", {}).get("ownerReferences") or []
-                    subjects_match = doc["kind"] != "ClusterRoleBinding" or [
-                        {**subject, "apiGroup": subject.get("apiGroup", "")} for subject in existing.get("subjects", [])
-                    ] == [{**subject, "apiGroup": subject.get("apiGroup", "")} for subject in doc["subjects"]]
-                    if (
-                        len(owners) != 1
-                        or any(owners[0].get(key) != value for key, value in owner.items())
-                        or not subjects_match
-                        or any(existing.get(key) != doc.get(key) for key in fields)
-                    ):
-                        raise ValueError(f"Refusing to overwrite unowned or changed Router RBAC: {resource}")
-                    continue
-                doc["metadata"]["ownerReferences"] = [owner]
-                path = Path(artifact.manifest_ref).with_name(f"{doc['kind'].lower()}-{doc['metadata']['name']}.yaml")
-                path.write_text(yaml.safe_dump(doc), encoding="utf-8")
-                register_artifacts(
-                    path.parent,
-                    owner_type="deployment-manifest",
-                    owner_id=artifact.manifest_checksum.removeprefix("sha256:"),
-                    source_version=artifact.source_ref,
-                    retention_class="configuration",
-                )
-                status, stdout, stderr = await self._runner(
-                    ["kubectl", "create", "--namespace", namespace, "--filename", str(path)]
-                )
-                if status:
-                    raise RuntimeError(stderr or stdout or f"Could not create {resource}")
+                    if is_unauthorized_output(stdout, stderr):
+                        raise ClusterInventoryAuthError(
+                            redact_kubectl_error((stderr or stdout or "Kubernetes authentication failed (401)").strip())
+                        )
+                    if is_forbidden_output(stdout, stderr):
+                        if not await _confirm_epp_bootstrap():
+                            raise RuntimeError(
+                                f"Namespace {namespace} requires Orchestration administrator "
+                                "bootstrap with EPP RBAC before deploying."
+                            )
+                        bootstrapped_via_admin = True
+                    else:
+                        raise RuntimeError(
+                            redact_kubectl_error(stderr or stdout or "Cannot establish the Router RBAC namespace owner")
+                        )
+            if not bootstrapped_via_admin:
+                uid = json.loads(stdout).get("metadata", {}).get("uid")
+                if not isinstance(uid, str) or not uid:
+                    raise ValueError("Namespace UID is required for Router RBAC ownership.")
+                owner = {"apiVersion": "v1", "kind": "Namespace", "name": namespace, "uid": uid}
+                for doc in rbac:
+                    resource = f"{doc['kind'].lower()}/{doc['metadata']['name']}"
+                    status, stdout, stderr = await self._runner(
+                        ["kubectl", "get", resource, "--namespace", namespace, "--ignore-not-found=true", "-o", "json"]
+                    )
+                    if status:
+                        if is_unauthorized_output(stdout, stderr):
+                            raise ClusterInventoryAuthError(
+                                redact_kubectl_error(
+                                    (stderr or stdout or "Kubernetes authentication failed (401)").strip()
+                                )
+                            )
+                        if is_forbidden_output(stdout, stderr) and await _confirm_epp_bootstrap():
+                            bootstrapped_via_admin = True
+                            break
+                        raise RuntimeError(redact_kubectl_error(stderr or stdout or f"Could not inspect {resource}"))
+                    if stdout.strip():
+                        existing = json.loads(stdout)
+                        try:
+                            self.router_rbac([existing], namespace, standalone=True)
+                        except ValueError as error:
+                            raise ValueError(f"Refusing to overwrite changed Router RBAC: {resource}") from error
+                        fields = ("rules",) if doc["kind"] == "ClusterRole" else ("roleRef",)
+                        owners = existing.get("metadata", {}).get("ownerReferences") or []
+                        subjects_match = doc["kind"] != "ClusterRoleBinding" or [
+                            {**subject, "apiGroup": subject.get("apiGroup", "")}
+                            for subject in existing.get("subjects", [])
+                        ] == [{**subject, "apiGroup": subject.get("apiGroup", "")} for subject in doc["subjects"]]
+                        if (
+                            len(owners) != 1
+                            or any(owners[0].get(key) != value for key, value in owner.items())
+                            or not subjects_match
+                            or any(existing.get(key) != doc.get(key) for key in fields)
+                        ):
+                            raise ValueError(f"Refusing to overwrite unowned or changed Router RBAC: {resource}")
+                        continue
+                    doc["metadata"]["ownerReferences"] = [owner]
+                    rbac_name = f"{doc['kind'].lower()}-{doc['metadata']['name']}.yaml"
+                    path = Path(artifact.manifest_ref).with_name(rbac_name)
+                    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+                    register_artifacts(
+                        path.parent,
+                        owner_type="deployment-manifest",
+                        owner_id=artifact.manifest_checksum.removeprefix("sha256:"),
+                        source_version=artifact.source_ref,
+                        retention_class="configuration",
+                    )
+                    status, stdout, stderr = await self._runner(
+                        ["kubectl", "create", "--namespace", namespace, "--filename", str(path)]
+                    )
+                    if status:
+                        if is_unauthorized_output(stdout, stderr):
+                            raise ClusterInventoryAuthError(
+                                redact_kubectl_error(
+                                    (stderr or stdout or "Kubernetes authentication failed (401)").strip()
+                                )
+                            )
+                        if is_forbidden_output(stdout, stderr) and await _confirm_epp_bootstrap():
+                            bootstrapped_via_admin = True
+                            break
+                        raise RuntimeError(redact_kubectl_error(stderr or stdout or f"Could not create {resource}"))
             content = yaml.safe_dump_all([doc for doc in documents if doc not in rbac], sort_keys=False)
             checksum = text_checksum(content)
             directory = self._output_root / checksum.removeprefix("sha256:")
@@ -1360,7 +1694,7 @@ class SourceCompositionAdapter(ConfigurationManifestAdapter):
                 retention_class="configuration",
             )
         labels = artifact.deployment_contract.get("namespaceLabels")
-        if labels:
+        if labels and not bootstrapped_via_admin:
             namespace = self._namespace(execution_context)
             path = Path(artifact.manifest_ref).with_name(f"{namespace}-namespace.yaml")
             path.write_text(
@@ -1384,10 +1718,30 @@ class SourceCompositionAdapter(ConfigurationManifestAdapter):
                 ["kubectl", "apply", "--namespace", namespace, "--filename", str(path)]
             )
             if status:
-                raise RuntimeError(stderr or stdout or "Namespace labels could not be applied")
+                if is_unauthorized_output(stdout, stderr):
+                    raise ClusterInventoryAuthError(
+                        redact_kubectl_error((stderr or stdout or "Kubernetes authentication failed (401)").strip())
+                    )
+                if is_forbidden_output(stdout, stderr):
+                    marker = await self._read_bootstrap_marker_via_runner(namespace)
+                    if not self._marker_matches_target(marker, namespace=namespace, cluster_id=exec_cluster_id):
+                        raise RuntimeError(
+                            redact_kubectl_error(stderr or stdout or "Namespace labels could not be applied")
+                        )
+                else:
+                    raise RuntimeError(
+                        redact_kubectl_error(stderr or stdout or "Namespace labels could not be applied")
+                    )
         return await super().deploy(artifact, execution_context, namespace_created=bool(rbac))
 
     async def cleanup(self, execution, artifact, *, force=False):
+        from llm_d_lens.deploy.slice_capacity import (
+            ClusterInventoryAuthError,
+            is_forbidden_output,
+            is_unauthorized_output,
+            redact_kubectl_error,
+        )
+
         result = await super().cleanup(execution, artifact, force=force)
         if not result["cleaned_up"]:
             return result
@@ -1397,6 +1751,12 @@ class SourceCompositionAdapter(ConfigurationManifestAdapter):
             status, stdout, stderr = await self._runner(
                 ["kubectl", "get", name, "--namespace", namespace, "--ignore-not-found=true", "-o", "json"]
             )
+            if status and is_unauthorized_output(stdout, stderr):
+                raise ClusterInventoryAuthError(
+                    redact_kubectl_error((stderr or stdout or "Kubernetes authentication failed (401)").strip())
+                )
+            if status and is_forbidden_output(stdout, stderr):
+                continue
             if not status and stdout.strip():
                 status, stdout, stderr = await self._runner(
                     [
@@ -1409,13 +1769,22 @@ class SourceCompositionAdapter(ConfigurationManifestAdapter):
                         f"--timeout={self._readiness_timeout_seconds}s",
                     ]
                 )
+                if status and is_unauthorized_output(stdout, stderr):
+                    raise ClusterInventoryAuthError(
+                        redact_kubectl_error((stderr or stdout or "Kubernetes authentication failed (401)").strip())
+                    )
+                if status and is_forbidden_output(stdout, stderr):
+                    continue
             if status and (
                 ("(NotFound)" in stderr and resource["name"] in stderr)
                 or stderr.strip() == "error: no matching resources found"
             ):
                 status = 0
             if status:
-                return {"cleaned_up": False, "error": stderr or stdout or f"Router RBAC cleanup pending: {name}"}
+                return {
+                    "cleaned_up": False,
+                    "error": redact_kubectl_error(stderr or stdout or f"Router RBAC cleanup pending: {name}"),
+                }
         return result
 
     @staticmethod

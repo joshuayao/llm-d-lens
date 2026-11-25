@@ -196,10 +196,492 @@ run_with_tail() {
 
 pid_file() { printf '%s/%s.pid' "$PID_DIR" "$1"; }
 
+is_pid_running() {
+    local pid="$1"
+    [[ -n "$pid" && "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [[ -r "/proc/$pid/stat" ]]; then
+        local stat_line state
+        stat_line="$(cat "/proc/$pid/stat" 2>/dev/null || true)"
+        if [[ -n "$stat_line" ]]; then
+            state="${stat_line##*) }"
+            state="${state%% *}"
+            [[ "$state" != "Z" && "$state" != "X" ]] || return 1
+        fi
+    fi
+    return 0
+}
+
 is_running() {
     local pid
     pid="$(cat "$(pid_file "$1")" 2>/dev/null || echo '')"
-    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+    is_pid_running "$pid"
+}
+
+resolve_python_bin() {
+    if command -v python3 >/dev/null 2>&1; then
+        command -v python3
+        return 0
+    fi
+    if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+        printf '%s\n' "$ROOT_DIR/.venv/bin/python"
+        return 0
+    fi
+    return 1
+}
+
+canonical_path() {
+    local path="$1" python_bin=""
+    if python_bin="$(resolve_python_bin)"; then
+        "$python_bin" -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$path"
+        return $?
+    fi
+    if command -v realpath >/dev/null 2>&1; then
+        realpath -m "$path" 2>/dev/null || realpath "$path" 2>/dev/null || printf '%s\n' "${path%/}"
+        return 0
+    fi
+    printf '%s\n' "${path%/}"
+}
+
+canonical_data_dir() {
+    canonical_path "$LENS_DATA_DIR"
+}
+
+data_dir_owner_file() {
+    local canon_dir
+    canon_dir="$(canonical_data_dir)"
+    if [[ "$canon_dir" == "/" ]]; then
+        printf '/.runtime/backend.owner'
+    else
+        printf '%s/.runtime/backend.owner' "$canon_dir"
+    fi
+}
+
+write_backend_owner_file() {
+    local pid="$1" port="$2" canon_dir runtime_dir owner_file tmp_file
+    canon_dir="$(canonical_data_dir)"
+    if [[ "$canon_dir" == "/" ]]; then
+        runtime_dir="/.runtime"
+    else
+        runtime_dir="$canon_dir/.runtime"
+    fi
+    owner_file="$runtime_dir/backend.owner"
+    mkdir -p "$runtime_dir"
+    tmp_file="$(mktemp "$runtime_dir/backend.owner.XXXXXX")"
+    printf 'pid=%s\nport=%s\nroot_dir=%s\ndata_dir=%s\n' \
+        "$pid" "$port" "$ROOT_DIR" "$canon_dir" > "$tmp_file"
+    mv -f "$tmp_file" "$owner_file"
+}
+
+read_owner_field() {
+    local owner_file="$1" key="$2" line
+    [[ -f "$owner_file" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s\n' "${line#"$key="}"
+            return 0
+        fi
+    done < "$owner_file"
+    return 1
+}
+
+lens_backend_proc_inspect() {
+    local python_bin=""
+    python_bin="$(resolve_python_bin)" || return 127
+    "$python_bin" - "$@" <<'PY'
+import os
+import pwd
+import subprocess
+import sys
+
+SHELL_NAMES = {"sh", "bash", "dash", "zsh", "ksh"}
+
+
+def is_run_backend_script_token(token):
+    return token == "run-backend.sh" or token.endswith("/run-backend.sh")
+
+
+def is_shell_running_backend(args):
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            i += 1
+            break
+        if arg in ("-o", "+o"):
+            i += 2
+            continue
+        if arg.startswith("-") and len(arg) > 1:
+            if "c" in arg[1:] or "n" in arg[1:] or arg in ("--help", "--version"):
+                return False
+            i += 1
+            continue
+        if arg.startswith("+") and len(arg) > 1:
+            i += 1
+            continue
+        return is_run_backend_script_token(arg)
+    return i < len(args) and is_run_backend_script_token(args[i])
+
+
+def is_lens_backend_argv(argv):
+    if not argv:
+        return False
+    has_uvicorn = any(arg == "uvicorn" or os.path.basename(arg) == "uvicorn" for arg in argv)
+    has_app = any(arg in ("llm_d_lens.api:app", "llm_d_lens.api.main:app") for arg in argv)
+    if has_uvicorn and has_app:
+        return True
+    exe = os.path.basename(argv[0])
+    if exe == "run-backend.sh":
+        return True
+    if exe in SHELL_NAMES:
+        return is_shell_running_backend(argv[1:])
+    if exe == "env":
+        i = 1
+        while i < len(argv):
+            arg = argv[i]
+            if arg == "--":
+                i += 1
+                break
+            if arg in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"):
+                i += 2
+                continue
+            if arg.startswith("-") or ("=" in arg and not arg.startswith("/")):
+                i += 1
+                continue
+            break
+        if i < len(argv):
+            cmd_exe = os.path.basename(argv[i])
+            if cmd_exe == "run-backend.sh":
+                return True
+            if cmd_exe in SHELL_NAMES:
+                return is_shell_running_backend(argv[i + 1 :])
+    return False
+
+
+def read_cmdline(pid):
+    with open(f"/proc/{pid}/cmdline", "rb") as fh:
+        raw = fh.read().rstrip(b"\x00")
+    if not raw:
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\x00")]
+
+
+def read_environ(pid):
+    with open(f"/proc/{pid}/environ", "rb") as fh:
+        raw = fh.read()
+    env = {}
+    for entry in raw.split(b"\x00"):
+        if b"=" not in entry:
+            continue
+        key, val = entry.split(b"=", 1)
+        env[key.decode("utf-8", "replace")] = val.decode("utf-8", "replace")
+    return env
+
+
+def resolve_proc_data_dir(env, default_home):
+    lens_data_dir = env.get("LENS_DATA_DIR", "")
+    if lens_data_dir:
+        return lens_data_dir
+    xdg_data_home = env.get("XDG_DATA_HOME", "")
+    if xdg_data_home:
+        return os.path.join(xdg_data_home, "lens")
+    home = env.get("HOME", "") or default_home
+    if not home:
+        return ""
+    return os.path.join(home, ".local", "share", "lens")
+
+
+def resolve_canonical_proc_data_dir(pid, env, default_home):
+    proc_data_dir = resolve_proc_data_dir(env, default_home)
+    if not proc_data_dir:
+        return ""
+    if not os.path.isabs(proc_data_dir):
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+            proc_data_dir = os.path.join(cwd, proc_data_dir)
+        except OSError:
+            pass
+    return os.path.realpath(proc_data_dir)
+
+
+def extract_port(argv, env, fallback_port=""):
+    port = ""
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--port" and i + 1 < len(argv) and argv[i + 1]:
+            port = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--port=") and arg[7:]:
+            port = arg[7:]
+        i += 1
+    if not port:
+        port = env.get("BACKEND_PORT") or env.get("SERVER_PORT") or env.get("PORT") or fallback_port or "unknown"
+    return port
+
+
+def extract_checkout(pid, fallback_root=""):
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return fallback_root or "unknown"
+
+
+def sanitize_field(value):
+    text = " ".join(str(value).replace("\t", " ").splitlines()).strip()
+    return text or "unknown"
+
+
+def ps_check_pid(pid, my_uid):
+    try:
+        out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "uid=,args="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    if not out:
+        return None
+    parts = out.split(None, 1)
+    if len(parts) < 2 or not parts[0].isdigit():
+        return None
+    if int(parts[0]) != my_uid:
+        return None
+    argv = parts[1].split()
+    if not is_lens_backend_argv(argv):
+        return None
+    return argv
+
+
+def is_proc_alive_not_zombie(pid):
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as fh:
+            stat_line = fh.read()
+    except OSError:
+        return False
+    rparen = stat_line.rfind(")")
+    if rparen != -1:
+        rest = stat_line[rparen + 1 :].lstrip()
+        if rest and rest[0] in ("Z", "X"):
+            return False
+    return True
+
+
+def check_live_backend_pid(pid, my_uid):
+    if pid <= 0:
+        return False
+    if os.path.isdir("/proc"):
+        try:
+            st = os.stat(f"/proc/{pid}")
+            if st.st_uid != my_uid or not is_proc_alive_not_zombie(pid):
+                return False
+            argv = read_cmdline(pid)
+        except OSError:
+            return False
+        return is_lens_backend_argv(argv)
+    return ps_check_pid(pid, my_uid) is not None
+
+
+def main():
+    mode = sys.argv[1]
+    my_uid = os.getuid()
+
+    if mode == "check-pid":
+        pid_str = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not pid_str.isdigit():
+            sys.exit(1)
+        sys.exit(0 if check_live_backend_pid(int(pid_str), my_uid) else 1)
+
+    if mode != "conflicts":
+        sys.exit(2)
+
+    target_data_dir = os.path.realpath(sys.argv[2])
+    owner_file = sys.argv[3] if len(sys.argv) > 3 else ""
+    caller_pid = sys.argv[4] if len(sys.argv) > 4 else ""
+    own_backend_pid = sys.argv[5] if len(sys.argv) > 5 else ""
+
+    default_home = os.environ.get("HOME", "")
+    if not default_home:
+        try:
+            default_home = pwd.getpwuid(my_uid).pw_dir
+        except KeyError:
+            default_home = ""
+
+    excluded = {os.getpid(), os.getppid()}
+    for raw_pid in (caller_pid, own_backend_pid):
+        if raw_pid.isdigit() and int(raw_pid) > 0:
+            excluded.add(int(raw_pid))
+
+    owner_pid = None
+    owner_port = ""
+    owner_root = ""
+    if owner_file and os.path.isfile(owner_file):
+        try:
+            with open(owner_file, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    key, sep, val = line.strip().partition("=")
+                    if not sep:
+                        continue
+                    if key == "pid" and val.isdigit():
+                        owner_pid = int(val)
+                    elif key == "port":
+                        owner_port = val
+                    elif key == "root_dir":
+                        owner_root = val
+        except OSError:
+            pass
+
+    found_pids = set()
+    results = []
+
+    if os.path.isdir("/proc"):
+        try:
+            entries = sorted(int(name) for name in os.listdir("/proc") if name.isdigit())
+        except OSError:
+            entries = []
+
+        for pid in entries:
+            if pid in excluded:
+                continue
+            try:
+                st = os.stat(f"/proc/{pid}")
+                if st.st_uid != my_uid or not is_proc_alive_not_zombie(pid):
+                    continue
+                argv = read_cmdline(pid)
+                if not is_lens_backend_argv(argv):
+                    continue
+                env = read_environ(pid)
+            except OSError:
+                continue
+
+            if resolve_canonical_proc_data_dir(pid, env, default_home) != target_data_dir:
+                continue
+
+            fallback_port = owner_port if pid == owner_pid else ""
+            fallback_root = owner_root if pid == owner_pid else ""
+            port = extract_port(argv, env, fallback_port)
+            checkout = extract_checkout(pid, fallback_root)
+            found_pids.add(pid)
+            results.append((pid, sanitize_field(port), sanitize_field(checkout)))
+
+    if owner_pid is not None and owner_pid > 0 and owner_pid not in excluded and owner_pid not in found_pids:
+        if os.path.isdir("/proc"):
+            try:
+                st = os.stat(f"/proc/{owner_pid}")
+                argv = read_cmdline(owner_pid) if st.st_uid == my_uid and is_proc_alive_not_zombie(owner_pid) else []
+            except OSError:
+                argv = []
+            if is_lens_backend_argv(argv):
+                env = None
+                try:
+                    env = read_environ(owner_pid)
+                except OSError:
+                    pass
+                if env is None or resolve_canonical_proc_data_dir(owner_pid, env, default_home) == target_data_dir:
+                    port = extract_port(argv, env or {}, owner_port)
+                    checkout = extract_checkout(owner_pid, owner_root)
+                    results.append((owner_pid, sanitize_field(port), sanitize_field(checkout)))
+        else:
+            argv = ps_check_pid(owner_pid, my_uid)
+            if argv is not None:
+                port = extract_port(argv, {}, owner_port)
+                checkout = owner_root or "unknown"
+                results.append((owner_pid, sanitize_field(port), sanitize_field(checkout)))
+
+    for pid, port, checkout in results:
+        print(f"{pid}\t{port}\t{checkout}")
+
+
+if __name__ == "__main__":
+    main()
+PY
+}
+
+is_live_lens_backend_pid() {
+    local pid="$1"
+    [[ -n "$pid" && "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    lens_backend_proc_inspect check-pid "$pid"
+}
+
+remove_backend_owner_if_owned() {
+    local stopped_pid="${1:-}" owner_file owner_pid rc=0
+    owner_file="$(data_dir_owner_file)"
+    [[ -f "$owner_file" ]] || return 0
+    owner_pid="$(read_owner_field "$owner_file" pid || true)"
+    if [[ -z "$owner_pid" || ! "$owner_pid" =~ ^[1-9][0-9]*$ ]]; then
+        rm -f "$owner_file"
+        return 0
+    fi
+    if [[ -n "$stopped_pid" && "$owner_pid" == "$stopped_pid" ]]; then
+        rm -f "$owner_file"
+        return 0
+    fi
+    is_live_lens_backend_pid "$owner_pid" || rc=$?
+    if [[ "$rc" -eq 1 ]]; then
+        rm -f "$owner_file"
+    elif [[ "$rc" -ne 0 ]] && ! is_pid_running "$owner_pid"; then
+        rm -f "$owner_file"
+    fi
+}
+
+find_conflicting_data_dir_backends() {
+    local canon_dir owner_file own_pid=""
+    canon_dir="$(canonical_data_dir)"
+    owner_file="$(data_dir_owner_file)"
+    if is_running backend; then
+        own_pid="$(cat "$(pid_file backend)" 2>/dev/null || true)"
+    fi
+    lens_backend_proc_inspect conflicts "$canon_dir" "$owner_file" "$$" "$own_pid"
+}
+
+guard_shared_data_dir_backends() {
+    local canon_dir conflicts="" scan_rc=0 pid port checkout
+    canon_dir="$(canonical_data_dir)"
+    conflicts="$(find_conflicting_data_dir_backends)" || scan_rc=$?
+    if [[ "$scan_rc" -ne 0 ]]; then
+        warn "skipping shared LENS_DATA_DIR conflict guard for $canon_dir: Python inspector unavailable (exit $scan_rc)."
+        return 0
+    fi
+    [[ -n "$conflicts" ]] || return 0
+
+    while IFS=$'\t' read -r pid port checkout; do
+        [[ -n "$pid" ]] || continue
+        warn "conflicting Lens backend detected on shared LENS_DATA_DIR ($canon_dir): pid=$pid port=$port checkout=$checkout"
+    done <<<"$conflicts"
+
+    if [[ "${LENS_ALLOW_SHARED_DATA_DIR_WRITERS:-0}" == "1" ]]; then
+        warn "skipping automatic stop because LENS_ALLOW_SHARED_DATA_DIR_WRITERS=1; continuing with multiple writers on $canon_dir."
+        return 0
+    fi
+
+    while IFS=$'\t' read -r pid port checkout; do
+        [[ -n "$pid" ]] || continue
+        if is_pid_running "$pid"; then
+            log "stopping conflicting Lens backend (pid $pid, port $port, checkout $checkout)..."
+            kill -TERM "$pid" 2>/dev/null || true
+            local waited=0
+            while is_pid_running "$pid" && [[ "$waited" -lt 50 ]]; do
+                sleep 0.1
+                waited=$((waited + 1))
+            done
+            if is_pid_running "$pid"; then
+                warn "conflicting Lens backend (pid $pid) did not exit gracefully — sending SIGKILL."
+                kill -KILL "$pid" 2>/dev/null || true
+                local kill_waited=0
+                while is_pid_running "$pid" && [[ "$kill_waited" -lt 20 ]]; do
+                    sleep 0.1
+                    kill_waited=$((kill_waited + 1))
+                done
+                if is_pid_running "$pid"; then
+                    fail "failed to stop conflicting Lens backend (pid $pid) on $canon_dir."
+                    return 1
+                fi
+            fi
+        fi
+        remove_backend_owner_if_owned "$pid"
+    done <<<"$conflicts"
 }
 
 port_in_use() {
@@ -640,11 +1122,15 @@ start_one() {
     local run_log="$name-$(date -u +%Y%m%dT%H%M%S%NZ)-$$.log"
     ln -sfn "$run_log" "$LOG_DIR/$name.log"
     nohup "$@" > "$LOG_DIR/$run_log" 2>&1 &
-    echo "$!" > "$(pid_file "$name")"
+    local pid="$!"
+    echo "$pid" > "$(pid_file "$name")"
     case "$name" in
         frontend) printf '%s\n' "$FRONTEND_PORT" > "$PID_DIR/$name.port" ;;
         server) printf '%s\n' "$SERVER_PORT" > "$PID_DIR/$name.port" ;;
-        backend) printf '%s\n' "$BACKEND_PORT" > "$PID_DIR/$name.port" ;;
+        backend)
+            printf '%s\n' "$BACKEND_PORT" > "$PID_DIR/$name.port"
+            write_backend_owner_file "$pid" "$BACKEND_PORT"
+            ;;
     esac
 }
 
@@ -766,7 +1252,10 @@ start_services() {
         fail "The legacy Node gateway is still running; use restart all to switch to the Python entry point."
         return 1
     fi
-    if [[ "$target" == all || "$target" == backend ]]; then ensure_database || return 1; fi
+    if [[ "$target" == all || "$target" == backend ]]; then
+        guard_shared_data_dir_backends || return 1
+        ensure_database || return 1
+    fi
     ensure_tls
 
     # Remember what was requested so we can report any port that got shifted.
@@ -845,12 +1334,17 @@ cmd_stop() {
         if [[ -f "$pf" ]]; then
             local pid
             pid="$(cat "$pf")"
-            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            if is_pid_running "$pid"; then
                 log "stopping $svc (pid $pid)..."
                 kill "$pid" 2>/dev/null || true
                 stopped=1
             fi
             rm -f "$pf"
+            if [[ "$svc" == "backend" ]]; then
+                remove_backend_owner_if_owned "$pid"
+            fi
+        elif [[ "$svc" == "backend" ]]; then
+            remove_backend_owner_if_owned ""
         fi
     done
     [[ "$stopped" -eq 1 ]] && sleep 1
@@ -867,6 +1361,19 @@ cmd_status() {
             log "  $svc: stopped"
         fi
     done
+    local canon_dir conflicts="" scan_rc=0 pid port checkout
+    canon_dir="$(canonical_data_dir)"
+    conflicts="$(find_conflicting_data_dir_backends)" || scan_rc=$?
+    if [[ "$scan_rc" -ne 0 ]]; then
+        warn "unable to check shared LENS_DATA_DIR ($canon_dir) for conflicting backends: Python inspector unavailable (exit $scan_rc)."
+        return 0
+    fi
+    if [[ -n "$conflicts" ]]; then
+        while IFS=$'\t' read -r pid port checkout; do
+            [[ -n "$pid" ]] || continue
+            warn "conflicting Lens backend attached to shared LENS_DATA_DIR ($canon_dir): pid=$pid port=$port checkout=$checkout"
+        done <<<"$conflicts"
+    fi
 }
 
 # ---- clean -------------------------------------------------------------------
@@ -1017,6 +1524,9 @@ Environment:
   NODE_MIN_MAJOR          Default 22
   NODE_AUTO_INSTALL       Default 1; set 0 to disable automatic Node downloads
   NODE_INSTALL_VERSION   Optional exact Node.js version
+  LENS_ALLOW_SHARED_DATA_DIR_WRITERS
+                          Default 0; set 1 to warn instead of stopping other
+                          Lens backends sharing LENS_DATA_DIR
 EOF
 }
 

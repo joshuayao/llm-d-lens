@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from collections.abc import Awaitable, Callable
@@ -42,7 +43,7 @@ from llm_d_lens.configuration.models import ModelSecretConfiguration
 from llm_d_lens.configuration.plan_models import DeploymentRequirements, OptimizationDecision
 from llm_d_lens.deploy.application import deployment_run_manager
 from llm_d_lens.deploy.contracts import DeployableConfiguration, DeploymentRunCreateRequest, RuntimeBinding
-from llm_d_lens.deploy.providers.hardware_profile import cluster_accelerator
+from llm_d_lens.deploy.providers.hardware_profile import cluster_accelerator, resolve_cluster_vllm_image
 from llm_d_lens.deploy.providers.target_node import validate_placement
 from llm_d_lens.estimate_tools.aic.models import DEFAULT_INPUT_TOKENS, DEFAULT_OUTPUT_TOKENS, AICEstimateRequest
 from llm_d_lens.estimate_tools.aic.service import AICError, estimate
@@ -1576,8 +1577,22 @@ class AgenticDeploymentService:
     @staticmethod
     def _refresh_configuration_plan(run: AgenticDeploymentRun) -> None:
         selected = next(item for item in run.candidates if item.id == run.selected_candidate.id)
-        accelerator = cluster_accelerator(run.planning_cluster_snapshot.get("hardware") or {})
-        configuration = build_agentic_configuration(run.request, selected, run.model_secret, accelerator=accelerator)
+        cluster_id = run.request.requirements.cluster_id if run.request.requirements is not None else None
+        if not cluster_id and getattr(run.request, "cluster_session_id", None):
+            with contextlib.suppress(ValueError):
+                cluster_id = require_active_session(run.request.cluster_session_id).server_id
+        cluster_vllm_image = resolve_cluster_vllm_image(cluster_id)
+        accelerator = cluster_accelerator(
+            run.planning_cluster_snapshot.get("hardware") or {},
+            cluster_vllm_image=cluster_vllm_image,
+        )
+        configuration = build_agentic_configuration(
+            run.request,
+            selected,
+            run.model_secret,
+            accelerator=accelerator,
+            cluster_vllm_image=cluster_vllm_image,
+        )
         run.configuration_plan = resolved_plan(run, configuration.model_dump(mode="json"))
 
     async def compare_manual_resources(self, run_id, candidate_id, render):
@@ -1954,6 +1969,7 @@ class AgenticDeploymentService:
         http_request=None,
         source_endpoint: str | None = None,
         approval=None,
+        target_namespace: str | None = None,
     ) -> AgenticDeploymentRun:
         if run_id in self._approving:
             raise ValueError("Deployment approval is already in progress.")
@@ -1973,13 +1989,30 @@ class AgenticDeploymentService:
                     raise ValueError("Choose a reviewed inference Service before deployment.")
                 run.source_endpoint = source_endpoint
                 return await approve_source_plan(
-                    self, run, owner_user_id=owner_user_id, request=http_request, approval=approval
+                    self,
+                    run,
+                    owner_user_id=owner_user_id,
+                    request=http_request,
+                    approval=approval,
+                    target_namespace=target_namespace,
                 )
-            return await self._approve(run_id, owner_user_id=owner_user_id, approval=approval)
+            return await self._approve(
+                run_id,
+                owner_user_id=owner_user_id,
+                approval=approval,
+                target_namespace=target_namespace,
+            )
         finally:
             self._approving.discard(run_id)
 
-    async def _approve(self, run_id: str, *, owner_user_id: str | None = None, approval=None) -> AgenticDeploymentRun:
+    async def _approve(
+        self,
+        run_id: str,
+        *,
+        owner_user_id: str | None = None,
+        approval=None,
+        target_namespace: str | None = None,
+    ) -> AgenticDeploymentRun:
         run = self._runs.get(run_id)
         if run is None:
             raise KeyError("agentic deployment run not found")
@@ -2003,10 +2036,33 @@ class AgenticDeploymentService:
         validate_placement(placement)
         if run.request.placement_node_label:
             nodes = await list_resources("nodes", cluster_id=session.server_id)
+            node_inventory_source = "kubernetes"
+            node_inventory_restricted = False
+            if not nodes:
+                from llm_d_lens.deploy.slice_capacity import (
+                    ClusterInventoryAuthError,
+                    ClusterInventoryForbiddenError,
+                    fetch_cluster_nodes_and_pods,
+                )
+
+                try:
+                    nodes, _pods, node_inventory_source = await fetch_cluster_nodes_and_pods(session.server_id)
+                except ClusterInventoryAuthError:
+                    raise
+                except ClusterInventoryForbiddenError:
+                    node_inventory_restricted = True
+                except (ValueError, OSError, TimeoutError):
+                    nodes = []
             label = run.request.placement_node_label
-            if not any(
+            has_matching_label = any(
                 (node.get("metadata") or {}).get("labels", {}).get(label["key"]) == label["value"] for node in nodes
-            ):
+            )
+            prometheus_lacks_label_key = (
+                node_inventory_source == "prometheus"
+                and bool(nodes)
+                and not any(label["key"] in ((node.get("metadata") or {}).get("labels") or {}) for node in nodes)
+            )
+            if not has_matching_label and not node_inventory_restricted and not prometheus_lacks_label_key:
                 raise ValueError("selected node label is not present in the cluster")
         selected = next(candidate for candidate in run.candidates if candidate.id == run.selected_candidate.id)
         errors = candidate_requirement_errors(run.request.requirements, selected)
@@ -2068,7 +2124,11 @@ class AgenticDeploymentService:
             )
 
         run.model_secret = model_secret or ModelSecretConfiguration()
-        accelerator = cluster_accelerator(refreshed.cluster_snapshot.get("hardware") or {})
+        cluster_vllm_image = resolve_cluster_vllm_image(session.server_id)
+        accelerator = cluster_accelerator(
+            refreshed.cluster_snapshot.get("hardware") or {},
+            cluster_vllm_image=cluster_vllm_image,
+        )
         if (
             run.configuration_plan is not None
             and run.configuration_plan.validation.get("status") == "resources_checked"
@@ -2076,7 +2136,11 @@ class AgenticDeploymentService:
             configuration = DeployableConfiguration.model_validate(run.configuration_plan.configuration)
         else:
             configuration = build_agentic_configuration(
-                run.request, selected, run.model_secret, accelerator=accelerator
+                run.request,
+                selected,
+                run.model_secret,
+                accelerator=accelerator,
+                cluster_vllm_image=cluster_vllm_image,
             )
         configuration.provenance["cluster_ref"] = {
             "id": session.server_id,
@@ -2105,6 +2169,7 @@ class AgenticDeploymentService:
                         "cluster_session_id": session.id,
                         "deployment_name": run.request.deployment_name,
                         "agentic_deployment_run_id": run.id,
+                        **({"target_namespace": target_namespace} if target_namespace else {}),
                     },
                 ),
                 owner_user_id,

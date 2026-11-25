@@ -293,10 +293,36 @@ running replica the box is grey, not green. A green dot means the component
 actually has a running replica. **Uninstall** removes the component entirely, and
 the box turns amber (`not installed`).
 
+## Admin vs Non-Admin cluster modes
+
+Lens detects each cluster's Kubernetes kubeconfig capabilities using SubjectAccessReview (SSAR) checks (`canManageGatewayInfra`, `canManageGatewayConfig`, `canReconcileRoutes`) and sets `accessMode` to either `admin` or `non_admin`:
+
+- **Admin (`admin`)**: Lens can directly manage Gateway infrastructure, IPP configuration, and `HTTPRoute` / `ReferenceGrant` / `InferenceModelRewrite` resources.
+- **Non-Admin (`non_admin`)**: The cluster kubeconfig is scoped (for example, to deployment namespaces) and lacks permissions in the Gateway namespace or cluster-level CRDs.
+
+### Status inspection on Non-Admin clusters
+
+On Non-Admin clusters, Lens avoids `kubectl port-forward` into the Gateway namespace and does not fail the page on `403 Forbidden` responses:
+
+- **Gateway reachability**: Lens probes the cluster's external HTTP Gateway endpoint (`gateway_public_url` or configured Gateway port/host) directly, and uses direct Prometheus metrics when configured.
+- **Auth vs restricted status**: Genuine `401 Unauthorized` or invalid kubeconfig errors are surfaced clearly as authentication errors, while `403 Forbidden` on restricted Gateway resources degrades cleanly without blocking permitted deployment-namespace inspection.
+
+### Orchestration administrator script handoff
+
+When a Non-Admin cluster cannot apply Kubernetes changes directly, Lens saves the desired state in the database and generates an idempotent `bash` + `kubectl` + `helm` handoff script for an orchestration administrator:
+
+1. **Triggering a handoff**: Publishing, updating, traffic-splitting, toggling, or deleting a Model Service, repairing the Gateway, or updating IPP configuration on a Non-Admin cluster returns an `admin_handoff_required` status instead of failing with a raw `403`.
+2. **Delivering the script**: Open the handoff drawer or panel to **Download `.sh`**, **Copy** the script, or **View operation details** (including pending operations and desired-state hash).
+3. **Verifying completion**: After an orchestration administrator runs the script, click **Re-check** (or call the verification endpoint). Lens checks the non-secret completion marker `ConfigMap` in the cluster's writable namespace together with a live Gateway HTTP route check to confirm the route is active.
+
 ## Permissions
 
 If an action is missing, ask an administrator to check your model-service
 permissions and cluster access. Do not use another account's API key.
+
+- **Reading route handoff details**: available to users with `model-service:gateway:read`, `model-service:group:read`, or `model-service:member:manage`.
+- **Generating and verifying `routes` handoff scripts**: available to users who can publish, update, toggle, or remove model services and members (`model-service:gateway:reconcile`, `model-service:gateway:manage`, `model-service:member:manage`, `model-service:group:manage`, `model-service:group:toggle`, or `model-service:group:remove`).
+- **Gateway repair and IPP handoff scripts** (`gateway_repair`, `ipp_config`, `all`): restricted to users with Gateway management or reconciliation permissions (`model-service:gateway:manage` or `model-service:gateway:reconcile`).
 
 ## Related pages
 

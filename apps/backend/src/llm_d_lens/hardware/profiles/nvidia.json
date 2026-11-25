@@ -15,6 +15,7 @@
   "access_modes": ["plugin", "dra"],
   "driver": {
     "installer": "helm",
+    "rbac": ["escalation"],
     "modes": {
       "plugin": {
         "manifest_ref": "nvidia-device-plugin",

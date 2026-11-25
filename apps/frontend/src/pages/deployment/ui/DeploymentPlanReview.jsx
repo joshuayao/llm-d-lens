@@ -1,6 +1,22 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { CheckCircle2, Clock3, Download, Pencil, Settings } from 'lucide-react';
-import { Badge, Button, Input, Modal, Panel, Select } from '../../../shared/ui';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+    AlertTriangle,
+    Check,
+    CheckCircle2,
+    ChevronRight,
+    ClipboardCopy,
+    Clock3,
+    Download,
+    Pencil,
+    RefreshCw,
+    Settings,
+    ShieldAlert,
+    XCircle,
+} from 'lucide-react';
+import { Badge, Button, Checkbox, Input, Label, Modal, Panel, Select, Spinner } from '../../../shared/ui';
+import { FormError } from '../../../shared/ui/FormError';
+import { cn } from '../../../shared/lib/cn';
+import { copyText } from '../../../shared/lib/clipboard';
 import { downloadBlob } from '../../../shared/lib/download';
 import { deploymentPlan, candidatePlan, overviewPlan, optimizationPlan, OPTIMIZATION_STATES } from '../model/deploymentPlan';
 import { candidateLabel, OPTIMIZATION_CONTROLS } from '../api/agenticDeploymentBackend';
@@ -210,4 +226,605 @@ export function DeploymentPlanReview({ content = '', candidate, model, mode = 'm
             </fieldset>
         </Modal>
     </Panel>;
+}
+
+function handoffRuleLabel(rule = {}) {
+    const verb = rule.verb || 'use';
+    const resource = rule.resource || rule.path || rule.nonResourceURL || 'resource';
+    const group = rule.apiGroup || rule.group;
+    const target = group ? `${resource}.${group}` : resource;
+    const subresource = rule.subresource ? `/${rule.subresource}` : '';
+    const scope = rule.namespace ? ` in ${rule.namespace}` : '';
+    return `${verb} ${target}${subresource}${scope}`.trim();
+}
+
+function handoffOperationId(entry) {
+    return typeof entry === 'string' ? entry : entry?.id;
+}
+
+function handoffOperationTitle(entry) {
+    if (typeof entry === 'string') return entry;
+    return entry?.title || entry?.id || 'Operation';
+}
+
+function handoffTargetLabel(entry = {}) {
+    if (typeof entry === 'string') return entry;
+    const kind = entry.kind || 'resource';
+    const target = entry.namespace ? `${entry.namespace}/${entry.name}` : entry.name;
+    return target ? `${kind}: ${target}` : kind;
+}
+
+function pluralCount(count, singular, plural = `${singular}s`) {
+    return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function HandoffOperationRow({ entry, tone = 'danger', statusLabel, ariaLabel, rules = [], children }) {
+    const id = handoffOperationId(entry);
+    const title = handoffOperationTitle(entry);
+    const Icon = tone === 'success' ? CheckCircle2 : tone === 'warning' ? AlertTriangle : XCircle;
+    return (
+        <li className={cn(
+            'border-l-2 pl-3',
+            tone === 'success'
+                ? 'border-emerald-500/70'
+                : tone === 'warning'
+                    ? 'border-amber-500/80'
+                    : 'border-rose-500/80',
+        )}>
+            <details className="group">
+                <summary
+                    title="Expand for details"
+                    className="-ml-3 flex cursor-pointer list-none items-start gap-2 py-1 pl-3 pr-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 [&::-webkit-details-marker]:hidden"
+                >
+                    <Icon
+                        size={14}
+                        role="img"
+                        aria-label={ariaLabel || statusLabel}
+                        className={cn(
+                            'mt-0.5 shrink-0',
+                            tone === 'success'
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : tone === 'warning'
+                                    ? 'text-amber-600 dark:text-amber-400'
+                                    : 'text-rose-600 dark:text-rose-400',
+                        )}
+                    />
+                    <span className="min-w-0 flex-1">
+                        <span className="block text-xs font-medium text-theme-text">{title}</span>
+                        {id && id !== title && (
+                            <span className="block break-all font-mono text-[11px] text-theme-muted">{id}</span>
+                        )}
+                    </span>
+                    <span className={cn(
+                        'shrink-0 text-[11px] font-medium',
+                        tone === 'success'
+                            ? 'text-emerald-700 dark:text-emerald-300'
+                            : tone === 'warning'
+                                ? 'text-amber-700 dark:text-amber-300'
+                                : 'text-rose-700 dark:text-rose-300',
+                    )}>
+                        {statusLabel}
+                    </span>
+                    <ChevronRight
+                        size={13}
+                        aria-hidden="true"
+                        className="mt-0.5 shrink-0 text-theme-muted transition-transform motion-reduce:transition-none group-open:rotate-90"
+                    />
+                </summary>
+                <div className="pb-2">
+                    {rules.length > 0 && (
+                        <ul className="mt-1.5 space-y-1" aria-label="Missing Kubernetes permissions">
+                            {rules.map((rule, index) => (
+                                <li key={`${rule.operationId || rule.resource || index}-rule`} className="break-all font-mono text-[11px] text-theme-muted">
+                                    {handoffRuleLabel(rule)}
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                    {children}
+                </div>
+            </details>
+        </li>
+    );
+}
+
+/**
+ * Reusable Orchestration administrator script handoff for non-admin deployment creation
+ * (mode="bootstrap") and two-phase deployment deletion (mode="cleanup").
+ */
+export function DeploymentPermissionHandoff({
+    mode = 'bootstrap',
+    report = null,
+    handoff = null,
+    namespace = '',
+    script = '',
+    filename,
+    instructions = '',
+    warnings = [],
+    error = '',
+    busy = false,
+    verifying = false,
+    generating = false,
+    identity = null,
+    subjectOverride = null,
+    onSubjectOverrideChange,
+    onGenerateScript,
+    onDownloadScript,
+    onCopyScript,
+    onPrimaryAction,
+    primaryActionLabel,
+    confirmed = false,
+    onConfirmChange,
+    onConfirmDelete,
+}) {
+    const [copied, setCopied] = useState(false);
+    const [localError, setLocalError] = useState('');
+    const copyTimerRef = useRef(null);
+
+    useEffect(() => () => {
+        if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+    }, []);
+
+    const isCleanup = mode === 'cleanup';
+    const resolvedNamespace = namespace || handoff?.namespace || report?.namespace || '';
+    const resolvedScript = typeof script === 'string' && script
+        ? script
+        : (typeof handoff?.script === 'string' ? handoff.script : '');
+    const defaultFilename = isCleanup ? 'lens-deployment-cleanup.sh' : 'lens-deployment-bootstrap.sh';
+    const resolvedFilename = filename || handoff?.scriptFilename || defaultFilename;
+    const resolvedInstructions = instructions || handoff?.instructions || (
+        isCleanup
+            ? 'Ask an Orchestration administrator to run this idempotent cleanup script once, then click Re-check & Delete.'
+            : 'Ask an Orchestration administrator to run this idempotent setup script once, then click Re-check & Deploy. It contains no kubeconfig or user secrets.'
+    );
+    const resolvedIdentity = identity || handoff?.identity || report?.identity || null;
+    const overrideRequired = !isCleanup && Boolean(
+        resolvedIdentity?.overrideRequired
+        || resolvedIdentity?.kind === 'unknown'
+        || resolvedIdentity?.source === 'override',
+    );
+    const overrideKind = subjectOverride?.kind || (resolvedIdentity?.source === 'override' ? resolvedIdentity.kind : 'ServiceAccount') || 'ServiceAccount';
+    const overrideName = subjectOverride?.name ?? (resolvedIdentity?.source === 'override' ? resolvedIdentity.name || '' : '');
+    const overrideNamespace = subjectOverride?.namespace ?? (resolvedIdentity?.source === 'override' ? resolvedIdentity.namespace || '' : '');
+    const overrideComplete = Boolean(overrideName.trim()) && (overrideKind !== 'ServiceAccount' || Boolean(overrideNamespace.trim()));
+
+    const marker = handoff?.marker || report?.marker || {};
+    const canVerifyMarker = Boolean(handoff?.canVerifyMarker ?? true);
+    const confirmRequired = isCleanup && Boolean(handoff?.confirmRequired || handoff?.unreachable || !canVerifyMarker);
+    const verifyStatus = handoff?.status || report?.status || (isCleanup ? 'pending_admin_cleanup' : 'admin_required');
+    const markerStatus = marker.status || (isCleanup && !canVerifyMarker ? 'unconfirmed' : verifyStatus);
+    const verified = Boolean(handoff?.verified || report?.sufficient || verifyStatus === 'verified' || verifyStatus === 'deleted');
+    const isStale = !verified && (markerStatus === 'stale' || verifyStatus === 'stale');
+    const isPartial = !verified && (markerStatus === 'partial' || verifyStatus === 'partial');
+    const isUnconfirmed = isCleanup && !verified && (!canVerifyMarker || markerStatus === 'unconfirmed');
+    const shouldExpandDetails = !verified;
+    const [detailsOpen, setDetailsOpen] = useState(shouldExpandDetails);
+
+    useEffect(() => {
+        setDetailsOpen(shouldExpandDetails);
+    }, [shouldExpandDetails]);
+
+    const handleDetailsToggle = (event) => {
+        if (event.target !== event.currentTarget) return;
+        setDetailsOpen(event.currentTarget.open);
+    };
+
+    const adminOperations = Array.isArray(report?.adminOperations) && report.adminOperations.length
+        ? report.adminOperations
+        : (Array.isArray(handoff?.operations) ? handoff.operations : []);
+    const userOperations = Array.isArray(report?.userOperations)
+        ? report.userOperations
+        : (Array.isArray(handoff?.completedOperations) ? handoff.completedOperations : []);
+    const missingRules = Array.isArray(handoff?.missing)
+        ? handoff.missing
+        : (Array.isArray(report?.missing) ? report.missing : []);
+    const remainingIds = new Set(
+        (Array.isArray(handoff?.remainingOperations) ? handoff.remainingOperations : []).map(handoffOperationId),
+    );
+    const hasVerifyCheck = Array.isArray(handoff?.remainingOperations);
+
+    const mergedWarnings = [];
+    for (const list of [warnings, report?.warnings, handoff?.warnings]) {
+        if (!Array.isArray(list)) continue;
+        for (const item of list) {
+            if (item && !mergedWarnings.includes(item)) mergedWarnings.push(item);
+        }
+    }
+
+    const badgeMeta = verified
+        ? { label: 'Verified', tone: 'success' }
+        : isStale
+            ? { label: 'Stale', tone: 'danger' }
+            : isPartial
+                ? { label: 'Partial', tone: 'warning' }
+                : isUnconfirmed
+                    ? { label: 'Unconfirmed', tone: 'warning' }
+                    : { label: 'Awaiting Orchestration administrator', tone: 'warning' };
+
+    const activeBusy = busy || verifying || generating;
+    const primaryLabel = primaryActionLabel || (isCleanup ? 'Re-check & Delete' : 'Re-check & Deploy');
+
+    const rulesFor = (id) => missingRules.filter((rule) => !rule.operationId || rule.operationId === id);
+
+    const detailParts = [];
+    if (adminOperations.length > 0) {
+        if (isCleanup) {
+            detailParts.push(`${adminOperations.length} remaining`);
+        } else if (verified) {
+            detailParts.push(`${adminOperations.length}/${adminOperations.length} done`);
+        } else {
+            detailParts.push(`${adminOperations.length} Orchestration administrator`);
+        }
+    }
+    if (userOperations.length > 0) {
+        detailParts.push(isCleanup ? `${userOperations.length} cleaned` : `${userOperations.length} ready`);
+    }
+    const detailSummaryLabel = detailParts.join(' · ');
+
+    const handleDownload = () => {
+        try {
+            setLocalError('');
+            if (onDownloadScript) onDownloadScript(resolvedScript, resolvedFilename);
+            else downloadBlob(new Blob([resolvedScript], { type: 'text/x-shellscript' }), resolvedFilename);
+        } catch {
+            setLocalError('Could not download the script. Copy it instead.');
+        }
+    };
+
+    const handleCopy = async () => {
+        setLocalError('');
+        try {
+            if (onCopyScript) await onCopyScript(resolvedScript);
+            else await copyText(resolvedScript);
+            setCopied(true);
+            if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+            copyTimerRef.current = setTimeout(() => setCopied(false), 1500);
+        } catch {
+            setLocalError('Could not copy the script. Download it instead.');
+        }
+    };
+
+    const updateOverride = (patch) => {
+        onSubjectOverrideChange?.({
+            kind: overrideKind,
+            name: overrideName,
+            namespace: overrideNamespace,
+            ...patch,
+        });
+    };
+
+    return (
+        <Panel
+            padding="sm"
+            tone="soft"
+            className={cn(
+                'border-l-4 shadow-none',
+                verified
+                    ? 'border-l-emerald-500'
+                    : isStale
+                        ? 'border-l-rose-500'
+                        : 'border-l-amber-500',
+            )}
+            title={(
+                <span className="flex items-center gap-2">
+                    <ShieldAlert
+                        size={15}
+                        className={cn(
+                            verified
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : isStale
+                                    ? 'text-rose-600 dark:text-rose-400'
+                                    : 'text-amber-600 dark:text-amber-400',
+                        )}
+                        aria-hidden="true"
+                    />
+                    {isCleanup ? 'Orchestration administrator namespace cleanup' : 'Orchestration administrator namespace setup'}
+                </span>
+            )}
+            actions={(
+                <div className="flex flex-wrap items-center gap-1.5">
+                    {resolvedNamespace && (
+                        <Badge tone="neutral" size="xs">
+                            <span className="font-mono">{resolvedNamespace}</span>
+                        </Badge>
+                    )}
+                    <Badge tone={badgeMeta.tone} size="xs">{badgeMeta.label}</Badge>
+                </div>
+            )}
+        >
+            <div className="space-y-3" role="status" aria-live="polite">
+                {verified ? (
+                    <p className="flex items-center gap-2 border-l-2 border-emerald-500 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-200">
+                        <CheckCircle2 size={14} className="shrink-0 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+                        <span>
+                            {isCleanup
+                                ? 'Orchestration administrator cleanup verified. The deployment record can now be deleted.'
+                                : 'Orchestration administrator namespace setup verified. Deployment can proceed now.'}
+                        </span>
+                    </p>
+                ) : isStale ? (
+                    <p className="flex items-start gap-2 border-l-2 border-rose-500 bg-rose-500/10 px-3 py-2 text-xs leading-relaxed text-rose-800 dark:text-rose-200">
+                        <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
+                        <span className="min-w-0 flex-1">
+                            {isCleanup
+                                ? `The cleanup marker belongs to an outdated cleanup plan. Ask an Orchestration administrator to run the updated script below, then click ${primaryLabel}.`
+                                : `The setup marker belongs to an older deployment plan. Ask an Orchestration administrator to run the updated script below, then click ${primaryLabel}.`}
+                        </span>
+                    </p>
+                ) : isPartial ? (
+                    <p className="flex items-start gap-2 border-l-2 border-amber-500 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
+                        <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
+                        <span className="min-w-0 flex-1">
+                            Orchestration administrator action is partial. Re-run the script below for the remaining work, then click <span className="font-semibold">{primaryLabel}</span>.
+                        </span>
+                    </p>
+                ) : isUnconfirmed ? (
+                    <p className="flex items-start gap-2 border-l-2 border-amber-500 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
+                        <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
+                        <span className="min-w-0 flex-1">
+                            {handoff?.detail || 'No readable marker namespace is available to confirm Orchestration administrator cleanup automatically.'} Ask an Orchestration administrator to run the cleanup script below, then re-check or confirm record deletion below once cleanup is complete.
+                        </span>
+                    </p>
+                ) : (
+                    <p className="max-w-[68ch] text-xs leading-relaxed text-theme-muted">
+                        {isCleanup
+                            ? (handoff?.detail || 'In-namespace workloads were cleaned with your kubeconfig, but deleting the Kubernetes namespace and cluster role binding requires an Orchestration administrator.')
+                            : `Your kubeconfig cannot create or configure namespace ${resolvedNamespace || 'for this deployment'} directly. Have an Orchestration administrator run the setup script once, then click ${primaryLabel} so Lens can deploy the model and copy secrets.`}
+                    </p>
+                )}
+
+                {mergedWarnings.map((item, index) => (
+                    <p
+                        key={`${index}-${item}`}
+                        className="flex items-start gap-2 border-l-2 border-amber-500 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200"
+                    >
+                        <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
+                        <span className="min-w-0 flex-1">{item}</span>
+                    </p>
+                ))}
+
+                {overrideRequired && (
+                    <div className="space-y-2.5 rounded-lg border border-theme-border bg-theme-bg/40 px-3 py-2.5">
+                        <p className="text-xs font-semibold text-theme-text">Kubernetes identity override</p>
+                        <p className="text-xs leading-relaxed text-theme-muted">
+                            Lens could not automatically detect the Kubernetes subject for your kubeconfig. Enter the ServiceAccount, User, or Group that should receive namespace permissions.
+                        </p>
+                        <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+                            <div>
+                                <Label htmlFor="deploy-subject-kind">Subject kind</Label>
+                                <Select
+                                    id="deploy-subject-kind"
+                                    value={overrideKind}
+                                    disabled={activeBusy}
+                                    onChange={(event) => updateOverride({ kind: event.target.value })}
+                                >
+                                    <option value="ServiceAccount">ServiceAccount</option>
+                                    <option value="User">User</option>
+                                    <option value="Group">Group</option>
+                                </Select>
+                            </div>
+                            <div>
+                                <Label htmlFor="deploy-subject-name">Subject name</Label>
+                                <Input
+                                    id="deploy-subject-name"
+                                    value={overrideName}
+                                    disabled={activeBusy}
+                                    placeholder={overrideKind === 'ServiceAccount' ? 'lens-deployer' : 'user@example.com'}
+                                    onChange={(event) => updateOverride({ name: event.target.value })}
+                                />
+                            </div>
+                            {overrideKind === 'ServiceAccount' && (
+                                <div>
+                                    <Label htmlFor="deploy-subject-namespace">ServiceAccount namespace</Label>
+                                    <Input
+                                        id="deploy-subject-namespace"
+                                        value={overrideNamespace}
+                                        disabled={activeBusy}
+                                        placeholder="team-namespace"
+                                        onChange={(event) => updateOverride({ namespace: event.target.value })}
+                                    />
+                                </div>
+                            )}
+                        </div>
+                        {onGenerateScript && (
+                            <div>
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    isLoading={generating}
+                                    disabled={activeBusy || !overrideComplete}
+                                    onClick={() => onGenerateScript({
+                                        kind: overrideKind,
+                                        name: overrideName.trim(),
+                                        ...(overrideKind === 'ServiceAccount' ? { namespace: overrideNamespace.trim() } : {}),
+                                    })}
+                                >
+                                    <Download size={13} aria-hidden="true" /> {resolvedScript ? 'Regenerate script' : 'Generate script'}
+                                </Button>
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {!verified && (resolvedScript || (onGenerateScript && !overrideRequired)) && (
+                    <div className="space-y-2 rounded-lg border border-theme-border bg-theme-bg/40 px-3 py-2.5">
+                        <p className="text-xs font-semibold text-theme-text">
+                            {isCleanup ? 'Orchestration administrator cleanup script' : 'Orchestration administrator setup script'}
+                        </p>
+                        <p className="max-w-[68ch] text-xs leading-relaxed text-theme-muted">{resolvedInstructions}</p>
+                        <div className="flex flex-wrap gap-2">
+                            {resolvedScript ? (
+                                <>
+                                    <Button variant="outline" size="sm" onClick={handleDownload} disabled={activeBusy}>
+                                        <Download size={13} aria-hidden="true" /> Download .sh
+                                    </Button>
+                                    <Button variant="outline" size="sm" onClick={handleCopy} disabled={activeBusy}>
+                                        {copied
+                                            ? <Check size={13} className="text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+                                            : <ClipboardCopy size={13} aria-hidden="true" />}
+                                        {copied ? 'Copied' : 'Copy script'}
+                                    </Button>
+                                </>
+                            ) : (
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => onGenerateScript?.()}
+                                    isLoading={generating}
+                                    disabled={activeBusy || !onGenerateScript}
+                                >
+                                    <Download size={13} aria-hidden="true" /> Generate script
+                                </Button>
+                            )}
+                        </div>
+                    </div>
+                )}
+
+                <div className="flex flex-wrap items-center gap-2 border-t border-theme-border pt-3">
+                    <Button
+                        variant="sky"
+                        size="sm"
+                        onClick={onPrimaryAction}
+                        isLoading={verifying}
+                        disabled={activeBusy || !onPrimaryAction}
+                    >
+                        <RefreshCw size={13} aria-hidden="true" /> {primaryLabel}
+                    </Button>
+                </div>
+
+                <FormError message={error || localError} />
+
+                {(verifying || generating) && (
+                    <p className="flex items-center gap-2 text-[11px] text-theme-muted">
+                        <Spinner size="xs" /> {generating ? 'Generating Orchestration administrator script…' : 'Checking cluster status…'}
+                    </p>
+                )}
+
+                {isCleanup && !canVerifyMarker && confirmRequired && (
+                    <div className="space-y-2.5 rounded-lg border border-rose-500/30 bg-rose-500/5 px-3 py-2.5">
+                        <Checkbox
+                            id="confirm-deployment-admin-cleanup"
+                            checked={Boolean(confirmed)}
+                            onChange={(event) => onConfirmChange?.(event.target.checked)}
+                            disabled={activeBusy}
+                            label="I confirm Orchestration administrator cleanup has been run (or accept leaving cluster resources behind) and want to delete the Lens deployment record."
+                        />
+                        <div className="flex flex-wrap gap-2">
+                            <Button
+                                variant="danger"
+                                size="sm"
+                                onClick={onConfirmDelete}
+                                disabled={!confirmed || activeBusy}
+                            >
+                                Confirm &amp; Delete Record
+                            </Button>
+                        </div>
+                    </div>
+                )}
+
+                {(adminOperations.length > 0 || userOperations.length > 0 || resolvedScript || marker.name || marker.namespace) && (
+                    <details
+                        className="group/details border-t border-theme-border pt-3"
+                        open={detailsOpen}
+                        onToggle={handleDetailsToggle}
+                    >
+                        <summary className="flex cursor-pointer list-none items-center justify-between gap-2 text-xs font-medium text-theme-muted hover:text-theme-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 [&::-webkit-details-marker]:hidden">
+                            <span className="flex items-center gap-1.5">
+                                <ChevronRight
+                                    size={13}
+                                    aria-hidden="true"
+                                    className="shrink-0 transition-transform motion-reduce:transition-none group-open/details:rotate-90"
+                                />
+                                View operation details
+                            </span>
+                            {detailSummaryLabel && <span className="font-mono text-[11px]">{detailSummaryLabel}</span>}
+                        </summary>
+
+                        <div className="mt-3 space-y-4">
+                            {adminOperations.length > 0 && (
+                                <section className="space-y-2" aria-labelledby="deploy-handoff-admin-heading">
+                                    <h4 id="deploy-handoff-admin-heading" className="text-xs font-semibold text-theme-text">
+                                        {isCleanup ? 'Remaining Orchestration administrator operations' : `Orchestration administrator operations (${pluralCount(adminOperations.length, 'operation')})`}
+                                    </h4>
+                                    <ul className="space-y-1">
+                                        {adminOperations.map((entry, index) => {
+                                            const id = handoffOperationId(entry);
+                                            const isDone = verified || (!isUnconfirmed && !isStale && hasVerifyCheck && Boolean(id) && !remainingIds.has(id));
+                                            const rowTone = isDone ? 'success' : isUnconfirmed ? 'warning' : 'danger';
+                                            const statusLabel = isDone
+                                                ? 'Done'
+                                                : isUnconfirmed
+                                                    ? 'Unconfirmed'
+                                                    : 'Remaining';
+                                            return (
+                                                <HandoffOperationRow
+                                                    key={`${id || index}-admin`}
+                                                    entry={entry}
+                                                    tone={rowTone}
+                                                    statusLabel={statusLabel}
+                                                    rules={rulesFor(id)}
+                                                >
+                                                    <p className="text-[11px] leading-relaxed text-theme-muted">
+                                                        {isCleanup
+                                                            ? handoffTargetLabel(entry)
+                                                            : (isDone ? 'Verified in the target namespace.' : 'Applied by the Orchestration administrator setup script.')}
+                                                    </p>
+                                                </HandoffOperationRow>
+                                            );
+                                        })}
+                                    </ul>
+                                </section>
+                            )}
+
+                            {userOperations.length > 0 && (
+                                <section className="space-y-2" aria-labelledby="deploy-handoff-user-heading">
+                                    <h4 id="deploy-handoff-user-heading" className="text-xs font-semibold text-theme-text">
+                                        {isCleanup ? 'Cleaned with your kubeconfig' : 'Your operations'}
+                                    </h4>
+                                    <ul className="space-y-1">
+                                        {userOperations.map((entry, index) => {
+                                            const id = handoffOperationId(entry);
+                                            return (
+                                                <HandoffOperationRow
+                                                    key={`${id || index}-user`}
+                                                    entry={entry}
+                                                    tone="success"
+                                                    statusLabel={isCleanup ? 'Cleaned' : 'Ready'}
+                                                    rules={rulesFor(id)}
+                                                >
+                                                    <p className="text-[11px] leading-relaxed text-theme-muted">
+                                                        {isCleanup ? handoffTargetLabel(entry) : 'Runs with your kubeconfig after namespace setup.'}
+                                                    </p>
+                                                </HandoffOperationRow>
+                                            );
+                                        })}
+                                    </ul>
+                                </section>
+                            )}
+
+                            {(marker.namespace || marker.name || marker.status) && (
+                                <div className="space-y-1 border-t border-theme-border pt-3">
+                                    <p className="text-xs font-semibold text-theme-text">Completion marker</p>
+                                    <dl className="grid gap-1 text-[11px] text-theme-muted sm:grid-cols-[8rem_1fr]">
+                                        <dt>Namespace</dt><dd className="break-all font-mono">{marker.namespace || 'not available'}</dd>
+                                        <dt>ConfigMap</dt><dd className="break-all font-mono">{marker.name || 'not available'}</dd>
+                                        <dt>Status</dt><dd>{marker.status || markerStatus}{marker.verified ? ' · verified' : ''}</dd>
+                                    </dl>
+                                </div>
+                            )}
+
+                            {resolvedScript && (
+                                <div className="space-y-1.5 border-t border-theme-border pt-3">
+                                    <p className="text-xs font-semibold text-theme-text">Script preview</p>
+                                    <pre className="max-h-60 overflow-auto rounded-lg border border-theme-border bg-theme-bg/70 p-3 font-mono text-[11px] leading-relaxed text-theme-text">
+                                        {resolvedScript}
+                                    </pre>
+                                </div>
+                            )}
+                        </div>
+                    </details>
+                )}
+            </div>
+        </Panel>
+    );
 }

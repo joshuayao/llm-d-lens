@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { setHardwareProfiles } from '../ui/benchmark-results/acceleratorDisplay.js';
+import { DEFAULT_RUNTIME_IMAGES, runtimeImageRepository, setHardwareProfiles } from '../ui/benchmark-results/acceleratorDisplay.js';
 setHardwareProfiles(['intel_xpu', 'nvidia'].map(name => JSON.parse(fs.readFileSync(new URL(`../../../../../backend/src/llm_d_lens/hardware/profiles/${name}.json`, import.meta.url), 'utf8'))));
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -46,4 +46,18 @@ test('shared paths and image build sources must match while irrelevant cache fie
     assert.equal(matchesEvaluationSetup(saved, { ...shared, storageVolumeId: 'unused' }), true);
     assert.equal(matchesEvaluationSetup(saved, { ...shared, modelPath: '/other' }), false);
     assert.equal(matchesEvaluationSetup(saved, { ...shared, buildSourceUrl: 'https://example.org/other' }), false);
+});
+
+test('sameRuntimeImage requires exact match when both carry tags/digests and falls back to repo only when repo-only', () => {
+    const profileImage = Object.values(DEFAULT_RUNTIME_IMAGES)[0];
+    const profileRepo = runtimeImageRepository(profileImage);
+    const customTag = `${profileRepo}:custom-tag`;
+    const digestImage = `${profileRepo}@sha256:${'a'.repeat(64)}`;
+
+    assert.equal(matchesEvaluationSetup(artifact('a', { image: profileImage }), { ...setup, image: profileImage }), true);
+    assert.equal(matchesEvaluationSetup(artifact('a', { image: profileImage }), { ...setup, image: customTag }), false);
+    assert.equal(matchesEvaluationSetup(artifact('a', { image: profileImage }), { ...setup, image: digestImage }), false);
+    assert.equal(matchesEvaluationSetup(artifact('a', { image: profileImage }), { ...setup, image: profileRepo }), true);
+    assert.equal(matchesEvaluationSetup(artifact('a', { image: profileRepo }), { ...setup, image: customTag }), true);
+    assert.equal(matchesEvaluationSetup(artifact('a', { image: 'registry.corp/vllm:v1' }), { ...setup, image: 'registry.corp/vllm' }), false);
 });

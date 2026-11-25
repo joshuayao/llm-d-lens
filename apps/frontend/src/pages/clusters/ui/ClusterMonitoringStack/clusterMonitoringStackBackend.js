@@ -12,13 +12,15 @@ import { requestMonitoringJson as requestJson } from '../../../../shared/api/mon
 
 
 function clusterQuery(namespace, clusterId) {
-    const query = new URLSearchParams({ namespace });
+    const query = new URLSearchParams();
+    if (namespace) query.set('namespace', namespace);
     if (clusterId) query.set('cluster_id', clusterId);
     return query.toString();
 }
 
 export function getClusterStackStatus(namespace, { signal, clusterId } = {}) {
-    return requestJson(`${BASE_PATH}/status?${clusterQuery(namespace, clusterId)}`, { signal });
+    const qs = clusterQuery(namespace, clusterId);
+    return requestJson(`${BASE_PATH}/status${qs ? `?${qs}` : ''}`, { signal });
 }
 
 export function preflightClusterStackInstall(request, { signal, clusterId } = {}) {
@@ -48,12 +50,40 @@ export function getClusterStackOperation(operationId, { signal } = {}) {
 }
 
 export function getClusterStackLinks(namespace, { signal, clusterId } = {}) {
-    return requestJson(`${BASE_PATH}/links?${clusterQuery(namespace, clusterId)}`, { signal });
+    const qs = clusterQuery(namespace, clusterId);
+    return requestJson(`${BASE_PATH}/links${qs ? `?${qs}` : ''}`, { signal });
 }
 
-export function getDeploymentFlowMap(executionId, { signal, clusterId } = {}) {
+export function getClusterStackAdminScript({ namespace, mode, includeAccelerators, clusterId, signal } = {}) {
+    const query = new URLSearchParams();
+    if (namespace) query.set('namespace', namespace);
+    if (mode) query.set('mode', mode);
+    if (includeAccelerators !== undefined) query.set('include_accelerators', String(Boolean(includeAccelerators)));
+    if (clusterId) query.set('cluster_id', clusterId);
+    const qs = query.toString();
+    return requestJson(`${BASE_PATH}/admin-script${qs ? `?${qs}` : ''}`, { signal });
+}
+
+export function recheckClusterStack(namespace, { clusterId } = {}) {
+    const query = new URLSearchParams();
+    if (namespace) query.set('namespace', namespace);
+    if (clusterId) query.set('cluster_id', clusterId);
+    const qs = query.toString();
+    return requestJson(`${BASE_PATH}/recheck${qs ? `?${qs}` : ''}`, { method: 'POST' });
+}
+
+export function updateClusterMonitoringEndpoints(clusterId, payload) {
+    return requestJson(`/api/cluster/clusters/${encodeURIComponent(clusterId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+}
+
+export function getDeploymentFlowMap(executionId, { signal, clusterId, monitoringNamespace } = {}) {
     const query = new URLSearchParams({ execution_id: executionId });
     if (clusterId) query.set('cluster_id', clusterId);
+    if (monitoringNamespace) query.set('monitoring_namespace', monitoringNamespace);
     return requestJson(`/api/v1/monitoring/profiling/flow-map?${query.toString()}`, { signal });
 }
 

@@ -7,6 +7,7 @@
 //     https://www.apache.org/licenses/LICENSE-2.0
 
 import { checkTone, checkLabel } from './preflightPresentation';
+import { DEFAULT_MONITORING_NAMESPACE, normalizeMonitoringNamespace } from './monitoringLinks';
 import { useMonitoringInstall } from './useMonitoringInstall';
 import React, { useState } from 'react';
 import { AlertTriangle, CheckCircle2, CircleX } from 'lucide-react';
@@ -21,14 +22,32 @@ function initialAccessModeFor(status, supportedAccessModes = []) {
 }
 
 export function InstallAcceleratorModal(props) {
-    return props.isOpen ? <InstallAcceleratorModalForm {...props} /> : null;
+    return props.isOpen ? (
+        <InstallAcceleratorModalForm
+            key={JSON.stringify([props.clusterId, props.accelerator, props.defaultNamespace, props.monitoringNamespace])}
+            {...props}
+        />
+    ) : null;
 }
 
-function InstallAcceleratorModalForm({ isOpen, accelerator, defaultNamespace, status, supportedAccessModes = [], initialAccessMode, clusterId, onClose, onOperationStarted }) {
+function InstallAcceleratorModalForm({
+    isOpen,
+    accelerator,
+    defaultNamespace,
+    monitoringNamespace = DEFAULT_MONITORING_NAMESPACE,
+    status,
+    supportedAccessModes = [],
+    initialAccessMode,
+    clusterId,
+    onClose,
+    onOperationStarted,
+}) {
+    const effectiveMonitoringNamespace = normalizeMonitoringNamespace(monitoringNamespace);
     const [request, setRequest] = useState({
         accelerator,
         access_mode: initialAccessMode || initialAccessModeFor(status, supportedAccessModes),
         namespace: defaultNamespace || '',
+        monitoring_namespace: effectiveMonitoringNamespace,
     });
     const { preflight, error, checking, installing, updateRequest, runPreflight, startInstall } = useMonitoringInstall({
         request, setRequest, preflightRequest: preflightAcceleratorInstall, installRequest: installAccelerator,
@@ -73,7 +92,7 @@ function InstallAcceleratorModalForm({ isOpen, accelerator, defaultNamespace, st
             isOpen={isOpen}
             onClose={installing ? undefined : onClose}
             title="Install accelerator observability"
-            subtitle="Prometheus and Grafana are always enabled and reuse the existing Cluster infrastructure stack."
+            subtitle={`Prometheus and Grafana are always enabled and reuse the existing Cluster infrastructure stack in namespace ${effectiveMonitoringNamespace}.`}
             size="lg"
             footer={footer}
             closeOnBackdrop={!installing}

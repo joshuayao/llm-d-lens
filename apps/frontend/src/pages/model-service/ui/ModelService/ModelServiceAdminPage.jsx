@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { requestJson } from '../../../../shared/api/httpClient';
-import { ArrowDown, Boxes, ListFilter, Loader2, Plus, Repeat, RotateCcw, Search } from 'lucide-react';
+import { AlertTriangle, ArrowDown, Boxes, Check, CheckCircle2, ChevronRight, ClipboardCopy, Download, ListFilter, Loader2, Plus, RefreshCw, Repeat, RotateCcw, Search, ShieldAlert } from 'lucide-react';
 import { usePolling } from '../../../../shared/lib/usePolling';
 import { useResourceList } from '../../../../shared/lib/useResourceList';
 import { useNotice } from '../../../../shared/lib/useNotice';
 import { useSubmission } from '../../../../shared/lib/useSubmission';
+import { useClipboard } from '../../../../shared/lib/useClipboard';
+import { downloadBlob } from '../../../../shared/lib/download';
 import { cn } from '../../../../shared/lib/cn';
 import { errorMessage } from '../../../../shared/lib/errorMessage';
 import { Button } from '../../../../shared/ui/Button';
-import { StatusChip } from '../../../../shared/ui/Badge';
+import { Badge, StatusChip } from '../../../../shared/ui/Badge';
 import { Input, Label, Select, Textarea } from '../../../../shared/ui/FormControls';
 import { EmptyState } from '../../../../shared/ui/EmptyState';
 import { FormError } from '../../../../shared/ui/FormError';
@@ -17,16 +19,25 @@ import { Modal } from '../../../../shared/ui/Modal';
 import { ModuleHeader } from '../../../../shared/ui/ModuleHeader';
 import { ModulePage } from '../../../../shared/ui/ModulePage';
 import { SectionLabel } from '../../../../shared/ui/SectionLabel';
+import { Spinner } from '../../../../shared/ui/Spinner';
 import { Toast } from '../../../../shared/ui/Toast';
 import { PermissionGate, useAuth } from '../../../auth';
 import {
     addModel,
+    applyMutationHandoffResult,
+    clusterHandoffMode,
+    componentHandoffAction,
     deleteGroup,
     deleteMember,
+    fetchClusterHandoff,
+    generateGatewayRemediation,
     getGatewayIppConfig,
     getGatewayStatus,
     getModelAccess,
     grantModelAccess,
+    performClusterBannerRecheck,
+    performHandoffRecheck,
+    performHandoffScriptRefresh,
     revokeModelAccess,
     listGroups,
     listMembers,
@@ -41,10 +52,10 @@ import {
     updateTrafficDistribution,
     setProvidersStatus,
 } from './modelServiceBackend';
-import { DataPlaneTopology } from './DataPlaneTopology';
+import { clusterCapabilities, DataPlaneTopology } from './DataPlaneTopology';
 import { loadCluster, listLensHosts } from '../../../optimization';
 import { ComponentLogViewer, GatewayOperationLogDrawer } from './GatewayOperationLogDrawer';
-import { availableModelProviders, filterServiceFlow, memberIsRoutable, MAX_TRAFFIC_WEIGHT, trafficDistributionError, trafficShare, trafficTotal } from '../../model/modelService';
+import { availableModelProviders, buildHandoffModalState, filterServiceFlow, memberIsRoutable, MAX_TRAFFIC_WEIGHT, trafficDistributionError, trafficShare, trafficTotal } from '../../model/modelService';
 import { CARD } from './modelServiceStyles';
 
 
@@ -54,6 +65,7 @@ const STATUS_DOT = {
     ready: 'bg-emerald-400',
     running: 'bg-emerald-400',
     installed: 'bg-emerald-400',
+    pending: 'bg-amber-400',
     missing: 'bg-amber-400',
     unhealthy: 'bg-rose-500',
     degraded: 'bg-amber-400',
@@ -90,10 +102,13 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
     const [accessGroup, setAccessGroup] = useState(null);
     const [ippConfigEdit, setIppConfigEdit] = useState(null);
     const [operationLog, setOperationLog] = useState(null);
+    const [handoffModal, setHandoffModal] = useState(null);
+    const [bannerRecheckingId, setBannerRecheckingId] = useState('');
     const [gatewayConfigCluster, setGatewayConfigCluster] = useState(null);
     const [logsTarget, setLogsTarget] = useState(null);
     const [logsLines, setLogsLines] = useState([]);
     const loadedOnceRef = useRef(false);
+    const loadSeqRef = useRef(0);
     const focusedGroupId = useRef('');
     const focusedClusterScope = useRef('');
     const handledInitialAction = useRef(false);
@@ -136,6 +151,8 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
         })
         .filter((group) => group.clusters.length > 0);
     const filteredFlow = filterServiceFlow(status.clusters, memberGroups, { clusterId: flowClusterId, modelQuery: flowModelQuery, status: flowStatus });
+    const handoffClusters = filteredFlow.clusters.filter((cluster) => cluster.reconcileStatus === 'admin_handoff_required');
+    const authErrorClusters = filteredFlow.clusters.filter((cluster) => Boolean(cluster.authError));
     const flowModelNames = [...new Set(memberGroups
         .filter((group) => (!flowStatus || group.status === flowStatus))
         .filter((group) => !flowClusterId || group.clusters.some((cluster) => cluster.clusterId === flowClusterId))
@@ -143,23 +160,23 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
     const hasFlowFilters = Boolean(flowClusterId || flowModelQuery || flowStatus);
 
     const load = useCallback(async () => {
+        const seq = ++loadSeqRef.current;
         try {
-            const [groupItems, memberItems, deployItems, gatewayStatus] = await Promise.all([
-                listGroups(),
-                listMembers(),
-                listPublishableDeployments(),
-                getGatewayStatus(),
-            ]);
-            setGroups(groupItems);
-            setMembers(memberItems);
-            setDeployments(deployItems);
-            setStatus(gatewayStatus);
+            const snapshot = await fetchModelServiceAdminSnapshot();
+            if (seq !== loadSeqRef.current) return;
+            setGroups(snapshot.groups);
+            setMembers(snapshot.members);
+            setDeployments(snapshot.deployments);
+            setStatus(snapshot.status);
             setError('');
         } catch (failure) {
+            if (seq !== loadSeqRef.current) return;
             setError(failure?.message || 'Failed to load model services');
         } finally {
-            loadedOnceRef.current = true;
-            setLoaded(true);
+            if (seq === loadSeqRef.current) {
+                loadedOnceRef.current = true;
+                setLoaded(true);
+            }
         }
     }, []);
 
@@ -229,9 +246,44 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
         });
     };
 
+    const openHandoffPayload = (handoff, clusterId = '') => {
+        if (!handoff) return;
+        setHandoffModal(buildHandoffModalState(handoff, { clusterId, clusters: status.clusters }));
+    };
+
+    const openClusterHandoff = (cluster, mode = clusterHandoffMode(cluster), { persist = false } = {}) => syncSubmission.run(async () => {
+        const payload = await fetchClusterHandoff(cluster, mode, { persist });
+        openHandoffPayload(payload, cluster.clusterId);
+    });
+
+    const recheckHandoff = () => performHandoffRecheck({
+        handoffModal,
+        setHandoffModal,
+        setStatus,
+        setNotice,
+        load,
+    });
+
+    const refreshHandoffScript = () => performHandoffScriptRefresh({
+        handoffModal,
+        setHandoffModal,
+        setStatus,
+    });
+
+    const recheckClusterBanner = (cluster) => performClusterBannerRecheck(cluster, {
+        bannerRecheckingId,
+        setBannerRecheckingId,
+        setHandoffModal,
+        setStatus,
+        setNotice,
+        setError: syncSubmission.setError,
+        load,
+    });
+
     const submitTrafficDistribution = () => trafficSubmission.run(async () => {
         const validation = trafficDistributionError(trafficDraft.rows);
         if (validation) throw new Error(validation);
+        const clusterId = trafficDraft.clusterId;
         const result = await updateTrafficDistribution(trafficDraft.groupId, {
             expectedWeights: trafficDraft.expectedWeights,
             members: trafficDraft.rows.map((row) => ({ executionId: row.executionId, weight: Number(row.weight) })),
@@ -247,9 +299,26 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
             })),
         });
         await load({ quiet: true });
+        if (result.reconcileStatus === 'admin_handoff_required') {
+            setTrafficDraft(null);
+            await applyMutationHandoffResult(result, {
+                clusterId,
+                clusters: status.clusters,
+                setHandoffModal,
+                setStatus,
+            });
+            setNotice('Traffic weights saved. Run the Orchestration administrator script to sync routes.');
+            return;
+        }
         if (result.operation.status !== 'succeeded') {
             throw new Error(`Configuration saved, but Gateway reconciliation failed: ${result.operation.message || 'See Reconcile logs.'}`);
         }
+        await applyMutationHandoffResult(result, {
+            clusterId,
+            clusters: status.clusters,
+            setHandoffModal,
+            setStatus,
+        });
         setTrafficDraft(null);
         setNotice('Traffic weights saved and submitted to the Gateway.');
     });
@@ -258,15 +327,34 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
         if (!modelForm.name.trim() || !selectedDeployment?.model) {
             throw new Error('Enter a public model name and select an available ready provider.');
         }
+        const clusterId = modelForm.clusterId;
         const result = await addModel({
             name: modelForm.name.trim(),
-            clusterId: modelForm.clusterId,
+            clusterId,
             executionId: selectedDeployment.executionId,
         });
         await load({ quiet: true });
+        if (result.reconcileStatus === 'admin_handoff_required') {
+            setModelOpen(false);
+            setSelectedGroupId(result.group.id);
+            await applyMutationHandoffResult(result, {
+                clusterId,
+                clusters: status.clusters,
+                setHandoffModal,
+                setStatus,
+            });
+            setNotice('Model saved. Run the Orchestration administrator script to apply routes in Kubernetes.');
+            return;
+        }
         if (result.operation && result.operation.status !== 'succeeded') {
             throw new Error(`Deployment added with weight ${result.weight}, but Gateway reconciliation failed: ${result.operation.message || 'Use Reconcile to retry.'}`);
         }
+        await applyMutationHandoffResult(result, {
+            clusterId,
+            clusters: status.clusters,
+            setHandoffModal,
+            setStatus,
+        });
         setModelOpen(false);
         setSelectedGroupId(result.group.id);
         setNotice(result.created
@@ -276,17 +364,40 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
 
     const removeProvider = () => deleteSubmission.run(async () => {
         if (!memberDelete) return;
-        await deleteMember(memberDelete.id);
+        const clusterId = memberDelete.clusterId;
+        const result = await deleteMember(memberDelete.id);
         setMemberDelete(null);
+        const outcome = await applyMutationHandoffResult(result, {
+            clusterId,
+            clusters: status.clusters,
+            setHandoffModal,
+            setStatus,
+        });
+        if (outcome === 'admin_handoff_required') {
+            setNotice('Provider removed from model. Run the Orchestration administrator script to clean up routes.');
+        } else {
+            setNotice('Provider removed from model.');
+        }
         await load({ quiet: true });
     });
 
     const removeModel = () => deleteSubmission.run(async () => {
         if (!modelDelete) return;
+        const clusterId = modelDelete.clusterId;
         try {
-            await deleteGroup(modelDelete.id);
+            const result = await deleteGroup(modelDelete.id);
             setModelDelete(null);
-            setNotice('Model removed. Its HTTPRoute and model mapping were safely cleaned up.');
+            const outcome = await applyMutationHandoffResult(result, {
+                clusterId,
+                clusters: status.clusters,
+                setHandoffModal,
+                setStatus,
+            });
+            if (outcome === 'admin_handoff_required') {
+                setNotice('Model record removed. Run the Orchestration administrator script to clean up Kubernetes routes.');
+            } else {
+                setNotice('Model removed. Its HTTPRoute and model mapping were safely cleaned up.');
+            }
         } finally {
             await load({ quiet: true });
         }
@@ -295,11 +406,22 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
     const toggleAllProviders = (groupId, online) => toggleSubmission.run(async () => {
         setNotice('');
         serviceToggleSubmission.setError('');
+        const group = groups.find((item) => item.id === groupId);
         try {
-            await setProvidersStatus(groupId, online ? 'active' : 'disabled');
-            setNotice(online
-                ? 'All providers online. Weights and Pods are unchanged; stopped models remain stopped and weight 0 stays standby.'
-                : 'All providers offline. Weights, model state and running Pods are unchanged.');
+            const items = await setProvidersStatus(groupId, online ? 'active' : 'disabled');
+            const outcome = await applyMutationHandoffResult(items, {
+                clusterId: group?.clusterId,
+                clusters: status.clusters,
+                setHandoffModal,
+                setStatus,
+            });
+            if (outcome === 'admin_handoff_required') {
+                setNotice('Provider statuses updated. Run the Orchestration administrator script to sync routes.');
+            } else {
+                setNotice(online
+                    ? 'All providers online. Weights and Pods are unchanged; stopped models remain stopped and weight 0 stays standby.'
+                    : 'All providers offline. Weights, model state and running Pods are unchanged.');
+            }
         } finally {
             await load({ quiet: true });
         }
@@ -310,12 +432,18 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
         setOperationLog({ title, status: 'running', lines: [], message: '' });
         const append = (line) => setOperationLog((prev) => (prev ? { ...prev, lines: [...prev.lines, line] } : prev));
         (async () => {
+            let handoffPayload = null;
+            let handoffClusterId = '';
             for (const payload of list) {
                 await new Promise((resolve) => {
                     (payload.op === 'reconcile' ? reconcileGateway : streamGatewayOperation)(payload, (type, data) => {
                         if (type === 'log') append(data.message);
                         else if (type === 'complete') {
                             if (data.message) append(data.message);
+                            if (data?.detailJson?.reconcileStatus === 'admin_handoff_required' && data?.detailJson?.handoff) {
+                                handoffPayload = data.detailJson.handoff;
+                                handoffClusterId = payload.clusterId;
+                            }
                             resolve();
                         } else if (type === 'error') {
                             append(data.message || 'Unexpected error.');
@@ -328,7 +456,13 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
                 });
             }
             setOperationLog((prev) => (prev ? { ...prev, status: 'succeeded' } : prev));
-            setNotice(`${title} finished`);
+            if (handoffPayload) {
+                setOperationLog(null);
+                openHandoffPayload(handoffPayload, handoffClusterId);
+                setNotice('Orchestration administrator route sync required.');
+            } else {
+                setNotice(`${title} finished`);
+            }
             load({ quiet: true });
         })();
     };
@@ -339,7 +473,31 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
             setNotice('No clusters with members to reconcile');
             return;
         }
-        runGatewayOperation(clusterIds.map((clusterId) => ({ op: 'reconcile', clusterId })), 'Reconcile data plane');
+        const adminClusterIds = [];
+        const nonAdminClusters = [];
+        for (const clusterId of clusterIds) {
+            const cluster = status.clusters.find((item) => item.clusterId === clusterId);
+            if (clusterCapabilities(cluster).canReconcile) adminClusterIds.push(clusterId);
+            else nonAdminClusters.push(cluster || { clusterId });
+        }
+        if (adminClusterIds.length > 0) {
+            runGatewayOperation(adminClusterIds.map((clusterId) => ({ op: 'reconcile', clusterId })), 'Reconcile data plane');
+        }
+        if (nonAdminClusters.length > 0) {
+            syncSubmission.run(async () => {
+                let firstHandoff = null;
+                for (const cluster of nonAdminClusters) {
+                    const handoff = await generateGatewayRemediation({ clusterId: cluster.clusterId, mode: 'routes' });
+                    if (!firstHandoff) firstHandoff = { handoff, clusterId: cluster.clusterId };
+                }
+                if (adminClusterIds.length === 0 && firstHandoff) {
+                    openHandoffPayload(firstHandoff.handoff, firstHandoff.clusterId);
+                } else if (firstHandoff) {
+                    setNotice('Orchestration administrator sync scripts generated for Non-Admin clusters.');
+                }
+                await load({ quiet: true });
+            });
+        }
     };
 
     const toggleMember = (member) => toggleSubmission.run(async () => {
@@ -347,12 +505,22 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
         serviceToggleSubmission.setError('');
         const online = member.status === 'disabled';
         try {
-            await updateMember(member.id, { status: online ? 'active' : 'disabled' });
-            setNotice(online
-                ? (member.weight === 0
-                    ? 'Deployment online at weight 0 (standby). Set its weight in Traffic distribution to receive requests.'
-                    : 'Deployment online. It receives traffic only while its model service is enabled.')
-                : 'Deployment offline. Its weight and running Pods are unchanged.');
+            const result = await updateMember(member.id, { status: online ? 'active' : 'disabled' });
+            const outcome = await applyMutationHandoffResult(result, {
+                clusterId: member.clusterId,
+                clusters: status.clusters,
+                setHandoffModal,
+                setStatus,
+            });
+            if (outcome === 'admin_handoff_required') {
+                setNotice('Deployment status updated. Run the Orchestration administrator script to sync routes.');
+            } else {
+                setNotice(online
+                    ? (member.weight === 0
+                        ? 'Deployment online at weight 0 (standby). Set its weight in Traffic distribution to receive requests.'
+                        : 'Deployment online. It receives traffic only while its model service is enabled.')
+                    : 'Deployment offline. Its weight and running Pods are unchanged.');
+            }
         } finally {
             await load({ quiet: true });
         }
@@ -362,11 +530,25 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
     const openIppConfig = (cluster) => {
         ippConfigSubmission.setError('');
         const clusterIdValue = cluster.clusterId;
-        setIppConfigEdit({ clusterId: clusterIdValue, name: cluster.clusterName || clusterIdValue, config: '', default: '', loading: true });
+        const caps = clusterCapabilities(cluster);
+        setIppConfigEdit({
+            clusterId: clusterIdValue,
+            name: cluster.clusterName || clusterIdValue,
+            config: '',
+            default: '',
+            loading: true,
+            canManageGatewayConfig: caps.canManageConfig,
+        });
         getGatewayIppConfig(clusterIdValue)
             .then((payload) => setIppConfigEdit((cur) => (
                 cur && cur.clusterId === clusterIdValue
-                    ? { ...cur, config: payload.config || '', default: payload.default || '', loading: false }
+                    ? {
+                        ...cur,
+                        config: payload.config || '',
+                        default: payload.default || '',
+                        loading: false,
+                        canManageGatewayConfig: payload.canManageGatewayConfig ?? cur.canManageGatewayConfig,
+                    }
                     : cur
             )))
             .catch((err) => setIppConfigEdit((cur) => (
@@ -375,9 +557,27 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
     };
 
     const submitIppConfig = () => ippConfigSubmission.run(async () => {
-        await setGatewayIppConfig(ippConfigEdit.clusterId, ippConfigEdit.config);
+        const clusterId = ippConfigEdit.clusterId;
+        if (ippConfigEdit.canManageGatewayConfig === false) {
+            const handoff = await generateGatewayRemediation({
+                clusterId,
+                mode: 'ipp_config',
+                ippConfig: ippConfigEdit.config || undefined,
+            });
+            setIppConfigEdit(null);
+            openHandoffPayload(handoff, clusterId);
+            setNotice('IPP Orchestration administrator script generated.');
+            await load({ quiet: true });
+            return;
+        }
+        const result = await setGatewayIppConfig(clusterId, ippConfigEdit.config);
         setIppConfigEdit(null);
-        setNotice('IPP config applied.');
+        if (result?.detailJson?.reconcileStatus === 'admin_handoff_required' && result?.detailJson?.handoff) {
+            openHandoffPayload(result.detailJson.handoff, clusterId);
+            setNotice('IPP Orchestration administrator script generated.');
+        } else {
+            setNotice('IPP config applied.');
+        }
         await load({ quiet: true });
     });
 
@@ -436,6 +636,11 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
 
     const handleComponentAction = (cluster, kind, action, service, member) => {
         const clusterId = cluster.clusterId;
+        const handoffAction = componentHandoffAction(action);
+        if (handoffAction) {
+            openClusterHandoff(cluster, handoffAction.mode, { persist: handoffAction.persist });
+            return;
+        }
         if (action === 'logs') {
             openLogs(kind, cluster, member);
             return;
@@ -567,10 +772,22 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
         toggleSubmission.setError('');
         const resume = group.status === 'disabled';
         try {
-            await setGroupStatus(group.id, resume ? 'active' : 'disabled');
-            setNotice(resume
-                ? 'Model enabled. Only online providers with positive weights receive traffic.'
-                : 'Model stopped serving. Provider states, weights and running Pods are unchanged.');
+            const result = await setGroupStatus(group.id, resume ? 'active' : 'disabled');
+            const outcome = await applyMutationHandoffResult(result, {
+                clusterId: group.clusterId,
+                clusters: status.clusters,
+                setHandoffModal,
+                setStatus,
+            });
+            if (outcome === 'admin_handoff_required') {
+                setNotice(resume
+                    ? 'Model enabled. Run the Orchestration administrator script to sync routes.'
+                    : 'Model stopped. Run the Orchestration administrator script to remove active routes.');
+            } else {
+                setNotice(resume
+                    ? 'Model enabled. Only online providers with positive weights receive traffic.'
+                    : 'Model stopped serving. Provider states, weights and running Pods are unchanged.');
+            }
         } finally {
             await load({ quiet: true });
         }
@@ -580,7 +797,8 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
         if (!serviceEdit?.name.trim() || !serviceEdit?.modelRef.trim()) {
             throw new Error('Name and model ref are required.');
         }
-        await updateGroup(serviceEdit.groupId, {
+        const clusterId = serviceEdit.clusterId;
+        const result = await updateGroup(serviceEdit.groupId, {
             name: serviceEdit.name.trim(),
             modelRef: serviceEdit.modelRef.trim(),
             servedName: serviceEdit.servedName.trim() || undefined,
@@ -591,6 +809,15 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
             status: serviceEdit.status,
         });
         setServiceEdit(null);
+        const outcome = await applyMutationHandoffResult(result, {
+            clusterId: result?.clusterId || clusterId,
+            clusters: status.clusters,
+            setHandoffModal,
+            setStatus,
+        });
+        if (outcome === 'admin_handoff_required') {
+            setNotice('Model updated. Run the Orchestration administrator script to sync routes.');
+        }
         await load({ quiet: true });
     });
 
@@ -696,6 +923,23 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
                             </Button>
                         </Panel>
                     </div>
+                    {authErrorClusters.length > 0 && (
+                        <div role="alert" className="mt-3 space-y-1 border-l-4 border-rose-500 bg-rose-500/10 px-3 py-2 text-xs text-rose-800 dark:text-rose-200">
+                            <p className="font-semibold">Kubernetes authentication error</p>
+                            {authErrorClusters.map((cluster) => (
+                                <p key={cluster.clusterId}>
+                                    <span className="font-medium">{cluster.clusterName || cluster.clusterId}:</span> {cluster.authError}
+                                </p>
+                            ))}
+                        </div>
+                    )}
+                    <ModelServiceHandoffBanner
+                        clusters={handoffClusters}
+                        pending={syncSubmission.pending}
+                        recheckingClusterId={bannerRecheckingId}
+                        onViewScript={(cluster) => openClusterHandoff(cluster, clusterHandoffMode(cluster))}
+                        onRecheck={recheckClusterBanner}
+                    />
                     <div className="relative mt-3 flex min-h-0 flex-1 flex-col" aria-busy={!loaded}>
                         {hasFlowFilters && filteredFlow.clusters.length === 0 ? (
                             <EmptyState title="No matching service flow"
@@ -861,15 +1105,17 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
                             Use chart default
                         </Button>
                         <Button variant="sky" size="sm" onClick={submitIppConfig} isLoading={ippConfigSubmission.pending} disabled={ippConfigEdit?.loading}>
-                            Save &amp; apply
+                            {ippConfigEdit?.canManageGatewayConfig === false ? 'Generate IPP script' : 'Save & apply'}
                         </Button>
                     </>
                 )}
             >
                 <p className="text-xs text-theme-muted">
-                    Inference Payload Processor config (PayloadProcessorConfig body). Read live from the
-                    cluster; saving upgrades IPP.
+                    {ippConfigEdit?.canManageGatewayConfig === false
+                        ? 'Inference Payload Processor config (PayloadProcessorConfig body). Generate an Orchestration administrator script to apply this config in Kubernetes.'
+                        : 'Inference Payload Processor config (PayloadProcessorConfig body). Read live from the cluster; saving upgrades IPP.'}
                 </p>
+                <FormError message={ippConfigSubmission.error} className="mt-2" />
                 {ippConfigEdit?.loadError && <p role="alert" className="mt-2 text-xs text-rose-300">{ippConfigEdit.loadError}</p>}
                 {ippConfigEdit?.loading ? (
                     <p className="mt-2 text-xs text-theme-muted">Loading…</p>
@@ -973,19 +1219,487 @@ export function ModelServiceAdminPage({ onToggleMobileNav, onNavigate, initialCl
             <GatewayConfigModal
                 cluster={gatewayConfigCluster}
                 onClose={() => setGatewayConfigCluster(null)}
-                onSaved={() => {
-                    setGatewayConfigCluster(null);
-                    setNotice('Gateway configuration saved');
-                    load({ quiet: true });
-                }}
+                onSaved={() => applyGatewayConfigSaved({
+                    setGatewayConfigCluster,
+                    setNotice,
+                    load,
+                })}
             />
+            <Modal
+                isOpen={Boolean(handoffModal)}
+                onClose={() => { if (!handoffModal?.busy && !handoffModal?.refreshing) setHandoffModal(null); }}
+                title={handoffModal?.clusterName
+                    ? `Orchestration administrator handoff — ${handoffModal.clusterName}`
+                    : 'Orchestration administrator handoff'}
+                subtitle={handoffModalSubtitle(handoffModal)}
+                size="lg"
+                closeOnBackdrop={!handoffModal?.busy && !handoffModal?.refreshing}
+                closeOnEscape={!handoffModal?.busy && !handoffModal?.refreshing}
+                footer={(
+                    <Button
+                        variant="secondary"
+                        size="sm"
+                        disabled={Boolean(handoffModal?.busy || handoffModal?.refreshing)}
+                        onClick={() => setHandoffModal(null)}
+                    >
+                        Close
+                    </Button>
+                )}
+            >
+                {handoffModal?.handoff && (
+                    <ModelServiceHandoffPanel
+                        handoff={handoffModal.handoff}
+                        verifyResult={handoffModal.verifyResult}
+                        clusterName={handoffModal.clusterName}
+                        onRecheck={recheckHandoff}
+                        onRefreshScript={refreshHandoffScript}
+                        busy={Boolean(handoffModal.busy)}
+                        refreshing={Boolean(handoffModal.refreshing)}
+                        error={handoffModal.error}
+                    />
+                )}
+            </Modal>
         </ModulePage>
+    );
+}
+
+export function ModelServiceHandoffBanner({
+    clusters = [],
+    pending = false,
+    recheckingClusterId = '',
+    onViewScript,
+    onRecheck,
+}) {
+    if (!Array.isArray(clusters) || clusters.length === 0) return null;
+    const controlsBusy = Boolean(pending || recheckingClusterId);
+    return (
+        <div role="status" aria-live="polite" className="mt-3 space-y-2 border-l-4 border-amber-500 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-800 dark:text-amber-200">
+            <div className="flex items-center gap-2">
+                <ShieldAlert size={14} className="shrink-0 text-amber-600 dark:text-amber-400" aria-hidden="true" />
+                <span className="font-semibold">Orchestration administrator route sync required</span>
+            </div>
+            <div className="space-y-1.5">
+                {clusters.map((cluster) => (
+                    <div key={cluster.clusterId} className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-theme-text dark:text-amber-100">
+                            {cluster.clusterName || cluster.clusterId}
+                            {cluster.pendingOperationsCount ? ` — ${cluster.pendingOperationsCount} pending` : ''}
+                        </span>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <Button
+                                type="button"
+                                variant="outline"
+                                size="xs"
+                                disabled={controlsBusy}
+                                onClick={() => onViewScript?.(cluster)}
+                            >
+                                View Orchestration administrator script
+                            </Button>
+                            <Button
+                                type="button"
+                                variant="sky"
+                                size="xs"
+                                isLoading={recheckingClusterId === cluster.clusterId}
+                                disabled={controlsBusy}
+                                onClick={() => onRecheck?.(cluster)}
+                            >
+                                Re-check
+                            </Button>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+}
+
+function hasAdvisoryRouteChecks(isVerified, routeChecks) {
+    return Boolean(
+        isVerified
+        && Array.isArray(routeChecks)
+        && routeChecks.some((check) => ['loading', 'degraded', 'unreachable'].includes(check?.status) || Boolean(check?.advisory)),
+    );
+}
+
+function routeCheckChipStatus(status) {
+    if (status === 'ready') return 'ready';
+    if (status === 'degraded') return 'degraded';
+    if (status === 'unreachable' || status === 'unknown') return 'unknown';
+    return 'pending';
+}
+
+export function handoffModalSubtitle(handoffModal) {
+    const isVerified = Boolean(handoffModal?.verifyResult?.verified)
+        || (!handoffModal?.verifyResult && handoffModal?.handoff?.reconcileStatus === 'synced');
+    if (!isVerified) {
+        return 'Ask an Orchestration administrator to run this idempotent script, then click Re-check.';
+    }
+    const routeChecks = Array.isArray(handoffModal?.verifyResult?.routeChecks)
+        ? handoffModal.verifyResult.routeChecks
+        : [];
+    if (hasAdvisoryRouteChecks(isVerified, routeChecks)) {
+        return 'Orchestration administrator route sync verified. Backend route probes reported advisory warnings.';
+    }
+    return 'Orchestration administrator route sync verified. Routes are ready.';
+}
+
+export function ModelServiceHandoffPanel({
+    handoff,
+    verifyResult = null,
+    clusterName = '',
+    onRecheck,
+    onRefreshScript,
+    busy = false,
+    refreshing = false,
+    error = '',
+    onDownloadScript,
+    onCopyScript,
+}) {
+    const clipboard = useClipboard();
+    const [localError, setLocalError] = useState('');
+
+    const script = typeof handoff?.adminScript === 'string' ? handoff.adminScript : '';
+    const filename = handoff?.filename || 'lens-model-service-admin.sh';
+    const pendingOperations = Array.isArray(handoff?.pendingOperations) ? handoff.pendingOperations : [];
+    const warnings = Array.isArray(handoff?.warnings) ? handoff.warnings : [];
+    const routeChecks = Array.isArray(verifyResult?.routeChecks) ? verifyResult.routeChecks : [];
+    const isVerified = Boolean(verifyResult?.verified) || (!verifyResult && handoff?.reconcileStatus === 'synced');
+    const hasAdvisoryChecks = hasAdvisoryRouteChecks(isVerified, routeChecks);
+    const visiblePendingOperations = isVerified ? [] : pendingOperations;
+    const isBusy = Boolean(busy || refreshing);
+    const shouldExpandDetails = !isVerified;
+    const [detailsOpen, setDetailsOpen] = useState(shouldExpandDetails);
+
+    useEffect(() => {
+        setDetailsOpen(shouldExpandDetails);
+    }, [shouldExpandDetails]);
+
+    useEffect(() => {
+        setLocalError('');
+    }, [handoff?.desiredHash, handoff?.adminScript]);
+
+    const handleDetailsToggle = (event) => {
+        if (event.target !== event.currentTarget) return;
+        setDetailsOpen(event.currentTarget.open);
+    };
+    const markerStatus = verifyResult?.markerStatus || '';
+    const markerNamespace = (isVerified
+        ? verifyResult?.markerNamespace || handoff?.markerNamespace
+        : handoff?.markerNamespace || verifyResult?.markerNamespace) || 'default';
+    const markerName = (isVerified
+        ? verifyResult?.markerName || handoff?.markerName
+        : handoff?.markerName || verifyResult?.markerName) || 'not available';
+    const desiredHash = (isVerified
+        ? verifyResult?.desiredHash || handoff?.desiredHash
+        : handoff?.desiredHash || verifyResult?.desiredHash) || 'not available';
+
+    const downloadScript = () => {
+        try {
+            setLocalError('');
+            if (onDownloadScript) onDownloadScript(script, filename);
+            else downloadBlob(new Blob([script], { type: 'text/x-shellscript' }), filename);
+        } catch {
+            setLocalError('Could not download the script. Copy it instead.');
+        }
+    };
+
+    const copyScript = async () => {
+        setLocalError('');
+        try {
+            if (onCopyScript) {
+                await onCopyScript(script);
+                return;
+            }
+            const copied = await clipboard.copy(script);
+            if (!copied) setLocalError('Could not copy the script. Download it instead.');
+        } catch {
+            setLocalError('Could not copy the script. Download it instead.');
+        }
+    };
+
+    const statusMeta = isVerified
+        ? { label: 'Verified', tone: 'success', border: 'border-l-emerald-500', iconClass: 'text-emerald-600 dark:text-emerald-400' }
+        : markerStatus === 'stale'
+            ? { label: 'Stale', tone: 'danger', border: 'border-l-rose-500', iconClass: 'text-rose-600 dark:text-rose-400' }
+            : markerStatus === 'partial'
+                ? { label: 'Partial', tone: 'warning', border: 'border-l-amber-500', iconClass: 'text-amber-600 dark:text-amber-400' }
+                : markerStatus === 'forbidden'
+                    ? { label: 'Unconfirmed', tone: 'warning', border: 'border-l-amber-500', iconClass: 'text-amber-600 dark:text-amber-400' }
+                    : markerStatus === 'missing'
+                        ? { label: 'Missing marker', tone: 'warning', border: 'border-l-amber-500', iconClass: 'text-amber-600 dark:text-amber-400' }
+                        : { label: 'Awaiting Orchestration administrator', tone: 'warning', border: 'border-l-amber-500', iconClass: 'text-amber-600 dark:text-amber-400' };
+
+    return (
+        <Panel
+            padding="sm"
+            tone="soft"
+            className={cn('border-l-4 shadow-none', statusMeta.border)}
+            title={(
+                <span className="flex items-center gap-2">
+                    <ShieldAlert size={15} className={statusMeta.iconClass} aria-hidden="true" />
+                    {clusterName ? `Orchestration administrator route sync — ${clusterName}` : 'Orchestration administrator route sync'}
+                </span>
+            )}
+            actions={<Badge tone={statusMeta.tone} size="xs">{statusMeta.label}</Badge>}
+        >
+            <div className="space-y-3" role="status" aria-live="polite">
+                {isVerified && (
+                    <p className="flex items-center gap-2 border-l-2 border-emerald-500 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-200">
+                        <CheckCircle2 size={14} className="shrink-0 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+                        <span>{verifyResult?.message || 'Orchestration administrator route sync verified. Routes are ready.'}</span>
+                    </p>
+                )}
+
+                {!isVerified && markerStatus === 'partial' && (
+                    <p className="flex items-start gap-2 border-l-2 border-amber-500 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
+                        <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
+                        <span className="min-w-0 flex-1">
+                            {verifyResult?.message || 'Orchestration administrator handoff is partial. Re-run the Orchestration administrator script below, then click Re-check.'}
+                        </span>
+                    </p>
+                )}
+
+                {!isVerified && markerStatus === 'stale' && (
+                    <p className="flex items-start gap-2 border-l-2 border-rose-500 bg-rose-500/10 px-3 py-2 text-xs leading-relaxed text-rose-800 dark:text-rose-200">
+                        <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
+                        <span className="min-w-0 flex-1">
+                            {verifyResult?.message || 'The completion marker belongs to an older route state. Run the updated Orchestration administrator script below, then click Re-check.'}
+                        </span>
+                    </p>
+                )}
+
+                {!isVerified && markerStatus === 'forbidden' && (
+                    <p className="flex items-start gap-2 border-l-2 border-amber-500 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
+                        <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
+                        <span className="min-w-0 flex-1">
+                            {verifyResult?.message || `Lens received 403 Forbidden reading ConfigMap ${markerName} in namespace ${markerNamespace}. Verify route readiness or grant ConfigMap get access there, then click Re-check.`}
+                        </span>
+                    </p>
+                )}
+
+                {!isVerified && markerStatus === 'missing' && (
+                    <p className="flex items-start gap-2 border-l-2 border-amber-500 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
+                        <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
+                        <span className="min-w-0 flex-1">
+                            {verifyResult?.message || 'Completion marker was not found yet. Ask an Orchestration administrator to run the script below, then click Re-check.'}
+                        </span>
+                    </p>
+                )}
+
+                {!isVerified && verifyResult?.message && !['partial', 'stale', 'forbidden', 'missing'].includes(markerStatus) && (
+                    <p className="flex items-start gap-2 border-l-2 border-amber-500 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
+                        <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
+                        <span className="min-w-0 flex-1">{verifyResult.message}</span>
+                    </p>
+                )}
+
+                {hasAdvisoryChecks && (
+                    <p className="flex items-start gap-2 border-l-2 border-amber-500 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
+                        <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
+                        <span className="min-w-0 flex-1">
+                            Advisory: handoff is verified and synced, though live route probes reported non-blocking backend warnings (loading, degraded, or unreachable from Lens).
+                        </span>
+                    </p>
+                )}
+
+                {routeChecks.length > 0 && (
+                    <ul className="space-y-1 rounded-lg border border-theme-border bg-theme-bg/40 px-3 py-2" aria-label="Route verification checks">
+                        {routeChecks.map((check, index) => (
+                            <li key={`${check.groupId || check.name || index}-route-check`} className="flex items-center justify-between gap-2 text-xs">
+                                <span className="truncate font-mono text-theme-text">{check.name || check.groupName || check.model || 'route'}</span>
+                                <StatusChip
+                                    variant="compact"
+                                    status={routeCheckChipStatus(check.status)}
+                                    title={check.detail || undefined}
+                                    label={check.httpStatus ? `${check.status || 'unknown'} (${check.httpStatus})` : (check.status || 'unknown')}
+                                />
+                            </li>
+                        ))}
+                    </ul>
+                )}
+
+                {warnings.map((warningText, index) => (
+                    <p
+                        key={`${index}-${warningText}`}
+                        className="flex items-start gap-2 border-l-2 border-amber-500 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200"
+                    >
+                        <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
+                        <span className="min-w-0 flex-1">{warningText}</span>
+                    </p>
+                ))}
+
+                {!isVerified && script && (
+                    <div className="space-y-2 rounded-lg border border-theme-border bg-theme-bg/40 px-3 py-2.5">
+                        <p className="text-xs font-semibold text-theme-text">Orchestration administrator script</p>
+                        <p className="max-w-[68ch] text-xs leading-relaxed text-theme-muted">
+                            {handoff?.instructions || 'Send this idempotent script to an Orchestration administrator to run once, then click Re-check (contains no kubeconfig or user secret).'}
+                        </p>
+                        <div className="flex flex-wrap gap-2">
+                            <Button variant="outline" size="sm" onClick={downloadScript} disabled={isBusy}>
+                                <Download size={13} aria-hidden="true" /> Download
+                            </Button>
+                            <Button variant="outline" size="sm" onClick={copyScript} disabled={isBusy}>
+                                {clipboard.copied
+                                    ? <Check size={13} className="text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+                                    : <ClipboardCopy size={13} aria-hidden="true" />}
+                                {clipboard.copied ? 'Copied' : 'Copy'}
+                            </Button>
+                        </div>
+                    </div>
+                )}
+
+                <div className="flex flex-wrap gap-2 border-t border-theme-border pt-3">
+                    <Button
+                        variant={isVerified ? 'ghost' : 'sky'}
+                        size="sm"
+                        onClick={onRecheck}
+                        isLoading={busy}
+                        disabled={isBusy || !onRecheck}
+                    >
+                        <RefreshCw size={13} aria-hidden="true" /> Re-check
+                    </Button>
+                    {onRefreshScript && !isVerified && (
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={onRefreshScript}
+                            isLoading={refreshing}
+                            disabled={isBusy}
+                        >
+                            <RotateCcw size={13} aria-hidden="true" /> Refresh script
+                        </Button>
+                    )}
+                </div>
+
+                <FormError message={error || localError} />
+
+                {isBusy && (
+                    <p className="flex items-center gap-2 text-[11px] text-theme-muted">
+                        <Spinner size="xs" /> {refreshing ? 'Refreshing script…' : 'Verifying…'}
+                    </p>
+                )}
+
+                {(visiblePendingOperations.length > 0 || script || handoff?.desiredHash || handoff?.markerName) && (
+                    <details
+                        className="group/details border-t border-theme-border pt-3"
+                        open={detailsOpen}
+                        onToggle={handleDetailsToggle}
+                    >
+                        <summary className="flex cursor-pointer list-none items-center justify-between gap-2 text-xs font-medium text-theme-muted hover:text-theme-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 [&::-webkit-details-marker]:hidden">
+                            <span className="flex items-center gap-1.5">
+                                <ChevronRight
+                                    size={13}
+                                    aria-hidden="true"
+                                    className="shrink-0 transition-transform motion-reduce:transition-none group-open/details:rotate-90"
+                                />
+                                View operation details
+                            </span>
+                            <span className="font-mono text-[11px]">{`${visiblePendingOperations.length} pending`}</span>
+                        </summary>
+
+                        <div className="mt-3 space-y-4">
+                            {visiblePendingOperations.length > 0 && (
+                                <ul className="space-y-1.5" aria-label="Pending Orchestration administrator operations">
+                                    {visiblePendingOperations.map((item, index) => (
+                                        <li key={item.id || `${item.kind}-${item.namespace}-${item.name}-${index}`} className="border-l-2 border-amber-500/80 pl-3 text-xs">
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <Badge tone={item.action === 'delete' ? 'danger' : 'warning'} size="xxs">
+                                                    {item.action || 'apply'}
+                                                </Badge>
+                                                <span className="font-mono text-[11px] text-theme-text">
+                                                    {item.kind}{item.namespace ? ` ${item.namespace}/${item.name}` : ` ${item.name}`}
+                                                </span>
+                                            </div>
+                                            {item.summary && (
+                                                <p className="mt-0.5 text-[11px] text-theme-muted">{item.summary}</p>
+                                            )}
+                                        </li>
+                                    ))}
+                                </ul>
+                            )}
+
+                            <div className="space-y-1 border-t border-theme-border pt-3">
+                                <p className="text-xs font-semibold text-theme-text">Completion marker</p>
+                                <dl className="grid gap-1 text-[11px] text-theme-muted sm:grid-cols-[8rem_1fr]">
+                                    <dt>Desired hash</dt><dd className="break-all font-mono">{desiredHash}</dd>
+                                    <dt>Marker</dt><dd className="break-all font-mono">{`${markerNamespace}/${markerName}`}</dd>
+                                    <dt>Mode</dt><dd className="font-mono">{handoff?.mode || 'routes'}</dd>
+                                </dl>
+                            </div>
+
+                            {script && (
+                                <div className="space-y-1.5 border-t border-theme-border pt-3">
+                                    <p className="text-xs font-semibold text-theme-text">Script preview</p>
+                                    <pre className="max-h-60 overflow-auto rounded-lg border border-theme-border bg-theme-bg/70 p-3 font-mono text-[11px] leading-relaxed text-theme-text">
+                                        {script}
+                                    </pre>
+                                </div>
+                            )}
+                        </div>
+                    </details>
+                )}
+            </div>
+        </Panel>
     );
 }
 
 export default ModelServiceAdminPage;
 
-function GatewayConfigModal({ cluster, onClose, onSaved }) {
+export async function fetchModelServiceAdminSnapshot() {
+    const [groups, members, deployments, status] = await Promise.all([
+        listGroups(),
+        listMembers(),
+        listPublishableDeployments(),
+        getGatewayStatus(),
+    ]);
+    return { groups, members, deployments, status };
+}
+
+export function applyGatewayConfigSaved({ setGatewayConfigCluster, setNotice, load }) {
+    setGatewayConfigCluster(null);
+    setNotice('Gateway configuration saved');
+    return load({ quiet: true });
+}
+
+export function resolveGatewayConfigFields(cluster, fullCluster = null, hosts = []) {
+    const resolvedPort = fullCluster?.gatewayPort ?? cluster?.gatewayPort;
+    return {
+        gatewayProvider: fullCluster?.gatewayProvider || cluster?.gatewayProvider || 'istio',
+        gatewayPort: resolvedPort ? String(resolvedPort) : '',
+        gatewayPublicUrl: fullCluster?.gatewayPublicUrl || cluster?.gatewayPublicUrl || '',
+        gatewayAuthzHost: fullCluster?.gatewayAuthzHost || cluster?.gatewayAuthzHost || hosts[0] || '',
+    };
+}
+
+export function buildGatewayConfigPatch(
+    { gatewayProvider, gatewayPort, gatewayPublicUrl, gatewayAuthzHost },
+    baselineCluster,
+) {
+    const baseline = baselineCluster || {};
+    const trimmedPort = String(gatewayPort ?? '').trim();
+    const baselinePort = baseline.gatewayPort ? String(baseline.gatewayPort) : '';
+    const trimmedPublicUrl = String(gatewayPublicUrl ?? '').trim();
+    const trimmedAuthzHost = String(gatewayAuthzHost ?? '').trim();
+    return {
+        ...(gatewayProvider !== (baseline.gatewayProvider || '') && { gatewayProvider: gatewayProvider || null }),
+        ...(trimmedPort !== baselinePort && { gatewayPort: trimmedPort ? Number(trimmedPort) : null }),
+        ...(trimmedPublicUrl !== (baseline.gatewayPublicUrl || '') && { gatewayPublicUrl: trimmedPublicUrl || null }),
+        ...(trimmedAuthzHost !== (baseline.gatewayAuthzHost || '') && { gatewayAuthzHost: trimmedAuthzHost || null }),
+    };
+}
+
+export async function submitGatewayConfig({ clusterId, fields, baselineCluster }) {
+    const patch = buildGatewayConfigPatch(fields, baselineCluster);
+    return requestJson(`/api/cluster/clusters/${encodeURIComponent(clusterId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+    });
+}
+
+export function GatewayConfigModal({ cluster, onClose, onSaved }) {
+    const [loadedCluster, setLoadedCluster] = useState(null);
+    const [loadingConfig, setLoadingConfig] = useState(false);
     const [gatewayProvider, setGatewayProvider] = useState('istio');
     const [gatewayPort, setGatewayPort] = useState('');
     const [gatewayPublicUrl, setGatewayPublicUrl] = useState('');
@@ -998,6 +1712,8 @@ function GatewayConfigModal({ cluster, onClose, onSaved }) {
     useEffect(() => {
         if (!cluster) return undefined;
         let alive = true;
+        setLoadedCluster(null);
+        setLoadingConfig(true);
         setGatewayProvider(cluster.gatewayProvider || 'istio');
         setGatewayPort(cluster.gatewayPort ? String(cluster.gatewayPort) : '');
         setGatewayPublicUrl(cluster.gatewayPublicUrl || '');
@@ -1007,23 +1723,31 @@ function GatewayConfigModal({ cluster, onClose, onSaved }) {
         Promise.all([loadCluster(cluster.clusterId), listLensHosts()])
             .then(([fullCluster, hosts]) => {
                 if (!alive) return;
-                setGatewayProvider(fullCluster.gatewayProvider || 'istio');
-                setGatewayPort(fullCluster.gatewayPort ? String(fullCluster.gatewayPort) : '');
-                setGatewayPublicUrl(fullCluster.gatewayPublicUrl || '');
-                setGatewayAuthzHost(fullCluster.gatewayAuthzHost || hosts[0] || '');
+                setLoadedCluster(fullCluster || null);
+                const fields = resolveGatewayConfigFields(cluster, fullCluster, hosts);
+                setGatewayProvider(fields.gatewayProvider);
+                setGatewayPort(fields.gatewayPort);
+                setGatewayPublicUrl(fields.gatewayPublicUrl);
+                setGatewayAuthzHost(fields.gatewayAuthzHost);
                 setLensHosts(hosts);
             })
             .catch((failure) => {
                 if (alive) setError(errorMessage(failure, 'Failed to load Gateway configuration'));
+            })
+            .finally(() => {
+                if (alive) setLoadingConfig(false);
             });
         return () => { alive = false; };
     }, [cluster]);
 
     if (!cluster) return null;
 
+    const baselineCluster = loadedCluster || cluster;
+
     const checkGatewayPort = async () => {
         const value = gatewayPort.trim();
-        if (!value || (cluster.gatewayPort && Number(value) === cluster.gatewayPort)) {
+        const knownPort = baselineCluster.gatewayPort ?? cluster.gatewayPort;
+        if (!value || (knownPort && Number(value) === knownPort)) {
             setPortError('');
             return;
         }
@@ -1037,22 +1761,17 @@ function GatewayConfigModal({ cluster, onClose, onSaved }) {
         }
     };
 
-    const canSave = !busy && !portError && (gatewayProvider === 'gke' || Boolean(gatewayAuthzHost.trim()));
+    const canSave = !busy && !loadingConfig && !portError && (gatewayProvider === 'gke' || Boolean(gatewayAuthzHost.trim()));
 
     const submit = async () => {
         if (!canSave) return;
         setBusy(true);
         setError('');
         try {
-            const payload = await requestJson(`/api/cluster/clusters/${encodeURIComponent(cluster.clusterId)}`, {
-                method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    ...(gatewayProvider !== (cluster.gatewayProvider || '') && { gatewayProvider: gatewayProvider || null }),
-                    ...(gatewayPort.trim() !== (cluster.gatewayPort ? String(cluster.gatewayPort) : '') && { gatewayPort: gatewayPort.trim() ? Number(gatewayPort.trim()) : null }),
-                    ...(gatewayPublicUrl.trim() !== (cluster.gatewayPublicUrl || '') && { gatewayPublicUrl: gatewayPublicUrl.trim() || null }),
-                    ...(gatewayAuthzHost.trim() !== (cluster.gatewayAuthzHost || '') && { gatewayAuthzHost: gatewayAuthzHost.trim() || null }),
-                }),
+            const payload = await submitGatewayConfig({
+                clusterId: cluster.clusterId,
+                fields: { gatewayProvider, gatewayPort, gatewayPublicUrl, gatewayAuthzHost },
+                baselineCluster,
             });
             onSaved?.(payload.cluster);
         } catch (failure) {

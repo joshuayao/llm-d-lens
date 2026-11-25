@@ -22,9 +22,11 @@ import TabItem from '@theme/TabItem';
 
     - `includeDrafts`（`boolean`，查询参数，默认 `false`）：是否包含草稿集群记录。
 
-    响应：`ClustersResponse`，每个可见集群对应一个 `ClusterRecord`。
+    响应：`ClustersResponse`，每个可见集群对应一个 `ClusterRecord`。`ready` 会校验集群连通性，包括命名空间作用域（`edit`）的 kubeconfig。
 
 `hfTokenSecret` 返回该集群 HF_TOKEN Secret 的命名空间和名称；集群没有该 Secret 时为 `null`。接口只返回位置信息，令牌值保存在目标集群上，不会由 API 返回。
+
+`ClusterRecord` 还包含 `vllmImage`（`string | null`，自定义 OCI 镜像引用；使用所选硬件配置文件的 `runtime_image` 默认值时为 `null`）以及监控配置字段：`monitoringMode`（`"managed"` 或 `"existing"`）、`monitoringNamespace`（默认 `"llm-d-monitoring"`）、`prometheusUrl`、`grafanaUrl`、`prometheusNodePort` 和 `grafanaNodePort`。
 
     ```json
     {
@@ -68,6 +70,42 @@ import TabItem from '@theme/TabItem';
             print(cluster.id, cluster.name, ready)
 
     asyncio.run(main())
+    ```
+  </TabItem>
+</Tabs>
+
+### 获取集群详情
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`GET /api/cluster/clusters/{cluster_id}`**
+
+    返回 `ClusterDetailResponse`：
+    `{cluster, plan, planHash, planVersion, draftHfTokenSaved, executionOperations, executionCompletedAt, executionCompletedPlanHash}`。
+
+    - `draftHfTokenSaved`：`boolean`，表示当前调用方是否已为该 draft 集群保存加密的
+      draft Hugging Face token（active 集群或由其他用户保存时始终为 `false`；token
+      本身永远不会通过 GET 返回）。
+    - `executionOperations`：operation id → `user_done` / `admin_done` /
+      `lens_done` / `failed`。
+    - `executionCompletedAt`：最近一次完成 run 的时间，未完成时为 `null`。
+    - `executionCompletedPlanHash`：该 run 记录的 plan hash，没有时为 `null`。
+
+    仅有非空 `executionCompletedAt` 不足以把旧 draft 视为已完成。如果
+    `executionCompletedPlanHash` 为 `null` 或与当前 `planHash` 不一致，必须重新
+    检查权限并重新执行 operation 列表。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.cluster import execution, guard, registry
+
+    cluster = registry.require_cluster("cluster-a")
+    state = guard.load_plan(cluster.id)
+    ledger = execution.operations(cluster.id)
+    completed_at = execution.completed_at(cluster.id)
+    completed_hash = execution.completed_plan_hash(cluster.id)
+    current_hash = state.plan_hash if state else None
+    print(ledger, completed_at, completed_hash, current_hash)
     ```
   </TabItem>
 </Tabs>
@@ -161,7 +199,8 @@ llm-d 组件版本由 Lens 技术栈配置文件固定（参见[获取支持的 
     - `gatewayPort`（`integer`，表单字段，可选）：共享网关暴露所使用的 NodePort（30000–32767）。
     - `gatewayAuthzHost`（`string`，表单字段）：该集群用来访问 Lens 的主机/IP（对于带有 Lens 地址钩子的供应商为必填：`envoy-ai-gateway`/`istio`/`agentgateway`）。可从 `GET /api/cluster/lens-hosts` 中选取；Lens 会自动添加自身的服务端口，为空时 Lens 会自动填入该主机地址。
     - `inotifyMaxUserInstances`（`integer`，表单字段，默认 `8192`）：Lens 应用于每个节点的每用户 inotify 实例数上限（`fs.inotify.max_user_instances`）。在运行大量 Pod 的节点上，应将其调高到 kind 默认值 128 之上。
-    - `draft`（`boolean`，表单字段，默认 `false`）：是否以草稿形式创建。
+    - `vllmImage`（`string`，表单字段，可选）：用于 vLLM 的自定义 OCI 容器镜像引用（需包含 `:tag` 或 `@sha256:` 摘要）；省略时默认使用所选硬件配置文件的 `runtime_image`。无效引用返回 `422 invalid_vllm_image`。
+    - `draft`（`boolean`，表单字段，可选）：集群永远以 draft 创建；显式 `draft=false` 返回 `400 draft_creation_forbidden`。
 
     示例字段取值：
 
@@ -224,6 +263,7 @@ llm-d 组件版本由 Lens 技术栈配置文件固定（参见[获取支持的 
         no_proxy="127.0.0.1,localhost,.svc",
         llm_d_ref="v0.3.0",
         llm_d_lensmark_ref="main",
+        vllm_image="ghcr.io/example/vllm:v0.8.0",
         draft=True,
     )
 
@@ -234,7 +274,7 @@ llm-d 组件版本由 Lens 技术栈配置文件固定（参见[获取支持的 
 
 ### 更新集群
 
-修改集群的可编辑设置，包括名称、描述、代理设置和草稿状态。kubeconfig 本身不在此补丁契约范围内。版本字段（`llmDRef`、`llmDBenchmarkRef`、`routerVersion`、`gieVersion`、`ippVersion`）由服务端根据技术栈配置文件管理，输入时会被忽略。
+修改集群的可编辑设置（名称、描述、代理、Gateway 和 inotify 设置）。kubeconfig 和 draft 状态不在此补丁契约范围内；使用 `POST /execution/complete` finalize。版本字段（`llmDRef`、`llmDBenchmarkRef`、`routerVersion`、`gieVersion`、`ippVersion`）由服务端根据技术栈配置文件管理，输入时会被忽略。
 
 Gateway 命名空间前缀会附加该 Lens 集群注册的稳定短 ID。注册 ID 为 `1234abcd` 时，
 默认命名空间为 `lens-gateway-1234abcd`；`gatewayNamespace: "custom"` 会解析为
@@ -259,7 +299,16 @@ Gateway 命名空间前缀会附加该 Lens 集群注册的稳定短 ID。注册
     - `gatewayPublicUrl`（`string`，可选）：外部可达的网关主机/IP —— Lens 会自动添加暴露端口；为空时将自动推导。
     - `gatewayAuthzHost`（`string`）：该集群用来访问 Lens 的主机/IP（对于带有 Lens 地址钩子的供应商为必填；Lens 会自动添加自身服务端口；为空时会自动填入该主机地址）。
     - `inotifyMaxUserInstances`（`integer`，可选）：应用于每个节点的每用户 inotify 实例数上限（默认 `8192`）。
-    - `draft`（`boolean`，可选）
+    - `monitoringMode`（`string`，可选）：`"managed"` 或 `"existing"`。
+    - `monitoringNamespace`（`string`，可选）：监控栈命名空间（默认 `"llm-d-monitoring"`）。
+    - `prometheusUrl`（`string`，可选）：显式 HTTP/HTTPS Prometheus URL；传入 `""` 或 `null` 可清除。
+    - `grafanaUrl`（`string`，可选）：显式 HTTP/HTTPS Grafana URL；传入 `""` 或 `null` 可清除。
+    - `prometheusNodePort`（`integer`，可选）：Prometheus NodePort（`30000`–`32767`）；传入 `null` 可清除。
+    - `grafanaNodePort`（`integer`，可选）：Grafana NodePort（`30000`–`32767`）；传入 `null` 可清除。
+    - `monitoringHost`（`string`，可选）：未设置显式 URL 时用于推导 NodePort URL 的主机/IP；传入 `""` 或 `null` 可清除。
+    - `installAcceleratorExporters`（`boolean`，可选）：是否安装加速器指标导出器。
+    - `vllmImage`（`string`，可选）：用于 vLLM 的自定义 OCI 容器镜像引用（需包含 `:tag` 或 `@sha256:` 摘要）；传入 `""` 或 `null` 可重置为所选硬件配置文件的 `runtime_image` 默认值。无效引用返回 `422 invalid_vllm_image`；在活跃 draft 执行期间修改返回 `409 execution_in_progress`。
+    - `draft`：不接受。发送它返回 `400 draft_update_forbidden`。
 
     ```json
     {
@@ -272,8 +321,7 @@ Gateway 命名空间前缀会附加该 Lens 集群注册的稳定短 ID。注册
         "noProxy": "127.0.0.1,localhost,.svc"
       },
       "llmDRef": "v0.3.0",
-      "llmDBenchmarkRef": "main",
-      "draft": false
+      "llmDBenchmarkRef": "main"
     }
     ```
 
@@ -316,60 +364,10 @@ Gateway 命名空间前缀会附加该 Lens 集群注册的稳定短 ID。注册
         llm_d_ref="v0.3.0",
         llm_d_lensmark_ref="main",
         gateway_authz_host="10.0.0.5",
-        draft=False,
+        update_vllm_image=True,
+        vllm_image="ghcr.io/example/vllm:v0.8.0",
     )
     print(cluster.id, cluster.name)
-    ```
-  </TabItem>
-</Tabs>
-
-### 创建集群 HF_TOKEN secret
-
-在目标集群上创建保存 Hugging Face 令牌的独立 Kubernetes Secret，并把它的坐标记录到 Lens 集群记录上，供部署和模型缓存下载默认使用。这是创建集群向导的模型缓存步骤。令牌值只写入集群；Lens 只保存命名空间和名称。Secret 已存在时返回 `409 secret_already_exists`，此时请使用下面的轮换接口替换令牌。
-
-<Tabs>
-  <TabItem value="rest-api" label="REST API">
-    **`POST /api/cluster/clusters/{cluster_id}/hf-token-secrets`**
-
-    请求体（`HfTokenSecretCreateRequest`）：
-
-    - `namespace`（`string`，必填）：创建 Secret 的命名空间；不存在时自动创建。
-    - `name`（`string`，必填）：Secret 名称。
-    - `token`（`string`，必填）：保存在 `HF_TOKEN` 键下的 Hugging Face 令牌。
-
-    ```json
-    {
-      "namespace": "llm-d-bench-storage-44395349",
-      "name": "hf-token-c758ced0",
-      "token": "hf_exampleTokenValue"
-    }
-    ```
-
-    响应：`HfTokenSecretRef`。
-
-    ```json
-    {
-      "namespace": "llm-d-bench-storage-44395349",
-      "name": "hf-token-c758ced0"
-    }
-    ```
-  </TabItem>
-  <TabItem value="python-api" label="Python API">
-    ```python
-    import asyncio
-
-    from llm_d_lens.cluster import registry, service
-
-    cluster = registry.get_cluster("cluster-a")
-    ref = asyncio.run(
-        service.create_hf_token_secret(
-            cluster,
-            "llm-d-bench-storage-44395349",
-            "hf-token-c758ced0",
-            "hf_exampleTokenValue",
-        )
-    )
-    print(ref["namespace"], ref["name"])
     ```
   </TabItem>
 </Tabs>
@@ -523,49 +521,251 @@ Gateway 命名空间前缀会附加该 Lens 集群注册的稳定短 ID。注册
   </TabItem>
 </Tabs>
 
-### 启动集群镜像预拉取
+### 读取并保存 provisioning plan
 
-为所选加速器在每个集群节点上预拉取 Lens 固定版本的 llm-d 镜像。这些镜像包括 llm-d-router EPP 和 P/D sidecar，以及各加速器对应的模型服务镜像；版本来自 Lens 技术栈配置文件，而非请求内容。一个特权 DaemonSet 会在每个节点上运行主机的 `crictl`；可通过下方的 GET 端点轮询每个节点的就绪状态。
+plan 是 Lens 状态；保存它不会变更目标集群。
 
 <Tabs>
   <TabItem value="rest-api" label="REST API">
-    **`POST /api/cluster/clusters/{cluster_id}/images/prepull`**
+    **`GET /api/cluster/clusters/{cluster_id}/plan`**
 
-    请求体：
+    返回 `{plan, planHash, planVersion}`。
 
-    - `accelerators`（`string[]`）：需要拉取模型服务镜像的加速器 id（例如 `["nvidia","intel"]`）。
+    **`PUT /api/cluster/clusters/{cluster_id}/plan`**
 
-    ```json
-    {
-      "accelerators": ["nvidia", "intel"]
-    }
-    ```
-
-    响应：总体状态、`ready`/`desired` 节点数、镜像列表以及每个节点的就绪状态。
-
-    ```json
-    {
-      "state": "pulling",
-      "desired": 2,
-      "ready": 1,
-      "images": [
-        { "name": "ghcr.io/llm-d/llm-d-router-endpoint-picker:v1.0.0", "ready": 2, "desired": 2, "state": "ready" },
-        { "name": "ghcr.io/llm-d/llm-d-router-disagg-sidecar:v1.0.0", "ready": 2, "desired": 2, "state": "ready" },
-        { "name": "ghcr.io/llm-d/llm-d-cuda:v0.9.0", "ready": 1, "desired": 2, "state": "pulling" }
-      ],
-      "nodes": [{ "node": "worker-1", "phase": "Running", "ready": true, "restarts": 0 }]
-    }
-    ```
-
-    当所有节点都已拉取该镜像时 `images[].state` 为 `ready`；拉取进行中为 `pulling`；若某节点拉取不断崩溃重试则为 `failed`。
+    接受 `ProvisioningPlan` JSON body 和可选 `If-Match: <planHash>`。仅 draft
+    可用；active 集群返回 `409 cluster_not_draft`，过期 `If-Match` 返回
+    `409 plan_conflict`。若 `stack` 中省略 `plan.stack.vllmImage`（可选 OCI 容器镜像引用，需包含 `:tag` 或 `@sha256:` 摘要），则保留现有值；若显式设为 `null` 或 `""`，则清除为 `null`（使用所选硬件配置文件的 `runtime_image` 默认值）。`plan.monitoring.autoDiscovered` 用于记录运行时发现的端点字段
+    （`prometheusUrl`、`grafanaUrl`、`prometheusNodePort`、`grafanaNodePort`、`host`），
+    且不会改变 `planHash`。当 `tokenSource` 为 `create-secret` 且命名空间为空或默认
+    `llm-d-bench-storage*` 时，该路由会自动将 `secretNamespace` 对齐到 edit
+    kubeconfig 经 SSAR 验证的可写命名空间（将 `secretNamespaceMode` 设为
+    `existing` 并对齐默认的 `handoff.namespace`），同时保留显式自定义命名空间和
+    `existing-secret:*`，并在 Kubernetes 不可达时优雅回退。
   </TabItem>
   <TabItem value="python-api" label="Python API">
     ```python
-    from llm_d_lens.cluster import images
+    from llm_d_lens.cluster import guard
 
-    status = await images.start_image_prepull("cluster-a", ["nvidia", "intel"])
-    print(status["state"], status["ready"], status["desired"])
+    state = guard.load_plan("cluster-a")
+    if state is not None:
+        print(state.plan_hash, state.plan)
     ```
+
+    `PUT /plan` 仅提供 REST：该路由会规范化 plan、校验硬件配置文件和命名空间
+    规则、以乐观并发写入，并同步集群记录上的派生列。请调用 endpoint，不要直接写
+    plan。
+  </TabItem>
+</Tabs>
+
+### 检查 operation 权限
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/cluster/clusters/{cluster_id}/permission-check`**
+
+    返回 `OperationReport`：
+    `{planHash, planVersion, plan, status, sufficient, userOperations, adminOperations, lensOperations, blockedOperations, missing, marker, remediation}`。
+    `status` 为 `ready`、`admin_required` 或 `blocked`。该检查绝不会变更目标
+    Kubernetes 集群；对于具有更新权限的空闲 draft 集群，它可能会在 Lens 状态中
+    将符合条件的默认 `create-secret` / `handoff` 命名空间自动对齐到 edit
+    kubeconfig 的可写命名空间，并返回更新后的 `plan`、`planHash` 和
+    `planVersion`。该检查会对远端 overlay operation 执行集群级通配符 SSAR 探测
+    （`*/*/*`），并应用反向依赖闭包提升，将编排平台管理员 operation 的所有未完成、
+    可提升上游依赖一并提升至 `adminOperations`。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    import asyncio
+
+    from llm_d_lens.cluster import evaluator, guard, operations, registry
+
+    cluster = registry.require_cluster("cluster-a")
+    state = guard.require_plan(cluster.id, None)
+    planned = operations.build_operations(state.plan, cluster_id=cluster.id)
+    report = asyncio.run(
+        evaluator.evaluate_operations(
+            cluster.id,
+            planned,
+            plan_hash=state.plan_hash,
+            handoff_namespace=state.plan.handoff.namespace,
+        )
+    )
+    print(report.status, report.user_operations)
+    ```
+  </TabItem>
+</Tabs>
+
+### 生成编排平台管理员 operation 脚本
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/cluster/clusters/{cluster_id}/permission-remediation`**
+
+    需要 `cluster:cluster:update`。返回
+    `{filename, script, instructions, planHash, adminOperations, marker, warnings}`。
+    ready 计划返回 `409 admin_operations_not_required`；pinned chart 来源无法解析时
+    返回 `503 admin_script_source_unavailable`。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    `POST /permission-remediation` 仅提供 REST：它会通过后端文件系统缓存解析 pinned
+    chart CRD、按精确 operation 顺序渲染脚本、写入审计记录并返回可下载文件。请使用
+    endpoint，确保生成的 marker 和 plan hash 与集群已存 plan 一致。
+  </TabItem>
+</Tabs>
+
+### 读取编排平台管理员移交状态
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`GET /api/cluster/clusters/{cluster_id}/admin-handoff/status`**
+
+    只读。返回 `{planHash, status, adminOperations, remainingOperations, marker,
+    warnings, monitoring}`，不写 ledger 或审计。`monitoring`（存在时）包含
+    `prometheusUrl`、`grafanaUrl`、`prometheusNodePort`、`grafanaNodePort`、
+    `host`、`checked` 和 `healthy`。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    `GET /admin-handoff/status` 仅提供 REST：它使用集群凭据读取 live marker，并与
+    已存 plan、operation catalog 和 execution ledger 组合。该路由只读，没有暴露
+    独立的 marker reader。
+  </TabItem>
+</Tabs>
+
+### 校验编排平台管理员完成 marker
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/cluster/clusters/{cluster_id}/admin-handoff/verify`**
+
+    需要 `cluster:cluster:update`。校验 marker，把 admin operations 记录为
+    `admin_done`，自动发现并持久化监控端点，并返回
+    `{planHash, status, adminOperations, remainingOperations, marker, warnings, monitoring, token}`。
+    `monitoring`（存在时）包含 `prometheusUrl`、`grafanaUrl`、`prometheusNodePort`、
+    `grafanaNodePort`、`host`、`checked` 和 `healthy`。
+    后续 user operations 复用该 token。未完成返回 `409 admin_handoff_incomplete`，
+    过期返回 `admin_handoff_stale`，不可读返回 `admin_handoff_unconfirmed`。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    `POST /admin-handoff/verify` 仅提供 REST：校验必须在 marker 完全验证后才原子
+    获取 execution token 并记录 `admin_done`。该路由执行集群访问检查及该事务；
+    没有公开的 Python wrapper。
+  </TabItem>
+</Tabs>
+
+### 保存 draft Hugging Face token
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`PUT /api/cluster/clusters/{cluster_id}/draft-hf-token`**
+
+    需要 `cluster:cluster:update` 权限和集群/所有者访问权限。仅 draft 可用；
+    对 active 集群返回 `409 cluster_not_draft`。
+
+    请求 body：`{"token": "..."}`（非空、单行、不含 NUL 字符，最长 16,384 个字符）。
+
+    可选 header：当 execution 锁处于激活状态时，可传入 `X-Lens-Execution-Token`。
+
+    返回 `204 No Content` 与 `Cache-Control: no-store`。token 会在静态加密后与调用方用户、
+    `cluster_id` 和 `created_at` 绑定存储。它只写不读（永远不会通过 `GET` API 返回，
+    也不会写入 provisioning plan、日志或编排平台管理员脚本）；当 `POST /operations/{operation_id}/execute`
+    执行 `cache.hf-secret` 且未传 `secretValues` 时会自动使用该 token，并在 finalize、
+    丢弃/删除 draft、`update_cluster(draft=False)` 或切换到 `existing-secret:` 时自动删除。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.cluster import registry
+
+    cluster = registry.require_cluster("cluster-a")
+    registry.write_draft_hf_token(cluster, "hf_...", actor_user_id="user-1")
+    ```
+  </TabItem>
+</Tabs>
+
+### 执行 user operation
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/cluster/clusters/{cluster_id}/operations/{operation_id}/execute`**
+
+    Headers：`X-Lens-Plan-Hash`；第一个 user operation 之后或 handoff verify 之后
+    带 `X-Lens-Execution-Token`。
+
+    可选 body：`{"secretValues": {"HF_TOKEN": "..."}}`，仅用于 user-owned secret
+    operation。对于 `cache.hf-secret`，如果同一用户此前已通过 `PUT /draft-hf-token`
+    保存了 draft Hugging Face token，则可省略 `secretValues`；显式传入的 `secretValues`
+    仍具有更高优先级。返回 `{operationId, status, token, result}` 和
+    `X-Lens-Execution-Token`。支持在线 `manifests_from_chart` 执行（当 chart
+    CRD 解析或校验失败时返回 `503 admin_script_source_unavailable`）。403 会按
+    上游依赖闭包重新拆分并进入编排平台管理员 handoff（保留已完成的 `user_done`
+    前置条件）；401/504/502 分别表示凭据、就绪或 operation 失败。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    import asyncio
+
+    from llm_d_lens.cluster import execution, guard, operations
+
+    state = guard.require_plan("cluster-a", plan_hash)
+    planned = operations.build_operations(state.plan, cluster_id="cluster-a")
+    operation = next(item for item in planned if item.id == "cache.hf-secret")
+    asyncio.run(
+        execution.execute_user_operation(
+            "cluster-a",
+            operation,
+            secret_values={"HF_TOKEN": "hf_..."},
+        )
+    )
+    ```
+
+    REST 路由还会管理 execution token，并在 ledger 中记录
+    `user_done`/`failed`。
+  </TabItem>
+</Tabs>
+
+### 完成 run
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/cluster/clusters/{cluster_id}/execution/complete`**
+
+    需要 live token。执行 Lens 本地 operation（包括监控端点发现与 Prometheus
+    就绪验证），确认每个 operation 为 user-done、admin-done 或 Lens-done，原子设置
+    `draft=false`、完成时间和 plan hash，并释放 token。返回 `204`。监控验证失败时
+    返回 `400` 或 `502` 及 `monitoring_*` 错误码（`monitoring_prometheus_url_missing`、
+    `monitoring_discovery_failed`、`monitoring_unhealthy`），同时保留 execution token
+    以便重试。
+
+    **`POST /api/cluster/clusters/{cluster_id}/execution/cancel`**
+
+    取消 active run 并释放锁。返回 `204`。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.cluster import execution
+
+    # 所有非 Lens operation 已记录，且 Lens 本地工作已完成之后。
+    execution.finalize("cluster-a", token, plan_hash=plan_hash)
+
+    # 或者取消/请求取消 active run。
+    execution.cancel("cluster-a", token)
+    ```
+  </TabItem>
+</Tabs>
+
+### 轮换集群凭据
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`PUT /api/cluster/clusters/{cluster_id}/kubeconfig`**
+
+    multipart `file`，active 集群可选 `confirm=true`。仅用于凭据轮换：校验 YAML、
+    egress、连通性和目标身份，不运行权限检查，也不更改计划。返回
+    `{planHash, targetMatchedBy, endpointChanged, warning}`。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    `PUT /kubeconfig` 仅提供 REST：该路由校验上传凭据、比对目标身份与已存记录、
+    更新 egress/session 状态并写入审计记录。轮换没有公开的 Python wrapper。
   </TabItem>
 </Tabs>
 
@@ -604,35 +804,6 @@ Gateway 命名空间前缀会附加该 Lens 集群注册的稳定短 ID。注册
   </TabItem>
 </Tabs>
 
-### 应用固定版本的 Gateway API / Gateway API Inference Extension / llm-d Router CRD
-
-应用由 Lens 技术栈配置文件固定版本的 Gateway API（`gateway.networking.k8s.io`）、Gateway API Inference Extension（`inference.networking.k8s.io`）和 llm-d Router（`inferencemodelrewrites.llm-d.ai`）CRD 包。该操作是幂等的；集群创建过程中也会执行此操作。执行 CRDs 操作时，Lens 还会重启 pod 模板中缺少当前 CRD 修订标记、由 Lens 管理的 router EPP，使其重新注册 `InferenceModelRewrite` API，公开模型别名才能生效。升级后首次执行该操作时，会重启所有已发布的 EPP 一次。新增的 `router_epp_repair` 键报告该结果。
-
-<Tabs>
-  <TabItem value="rest-api" label="REST API">
-    **`POST /api/cluster/clusters/{cluster_id}/crds`**
-
-    响应：每个 CRD 包的执行结果，以及新增的 `router_epp_repair` 结果。
-
-    ```json
-    {
-      "gateway_api": { "ok": true, "message": "" },
-      "gateway_api_inference_extension": { "ok": true, "message": "" },
-      "llm_d_router": { "ok": true, "message": "" },
-      "router_epp_repair": { "ok": true, "restarted": ["deploy/qwen-epp"], "message": "" }
-    }
-    ```
-  </TabItem>
-  <TabItem value="python-api" label="Python API">
-    ```python
-    from llm_d_lens.cluster import gateway_crds
-
-    result = await gateway_crds.apply_gateway_crds("cluster-a")
-    print(result["gateway_api"]["ok"], result["llm_d_router"]["ok"])
-    ```
-  </TabItem>
-</Tabs>
-
 ### 获取 Gateway API / GIE / llm-d Router CRD 状态
 
 报告集群上是否存在固定版本的 Gateway API、Gateway API Inference Extension 和 llm-d Router CRD（每个包的状态为 `ready`/`missing`）。只有当服务发现也提供 `inferencemodelrewrites` 资源时，llm-d Router 包才为就绪。
@@ -655,36 +826,6 @@ Gateway 命名空间前缀会附加该 Lens 集群注册的稳定短 ID。注册
 
     status = await gateway_crds.gateway_crds_status("cluster-a")
     print(status["gateway_api"], status["llm_d_router"])
-    ```
-  </TabItem>
-</Tabs>
-
-### 安装 LeaderWorkerSet 控制器
-
-安装或升级 Lens 技术栈配置文件固定的 LeaderWorkerSet 控制器，启用 llm-d v1.0 P/D Guide 使用的 `DisaggregatedSet` API。Lens 先以服务端应用方式安装 CRD，再升级 Helm release。操作幂等；创建向导在安装 Gateway CRD 后也会调用此端点。
-
-<Tabs>
-  <TabItem value="rest-api" label="REST API">
-    **`POST /api/cluster/clusters/{cluster_id}/lws`**
-
-    ```json
-    {
-      "ok": true,
-      "ready": true,
-      "crd": "ready",
-      "controller": "ready",
-      "version": "v1.0.0",
-      "namespace": "lws-system",
-      "message": ""
-    }
-    ```
-  </TabItem>
-  <TabItem value="python-api" label="Python API">
-    ```python
-    from llm_d_lens.cluster import service
-
-    result = await service.install_lws("cluster-a")
-    print(result["ready"], result["version"])
     ```
   </TabItem>
 </Tabs>
@@ -751,15 +892,15 @@ Gateway 命名空间前缀会附加该 Lens 集群注册的稳定短 ID。注册
 
 删除由 Lens 管理的集群记录，并清理相关状态。仅当需要将集群从 Lens 中彻底移除时才应使用此操作。
 
-该接口会执行以下远端清理：
+删除采用两阶段清理流程，使仅拥有命名空间级 `edit` kubeconfig 的用户在遇到需要编排平台管理员权限的集群级或跨命名空间清理时不会被阻塞：
 
-- 删除注册独立的 Gateway 命名空间（通常为 `lens-gateway-<cluster-id>`），以及其中的 Gateway、IPP、鉴权资源和路由。命名空间不存在视为成功，不删除旧共享命名空间、其他注册的命名空间或共享 Gateway 控制器。
-- 删除 `hfTokenSecret` 中记录的集群 `HF_TOKEN` Secret；当其所在命名空间没有理由在集群之后继续存在时，该命名空间也会一并删除。以下情况属于此类：Lens 自有的 `llm-d-bench-storage-{cluster_id}` 命名空间、Lens 为该 Secret 创建的任何命名空间（带有 `app.kubernetes.io/managed-by: llm-d-lens` 标签），以及删除该 Secret 后仅剩 Kubernetes 和集群插件注入到每个命名空间中的对象（`default` 服务账号及其令牌 Secret、`kube-root-ca.crt` 等 CA 证书包 ConfigMap）的命名空间。仍包含任何其他对象（包括自定义资源）的命名空间会被保留；`default`、`kube-system`、`kube-public` 和 `kube-node-lease` 永远不会被删除。如果无法列出命名空间内容，则保留该命名空间。
-- 对于草稿集群，仍挂在其上的每个存储卷都会连同其 `PersistentVolumeClaim` 和 `PersistentVolume` 对象一起删除。底层 NFS 或主机路径存储上的模型文件会保留，因为 `PersistentVolume` 使用 `Retain` 回收策略。
+- **阶段 A（使用已保存的 kubeconfig 尽力清理）**：Lens 删除其有权限清理的资源，包括注册独立的 Gateway 命名空间（通常为 `lens-gateway-<cluster-id>`）；若使用共享/已有 Gateway 命名空间（`namespaceMode: "existing"` 或不可删除命名空间），则仅删除 Lens 自有的 Gateway 资源（`gateway.gateway.networking.k8s.io/<gateway_name>` 及尽力清理的 provider/authz/`lens-node-sysctl` 配套资源）。对于 `HF_TOKEN` Secret，永远不会删除 `existing-secret:*` 及其 `existing` 模式命名空间；`create-secret` 且为 `create` 模式的命名空间在非受保护/非共享时直接作为 `hf-secret.namespace` 删除，创建后轮换的 HF Secret 仅删除 Secret 本身（不删除命名空间），无计划的旧版外部 Secret 命名空间仅在 Lens 自有或移除后仅剩系统注入对象时删除。受保护命名空间（`default`、`kube-system`、`kube-public`、`kube-node-lease`、`istio-system`、`envoy-gateway-system`、`envoy-ai-gateway-system`、`agentgateway-system`）、`lens-gateway`、`llm-d-bench-storage` 以及 kubeconfig/handoff 命名空间永远不会被删除。对于草稿集群，仍挂在其上的存储卷也会连同其 `PersistentVolumeClaim` 和 `PersistentVolume` 对象一起删除（底层 NFS 或主机路径文件因 `Retain` 回收策略而保留）。
+- **阶段 B（编排平台管理员交接）**：如果任何必需的清理操作因 `403`/RBAC 权限不足而失败，Lens 会在 `marker.namespace` 中检查完成标记 `ConfigMap`（`lens-admin-cleanup-<cluster_id>`），验证其 `clusterId`、`status: "completed"`、`cleanupDigest` 及所有未验证操作。若尚未完成，Lens 返回 `409 cluster_admin_cleanup_required`（RFC-7807），并在响应中包含幂等清理脚本 `script`、`cleanupDigest`、`operations`、`completedOperations`、`marker`、`canVerifyMarker` 和 `confirmRequired`，供编排平台管理员执行脚本后重试删除。
+- **离线/不可达回退**：如果删除时集群不可达，Lens 返回 `502 cluster_gateway_cleanup_failed`，并在错误载荷中附带幂等 `script` 和 `cleanupDigest`。传入 `confirmAdminCleanup=true` 可确认已完成手动清理并移除 Lens 注册记录。
 
-Gateway 命名空间必须清理成功：失败或超时返回 `502 cluster_gateway_cleanup_failed`，
-并保留集群记录和 kubeconfig 以便重试。HF-token 和草稿存储清理仍为尽力而为。
-非草稿集群仍有可用部署或存储卷时返回 `409`，请先清理这些资源。
+非草稿集群如果仍有可用部署或存储卷，即使传入 `confirmAdminCleanup=true` 也始终会返回 `409`（`cluster_has_available_deployments` 或 `cluster_has_storage_volumes`）。
+
+如果可以直接提供临时编排平台管理员 kubeconfig，仍可使用 `POST /api/cluster/clusters/{cluster_id}/cleanup` 作为替代方案。
 
 <Tabs>
   <TabItem value="rest-api" label="REST API">
@@ -768,12 +909,14 @@ Gateway 命名空间必须清理成功：失败或超时返回 `502 cluster_gate
     请求：无请求体。
 
     - `cluster_id`（`string`，路径参数）：目标集群 id。
+    - `confirmAdminCleanup`（`boolean`，查询参数，默认 `false`）：当标记不可验证（`canVerifyMarker: false`）或集群不可达（`502`）时，设为 `true` 表示确认编排平台管理员已执行清理脚本。
 
     响应：`204 No Content`。此端点不返回 JSON 响应体。
 
-    失败：`502 cluster_gateway_cleanup_failed` 表示独立 Gateway 命名空间无法删除；
-    `409 cluster_has_available_deployments` 或 `cluster_has_storage_volumes`
-    表示已完成注册的集群仍有对应资源。
+    失败：
+    - `409 cluster_has_available_deployments` 或 `409 cluster_has_storage_volumes`：已完成注册的集群仍有对应资源。
+    - `409 cluster_admin_cleanup_required`：必需的远端清理需要编排平台管理员权限（包含 `script`、`cleanupDigest`、`operations`、`completedOperations`、`marker`、`canVerifyMarker` 和 `confirmRequired`）。
+    - `502 cluster_gateway_cleanup_failed`：集群不可达或必需清理失败且未传 `confirmAdminCleanup=true`（可用时包含 `script` 和 `cleanupDigest`）。
   </TabItem>
   <TabItem value="python-api" label="Python API">
     必要清理失败时，`service.delete_cluster()` 抛出包含相同状态和错误码的 `ClusterOverviewError`。
@@ -784,7 +927,7 @@ Gateway 命名空间必须清理成功：失败或超时返回 `502 cluster_gate
     from llm_d_lens.cluster import service
 
     async def main() -> None:
-        await service.delete_cluster("cluster-a")
+        await service.delete_cluster("cluster-a", confirm_admin_cleanup=False)
 
     asyncio.run(main())
     ```
@@ -856,7 +999,7 @@ NVIDIA profile 使用 GFD 的 `nvidia.com/gpu.memory`（MiB）和 `nvidia.com/gp
 
     - `clusterId`（`string`，查询参数）：目标集群 id。
 
-    响应：`OverviewResponse`。
+    响应：`OverviewResponse`。配置监控后，Lens 会直接通过 HTTP 从 Prometheus 获取实时节点、CPU、内存、磁盘和加速器遥测数据（支持无集群级 `nodes` RBAC 权限的受限命名空间作用域 kubeconfig）。`kubernetes` 包含附加元数据字段：`telemetrySource`（`"prometheus"`、`"kubernetes"`、`"hybrid"` 或 `"unavailable"`）、`prometheusReachable`（`boolean`）、`monitoringRequired`（`boolean`）、`restrictedResources`（`string[]`）以及 `notice`（`string | null`）。
 
     ```json
     {
@@ -1306,6 +1449,6 @@ users: []
   </TabItem>
 </Tabs>
 
-还有一些其他端点可用于网关端口可用性检查、HF token 密钥创建、模型密钥列表、节点 cordon/uncordon 以及旧版集群概览会话断开路由 —— 详见完整的 OpenAPI 参考文档。
+还有一些其他端点可用于网关端口可用性检查、HF token 密钥轮换、模型密钥列表、节点 cordon/uncordon 以及旧版集群概览会话断开路由 —— 详见完整的 OpenAPI 参考文档。
 
 完整的请求/响应模式请参见 FastAPI OpenAPI 模式（使用 `npm run docs:api` 重新生成）。

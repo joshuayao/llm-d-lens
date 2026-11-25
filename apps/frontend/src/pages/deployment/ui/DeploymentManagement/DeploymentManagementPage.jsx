@@ -327,6 +327,15 @@ export function DeploymentManagementPage({ onNavigate, initialSearch = '', initi
         }
     };
 
+    const handleCleanupComplete = () => {
+        const executionId = selected?.execution_id;
+        if (executionId) {
+            setItems((current) => current.filter((item) => item.execution_id !== executionId));
+        }
+        setNotice('Deployment deleted');
+        closeDialog();
+    };
+
     const handleDelete = async ({ deleteNamespace = false } = {}) => {
         if (selected.pending) return;
         const executionId = selected.execution_id;
@@ -530,7 +539,7 @@ export function DeploymentManagementPage({ onNavigate, initialSearch = '', initi
             {dialog === 'edit' && <EditDeploymentModal deployment={selected} onCancel={closeDialog} onSave={handleSave} />}
             {dialog === 'scale' && <ScaleDeploymentModal deployment={selected} onCancel={closeDialog} onScale={handleScale} />}
             {dialog === 'benchmark' && <BenchmarkDeploymentModal deployment={selected} onCancel={closeDialog} onStart={handleBenchmark} />}
-            {dialog === 'delete' && <DeleteDeploymentModal deployment={selected} clusterNameById={clusterNameById} onCancel={closeDialog} onDelete={handleDelete} />}
+            {dialog === 'delete' && <DeleteDeploymentModal deployment={selected} clusterNameById={clusterNameById} onCancel={closeDialog} onDelete={handleDelete} onCleanupComplete={handleCleanupComplete} />}
             {dialog === 'pods-logs' && <DeploymentPodsLogsModal deployment={selected} onClose={closeDialog} />}
             <Toast
                 message={notice}

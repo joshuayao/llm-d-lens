@@ -740,3 +740,100 @@ async def test_job_launch_failure_keeps_pending_batch_and_propagates(monkeypatch
         )
     assert [p.status for p in entry.node_progress] == ["pending", "pending"]
     assert [m["metadata"]["labels"]["prism.ai/model-cache-action"] for m in applied] == [action, action]
+
+
+@pytest.mark.asyncio
+async def test_jobs_target_aligned_local_disk_and_nfs_namespace_and_set_plan_hash(monkeypatch):
+    import json as json_module
+
+    class _FastRunner:
+        def __init__(self) -> None:
+            self.calls: list[tuple[list[str], str | None]] = []
+
+        async def run(self, argv, **kwargs):
+            self.calls.append((list(argv), kwargs.get("input")))
+            if argv[:3] == ["kubectl", "get", "job"]:
+                return FakeResult(1, stderr="not found")
+            if argv[:3] == ["kubectl", "get", "secret"]:
+                return FakeResult(0, stdout=json_module.dumps({"data": {"HF_TOKEN": "aGZfYWJj"}}))
+            if argv[:2] == ["kubectl", "logs"]:
+                return FakeResult(0, stdout="models--org--model\n")
+            return FakeResult(0)
+
+    runner = _FastRunner()
+    monkeypatch.setattr(jobs_module, "scoped_runner", lambda _cid: runner)
+
+    async def fake_discover_nodes(_cid):
+        return [StorageNodeSummary(name="worker-1", ready=True, schedulable=True)]
+
+    monkeypatch.setattr(jobs_module, "discover_nodes", fake_discover_nodes)
+
+    list_namespaces: list[str | None] = []
+
+    async def fake_list_resources(resource, *, namespace=None, selector=None, cluster_id=None, **kwargs):
+        del resource, selector, cluster_id, kwargs
+        list_namespaces.append(namespace)
+        return [
+            {
+                "metadata": {"name": "model-cache-scan-vol-edit-worker-1"},
+                "status": {"succeeded": 1},
+            }
+        ]
+
+    monkeypatch.setattr(jobs_module, "list_resources", fake_list_resources)
+
+    local_vol = _local_disk_volume(
+        id="vol-edit",
+        localDisk=LocalDiskSpec(hostPath="/data/models", namespace="lens-edit"),
+        pvcName="prism-storage-vol-edit",
+    )
+    nfs_vol = _nfs_volume(
+        id="vol-nfs-edit",
+        nfs=NfsSpec(server="nfs.example.com", path="/exports", namespace="lens-edit"),
+        pvcName="prism-storage-vol-nfs-edit",
+    )
+    assert jobs_module._pvc_namespace(local_vol) == "lens-edit"
+    assert jobs_module._pvc_namespace(nfs_vol) == "lens-edit"
+
+    entry = _entry(
+        id="mc-edit",
+        storageVolumeId=local_vol.id,
+        tokenSource=TokenSource(mode=TokenSourceMode.EXISTING_SECRET, namespace="src-ns", name="hf-tok"),
+    )
+    await start_download(entry, volume=local_vol, plan_hash="0123456789abcdef")
+
+    secret_apply = next(
+        (argv, payload)
+        for argv, payload in runner.calls
+        if argv[:3] == ["kubectl", "apply", "--namespace"] and "Secret" in (payload or "")
+    )
+    assert secret_apply[0][3] == "lens-edit"
+    assert json_module.loads(secret_apply[1])["metadata"]["namespace"] == "lens-edit"
+
+    job_apply = next(
+        (argv, payload)
+        for argv, payload in runner.calls
+        if argv[:3] == ["kubectl", "apply", "--namespace"] and '"Job"' in (payload or "")
+    )
+    assert job_apply[0][3] == "lens-edit"
+    job_manifest = json_module.loads(job_apply[1])
+    assert job_manifest["metadata"]["namespace"] == "lens-edit"
+    assert job_manifest["metadata"]["labels"][jobs_module.PLAN_HASH_LABEL] == "0123456789abcdef"
+
+    await start_delete(entry, volume=nfs_vol)
+    await poll_progress(entry, volume=nfs_vol, action="download")
+    await jobs_module.tail_logs(entry, volume=nfs_vol, node="*", action="download")
+    await delete_jobs_for_volume(nfs_vol, cluster_id="cluster-1")
+    await jobs_module.delete_jobs_for_entry(entry, volume=nfs_vol)
+    found = await jobs_module.scan_existing_models(local_vol, cluster_id="cluster-1")
+
+    assert found == {"org/model": ["worker-1"]}
+    assert list_namespaces and all(ns == "lens-edit" for ns in list_namespaces)
+    assert any(
+        argv[:3] == ["kubectl", "delete", "job"] and argv[argv.index("--namespace") + 1] == "lens-edit"
+        for argv, _ in runner.calls
+    )
+    assert any(
+        argv[:2] == ["kubectl", "logs"] and argv[argv.index("--namespace") + 1] == "lens-edit"
+        for argv, _ in runner.calls
+    )

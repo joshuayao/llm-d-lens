@@ -1,17 +1,27 @@
 import { scaleBytes } from '../../../shared/lib/formatBytes';
 import { requestJson } from '../../../shared/api/httpClient';
+import { cn } from '../../../shared/lib/cn';
 import { usePolling } from '../../../shared/lib/usePolling';
 import { useResourceList } from '../../../shared/lib/useResourceList';
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Activity, AlertCircle, Boxes, ChevronDown, ChevronUp, Cpu, Gpu, HardDrive, MemoryStick, MoreVertical, Network, Pencil, Plus, Rocket, Server, Trash2, Webcam } from 'lucide-react';
-import { Button, EmptyState, Input, Label, Modal, Panel, SectionLabel, Select, Textarea, ModuleHeader, ModulePage } from '../../../shared/ui';
+import { Badge, Button, EmptyState, Input, Label, Modal, Panel, SectionLabel, Select, Textarea, ModuleHeader, ModulePage } from '../../../shared/ui';
 import { HelpTooltip } from '../../../shared/ui/FormControls';
+import { FormError } from '../../../shared/ui/FormError';
 import { CreateClusterWizard } from './CreateClusterWizard';
 import { EditClusterModal } from './EditClusterModal';
+import { deleteCluster, parseDeleteCleanupHandoff } from './clusterPermissionBackend';
+import { CleanupHandoffPanel } from './PermissionHandoffPanel';
 import { storePendingModelMarketCluster } from '../../model-market';
 import { PermissionGate, useAuth } from '../../auth';
 import { VIEW_PERMISSIONS } from '../../auth/permissions';
+import {
+    clusterHealthIsAbnormal,
+    describeMonitoringNotice,
+    monitoringCardDisplay,
+    monitoringMetricStatus,
+} from './ClusterMonitoringStack/preflightPresentation';
 
 function request(path, options = {}) {
     return requestJson(path, { headers: { 'Content-Type': 'application/json' }, ...options });
@@ -37,50 +47,16 @@ function formatUsagePercent(value) {
     return typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(value % 1 === 0 ? 0 : 1)}%` : '—';
 }
 
-// Derives whether a cluster's *own* latest overview payload shows an
-// abnormality (a NotReady node, an under-provisioned capacity, a near-full
-// disk reported directly by kubelet, or a broken core component) -- pure
-// function of that cluster's own cached `/api/cluster/overview` response, so
-// it can be applied independently to every cluster in the sidebar list, not
-// only the one currently selected/displayed in the detail panel.
-// Returns `null` when the overview hasn't loaded yet (unknown health, not
-// flagged as abnormal), or `true`/`false` once data is available.
-function clusterHealthIsAbnormal(overviewPayload) {
-    if (!overviewPayload) return null;
-    const kubernetes = overviewPayload.kubernetes || {};
-    const nodes = kubernetes.nodes || [];
-    const hardware = kubernetes.hardware || {};
-    const components = kubernetes.components || {};
-    const nodesReady = nodes.filter((node) => node.ready).length;
-    const nodesTotal = nodes.length;
-    const readyNodes = nodes.filter((node) => node.ready);
-    const actualCpuCores = readyNodes.reduce((sum, node) => sum + (node.cpu || 0), 0);
-    const actualMemoryBytes = readyNodes.reduce((sum, node) => sum + (node.memoryBytes || 0), 0);
-    const actualGpuCount = readyNodes.reduce((sum, node) => sum + (node.gpuCount || 0), 0);
-    const underProvisioned = (actual, planned) => planned > 0 && actual < planned - 1e-6;
-    const diskUsagePercent = hardware.diskUsagePercent;
-    const diskDegraded = typeof diskUsagePercent === 'number' && diskUsagePercent >= 75;
-    return Boolean(
-        nodesReady < nodesTotal ||
-        underProvisioned(actualCpuCores, hardware.cpuCores ?? 0) ||
-        underProvisioned(actualMemoryBytes, hardware.memoryBytes ?? 0) ||
-        underProvisioned(actualGpuCount, hardware.gpuCount ?? 0) ||
-        diskDegraded ||
-        (components.intelDevicePlugin?.installed && components.intelDevicePlugin.status !== 'ready') ||
-        (components.monitoring?.installed && components.monitoring.status !== 'ready' && components.monitoring.status !== 'external')
-    );
-}
-
 function UtilizationBar({ capacity, value }) {
     const hasValue = typeof value === 'number' && Number.isFinite(value);
     const width = hasValue ? Math.min(100, Math.max(0, value)) : 0;
     return (
         <div className="min-w-[8rem]">
-            <div className="flex items-center justify-between gap-2 text-xs font-medium text-slate-400">
-                <span className="truncate text-slate-300">{capacity}</span>
-                <span>{formatUsagePercent(value)}</span>
+            <div className="flex items-center justify-between gap-2 text-xs font-medium text-theme-muted">
+                <div className="min-w-0 truncate text-theme-text">{capacity}</div>
+                <span className="shrink-0">{formatUsagePercent(value)}</span>
             </div>
-            <div className="utilization-track mt-1 h-1.5 overflow-hidden rounded-full bg-slate-800">
+            <div className="utilization-track mt-1 h-1.5 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
                 <div
                     className="h-full rounded-full bg-gradient-to-r from-cyan-500 to-emerald-400 transition-[width]"
                     style={{ width: `${width}%` }}
@@ -97,9 +73,11 @@ function formatCores(value) {
 }
 
 function formatThroughput(bytesPerSec) {
-    if (!bytesPerSec || Number.isNaN(Number(bytesPerSec))) return '0 B/s';
+    if (bytesPerSec == null || Number.isNaN(Number(bytesPerSec))) return '—';
+    const num = Number(bytesPerSec);
+    if (num === 0) return '0 B/s';
     const units = ['B/s', 'KiB/s', 'MiB/s', 'GiB/s', 'TiB/s'];
-    let val = Number(bytesPerSec);
+    let val = num;
     let u = 0;
     while (val >= 1024 && u < units.length - 1) {
         val /= 1024;
@@ -118,48 +96,32 @@ function getNodeGpus(node) {
     const count = node.gpuCount || 1;
     const totalVram = node.vramBytes || 0;
     const vramPerGpu = count > 0 ? Math.floor(totalVram / count) : 0;
-    const gpuUsage = typeof node.gpuUsagePercent === 'number' ? node.gpuUsagePercent : 0;
+    const gpuUsage = typeof node.gpuUsagePercent === 'number' ? node.gpuUsagePercent : null;
     const vramUsage = typeof node.vramUsagePercent === 'number' ? node.vramUsagePercent : null;
+    const fallbackModel = Object.values(node.gpuModelsByProfile || {})
+        .flat()
+        .find((value) => typeof value === 'string' && value.trim());
 
     return Array.from({ length: count }, (_, i) => {
-        const computePct = Math.min(100, Math.max(0, gpuUsage));
-        const vramUsed = vramUsage === null ? null : Math.floor(vramPerGpu * (vramUsage / 100));
+        const computePct = gpuUsage === null ? null : Math.min(100, Math.max(0, gpuUsage));
+        const vramUsed = vramUsage === null || vramPerGpu <= 0 ? null : Math.floor(vramPerGpu * (vramUsage / 100));
 
         return {
             id: `gpu-${i}`,
             index: i,
             name: `GPU #${i}`,
-            pciAddress: `0000:0${i + 3}:00.0`,
-            computeUsagePercent: Math.round(computePct * 10) / 10,
+            model: fallbackModel || undefined,
+            pciAddress: '',
+            computeUsagePercent: computePct === null ? null : Math.round(computePct * 10) / 10,
             vramTotalBytes: vramPerGpu,
             vramUsedBytes: vramUsed,
             vramUsagePercent: vramUsed === null ? null : Math.round((vramPerGpu > 0 ? vramUsed / vramPerGpu : 0) * 100 * 10) / 10,
-            vramReadThroughputBytes: 0,
-            vramWriteThroughputBytes: 0,
-            vramTotalThroughputBytes: 0,
-            vramBandwidthPercent: 0,
+            vramReadThroughputBytes: null,
+            vramWriteThroughputBytes: null,
+            vramTotalThroughputBytes: null,
+            vramBandwidthPercent: null,
         };
     });
-}
-
-function componentMetricStatus(status) {
-    switch (status) {
-        case 'ready':
-            return { status: 'ready', label: 'Ready' };
-        case 'external':
-            return { status: 'external', label: 'External' };
-        case 'installing':
-        case 'progressing':
-            return { status, label: status === 'installing' ? 'Installing' : 'Progressing' };
-        case 'absent':
-            return { status: 'absent', label: 'Not installed' };
-        case 'degraded':
-        case 'unreachable':
-        case 'failed':
-            return { status, label: status.charAt(0).toUpperCase() + status.slice(1) };
-        default:
-            return { status: 'neutral', label: status || 'Unknown' };
-    }
 }
 
 function statusDotClass(status) {
@@ -187,11 +149,43 @@ function MetricStatusLabel({ status, label }) {
     );
 }
 
-function ClusterMetricCard({ icon, title, value, unit, status, usagePercent, showUsageBar = false }) {
+function ClusterMetricCard({
+    icon,
+    title,
+    value,
+    unit,
+    status,
+    usagePercent,
+    showUsageBar = false,
+    detail,
+    actionLabel,
+    onClick,
+    ariaLabel,
+    titleTooltip,
+}) {
     const hasUsage = typeof usagePercent === 'number' && Number.isFinite(usagePercent);
     const usageWidth = hasUsage ? Math.min(100, Math.max(0, usagePercent)) : 0;
+    const interactive = typeof onClick === 'function';
+    const handleKeyDown = (event) => {
+        if (!interactive) return;
+        if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            onClick(event);
+        }
+    };
     return (
-        <div className="flex h-full flex-col gap-3 rounded-xl border border-slate-700/60 bg-slate-800/60 p-4 text-left shadow-lg backdrop-blur-xl">
+        <div
+            role={interactive ? 'button' : undefined}
+            tabIndex={interactive ? 0 : undefined}
+            onClick={interactive ? onClick : undefined}
+            onKeyDown={interactive ? handleKeyDown : undefined}
+            aria-label={interactive ? (ariaLabel || title) : undefined}
+            title={titleTooltip}
+            className={cn(
+                'flex h-full flex-col gap-3 rounded-xl border border-slate-700/60 bg-slate-800/60 p-4 text-left shadow-lg backdrop-blur-xl',
+                interactive && 'cursor-pointer transition-colors hover:border-sky-400/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500/60',
+            )}
+        >
             <div className="flex items-center justify-between gap-3">
                 <div className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-slate-400">
                     <span className="shrink-0 text-slate-400">{icon}</span>
@@ -218,12 +212,20 @@ function ClusterMetricCard({ icon, title, value, unit, status, usagePercent, sho
                     )}
                 </div>
             )}
+            {(detail || actionLabel) && (
+                <div className="mt-auto flex items-center justify-between gap-2 text-[11px] text-slate-400">
+                    {detail ? <span className="truncate" title={detail}>{detail}</span> : <span />}
+                    {actionLabel && (
+                        <span className="shrink-0 font-medium text-sky-400">{actionLabel}</span>
+                    )}
+                </div>
+            )}
         </div>
     );
 }
 
 export default function OptimizationClusterOverview({ onNavigate, onToggleMobileNav, initialClusterId = '', initialAction = '' }) {
-    const { can } = useAuth();
+    const { can, canView } = useAuth();
     const [selectedId, setSelectedId] = useState('');
     const [overview, setOverview] = useState(null);
     const [overviewByCluster, setOverviewByCluster] = useState({});
@@ -235,6 +237,8 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
     const [deleteTarget, setDeleteTarget] = useState(null);
     const [deleting, setDeleting] = useState(false);
     const [deleteError, setDeleteError] = useState('');
+    const [deleteHandoff, setDeleteHandoff] = useState(null);
+    const [confirmAdminCleanup, setConfirmAdminCleanup] = useState(false);
     const [editTarget, setEditTarget] = useState(null);
     const [selectedNodeNames, setSelectedNodeNames] = useState(() => new Set());
     const [maintenanceBusy, setMaintenanceBusy] = useState(false);
@@ -340,6 +344,7 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
 
     useEffect(() => {
         setSelectedNodeNames(new Set());
+        setExpandedNodeName(null);
         setMaintenanceError('');
         setMaintenanceConfirm(null);
     }, [selectedId]);
@@ -358,21 +363,56 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
         return () => { cancelled = true; };
     }, [selectedId]);
 
-    const confirmDelete = (cluster) => {
-        setDeleteTarget(cluster);
+    const resetDeleteState = () => {
         setDeleteError('');
+        setDeleteHandoff(null);
+        setConfirmAdminCleanup(false);
     };
 
-    const submitDelete = async () => {
-        if (!deleteTarget) return;
+    const confirmDelete = (cluster) => {
+        setDeleteTarget(cluster);
+        resetDeleteState();
+    };
+
+    const closeDeleteModal = () => {
+        if (deleting) return;
+        setDeleteTarget(null);
+        resetDeleteState();
+    };
+
+    const submitDelete = async ({ forceConfirm = false } = {}) => {
+        if (!deleteTarget || deleting) return;
         setDeleting(true);
         setDeleteError('');
         try {
-            await request(`/api/cluster/clusters/${encodeURIComponent(deleteTarget.id)}`, { method: 'DELETE' });
+            await deleteCluster(deleteTarget.id, {
+                confirmAdminCleanup: Boolean(forceConfirm && confirmAdminCleanup),
+            });
             setDeleteTarget(null);
+            resetDeleteState();
             await loadClusters();
         } catch (nextError) {
-            setDeleteError(nextError.message);
+            const handoff = parseDeleteCleanupHandoff(nextError);
+            if (handoff) {
+                const wasHandoff = deleteHandoff !== null;
+                const digestChanged = deleteHandoff?.cleanupDigest !== handoff.cleanupDigest;
+                setDeleteHandoff(handoff);
+                if (digestChanged || (!handoff.confirmRequired && !handoff.unreachable)) {
+                    setConfirmAdminCleanup(false);
+                }
+                if (wasHandoff && !forceConfirm) {
+                    const markerStatus = handoff.marker?.status;
+                    if (handoff.unreachable) {
+                        setDeleteError('Cluster is still unreachable.');
+                    } else if (markerStatus === 'missing') {
+                        setDeleteError('Cleanup marker ConfigMap was not found yet. Ensure the Orchestration administrator ran the script, then try again.');
+                    } else if (markerStatus === 'still_present') {
+                        setDeleteError('Target cluster resources are still present. Run the Orchestration administrator cleanup script, then try again.');
+                    }
+                }
+            } else {
+                setDeleteError(nextError.message);
+            }
         } finally {
             setDeleting(false);
         }
@@ -386,6 +426,10 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
     const components = kubernetes.components || {};
     const nodes = kubernetes.nodes || [];
     const hardware = kubernetes.hardware || {};
+    const monitoringRequired = Boolean(kubernetes.monitoringRequired);
+    const prometheusReachable = Boolean(kubernetes.prometheusReachable);
+    const telemetrySource = kubernetes.telemetrySource || 'kubernetes';
+    const kubernetesNotice = kubernetes.notice || '';
     const nodesReady = nodes.filter((node) => node.ready).length;
     const nodesTotal = nodes.length;
     const workerNodes = nodes.filter((node) => node.role === 'worker');
@@ -479,7 +523,7 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
             : diskUsagePercent >= 75
                 ? { status: 'degraded', label: 'High' }
                 : { status: 'ready', label: 'Healthy' };
-    const monitoringMetric = componentMetricStatus(components.monitoring?.status);
+    const monitoringMetric = monitoringMetricStatus(components.monitoring);
     const cpuDisplay = { value: `${formatCores(actualCpuCores)} cores`, unit: `/ ${formatCores(hardware.cpuCores)} cores` };
     // Memory and Disk lead with the capacity still free, not the share already
     // taken -- the usage percentage stays on the card's usage line below. When
@@ -510,20 +554,18 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
         : clusters;
     const orderedClusters = [...filteredClusters].sort((a, b) => (a.id === selectedId ? -1 : b.id === selectedId ? 1 : 0));
 
-    const hasClusterAbnormality = Boolean(
-        overview && (
-            nodesReady < nodesTotal ||
-            workersMetric.status === 'degraded' ||
-            workersMetric.status === 'failed' ||
-            cpuMetric.status === 'degraded' ||
-            memoryMetric.status === 'degraded' ||
-            gpuMetric.status === 'degraded' ||
-            diskMetric.status === 'degraded' ||
-            diskMetric.status === 'unreachable' ||
-            (components.intelDevicePlugin && components.intelDevicePlugin.installed && components.intelDevicePlugin.status !== 'ready') ||
-            (components.monitoring && components.monitoring.installed && components.monitoring.status !== 'ready' && components.monitoring.status !== 'external')
-        )
-    );
+    const canOpenObservability = canView('cluster-monitoring-stack');
+    const monitoringDisplay = monitoringCardDisplay(components.monitoring, selectedCluster);
+    const monitoringNotice = describeMonitoringNotice({
+        monitoring: components.monitoring,
+        cluster: selectedCluster,
+        monitoringRequired,
+        kubernetesNotice,
+        telemetrySource,
+        prometheusReachable,
+    });
+
+    const hasClusterAbnormality = Boolean(clusterHealthIsAbnormal(overview));
 
     const getClusterStatus = (cluster) => {
         if (!cluster?.ready) return 'failed';
@@ -570,6 +612,14 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
                                         <option key={cluster.id} value={cluster.id}>{cluster.name || cluster.id}</option>
                                     ))}
                                 </Select>
+                                {selectedCluster?.vllmImage && (
+                                    <div className="flex items-center justify-between gap-2 rounded-lg border border-theme-border bg-theme-bg/60 px-2.5 py-1.5 text-[11px]">
+                                        <Badge tone="info" size="xs" className="shrink-0">Custom vLLM</Badge>
+                                        <span className="min-w-0 truncate font-mono text-theme-text" title={selectedCluster.vllmImage}>
+                                            {selectedCluster.vllmImage}
+                                        </span>
+                                    </div>
+                                )}
                                 <Button
                                     variant="sky"
                                     size="sm"
@@ -721,6 +771,52 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
                 )}
 
                 {selectedId && <>
+                    {monitoringNotice && (
+                        <div
+                            role={monitoringNotice.tone === 'danger' ? 'alert' : 'status'}
+                            className={cn(
+                                'flex flex-wrap items-center justify-between gap-3 rounded-2xl border px-5 py-4 text-sm',
+                                monitoringNotice.tone === 'danger'
+                                    ? 'border-red-500/35 bg-red-500/10 text-red-900 dark:text-red-200'
+                                    : monitoringNotice.tone === 'warning'
+                                        ? 'border-amber-500/30 bg-amber-500/10 text-amber-900 dark:text-amber-200'
+                                        : 'border-sky-500/30 bg-sky-500/10 text-sky-900 dark:text-sky-200',
+                            )}
+                        >
+                            <div className="flex min-w-0 items-start gap-2.5">
+                                <Webcam
+                                    className={cn(
+                                        'mt-0.5 h-4 w-4 shrink-0',
+                                        monitoringNotice.tone === 'danger'
+                                            ? 'text-red-500 dark:text-red-400'
+                                            : monitoringNotice.tone === 'warning'
+                                                ? 'text-amber-500 dark:text-amber-400'
+                                                : 'text-sky-500 dark:text-sky-400',
+                                    )}
+                                />
+                                <div className="min-w-0 space-y-0.5">
+                                    <p className="font-medium">{monitoringNotice.title}</p>
+                                    <p className="text-xs opacity-90">{monitoringNotice.message}</p>
+                                    {monitoringNotice.affectedComponents?.length > 0 && (
+                                        <p className="text-[11px] opacity-80">
+                                            Affected components: {monitoringNotice.affectedComponents.join(', ')}
+                                        </p>
+                                    )}
+                                </div>
+                            </div>
+                            <PermissionGate permission={VIEW_PERMISSIONS['cluster-monitoring-stack']}>
+                                <Button
+                                    variant="sky"
+                                    size="sm"
+                                    className="shrink-0"
+                                    onClick={() => onNavigate?.('cluster-monitoring-stack', { clusterId: selectedId })}
+                                >
+                                    <Webcam size={14} />
+                                    <span>Open Observability</span>
+                                </Button>
+                            </PermissionGate>
+                        </div>
+                    )}
                     <section className="flex flex-col gap-3">
                         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
                             <ClusterMetricCard icon={<Server size={13} />} title="Workers" value={nodesReady} unit={`/ ${nodesTotal}`} status={workersMetric} />
@@ -731,17 +827,30 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
                                 <ClusterMetricCard icon={<MemoryStick size={13} />} title="VRAM" value={vramDisplay.value} unit={vramDisplay.unit} status={vramMetric} usagePercent={hardware.vramUsagePercent} showUsageBar />
                             )}
                             <ClusterMetricCard icon={<HardDrive size={13} />} title="Disk" value={diskDisplay.value} unit={diskDisplay.unit} status={diskMetric} usagePercent={diskUsagePercent} showUsageBar />
-                            <ClusterMetricCard icon={<Activity size={13} />} title="Monitoring" value={components.monitoring?.ready ?? 0} unit={`/ ${components.monitoring?.desired ?? 0}`} status={monitoringMetric} />
+                            <ClusterMetricCard
+                                icon={<Activity size={13} />}
+                                title="Monitoring"
+                                value={monitoringDisplay.value}
+                                unit={monitoringDisplay.unit}
+                                status={monitoringMetric}
+                                detail={monitoringDisplay.detail}
+                                actionLabel={canOpenObservability ? 'Open Observability' : undefined}
+                                onClick={canOpenObservability ? () => onNavigate?.('cluster-monitoring-stack', { clusterId: selectedId }) : undefined}
+                                ariaLabel={canOpenObservability ? 'Monitoring — Open Observability' : undefined}
+                                titleTooltip={components.monitoring?.message || undefined}
+                            />
                         </div>
                     </section>
 
-                    <section className="relative overflow-hidden border border-slate-800/80 rounded-2xl bg-gradient-to-br from-slate-900/90 via-slate-900/50 to-slate-950/90 shadow-2xl backdrop-blur-xl">
-                        <div className="relative p-6">
+                    <Panel padding="md" className="relative overflow-hidden rounded-2xl shadow-lg">
+                        <div className="relative">
                             <div className="flex flex-wrap items-center justify-between gap-3">
-                                <SectionLabel className="text-[#037ffc] text-sm font-semibold normal-case tracking-normal">{`Workers (${nodesTotal})`}</SectionLabel>
+                                <SectionLabel tone="blue" uppercase={false} className="mb-0 text-sm font-semibold tracking-normal">
+                                    {`Workers (${nodesTotal})`}
+                                </SectionLabel>
                                 {selectedWorkerNodes.length > 0 && (
                                     <div className="flex flex-wrap items-center gap-2">
-                                        <span className="text-xs text-slate-400">{selectedWorkerNodes.length} selected</span>
+                                        <span className="text-xs text-theme-muted">{selectedWorkerNodes.length} selected</span>
                                         <Button variant="sky" size="sm" onClick={() => requestNodeMaintenance(true)} disabled={maintenanceBusy}>
                                             Enter maintenance mode
                                         </Button>
@@ -751,15 +860,15 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
                                     </div>
                                 )}
                             </div>
-                            {maintenanceError && <p className="mt-2 text-xs text-rose-300">{maintenanceError}</p>}
-                            <div className="mt-2 overflow-x-auto rounded-xl border border-slate-800/60">
+                            {maintenanceError && <p className="mt-2 text-xs text-rose-600 dark:text-rose-300">{maintenanceError}</p>}
+                            <div className="mt-2 overflow-x-auto rounded-xl border border-theme-border">
                                 <table className="w-full min-w-[56rem] text-left text-sm">
-                                    <thead className="bg-slate-950/60 text-slate-400">
+                                    <thead className="bg-slate-50/80 text-theme-muted dark:bg-slate-950/60">
                                         <tr>
                                             <th className="w-10 px-5 py-3">
                                                 <input
                                                     type="checkbox"
-                                                    className="h-3.5 w-3.5 rounded border-slate-600 bg-slate-800 accent-cyan-500"
+                                                    className="h-3.5 w-3.5 rounded border-theme-border bg-theme-card accent-sky-600 dark:accent-cyan-500"
                                                     checked={allWorkersSelected}
                                                     onChange={toggleAllWorkersSelected}
                                                     disabled={!selectableWorkerNames.length}
@@ -776,174 +885,312 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
                                             <th className="px-5 py-3 text-xs font-semibold uppercase tracking-wider">Disk</th>
                                         </tr>
                                     </thead>
-                                    <tbody className="workers-table-body divide-y divide-slate-800/70">
+                                    <tbody className="workers-table-body divide-y divide-theme-border">
+                                        {nodes.length === 0 && monitoringRequired && (
+                                            <tr>
+                                                <td colSpan={showVramColumn ? 7 : 6} className="px-5 py-6 text-center text-sm text-theme-muted">
+                                                    <div className="flex flex-wrap items-center justify-center gap-3">
+                                                        <span>
+                                                            Node inventory requires Monitoring or cluster-wide permissions. Open Observability to enable or connect Monitoring.
+                                                        </span>
+                                                        <PermissionGate permission={VIEW_PERMISSIONS['cluster-monitoring-stack']}>
+                                                            <Button
+                                                                variant="sky"
+                                                                size="sm"
+                                                                onClick={() => onNavigate?.('cluster-monitoring-stack', { clusterId: selectedId })}
+                                                            >
+                                                                Open Observability
+                                                            </Button>
+                                                        </PermissionGate>
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        )}
                                         {nodes.map((node) => {
                                             const isExpanded = expandedNodeName === node.name;
                                             const nodeGpus = getNodeGpus(node);
+                                            const gpuCount = node.gpuCount || nodeGpus.length;
                                             const isMaintenance = Boolean(node.schedulingDisabled);
+                                            const gpuPanelId = `worker-gpus-${String(node.name || 'node').replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+                                            const toggleNodeExpanded = () => setExpandedNodeName((current) => (current === node.name ? null : node.name));
+                                            const nodeFallbackModel = Object.values(node.gpuModelsByProfile || {})
+                                                .flat()
+                                                .find((value) => typeof value === 'string' && value.trim()) || '';
                                             return (
                                                 <Fragment key={node.name}>
                                                     <tr
-                                                        className={`transition-colors ${
-                                                            isExpanded ? 'bg-slate-800/80' : 'hover:bg-slate-800/40'
-                                                        }`}
+                                                        onClick={toggleNodeExpanded}
+                                                        className={cn(
+                                                            'cursor-pointer transition-colors',
+                                                            isExpanded
+                                                                ? 'bg-sky-500/5 dark:bg-slate-800/80'
+                                                                : 'hover:bg-slate-500/5 dark:hover:bg-slate-800/40',
+                                                        )}
                                                     >
                                                         <td className="w-10 px-5 py-3" onClick={(event) => event.stopPropagation()}>
                                                             {node.role === 'worker' && (
                                                                 <input
                                                                     type="checkbox"
-                                                                    className="h-3.5 w-3.5 rounded border-slate-600 bg-slate-800 accent-cyan-500"
+                                                                    className="h-3.5 w-3.5 rounded border-theme-border bg-theme-card accent-sky-600 dark:accent-cyan-500"
                                                                     checked={selectedNodeNames.has(node.name)}
                                                                     onChange={() => toggleNodeSelected(node.name)}
                                                                     aria-label={`Select ${node.name}`}
                                                                 />
                                                             )}
                                                         </td>
-                                                        <td
-                                                            className="px-5 py-3 font-mono text-[15px] text-slate-200 cursor-pointer"
-                                                            onClick={() => setExpandedNodeName(isExpanded ? null : node.name)}
-                                                            title="Click to expand/collapse GPU details"
-                                                        >
-                                                            <span className="inline-flex items-center gap-2">
-                                                                {isExpanded ? (
-                                                                    <ChevronUp size={14} className="text-cyan-400 shrink-0" />
-                                                                ) : (
-                                                                    <ChevronDown size={14} className="text-slate-500 shrink-0" />
-                                                                )}
+                                                        <td className="px-5 py-3">
+                                                            <div className="flex items-center gap-2">
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={(event) => {
+                                                                        event.stopPropagation();
+                                                                        toggleNodeExpanded();
+                                                                    }}
+                                                                    aria-expanded={isExpanded}
+                                                                    aria-controls={gpuPanelId}
+                                                                    aria-label={isExpanded ? `Collapse GPU details for ${node.name}` : `Expand GPU details for ${node.name}`}
+                                                                    title={isExpanded ? 'Collapse GPU details' : 'Expand GPU details'}
+                                                                    className={cn(
+                                                                        'inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/50',
+                                                                        isExpanded
+                                                                            ? 'border-sky-500/40 bg-sky-500/15 text-sky-700 dark:border-cyan-400/40 dark:bg-cyan-400/15 dark:text-cyan-300'
+                                                                            : 'border-theme-border bg-theme-card text-theme-muted hover:border-sky-500/40 hover:text-theme-text dark:hover:border-cyan-400/40',
+                                                                    )}
+                                                                >
+                                                                    {isExpanded ? <ChevronUp size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />}
+                                                                </button>
                                                                 <span
-                                                                    className={`h-1.5 w-1.5 shrink-0 rounded-full motion-safe:animate-pulse [animation-duration:2.4s] ${statusDotClass(node.ready ? 'ready' : 'failed')}`}
+                                                                    className={cn(
+                                                                        'h-1.5 w-1.5 shrink-0 rounded-full motion-safe:animate-pulse [animation-duration:2.4s]',
+                                                                        statusDotClass(node.ready ? 'ready' : 'failed'),
+                                                                    )}
                                                                     title={node.ready ? 'Ready' : 'Not ready'}
                                                                     aria-label={node.ready ? 'Ready' : 'Not ready'}
                                                                 />
-                                                                {node.name}
+                                                                <span className="font-mono text-[15px] text-theme-text">{node.name}</span>
                                                                 {isMaintenance && (
-                                                                    <span className="rounded-full border border-amber-400/40 bg-amber-400/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-300">
+                                                                    <Badge tone="warning" size="xs" className="rounded-full">
                                                                         Maintenance
-                                                                    </span>
+                                                                    </Badge>
                                                                 )}
-                                                            </span>
+                                                            </div>
                                                         </td>
-                                                        <td className="px-5 py-3" onClick={() => setExpandedNodeName(isExpanded ? null : node.name)}><UtilizationBar capacity={`${formatCores(node.cpu)} cores`} value={node.cpuUsagePercent} /></td>
-                                                        <td className="px-5 py-3" onClick={() => setExpandedNodeName(isExpanded ? null : node.name)}><UtilizationBar capacity={formatBytes(node.memoryBytes)} value={node.memoryUsagePercent} /></td>
-                                                        <td className="px-5 py-3" onClick={() => setExpandedNodeName(isExpanded ? null : node.name)}><UtilizationBar capacity={node.gpu ? `${node.gpuCount || 0} GPU` : '—'} value={node.gpuUsagePercent} /></td>
+                                                        <td className="px-5 py-3"><UtilizationBar capacity={`${formatCores(node.cpu)} cores`} value={node.cpuUsagePercent} /></td>
+                                                        <td className="px-5 py-3"><UtilizationBar capacity={formatBytes(node.memoryBytes)} value={node.memoryUsagePercent} /></td>
+                                                        <td className="px-5 py-3">
+                                                            <UtilizationBar
+                                                                capacity={gpuCount > 0 ? (
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={(event) => {
+                                                                            event.stopPropagation();
+                                                                            toggleNodeExpanded();
+                                                                        }}
+                                                                        aria-expanded={isExpanded}
+                                                                        aria-controls={gpuPanelId}
+                                                                        aria-label={isExpanded ? `Hide ${gpuCount} GPU details on ${node.name}` : `Show ${gpuCount} GPU details on ${node.name}`}
+                                                                        className={cn(
+                                                                            'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/50',
+                                                                            isExpanded
+                                                                                ? 'border-sky-500/50 bg-sky-500/15 text-sky-700 dark:border-cyan-400/50 dark:bg-cyan-400/15 dark:text-cyan-200'
+                                                                                : 'border-sky-500/30 bg-sky-500/10 text-sky-700 hover:border-sky-500/50 hover:bg-sky-500/20 dark:border-cyan-400/30 dark:bg-cyan-400/10 dark:text-cyan-300 dark:hover:border-cyan-400/50 dark:hover:bg-cyan-400/20',
+                                                                        )}
+                                                                    >
+                                                                        <Gpu size={11} aria-hidden="true" />
+                                                                        <span>{gpuCount} {gpuCount === 1 ? 'GPU' : 'GPUs'}</span>
+                                                                        {isExpanded ? <ChevronUp size={11} aria-hidden="true" /> : <ChevronDown size={11} aria-hidden="true" />}
+                                                                    </button>
+                                                                ) : '—'}
+                                                                value={node.gpuUsagePercent}
+                                                            />
+                                                        </td>
                                                         {showVramColumn && (
-                                                            <td className="px-5 py-3" onClick={() => setExpandedNodeName(isExpanded ? null : node.name)}><UtilizationBar capacity={formatBytes(node.vramBytes)} value={node.vramUsagePercent} /></td>
+                                                            <td className="px-5 py-3"><UtilizationBar capacity={node.vramBytes > 0 ? formatBytes(node.vramBytes) : '—'} value={node.vramUsagePercent} /></td>
                                                         )}
-                                                        <td className="px-5 py-3" onClick={() => setExpandedNodeName(isExpanded ? null : node.name)}><UtilizationBar capacity={node.diskBytes ? formatBytes(node.diskBytes) : '—'} value={node.diskUsagePercent} /></td>
+                                                        <td className="px-5 py-3"><UtilizationBar capacity={node.diskBytes ? formatBytes(node.diskBytes) : '—'} value={node.diskUsagePercent} /></td>
                                                     </tr>
                                                     {isExpanded && (
-                                                        <tr className="bg-slate-950/90 border-t border-b border-cyan-500/30">
+                                                        <tr
+                                                            id={gpuPanelId}
+                                                            className="border-y border-sky-500/30 bg-theme-bg/70 dark:border-cyan-500/30 dark:bg-slate-950/90"
+                                                        >
                                                             <td colSpan={showVramColumn ? 7 : 6} className="p-4">
-
-                                                                <div className="rounded-xl border border-slate-700/80 bg-slate-900/90 p-4 space-y-4">
-                                                                    <div className="flex items-center justify-between pb-2.5 border-b border-slate-800">
-                                                                        <div className="flex items-center gap-2">
-                                                                            <Gpu className="text-cyan-400" size={16} />
-                                                                            <span className="font-semibold text-xs text-white">
-                                                                                GPU Accelerators on <code className="font-mono text-cyan-300">{node.name}</code>
+                                                                <div className="space-y-4 rounded-xl border border-theme-border bg-theme-card p-4 shadow-sm">
+                                                                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-theme-border pb-2.5">
+                                                                        <div className="flex flex-wrap items-center gap-2">
+                                                                            <Gpu className="text-sky-600 dark:text-cyan-400" size={16} aria-hidden="true" />
+                                                                            <span className="text-xs font-semibold text-theme-text">
+                                                                                GPU Accelerators on <code className="font-mono text-sky-700 dark:text-cyan-300">{node.name}</code>
                                                                             </span>
-                                                                            <span className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2 py-0.5 text-[10px] font-medium text-cyan-200">
-                                                                                {nodeGpus.length} GPU{nodeGpus.length === 1 ? '' : 's'}
-                                                                            </span>
+                                                                            <Badge tone="info" size="sm" className="rounded-full font-medium normal-case tracking-normal">
+                                                                                {nodeGpus.length} {nodeGpus.length === 1 ? 'GPU' : 'GPUs'}
+                                                                            </Badge>
                                                                         </div>
-                                                                        <span className="text-[11px] text-slate-400">
-                                                                            Click worker row to collapse
-                                                                        </span>
+                                                                        <Button
+                                                                            type="button"
+                                                                            variant="ghost"
+                                                                            size="xs"
+                                                                            onClick={() => setExpandedNodeName(null)}
+                                                                            aria-label={`Collapse GPU details for ${node.name}`}
+                                                                        >
+                                                                            <span>Collapse</span>
+                                                                            <ChevronUp size={12} aria-hidden="true" />
+                                                                        </Button>
                                                                     </div>
 
                                                                     {nodeGpus.length === 0 ? (
-                                                                        <p className="py-4 text-center text-xs text-slate-500">
+                                                                        <p className="py-4 text-center text-xs text-theme-muted">
                                                                             No GPU accelerators detected on this worker node.
                                                                         </p>
                                                                     ) : (
                                                                         <>
                                                                             {!node.ready && (
-                                                                                <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
+                                                                                <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-200">
                                                                                     This node is Not Ready (kubelet has stopped reporting status). The GPU
                                                                                     metrics below are the last values collected before contact was lost and
                                                                                     may be stale.
                                                                                 </p>
                                                                             )}
                                                                             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                                                                                {nodeGpus.map((gpu) => (
-                                                                                <div key={gpu.id || gpu.index} className="gpu-card rounded-lg border border-slate-800 bg-slate-950/80 p-3 flex flex-col gap-2.5 shadow-sm">
-                                                                                    <div className="flex items-center justify-between gap-2 border-b border-slate-800 pb-2">
-                                                                                        <div className="flex items-center gap-1.5 min-w-0">
-                                                                                            <span
-                                                                                                className={`h-2 w-2 rounded-full shrink-0 ${node.ready ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'}`}
-                                                                                                title={node.ready ? 'Reporting' : 'Node not ready; metrics may be stale'}
-                                                                                            />
-                                                                                            <span className="font-bold text-xs text-white truncate">{gpu.name}</span>
-                                                                                        </div>
-                                                                                        <code className="text-[10px] font-mono text-slate-400 shrink-0">{gpu.pciAddress}</code>
-                                                                                    </div>
+                                                                                {nodeGpus.map((gpu, gpuIdx) => {
+                                                                                    const gpuIndexLabel = typeof gpu.index === 'number' ? `GPU #${gpu.index}` : `GPU #${gpuIdx}`;
+                                                                                    const gpuModelLabel = [gpu.model, gpu.name, nodeFallbackModel]
+                                                                                        .map((val) => (typeof val === 'string' ? val.trim() : ''))
+                                                                                        .filter(Boolean)
+                                                                                        .find((val) => val.toLowerCase() !== gpuIndexLabel.toLowerCase()) || '';
+                                                                                    const pciAddress = String(gpu.pciAddress || gpu.pciBdf || '').trim();
 
-                                                                                    {/* Compute Utilization */}
-                                                                                    {hasDeviceMetric('computeUsagePercent') && (
-                                                                                    <div className="space-y-1">
-                                                                                        <div className="flex justify-between text-[11px]">
-                                                                                            <span className="text-slate-400">Compute Utilization</span>
-                                                                                            <span className="font-semibold text-cyan-300">{formatUsagePercent(gpu.computeUsagePercent)}</span>
-                                                                                        </div>
-                                                                                        <div className="utilization-track h-1.5 rounded-full bg-slate-800 overflow-hidden">
-                                                                                            <div
-                                                                                                className="h-full rounded-full bg-gradient-to-r from-cyan-500 to-emerald-400 transition-all"
-                                                                                                style={{ width: `${Math.min(100, Math.max(0, gpu.computeUsagePercent || 0))}%` }}
-                                                                                            />
-                                                                                        </div>
-                                                                                    </div>
-                                                                                    )}
+                                                                                    const hasCompute = typeof gpu.computeUsagePercent === 'number' && Number.isFinite(gpu.computeUsagePercent);
+                                                                                    const showCompute = hasDeviceMetric('computeUsagePercent') || (hasCompute && gpu.computeUsagePercent > 0);
 
-                                                                                    {/* VRAM Capacity Utilization */}
-                                                                                    {hasDeviceMetric('vramTotalBytes') && (
-                                                                                    <div className="space-y-1">
-                                                                                        <div className="flex justify-between text-[11px]">
-                                                                                            <span className="text-slate-400">VRAM Capacity</span>
-                                                                                            <span className="font-semibold text-purple-300">{formatUsagePercent(gpu.vramUsagePercent)}</span>
-                                                                                        </div>
-                                                                                        <div className="utilization-track h-1.5 rounded-full bg-slate-800 overflow-hidden">
-                                                                                            <div
-                                                                                                className="h-full rounded-full bg-gradient-to-r from-purple-500 to-indigo-400 transition-all"
-                                                                                                style={{ width: `${Math.min(100, Math.max(0, gpu.vramUsagePercent || 0))}%` }}
-                                                                                            />
-                                                                                        </div>
-                                                                                        <div className="text-[10px] text-slate-400 text-right font-mono">
-                                                                                            {gpu.vramUsedBytes == null ? '—' : formatBytes(gpu.vramUsedBytes)} / {formatBytes(gpu.vramTotalBytes)}
-                                                                                        </div>
-                                                                                    </div>
-                                                                                    )}
+                                                                                    const vramTotal = typeof gpu.vramTotalBytes === 'number' && Number.isFinite(gpu.vramTotalBytes) ? gpu.vramTotalBytes : 0;
+                                                                                    const hasVramUsed = typeof gpu.vramUsedBytes === 'number' && Number.isFinite(gpu.vramUsedBytes);
+                                                                                    const effectiveVramPercent = typeof gpu.vramUsagePercent === 'number' && Number.isFinite(gpu.vramUsagePercent)
+                                                                                        ? gpu.vramUsagePercent
+                                                                                        : (vramTotal > 0 && hasVramUsed ? (gpu.vramUsedBytes / vramTotal) * 100 : null);
+                                                                                    const hasVramPercent = typeof effectiveVramPercent === 'number' && Number.isFinite(effectiveVramPercent);
+                                                                                    const showVram = hasDeviceMetric('vramTotalBytes') || vramTotal > 0 || hasVramUsed;
 
-                                                                                    {/* VRAM Bandwidth */}
-                                                                                    {(hasDeviceMetric('vramBandwidthPercent') || hasDeviceMetric('vramReadThroughputBytes') || hasDeviceMetric('vramWriteThroughputBytes')) && (
-                                                                                    <div className="space-y-1 pt-1.5 border-t border-slate-800/80">
-                                                                                        {hasDeviceMetric('vramBandwidthPercent') && (
-                                                                                        <>
-                                                                                        <div className="flex justify-between text-[11px]">
-                                                                                            <span className="text-slate-400">VRAM Bandwidth</span>
-                                                                                            <span className="font-semibold text-emerald-300">{formatUsagePercent(gpu.vramBandwidthPercent)}</span>
-                                                                                        </div>
-                                                                                        <div className="utilization-track h-1.5 rounded-full bg-slate-800 overflow-hidden">
-                                                                                            <div
-                                                                                                className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-300 transition-all"
-                                                                                                style={{ width: `${Math.min(100, Math.max(0, gpu.vramBandwidthPercent || 0))}%` }}
-                                                                                            />
-                                                                                        </div>
-                                                                                        </>
-                                                                                        )}
-                                                                                        {(hasDeviceMetric('vramReadThroughputBytes') || hasDeviceMetric('vramWriteThroughputBytes')) && (
-                                                                                        <div className="grid grid-cols-2 gap-1 pt-1 text-[10px] text-slate-400">
-                                                                                            {hasDeviceMetric('vramReadThroughputBytes') && (
-                                                                                            <div>Read: <span className="text-slate-200 font-mono">{formatThroughput(gpu.vramReadThroughputBytes)}</span></div>
+                                                                                    const hasBandwidthPct = typeof gpu.vramBandwidthPercent === 'number' && Number.isFinite(gpu.vramBandwidthPercent);
+                                                                                    const hasTotalThroughput = typeof gpu.vramTotalThroughputBytes === 'number' && Number.isFinite(gpu.vramTotalThroughputBytes);
+                                                                                    const hasReadThroughput = typeof gpu.vramReadThroughputBytes === 'number' && Number.isFinite(gpu.vramReadThroughputBytes);
+                                                                                    const hasWriteThroughput = typeof gpu.vramWriteThroughputBytes === 'number' && Number.isFinite(gpu.vramWriteThroughputBytes);
+
+                                                                                    const showBandwidthPct = hasDeviceMetric('vramBandwidthPercent') || (hasBandwidthPct && gpu.vramBandwidthPercent > 0);
+                                                                                    const showTotalThroughput = hasDeviceMetric('vramTotalThroughputBytes') || (hasTotalThroughput && gpu.vramTotalThroughputBytes > 0);
+                                                                                    const showReadThroughput = hasDeviceMetric('vramReadThroughputBytes') || (hasReadThroughput && gpu.vramReadThroughputBytes > 0);
+                                                                                    const showWriteThroughput = hasDeviceMetric('vramWriteThroughputBytes') || (hasWriteThroughput && gpu.vramWriteThroughputBytes > 0);
+
+                                                                                    const effectiveTotalThroughput = (showTotalThroughput && hasTotalThroughput)
+                                                                                        ? gpu.vramTotalThroughputBytes
+                                                                                        : (showReadThroughput || showWriteThroughput) && (hasReadThroughput || hasWriteThroughput)
+                                                                                            ? (gpu.vramReadThroughputBytes || 0) + (gpu.vramWriteThroughputBytes || 0)
+                                                                                            : null;
+                                                                                    const showMemoryBandwidthSection = showBandwidthPct || showTotalThroughput || showReadThroughput || showWriteThroughput;
+
+                                                                                    return (
+                                                                                        <div
+                                                                                            key={gpu.id || gpu.index || gpuIdx}
+                                                                                            className="gpu-card flex flex-col gap-2.5 rounded-lg border border-theme-border bg-theme-bg/60 p-3 shadow-sm dark:bg-slate-950/80"
+                                                                                        >
+                                                                                            <div className="flex items-start justify-between gap-2 border-b border-theme-border pb-2">
+                                                                                                <div className="min-w-0 space-y-0.5">
+                                                                                                    <div className="flex min-w-0 items-center gap-1.5">
+                                                                                                        <span
+                                                                                                            className={cn(
+                                                                                                                'h-2 w-2 shrink-0 rounded-full',
+                                                                                                                node.ready ? 'bg-emerald-500 dark:bg-emerald-400 motion-safe:animate-pulse' : 'bg-slate-400 dark:bg-slate-600',
+                                                                                                            )}
+                                                                                                            title={node.ready ? 'Reporting' : 'Node not ready; metrics may be stale'}
+                                                                                                            aria-hidden="true"
+                                                                                                        />
+                                                                                                        <span className="truncate text-xs font-bold text-theme-text">{gpuIndexLabel}</span>
+                                                                                                    </div>
+                                                                                                    {gpuModelLabel && (
+                                                                                                        <p className="truncate text-[11px] font-medium text-theme-muted" title={gpuModelLabel}>
+                                                                                                            {gpuModelLabel}
+                                                                                                        </p>
+                                                                                                    )}
+                                                                                                </div>
+                                                                                                <code className="shrink-0 font-mono text-[10px] text-theme-muted">{pciAddress || '—'}</code>
+                                                                                            </div>
+
+                                                                                            {showCompute && (
+                                                                                                <div className="space-y-1">
+                                                                                                    <div className="flex justify-between text-[11px]">
+                                                                                                        <span className="text-theme-muted">Compute Utilization</span>
+                                                                                                        <span className="font-semibold text-sky-700 dark:text-cyan-300">{formatUsagePercent(gpu.computeUsagePercent)}</span>
+                                                                                                    </div>
+                                                                                                    <div className="utilization-track h-1.5 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+                                                                                                        <div
+                                                                                                            className="h-full rounded-full bg-gradient-to-r from-cyan-500 to-emerald-400 transition-all"
+                                                                                                            style={{ width: `${hasCompute ? Math.min(100, Math.max(0, gpu.computeUsagePercent)) : 0}%` }}
+                                                                                                        />
+                                                                                                    </div>
+                                                                                                </div>
                                                                                             )}
-                                                                                            {hasDeviceMetric('vramWriteThroughputBytes') && (
-                                                                                            <div>Write: <span className="text-slate-200 font-mono">{formatThroughput(gpu.vramWriteThroughputBytes)}</span></div>
+
+                                                                                            {showVram && (
+                                                                                                <div className="space-y-1">
+                                                                                                    <div className="flex justify-between text-[11px]">
+                                                                                                        <span className="text-theme-muted">VRAM Capacity</span>
+                                                                                                        <span className="font-semibold text-violet-700 dark:text-purple-300">{formatUsagePercent(effectiveVramPercent)}</span>
+                                                                                                    </div>
+                                                                                                    <div className="utilization-track h-1.5 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+                                                                                                        <div
+                                                                                                            className="h-full rounded-full bg-gradient-to-r from-purple-500 to-indigo-400 transition-all"
+                                                                                                            style={{ width: `${hasVramPercent ? Math.min(100, Math.max(0, effectiveVramPercent)) : 0}%` }}
+                                                                                                        />
+                                                                                                    </div>
+                                                                                                    <div className="text-right font-mono text-[10px] text-theme-muted">
+                                                                                                        {hasVramUsed ? formatBytes(gpu.vramUsedBytes) : '—'} / {vramTotal > 0 ? formatBytes(vramTotal) : '—'}
+                                                                                                    </div>
+                                                                                                </div>
+                                                                                            )}
+
+                                                                                            {showMemoryBandwidthSection && (
+                                                                                                <div className="space-y-1.5 border-t border-theme-border pt-1.5">
+                                                                                                    {showBandwidthPct && (
+                                                                                                        <div className="space-y-1">
+                                                                                                            <div className="flex justify-between text-[11px]">
+                                                                                                                <span className="text-theme-muted">VRAM Bandwidth</span>
+                                                                                                                <span className="font-semibold text-emerald-700 dark:text-emerald-300">{formatUsagePercent(gpu.vramBandwidthPercent)}</span>
+                                                                                                            </div>
+                                                                                                            <div className="utilization-track h-1.5 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+                                                                                                                <div
+                                                                                                                    className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-300 transition-all"
+                                                                                                                    style={{ width: `${hasBandwidthPct ? Math.min(100, Math.max(0, gpu.vramBandwidthPercent)) : 0}%` }}
+                                                                                                                />
+                                                                                                            </div>
+                                                                                                        </div>
+                                                                                                    )}
+                                                                                                    {(showTotalThroughput || effectiveTotalThroughput != null) && (
+                                                                                                        <div className="flex items-center justify-between text-[10px] text-theme-muted">
+                                                                                                            <span>Memory I/O</span>
+                                                                                                            <span className="font-mono font-medium text-theme-text">
+                                                                                                                {effectiveTotalThroughput != null ? formatThroughput(effectiveTotalThroughput) : '—'}
+                                                                                                            </span>
+                                                                                                        </div>
+                                                                                                    )}
+                                                                                                    {(showReadThroughput || showWriteThroughput) && (
+                                                                                                        <div className="grid grid-cols-2 gap-1 text-[10px] text-theme-muted">
+                                                                                                            {showReadThroughput && (
+                                                                                                                <div>
+                                                                                                                    Read: <span className="font-mono text-theme-text">{hasReadThroughput ? formatThroughput(gpu.vramReadThroughputBytes) : '—'}</span>
+                                                                                                                </div>
+                                                                                                            )}
+                                                                                                            {showWriteThroughput && (
+                                                                                                                <div>
+                                                                                                                    Write: <span className="font-mono text-theme-text">{hasWriteThroughput ? formatThroughput(gpu.vramWriteThroughputBytes) : '—'}</span>
+                                                                                                                </div>
+                                                                                                            )}
+                                                                                                        </div>
+                                                                                                    )}
+                                                                                                </div>
                                                                                             )}
                                                                                         </div>
-                                                                                        )}
-                                                                                    </div>
-                                                                                    )}
-                                                                                </div>
-                                                                                ))}
+                                                                                    );
+                                                                                })}
                                                                             </div>
                                                                         </>
                                                                     )}
@@ -957,9 +1204,9 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
                                     </tbody>
                                 </table>
                             </div>
-                            {!nodes.length && <p className="px-5 py-5 text-sm text-slate-500">No workers reported.</p>}
+                            {!nodes.length && !monitoringRequired && <p className="px-5 py-5 text-sm text-theme-muted">No workers reported.</p>}
                         </div>
-                    </section>
+                    </Panel>
 
                 </>}
                     </div>
@@ -988,21 +1235,43 @@ export default function OptimizationClusterOverview({ onNavigate, onToggleMobile
 
             <Modal
                 isOpen={!!deleteTarget}
-                onClose={() => !deleting && setDeleteTarget(null)}
-                title="Delete cluster"
-                size="sm"
-                footer={<>
-                    <Button variant="secondary" onClick={() => setDeleteTarget(null)} disabled={deleting}>Cancel</Button>
-                    <Button variant="danger" onClick={submitDelete} isLoading={deleting}>Delete</Button>
-                </>}
+                onClose={closeDeleteModal}
+                title={deleteHandoff
+                    ? (deleteHandoff.unreachable ? 'Cluster unreachable' : 'Orchestration administrator cleanup required')
+                    : 'Delete cluster'}
+                size={deleteHandoff ? 'lg' : 'sm'}
+                footer={deleteHandoff ? (
+                    <>
+                        <Button variant="secondary" onClick={closeDeleteModal} disabled={deleting}>Close</Button>
+                        <Button variant="sky" onClick={() => submitDelete({ forceConfirm: false })} isLoading={deleting}>
+                            {deleteHandoff.unreachable ? 'Retry & Delete' : 'Re-check & Delete'}
+                        </Button>
+                    </>
+                ) : (
+                    <>
+                        <Button variant="secondary" onClick={closeDeleteModal} disabled={deleting}>Cancel</Button>
+                        <Button variant="danger" onClick={() => submitDelete({ forceConfirm: false })} isLoading={deleting}>Delete</Button>
+                    </>
+                )}
             >
-                <div className="space-y-3">
-                    <p className="text-sm text-slate-300">
-                        Delete <span className="font-semibold text-slate-100">{deleteTarget?.name || deleteTarget?.id}</span>?
-                        Its kubeconfig and metadata will be permanently removed.
-                    </p>
-                    {deleteError && <p role="alert" className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-400">{deleteError}</p>}
-                </div>
+                {deleteHandoff ? (
+                    <CleanupHandoffPanel
+                        handoff={deleteHandoff}
+                        confirmed={confirmAdminCleanup}
+                        onConfirmChange={setConfirmAdminCleanup}
+                        onConfirmDelete={() => submitDelete({ forceConfirm: true })}
+                        busy={deleting}
+                        error={deleteError}
+                    />
+                ) : (
+                    <div className="space-y-3">
+                        <p className="text-sm text-theme-muted">
+                            Delete <span className="font-semibold text-theme-text">{deleteTarget?.name || deleteTarget?.id}</span>?
+                            Its kubeconfig and metadata will be permanently removed.
+                        </p>
+                        <FormError message={deleteError} />
+                    </div>
+                )}
             </Modal>
 
             <Modal

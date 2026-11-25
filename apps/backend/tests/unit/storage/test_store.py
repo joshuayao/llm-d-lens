@@ -94,3 +94,72 @@ def test_same_name_is_rejected_within_one_cluster_regardless_of_case(tmp_path):
     store.create(_volume(clusterId="cluster-1", name="qwen-cache"))
     with pytest.raises(StorageVolumeStoreError):
         store.create(_volume(clusterId="cluster-1", name="Qwen-Cache"))
+
+
+def test_set_owner_persists_user_id_and_tolerates_missing_user_fk(tmp_path):
+    from llm_d_lens.auth.records import UserRecord
+    from llm_d_lens.db.dao.user import UserDao
+
+    user = UserDao().create(UserRecord(username="storage-owner"))
+    store = StorageVolumeStore(tmp_path)
+    volume = store.create(_volume(clusterId="cluster-1", name="owned-vol"))
+    assert store.get_owner(volume.id) is None
+
+    store.set_owner(volume.id, user.id)
+    assert store.get_owner(volume.id) == user.id
+
+    # Synthetic unit-test IDs without a matching users row must not crash.
+    store.set_owner(volume.id, "synthetic-missing-user")
+    assert store.get_owner(volume.id) in (user.id, "synthetic-missing-user")
+
+
+def test_store_roundtrips_local_disk_and_nfs_namespace_and_preserves_legacy_null(tmp_path):
+    from llm_d_lens.db.dao.storage_volume import StorageVolumeDao
+    from llm_d_lens.db.models.storage_volume import StorageVolumeRow
+    from llm_d_lens.storage.contracts import DynamicPvcSpec, NfsSpec
+
+    store = StorageVolumeStore(tmp_path)
+    local_vol = store.create(
+        _volume(
+            name="local-edit",
+            localDisk=LocalDiskSpec(hostPath="/data/models", namespace="lens-edit"),
+        )
+    )
+    nfs_vol = store.create(
+        StorageVolume(
+            clusterId="cluster-1",
+            name="nfs-edit",
+            kind=StorageVolumeKind.NFS,
+            capacity="20Gi",
+            readOnly=False,
+            nfs=NfsSpec(server="nfs.example.com", path="/exports", namespace="team-ns"),
+        )
+    )
+    dyn_vol = store.create(
+        StorageVolume(
+            clusterId="cluster-1",
+            name="dyn-edit",
+            kind=StorageVolumeKind.DYNAMIC_PVC,
+            capacity="30Gi",
+            readOnly=True,
+            dynamicPvc=DynamicPvcSpec(storageClass="fast", namespace="dyn-ns"),
+        )
+    )
+
+    fetched_local = store.get(local_vol.id)
+    fetched_nfs = store.get(nfs_vol.id)
+    fetched_dyn = store.get(dyn_vol.id)
+    assert fetched_local is not None and fetched_local.local_disk.namespace == "lens-edit"
+    assert fetched_nfs is not None and fetched_nfs.nfs.namespace == "team-ns"
+    assert fetched_dyn is not None and fetched_dyn.dynamic_pvc.namespace == "dyn-ns"
+
+    # Legacy row with dynamic_pvc_namespace=NULL deserializes cleanly with namespace=None.
+    legacy = store.create(_volume(name="legacy-local", localDisk=LocalDiskSpec(hostPath="/data/legacy")))
+    dao = StorageVolumeDao()
+    with dao._transaction() as session:
+        row = session.get(StorageVolumeRow, legacy.id)
+        assert row is not None
+        assert row.dynamic_pvc_namespace is None
+    fetched_legacy = store.get(legacy.id)
+    assert fetched_legacy is not None
+    assert fetched_legacy.local_disk.namespace is None

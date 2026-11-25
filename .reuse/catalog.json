@@ -3206,18 +3206,19 @@
       "id": "cluster-hf-token-secret",
       "path": "apps/backend/src/llm_d_lens/cluster/service.py",
       "symbols": [
-        "create_hf_token_secret",
         "update_hf_token_secret"
       ],
-      "purpose": "Write the cluster-level HF_TOKEN Secret on the target cluster and record its namespace/name on the Lens cluster record so Deploy and Model Cache default to it.",
-      "boundaries": "The token value lives only on the target cluster; Lens persists coordinates, never the secret. Creation uses kubectl create so a name collision fails explicitly; rotation uses kubectl apply and defaults the coordinates to the ones already recorded. Namespace-local llm-d-hf-token copies derived by deploy/runtime/composition.py and model_cache/jobs.py are re-derived per run and are not rewritten here.",
+      "purpose": "Create the plan's HF_TOKEN Secret through the cache.hf-secret operation, and rotate the cluster-level Secret through PUT /clusters/{id}/hf-token-secret while recording its namespace/name on the Lens cluster record for Deploy and Model Cache defaults.",
+      "boundaries": "Creation is operations.py cache.hf-secret (with hf-secret.namespace when needed) and never a direct service call. Rotation uses kubectl apply and defaults coordinates to the ones already recorded on the cluster. The token value lives only on the target cluster; Lens persists coordinates, never the secret. Namespace-local llm-d-hf-token copies derived by deploy/runtime/composition.py and model_cache/jobs.py are re-derived per run and are not rewritten here.",
       "examples": [
+        "apps/backend/src/llm_d_lens/cluster/operations.py",
         "apps/backend/src/llm_d_lens/cluster/router.py",
-        "apps/frontend/src/pages/clusters/ui/EditClusterModal.jsx",
-        "apps/frontend/src/pages/clusters/ui/CreateClusterWizard.jsx"
+        "apps/frontend/src/pages/clusters/ui/EditClusterModal.jsx"
       ],
       "tests": [
-        "apps/backend/tests/unit/cluster/test_service.py"
+        "apps/backend/tests/unit/cluster/test_service.py",
+        "apps/backend/tests/unit/cluster/test_operations.py",
+        "apps/backend/tests/unit/cluster/test_execution_api.py"
       ]
     }
   ]

@@ -9,7 +9,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from llm_d_lens.api.problems import problem
 from llm_d_lens.auth.access import (
@@ -22,6 +22,18 @@ from llm_d_lens.auth.access import (
 )
 from llm_d_lens.db.dao.deployment_batch import DeploymentBatchDao
 from llm_d_lens.deploy.application import deployment_run_manager
+from llm_d_lens.deploy.capabilities import (
+    DeploymentBootstrapVerifyRequest,
+    DeploymentCapabilityUnavailableError,
+    DeploymentCapabilityValidationError,
+    DeploymentClusterAuthError,
+    DeploymentPermissionCheckRequest,
+    check_deployment_permissions,
+    generate_deployment_bootstrap_script,
+    record_verified_namespace,
+    redact_kubectl_error,
+    verify_deployment_bootstrap,
+)
 from llm_d_lens.deploy.contracts import (
     DeploymentCaseStatus,
     DeploymentMetadataUpdateRequest,
@@ -32,6 +44,7 @@ from llm_d_lens.deploy.contracts import (
 )
 from llm_d_lens.deploy.endpoint import DeploymentEndpointResolutionError
 from llm_d_lens.deploy.executions import (
+    DeploymentCleanupPermissionDenied,
     DeploymentExecutionConflictError,
     DeploymentExecutionNotFoundError,
     DeploymentScaleError,
@@ -42,6 +55,7 @@ from llm_d_lens.deploy.executions import (
     scale_deployment_execution,
     serving_metadata,
     update_execution_metadata,
+    verify_execution_cleanup,
 )
 from llm_d_lens.deploy.executions import (
     delete_execution as delete_execution_record,
@@ -84,6 +98,40 @@ class RestartCaseRequest(BaseModel):
     model_token: str | None = None
 
 
+class CleanupVerifyRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    cleanup_digest: str | None = Field(
+        default=None, validation_alias=AliasChoices("cleanup_digest", "cleanupDigest")
+    )
+    delete_record_on_verify: bool = Field(
+        default=True, validation_alias=AliasChoices("delete_record_on_verify", "deleteRecordOnVerify")
+    )
+    force_delete_record: bool = Field(
+        default=False, validation_alias=AliasChoices("force_delete_record", "forceDeleteRecord")
+    )
+
+
+def _is_cluster_auth_error(error: Exception) -> bool:
+    if isinstance(error, DeploymentClusterAuthError):
+        return True
+    from llm_d_lens.deploy import slice_capacity
+
+    auth_cls = getattr(slice_capacity, "ClusterInventoryAuthError", None)
+    return bool(auth_cls is not None and isinstance(error, auth_cls))
+
+
+async def _fetch_nodes_and_pods(cluster_id: str) -> tuple[list[dict], list[dict], str]:
+    from llm_d_lens.deploy import slice_capacity
+
+    fetcher = getattr(slice_capacity, "fetch_cluster_nodes_and_pods", None)
+    if callable(fetcher):
+        return await fetcher(cluster_id)
+    from llm_d_lens.deploy.prepared_plans import inventory
+
+    return await inventory(cluster_id, "nodes"), await inventory(cluster_id, "pods"), "kubernetes"
+
+
 class RuntimeVerificationRequest(BaseModel):
     smoke: bool = Field(
         default=False,
@@ -122,8 +170,12 @@ async def prepare_deployment_plan(request: DeploymentRunCreateRequest, http_requ
                 deployment_run_manager, request, owner_user_id=owner_for_create(current_principal(http_request))
             )
         )
-    except ValueError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
+    except Exception as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        if isinstance(error, ValueError):
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        raise
 
 
 @router.get(
@@ -160,12 +212,10 @@ async def get_deployment_plan(plan_id: str, http_request: Request):
 )
 async def get_deployment_topology(cluster_id: str, http_request: Request):
     from llm_d_lens.configuration.disaggregated_set import resource_requests
-    from llm_d_lens.deploy.prepared_plans import inventory
 
     require_cluster_access(current_principal(http_request), cluster_id)
     try:
-        nodes = await inventory(cluster_id, "nodes")
-        pods = await inventory(cluster_id, "pods")
+        nodes, pods, _source = await _fetch_nodes_and_pods(cluster_id)
         return {
             "clusterId": cluster_id,
             "nodes": [
@@ -190,8 +240,12 @@ async def get_deployment_topology(cluster_id: str, http_request: Request):
                 for item in pods
             ],
         }
-    except (ValueError, TimeoutError, OSError) as error:
-        raise HTTPException(status_code=503, detail="Cluster topology inventory unavailable") from error
+    except Exception as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        if isinstance(error, (ValueError, TimeoutError, OSError)):
+            raise HTTPException(status_code=503, detail="Cluster topology inventory unavailable") from error
+        raise
 
 
 @router.post(
@@ -235,7 +289,13 @@ async def verify_deployment_execution(execution_id: str, body: RuntimeVerificati
     except (httpx.HTTPError, KeyError, IndexError) as error:
         raise HTTPException(status_code=503, detail="Runtime inference evidence unavailable") from error
     except (ValueError, TimeoutError, OSError) as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
         raise HTTPException(status_code=503, detail="Runtime evidence is unavailable") from error
+    except Exception as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        raise
 
 
 def _ready_model_cache_entry(entries, model: str):
@@ -339,6 +399,8 @@ async def _validate_cluster_placement(placement: dict | None, cluster_id: str | 
             raise ValueError("cluster_server_id is required for a node label")
         require_cluster_access(current_principal(http_request), cluster_id)
         nodes = await list_resources("nodes", cluster_id=cluster_id)
+        if not nodes:
+            nodes, _pods, _source = await _fetch_nodes_and_pods(cluster_id)
         if not any(
             (node.get("metadata") or {}).get("labels", {}).get(node_label["key"]) == node_label["value"]
             for node in nodes
@@ -367,8 +429,12 @@ async def create_run(request: DeploymentRunCreateRequest, http_request: Request 
         return await deployment_run_manager.start_run(
             request, owner_user_id=owner_for_create(current_principal(http_request))
         )
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+    except Exception as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        if isinstance(error, ValueError):
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        raise
 
 
 @router.get(
@@ -381,6 +447,15 @@ async def create_run(request: DeploymentRunCreateRequest, http_request: Request 
 async def list_deployment_node_labels(cluster_id: str = Query(..., min_length=1), request: Request = None) -> dict:
     require_cluster_access(current_principal(request), cluster_id)
     nodes = await list_resources("nodes", cluster_id=cluster_id)
+    if not nodes:
+        try:
+            nodes, _pods, _source = await _fetch_nodes_and_pods(cluster_id)
+        except Exception as error:
+            if _is_cluster_auth_error(error):
+                return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+            if isinstance(error, (ValueError, TimeoutError, OSError)):
+                raise HTTPException(status_code=503, detail=str(error)) from error
+            raise
     labels = {
         (key, value)
         for node in nodes
@@ -419,8 +494,12 @@ async def list_deployment_runtime_classes(
         raise HTTPException(status_code=422, detail=str(error)) from error
     try:
         capabilities = await discover_runtime_classes(cluster_id)
-    except ValueError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+    except Exception as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        if isinstance(error, ValueError):
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        raise
     items = []
     for runtime in capabilities["items"]:
         scheduling = runtime.get("scheduling") or {}
@@ -441,16 +520,21 @@ async def list_deployment_runtime_classes(
             }
         )
     suggested = mode.get("runtime_class_name")
+    warnings = [
+        "Class existence does not verify node handler, CDI or driver readiness. "
+        "Use node-default only when the node default runtime provides device access."
+    ]
+    if capabilities.get("restricted"):
+        warnings.append(
+            "RuntimeClass discovery is restricted for this kubeconfig; using node-default or manual selection."
+        )
     return {
         "items": items,
         "profile_suggestion": suggested,
         "available_suggestion": suggested if any(item["name"] == suggested for item in items) else None,
         "requirement": "unknown",
         "node_runtime_readiness": "unknown",
-        "warnings": [
-            "Class existence does not verify node handler, CDI or driver readiness. "
-            "Use node-default only when the node default runtime provides device access."
-        ],
+        "warnings": warnings,
     }
 
 
@@ -501,10 +585,15 @@ async def create_standard_kubernetes_service_run(
             if ready_entry is None:
                 raise ValueError("selected model is not ready in the selected model cache storage")
             model_revision = ready_entry.source.huggingface.revision
-        overview = await cluster_service.build_overview(registry.require_cluster(session.server_id))
-        accelerator = cluster_accelerator(overview.get("hardware") or {})
+        cluster = registry.require_cluster(session.server_id)
+        cluster_vllm_image = getattr(cluster, "vllm_image", None)
+        overview = await cluster_service.build_overview(cluster)
+        accelerator = cluster_accelerator(overview.get("hardware") or {}, cluster_vllm_image=cluster_vllm_image)
         configuration = build_standard_kubernetes_service_configuration(
-            request, accelerator=accelerator, model_revision=model_revision
+            request,
+            accelerator=accelerator,
+            model_revision=model_revision,
+            cluster_vllm_image=cluster_vllm_image,
         )
         return await deployment_run_manager.start_run(
             DeploymentRunCreateRequest(
@@ -530,8 +619,12 @@ async def create_standard_kubernetes_service_run(
             ),
             owner_user_id=owner_for_create(current_principal(http_request)),
         )
-    except ValueError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
+    except Exception as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        if isinstance(error, ValueError):
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        raise
 
 
 def _owner_for_run(run_id: str | None):
@@ -825,6 +918,7 @@ async def get_execution_pods(execution_id: str, request: Request = None):
         return {"execution_id": execution_id, "namespace": None, "pods": []}
 
     cluster_id = _resolve_execution_cluster_id(context)
+    from llm_d_lens.cluster.service import _is_unauthorized_output
     from llm_d_lens.infrastructure.kubernetes import run_kubectl
 
     try:
@@ -834,7 +928,7 @@ async def get_execution_pods(execution_id: str, request: Request = None):
             timeout=15,
         )
     except (FileNotFoundError, TimeoutError) as error:
-        logger.warning("Unable to list deployment pods for %s: %s", execution_id, error)
+        logger.warning("Unable to list deployment pods for %s: %s", execution_id, redact_kubectl_error(str(error)))
         return {
             "execution_id": execution_id,
             "namespace": context.namespace,
@@ -842,12 +936,19 @@ async def get_execution_pods(execution_id: str, request: Request = None):
             "error": "Unable to list deployment pods",
         }
 
+    if _is_unauthorized_output(result):
+        return problem(
+            401,
+            "Kubeconfig unauthorized",
+            "Kubernetes cluster rejected kubeconfig credentials (401 Unauthorized).",
+            "kubeconfig_unauthorized",
+        )
     if result.returncode != 0:
         return {
             "execution_id": execution_id,
             "namespace": context.namespace,
             "pods": [],
-            "error": (result.stderr or result.stdout or "kubectl get pods failed").strip(),
+            "error": redact_kubectl_error((result.stderr or result.stdout or "kubectl get pods failed").strip()),
         }
 
     try:
@@ -949,6 +1050,7 @@ async def get_execution_pod_logs(
         raise HTTPException(status_code=422, detail="deployment has no namespace")
 
     cluster_id = _resolve_execution_cluster_id(context)
+    from llm_d_lens.cluster.service import _is_unauthorized_output
     from llm_d_lens.infrastructure.kubernetes import run_kubectl
 
     cmd = ["logs", pod_name, "--namespace", context.namespace, f"--tail={tail}"]
@@ -960,9 +1062,20 @@ async def get_execution_pod_logs(
     try:
         result = await run_kubectl(cmd, cluster_id=cluster_id, timeout=20)
     except (FileNotFoundError, TimeoutError) as error:
-        raise HTTPException(status_code=502, detail=str(error)) from error
+        raise HTTPException(status_code=502, detail=redact_kubectl_error(str(error))) from error
 
-    logs = (result.stdout if result.returncode == 0 else result.stderr or result.stdout or "").strip()
+    if _is_unauthorized_output(result):
+        return problem(
+            401,
+            "Kubeconfig unauthorized",
+            "Kubernetes cluster rejected kubeconfig credentials (401 Unauthorized).",
+            "kubeconfig_unauthorized",
+        )
+    logs = (
+        result.stdout
+        if result.returncode == 0
+        else redact_kubectl_error(result.stderr or result.stdout or "")
+    ).strip()
     return {
         "execution_id": execution_id,
         "namespace": context.namespace,
@@ -1070,12 +1183,25 @@ async def delete_execution(execution_id: str, delete_namespace: bool = True, req
         await delete_execution_record(execution_id, delete_namespace=delete_namespace)
     except DeploymentExecutionNotFoundError as error:
         return problem(404, "Deployment not found", str(error), "deployment_not_found")
+    except DeploymentCleanupPermissionDenied as error:
+        logger.info("event=deployment_delete_admin_handoff execution_id=%s", execution_id)
+        return problem(
+            409,
+            "Deployment cleanup requires Orchestration administrator action",
+            str(error),
+            "deployment_cleanup_permission_denied",
+            extra=error.payload,
+        )
     except DeploymentExecutionConflictError as error:
         logger.info("event=deployment_delete_blocked execution_id=%s code=%s", execution_id, error.code)
         return problem(409, "Deployment cannot be deleted", str(error), error.code)
     except PortForwardError as error:
         logger.warning("event=deployment_delete_cleanup_failed execution_id=%s error=%s", execution_id, error)
         return problem(502, "Deployment cleanup failed", str(error), "deployment_cleanup_failed")
+    except Exception as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        raise
     logger.info("event=deployment_deleted execution_id=%s", execution_id)
     return Response(status_code=204)
 
@@ -1218,15 +1344,27 @@ async def get_run(run_id: str, request: Request = None):
     ),
     operation_id="delete_deployment_run",
 )
-async def delete_run(run_id: str, request: Request = None) -> None:
+async def delete_run(run_id: str, request: Request = None):
     run = _store.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="deployment run not found")
     _require_run_permission(current_principal(request), run, "deployment:execution:delete")
     try:
         await deployment_run_manager.worker_for_run(run_id).delete_run(run_id)
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+    except DeploymentCleanupPermissionDenied as error:
+        return problem(
+            409,
+            "Deployment cleanup requires Orchestration administrator action",
+            str(error),
+            "deployment_cleanup_permission_denied",
+            extra=error.payload,
+        )
+    except Exception as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        if isinstance(error, ValueError):
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        raise
 
 
 @router.post(
@@ -1390,8 +1528,12 @@ async def restart_case(run_id: str, case_id: str, request: RestartCaseRequest, h
         case = await deployment_run_manager.worker_for_run(run_id).restart_case(
             run_id, case_id, model_token=(request.model_token or "").strip() or None
         )
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+    except Exception as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        if isinstance(error, ValueError):
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        raise
     return {"case": case}
 
 
@@ -1445,3 +1587,113 @@ def _case_response(case, execution):
         "execution": execution,
         "deployment": _deployment_payload(case, execution),
     }
+
+
+@router.post("/permission-check")
+async def check_deployment_permissions_route(
+    body: DeploymentPermissionCheckRequest,
+    http_request: Request = None,
+):
+    """Run per-namespace SSAR permission preflight for a target deployment."""
+    principal = current_principal(http_request)
+    require_cluster_access(principal, body.cluster_id)
+    try:
+        report = await check_deployment_permissions(body)
+        marker = report.get("marker") or {}
+        explicit_ns = bool(body.namespace and body.namespace.strip())
+        markerless_non_admin = (
+            bool(report.get("namespaceExists"))
+            and not bool(report.get("canCreateNamespaces"))
+            and explicit_ns
+        )
+        if (
+            report.get("sufficient")
+            and marker.get("status") != "stale"
+            and (bool(marker.get("present")) or markerless_non_admin)
+        ):
+            record_verified_namespace(
+                report["clusterId"],
+                report["namespace"],
+                owner_user_id=owner_for_create(principal),
+                agentic_deployment_run_id=body.agentic_deployment_run_id,
+                deployment_name=body.deployment_name,
+                prepared_plan_id=body.prepared_plan_id,
+            )
+        return report
+    except DeploymentClusterAuthError as error:
+        return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+    except DeploymentCapabilityValidationError as error:
+        return problem(error.status_code, "Invalid deployment permission check", str(error), error.code)
+    except DeploymentCapabilityUnavailableError as error:
+        return problem(503, "Cluster permission check unavailable", str(error), error.code)
+
+
+@router.post("/permission-remediation")
+async def generate_deployment_permission_remediation(
+    body: DeploymentPermissionCheckRequest,
+    http_request: Request = None,
+):
+    """Render an idempotent Orchestration administrator bash script for the deployment namespace."""
+    require_cluster_access(current_principal(http_request), body.cluster_id)
+    try:
+        return await generate_deployment_bootstrap_script(body)
+    except DeploymentClusterAuthError as error:
+        return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+    except DeploymentCapabilityValidationError as error:
+        return problem(error.status_code, "Invalid deployment bootstrap request", str(error), error.code)
+    except DeploymentCapabilityUnavailableError as error:
+        return problem(503, "Cluster permission check unavailable", str(error), error.code)
+
+
+@router.post("/admin-handoff/verify")
+async def verify_deployment_admin_handoff(
+    body: DeploymentBootstrapVerifyRequest,
+    http_request: Request = None,
+):
+    """Re-verify live SSAR and bootstrap completion marker after Orchestration administrator setup."""
+    principal = current_principal(http_request)
+    require_cluster_access(principal, body.cluster_id)
+    try:
+        return await verify_deployment_bootstrap(body, owner_user_id=owner_for_create(principal))
+    except DeploymentClusterAuthError as error:
+        return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+    except DeploymentCapabilityValidationError as error:
+        return problem(error.status_code, "Invalid bootstrap verification request", str(error), error.code)
+    except DeploymentCapabilityUnavailableError as error:
+        return problem(503, "Cluster permission check unavailable", str(error), error.code)
+
+
+@router.post("/executions/{execution_id}/cleanup-verify")
+async def verify_deployment_execution_cleanup(
+    execution_id: str,
+    body: CleanupVerifyRequest | None = None,
+    http_request: Request = None,
+):
+    """Verify Phase-2 Orchestration administrator namespace cleanup and delete the deployment record."""
+    existing = find_execution_context(execution_id)
+    if existing is None:
+        return problem(
+            404,
+            "Deployment not found",
+            f"deployment execution not found: {execution_id}",
+            "deployment_not_found",
+        )
+    _require_execution_permission(current_principal(http_request), existing, "deployment:execution:delete")
+    payload = body or CleanupVerifyRequest()
+    try:
+        return await verify_execution_cleanup(
+            execution_id,
+            cleanup_digest=payload.cleanup_digest,
+            delete_record_on_verify=payload.delete_record_on_verify,
+            force_delete_record=payload.force_delete_record,
+        )
+    except DeploymentExecutionNotFoundError as error:
+        return problem(404, "Deployment not found", str(error), "deployment_not_found")
+    except DeploymentClusterAuthError as error:
+        return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+    except DeploymentExecutionConflictError as error:
+        return problem(409, "Deployment cleanup conflict", str(error), error.code)
+    except Exception as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        raise

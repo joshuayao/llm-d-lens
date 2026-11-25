@@ -7,6 +7,7 @@ import {
     nodeDriftMessage,
     purposeLabel,
     resourcePhaseDotClass,
+    resourceStatusSource,
     statusDotClass,
     statusLabel,
     volumeLocation,
@@ -86,8 +87,13 @@ function ResourceDetail({ resource }) {
 
 // Human-readable tooltip explaining why the status dot shows a different
 // color than the volume's own `status` field (see effectiveStorageStatus).
-function resourceStatusTitle(item, pvc, pv) {
-    const effective = effectiveStorageStatus(item, pvc, pv);
+function resourceStatusTitle(item, pvc, pv, statusSource) {
+    const effective = effectiveStorageStatus(item, pvc, pv, statusSource);
+    if (statusSource === 'unverified' && !pvc && item?.status === 'ready') {
+        return effective === 'attention'
+            ? nodeDriftMessage(item)
+            : 'Registered as ready; live status is unverified (awaiting Prometheus metrics or Orchestration administrator read access).';
+    }
     if (effective === item.status) return undefined;
     if (effective === 'attention') return nodeDriftMessage(item);
     const pvcText = pvc ? pvc.phase || 'Unknown' : 'not found';
@@ -135,9 +141,11 @@ export function StorageVolumeTable({ items, resourceStatuses = {}, mutatingId, c
                     <tbody className="storage-volume-rows divide-y divide-slate-800/70">
                         {items.map((item) => {
                             const busy = mutatingId === item.id;
-                            const claims = (resourceStatuses[item.id] || {}).persistentVolumeClaims || [];
+                            const entry = resourceStatuses[item.id] || {};
+                            const claims = entry.persistentVolumeClaims || [];
                             const pvc = claims.length ? claims[0] : null;
                             const pv = pvc ? pvc.persistentVolume : null;
+                            const statusSource = resourceStatusSource(entry);
                             const isSelected = selectedId === item.id;
                             return (
                                 <tr
@@ -152,8 +160,8 @@ export function StorageVolumeTable({ items, resourceStatuses = {}, mutatingId, c
                                     <td className={`min-w-0 border-l-2 px-4 py-3.5 ${isSelected ? 'border-l-[#037ffc]' : 'border-l-transparent'}`}>
                                         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                                             <StatusDot
-                                                status={effectiveStorageStatus(item, pvc, pv)}
-                                                title={resourceStatusTitle(item, pvc, pv)}
+                                                status={effectiveStorageStatus(item, pvc, pv, statusSource)}
+                                                title={resourceStatusTitle(item, pvc, pv, statusSource)}
                                             />
                                             <KindIcon kind={item.kind} />
                                             <span
@@ -184,17 +192,19 @@ export function StorageVolumeTable({ items, resourceStatuses = {}, mutatingId, c
             <div className="flex flex-col gap-3 p-3 lg:hidden">
                 {items.map((item) => {
                     const busy = mutatingId === item.id;
-                    const claims = (resourceStatuses[item.id] || {}).persistentVolumeClaims || [];
+                    const entry = resourceStatuses[item.id] || {};
+                    const claims = entry.persistentVolumeClaims || [];
                     const pvc = claims.length ? claims[0] : null;
                     const pv = pvc ? pvc.persistentVolume : null;
+                    const statusSource = resourceStatusSource(entry);
                     return (
                         <div key={item.id} aria-busy={busy} className={`rounded-xl border bg-slate-950/40 p-3 ${item.id === selectedId ? 'border-[#037ffc]' : 'border-slate-800/60'}`}>
                             <div className="flex items-start justify-between gap-2">
                                 <div className="min-w-0">
                                     <div className="flex items-center gap-2">
                                         <StatusDot
-                                            status={effectiveStorageStatus(item, pvc, pv)}
-                                            title={resourceStatusTitle(item, pvc, pv)}
+                                            status={effectiveStorageStatus(item, pvc, pv, statusSource)}
+                                            title={resourceStatusTitle(item, pvc, pv, statusSource)}
                                         />
                                         <span className="truncate text-sm font-semibold text-slate-100">{volumeTitle(item)}</span>
                                     </div>

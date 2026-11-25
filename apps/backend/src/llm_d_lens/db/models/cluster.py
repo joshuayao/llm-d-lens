@@ -18,12 +18,13 @@ module instead of ``column_map``:
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import Boolean, ForeignKey, Index, String, Text, func
+from sqlalchemy import Boolean, ForeignKey, Index, String, Text, false, func
 from sqlalchemy.orm import Mapped, mapped_column
 
-from llm_d_lens.cluster.registry import Cluster
-from llm_d_lens.db.base import Base, DeclarativeDtoMixin, UTCDateTime
+from llm_d_lens.cluster.registry import Cluster, resolve_monitoring_settings, resolve_vllm_image
+from llm_d_lens.db.base import Base, DeclarativeDtoMixin, JSONVariant, UTCDateTime
 
 
 class ClusterRow(Base, DeclarativeDtoMixin):
@@ -54,6 +55,7 @@ class ClusterRow(Base, DeclarativeDtoMixin):
         "router_version": "router_version",
         "gie_version": "gie_version",
         "ipp_version": "ipp_version",
+        "owner_user_id": "owner_user_id",
     }
 
     id: Mapped[str] = mapped_column(String(8), primary_key=True)
@@ -104,6 +106,26 @@ class ClusterRow(Base, DeclarativeDtoMixin):
     router_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     gie_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     ipp_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Normalized create/cluster plan and the cross-worker execution lock (see
+    # docs/design/cluster-permission-preflight-design.md sections 4.1 and 7).
+    # Managed by dedicated DAO methods with conditional UPDATE/CAS semantics,
+    # not by the generic column_map or update() whitelist.
+    provisioning_plan: Mapped[dict[str, Any] | None] = mapped_column(JSONVariant, nullable=True)
+    execution_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    execution_started_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    execution_heartbeat_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    execution_cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    #: ``{operation_id: "user_done" | "admin_done" | "lens_done" | "failed"}``
+    #: for the current plan (see design section 7).
+    execution_operations: Mapped[dict[str, Any] | None] = mapped_column(JSONVariant, nullable=True)
+    #: Set when the guarded operation run completes; finalization reads it so
+    #: ``draft`` can only clear after every operation is done.
+    execution_completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    #: The plan hash the completed run belongs to. Finalize requires it to match
+    #: the current normalized plan; old rows without it are stale.
+    execution_completed_plan_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), nullable=False, server_default=func.now(), onupdate=func.now()
@@ -130,4 +152,19 @@ class ClusterRow(Base, DeclarativeDtoMixin):
         values = {path: getattr(self, col) for col, path in self.column_map.items()}
         values["id"] = self.id
         values["created_at"] = self.created_at.isoformat()
+        monitoring = resolve_monitoring_settings(
+            self.provisioning_plan,
+            gateway_public_url=self.gateway_public_url,
+            kubeconfig_text=self.kubeconfig,
+        )
+        for key in (
+            "monitoring_mode",
+            "monitoring_namespace",
+            "prometheus_url",
+            "grafana_url",
+            "prometheus_node_port",
+            "grafana_node_port",
+        ):
+            values[key] = monitoring[key]
+        values["vllm_image"] = resolve_vllm_image(self.provisioning_plan)
         return Cluster(**values)

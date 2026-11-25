@@ -10,13 +10,23 @@ description: 安装监控、打开仪表盘并查看部署性能。
 命名空间检查和仪表盘链接按标签分组，Kubernetes 上下文显示在集群选择器下方。
 宽屏下各组并排显示，窄屏下纵向排列，下方紧接实时状态卡片和组件详情。
 
+## 管理员与非管理员视图
+
+可观测性页面会通过 Kubernetes `SelfSubjectAccessReview` 自动检测您的集群权限（Cluster 与 Deployments 为 `access_mode`，Accelerators 为 `cluster_access_mode`：`admin` 或 `non_admin`）：
+
+- **管理员（`admin`）**：拥有完整的集群级安装、预检、重装以及 `port-forward` 仪表盘访问能力。
+- **非管理员（`non_admin`）**：只读或命名空间级用户将看到 Prometheus HTTP 健康探测、只读的 **Monitoring endpoints（监控端点）**状态面板、直连外部 Prometheus/Grafana URL（无需 `port-forward`），以及按需弹出的**编排平台管理员安装 / 修复脚本**模态对话框（在组件需要安装或修复时点击 **Install（安装）** 或 **Reinstall（重装）**，或触发部署监控操作时打开），而非特权集群内安装操作。健康的集群和加速器不会显示 **Install**/**Reinstall** 按钮或脚本面板。
+
 ## 查看集群可观测性状态
 
 1. 打开 **Observability → Cluster（集群）**。
 2. 使用**目标集群**选择你想查看的集群。
 3. 在**命名空间**中输入你要检查的命名空间，然后点击**检查**。
 4. 查看**实时状态**、**安装操作**和**技术栈组件**。
-5. 当这些按钮针对当前状态出现时，使用**刷新**、**重试**或**重新检查**。
+   在 `non_admin` 模式下，**技术栈组件**展示基于 Prometheus HTTP 健康探测的结果，涵盖 Prometheus、`kube-state-metrics`、`node-exporter`、硬件配置驱动的加速器导出器以及 Grafana 可达性。
+5. 在 `non_admin` 模式下，**Monitoring endpoints（监控端点）**面板为只读状态展示，显示 **Monitoring mode（监控模式）**（`Managed` 或 `Existing`）、**Prometheus endpoint**、**Grafana endpoint** 以及 `managed` 模式下自动发现的 NodePort（可观测性页面没有 `Save endpoints` 表单）。在 `managed` 模式下，端点和 NodePort 会在安装或点击 **Re-check（重新检查）** 时自动发现；外部（`Existing`）Prometheus 及可选 Grafana URL 需在创建集群时或通过 **Clusters（集群）**页面的 **Edit cluster（编辑集群）**进行维护，随后在 **Observability（可观测性）**页面点击 **Re-check（重新检查）**完成验证。
+6. 如果 `non_admin` 模式下组件缺失或降级，点击 **Install（安装）** 或 **Reinstall（重装）** 打开**编排平台管理员安装 / 修复脚本**模态对话框（页面加载时不内联渲染脚本面板，健康集群不显示 **Install**/**Reinstall** 按钮）。使用 **Copy（复制）**、**Download `.sh`（下载 `.sh`）** 以及默认展开的操作详情将脚本交接给编排平台管理员执行，执行后点击 **Re-check（重新检查）**（或点击 **Close（关闭）** 关闭弹窗）。
+7. 当这些按钮针对当前状态出现时，使用**刷新**、**重试**或**重新检查**。
 
 ## 安装集群可观测性技术栈
 
@@ -41,6 +51,7 @@ description: 安装监控、打开仪表盘并查看部署性能。
 
 1. 停留在**集群**标签。
 2. 在 **GUIs** 中，点击 **Prometheus** 或 **Grafana**。
+   在 `non_admin` 模式下，**Prometheus** 和 **Grafana** 会直接打开已配置的外部 URL，无需启动 `port-forward`。
 3. 如果无法打开仪表盘，请阅读按钮旁显示的内联错误信息。
 
 ## 查看加速器可观测性
@@ -50,6 +61,7 @@ description: 安装监控、打开仪表盘并查看部署性能。
 3. 查看 **GPU 访问模式**，如有需要，可在该加速器支持的模式之间切换
    （例如 **DRA** 和**设备插件**）。
 4. 查看所选加速器的**可观测性界面**和**技术栈组件**。
+   在 `non_admin` 模式下，导出器健康状态通过 Prometheus HTTP 查询探测；当导出器需要安装或修复时，点击 **Install（安装）** 或 **Reinstall（重装）** 打开**编排平台管理员安装 / 修复脚本**模态对话框（包含 **Copy（复制）**、**Download `.sh`（下载 `.sh`）**、默认展开的操作详情、**Re-check（重新检查）** 和 **Close（关闭）**），将脚本交接给编排平台管理员。健康的加速器不会显示 **Install**/**Reinstall** 按钮或脚本面板。
 5. 当这些操作可用时，使用 **Prometheus**、**Grafana**、**刷新**或**重试**。
 
 ## 安装或修复加速器可观测性
@@ -68,16 +80,19 @@ description: 安装监控、打开仪表盘并查看部署性能。
 
 1. 打开**部署**标签。
 2. 在**目标集群**中选择集群。
+   在 `non_admin` 模式下，技术栈就绪状态通过 Prometheus HTTP 探测进行验证。
 3. 在**部署监控**中，为要管理的部署打开**监控**菜单。
 4. 当没有监控时选择**安装**；当监控已禁用时选择**启用**；当监控已启用时
    选择**禁用**；选择**卸载**以将其移除。在部署本身就绪之前，**安装**和**启用**
    均不可用，因为监控采集的是该部署的 Pod。
-5. 等待**监控**状态更新，再打开仪表盘。
+5. 如果**安装**、**启用**、**禁用**或**卸载**遇到 RBAC `403` 错误（例如创建 `epp-auth-delegator` `ClusterRoleBinding`、`ServiceMonitor` 或 `PodMonitor` 权限不足），将弹出**编排平台管理员安装 / 修复脚本**模态对话框，提供 **Copy（复制）**、**Download `.sh`（下载 `.sh`）**、默认展开的操作详情、**Re-check（重新检查）** 和 **Close（关闭）**，便于将脚本交接给编排平台管理员并在应用后点击 **Re-check（重新检查）**。
+6. 等待**监控**状态更新，再打开仪表盘。
 
 ## 打开部署仪表盘
 
 1. 在**部署**标签中，为已启用监控的某个部署打开**监控**菜单。
 2. 点击**打开 Grafana**或**打开 Prometheus**。
+   在 `non_admin` 模式下，**打开 Grafana** 会直接打开带部署命名空间过滤参数（`var-namespace`）的外部 Grafana URL，**打开 Prometheus** 会直接打开外部 Prometheus URL，无需 `port-forward`。
 
 ## 查看部署性能剖析
 

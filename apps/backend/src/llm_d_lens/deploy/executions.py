@@ -21,8 +21,6 @@ from typing import Any
 
 import yaml
 
-from llm_d_lens.configuration.manifest_facts import vllm_argument_value, workload_roles
-from llm_d_lens.deploy.application import deployment_run_manager
 from llm_d_lens.deploy.contracts import (
     DeploymentMetadata,
     DeploymentMetadataUpdateRequest,
@@ -31,14 +29,33 @@ from llm_d_lens.deploy.contracts import (
     utcnow,
 )
 from llm_d_lens.deploy.data_plane import deployment_uses_shared_gateway
-from llm_d_lens.deploy.runtime.composition import RuntimeConfigurationError
 from llm_d_lens.deploy.usage import active_usage_reason
 from llm_d_lens.infrastructure.kubernetes import run_kubectl
 
-_store = deployment_run_manager.store
+_store: Any = None
 # Serializes user-driven mutations of one deployment so a metadata edit and a
 # delete never interleave their read-modify-write cycles.
 _execution_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_run_manager():
+    manager = globals().get("deployment_run_manager")
+    if manager is not None:
+        return manager
+    from llm_d_lens.deploy.application import deployment_run_manager as manager
+
+    globals()["deployment_run_manager"] = manager
+    return manager
+
+
+def _get_store():
+    return _store if _store is not None else _get_run_manager().store
+
+
+def __getattr__(name: str) -> Any:
+    if name == "deployment_run_manager":
+        return _get_run_manager()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class DeploymentExecutionNotFoundError(Exception):
@@ -51,6 +68,14 @@ class DeploymentExecutionConflictError(Exception):
     def __init__(self, message: str, code: str = "deployment_conflict") -> None:
         super().__init__(message)
         self.code = code
+
+
+class DeploymentCleanupPermissionDenied(DeploymentExecutionConflictError):  # noqa: N818 - name locked by design spec
+    """Raised when namespace/ClusterRoleBinding deletion requires Orchestration administrator action."""
+
+    def __init__(self, message: str, *, payload: dict[str, Any]) -> None:
+        super().__init__(message, code="deployment_cleanup_permission_denied")
+        self.payload = payload
 
 
 class DeploymentScaleError(Exception):
@@ -199,6 +224,8 @@ def _isoformat(value: Any) -> Any:
 def _rendered_serving_metadata(execution) -> dict[str, Any]:
     if execution is None:
         return {}
+    from llm_d_lens.configuration.manifest_facts import vllm_argument_value, workload_roles
+
     try:
         workloads = workload_roles(_execution_manifest_documents(execution))
     except (OSError, DeploymentScaleError):
@@ -484,15 +511,16 @@ def list_execution_contexts(
     needle = query.strip().lower()
     contexts: list[DeploymentExecutionContext] = []
     executions_by_request_id = {}
-    if hasattr(_store, "list_executions"):
+    store = _get_store()
+    if hasattr(store, "list_executions"):
         try:
             executions_by_request_id = {
-                e.request_id: e for e in _store.list_executions() if getattr(e, "request_id", None)
+                e.request_id: e for e in store.list_executions() if getattr(e, "request_id", None)
             }
         except Exception:
             executions_by_request_id = {}
 
-    for run in reversed(_store.list_runs()):
+    for run in reversed(store.list_runs()):
         if cluster_id and str(run.provenance.get("cluster_server_id") or "") != cluster_id:
             continue
         if (
@@ -509,7 +537,7 @@ def list_execution_contexts(
                 case.execution_id = executions_by_request_id[case.create_request.request_id].execution_id
             if not case.execution_id:
                 continue
-            execution = _store.get_execution(case.execution_id)
+            execution = store.get_execution(case.execution_id)
             if execution is None or (wanted and execution.status not in wanted):
                 continue
             context = _context(run, case, execution)
@@ -523,22 +551,23 @@ def list_execution_contexts(
 
 def find_execution_context(execution_id: str) -> DeploymentExecutionContext | None:
     """Resolve one deployment execution and its owning run/case."""
-    execution = _store.get_execution(execution_id)
+    store = _get_store()
+    execution = store.get_execution(execution_id)
     if execution is None and execution_id.startswith("pending:"):
         parts = execution_id.split(":", 2)
         if len(parts) == 3:
             run_id, case_id = parts[1], parts[2]
-            case = _store.get_case(run_id, case_id)
+            case = store.get_case(run_id, case_id)
             if case:
                 if case.execution_id:
-                    execution = _store.get_execution(case.execution_id)
+                    execution = store.get_execution(case.execution_id)
                     if execution:
                         execution_id = case.execution_id
-                if execution is None and case.create_request and hasattr(_store, "list_executions"):
+                if execution is None and case.create_request and hasattr(store, "list_executions"):
                     req_id = case.create_request.request_id
                     try:
                         execution = next(
-                            (e for e in _store.list_executions() if getattr(e, "request_id", None) == req_id), None
+                            (e for e in store.list_executions() if getattr(e, "request_id", None) == req_id), None
                         )
                     except Exception:
                         execution = None
@@ -547,7 +576,7 @@ def find_execution_context(execution_id: str) -> DeploymentExecutionContext | No
                         execution_id = execution.execution_id
 
     if execution is not None:
-        for run in reversed(_store.list_runs()):
+        for run in reversed(store.list_runs()):
             for case in run.cases:
                 if case.execution_id == execution_id or (
                     case.create_request and case.create_request.request_id == execution.request_id
@@ -590,8 +619,8 @@ def find_execution_context(execution_id: str) -> DeploymentExecutionContext | No
         parts = execution_id.split(":", 2)
         if len(parts) == 3:
             run_id, case_id = parts[1], parts[2]
-            run = _store.get_run(run_id)
-            case = _store.get_case(run_id, case_id)
+            run = store.get_run(run_id)
+            case = store.get_case(run_id, case_id)
             if run and case:
                 provenance = case.create_request.provenance or run.provenance or {}
                 serving = serving_metadata(case, None)
@@ -633,7 +662,7 @@ def resolve_legacy_execution_id(run_id: str | None, case_id: str | None) -> str 
     """
     if not run_id or not case_id:
         return None
-    case = _store.get_case(run_id, case_id)
+    case = _get_store().get_case(run_id, case_id)
     return case.execution_id if case else None
 
 
@@ -649,11 +678,12 @@ def list_storage_volume_usage(volume_id: str) -> list[str]:
     directly since Deploy already depends on Storage for mount resolution).
     """
     matches: list[str] = []
-    for run in _store.list_runs():
+    store = _get_store()
+    for run in store.list_runs():
         for case in run.cases:
             if not case.execution_id:
                 continue
-            execution = _store.get_execution(case.execution_id)
+            execution = store.get_execution(case.execution_id)
             if execution is None or execution.status in _TERMINAL_STATUSES:
                 continue
             runtime = _case_runtime(case)
@@ -688,9 +718,10 @@ def get_execution_context(execution_id: str) -> DeploymentExecutionContext:
 
 def execution_deployment_plan(context: DeploymentExecutionContext) -> dict[str, Any]:
     """Return the stored configuration plan and rendered manifest of one execution."""
-    case = _store.get_case(context.run_id, context.case_id) if context.run_id and context.case_id else None
+    store = _get_store()
+    case = store.get_case(context.run_id, context.case_id) if context.run_id and context.case_id else None
     artifacts = case.create_request.configuration_artifacts if case and case.create_request else []
-    execution = None if context.execution_id.startswith("pending:") else _store.get_execution(context.execution_id)
+    execution = None if context.execution_id.startswith("pending:") else store.get_execution(context.execution_id)
     manifest = None
     if execution is not None:
         reference = Path(getattr(execution.artifact, "manifest_ref", None) or "")
@@ -871,6 +902,8 @@ async def _live_disaggregated_sets(execution, names: set[str]) -> dict[str, dict
 
 
 def _scale_workloads(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from llm_d_lens.configuration.manifest_facts import workload_roles
+
     workloads: list[dict[str, Any]] = []
     unsupported: list[str] = []
     for item in workload_roles(documents):
@@ -1006,7 +1039,7 @@ async def _build_scale_plan(execution) -> dict[str, Any]:
 
 async def deployment_scale_plan(execution_id: str) -> dict[str, Any]:
     """Return the current scalable model-server roles for one execution."""
-    execution = _store.get_execution(execution_id)
+    execution = _get_store().get_execution(execution_id)
     if execution is None:
         raise DeploymentExecutionNotFoundError(f"deployment execution not found: {execution_id}")
     return await _build_scale_plan(execution)
@@ -1025,7 +1058,8 @@ async def scale_deployment_execution(
 ) -> DeploymentExecutionContext:
     """Scale live model-server Deployments and record the desired replica counts."""
     async with _execution_lock(execution_id):
-        execution = _store.get_execution(execution_id)
+        store = _get_store()
+        execution = store.get_execution(execution_id)
         if execution is None:
             raise DeploymentExecutionNotFoundError(f"deployment execution not found: {execution_id}")
         plan = await _build_scale_plan(execution)
@@ -1152,7 +1186,7 @@ async def scale_deployment_execution(
         manual["updatedAt"] = utcnow().isoformat()
         manual["updatedBy"] = actor or ""
         provenance["manual_scale"] = manual
-        _store.update_execution_provenance(execution_id, provenance)
+        store.update_execution_provenance(execution_id, provenance)
         if failures:
             raise DeploymentScaleError(
                 "Deployment scale was partially applied: " + "; ".join(failures),
@@ -1172,8 +1206,37 @@ async def update_execution_metadata(
     """
     async with _execution_lock(execution_id):
         get_execution_context(execution_id)
-        _store.update_execution_metadata(execution_id, request)
+        _get_store().update_execution_metadata(execution_id, request)
         return get_execution_context(execution_id)
+
+
+def _auth_error_types() -> tuple[type[BaseException], ...]:
+    from llm_d_lens.deploy import slice_capacity
+    from llm_d_lens.deploy.capabilities import DeploymentClusterAuthError
+
+    types: list[type[BaseException]] = [DeploymentClusterAuthError]
+    inv_auth = getattr(slice_capacity, "ClusterInventoryAuthError", None)
+    if isinstance(inv_auth, type) and issubclass(inv_auth, BaseException):
+        types.append(inv_auth)
+    return tuple(types)
+
+
+def _stored_cleanup_digest(execution: Any) -> str | None:
+    diagnostics = getattr(execution, "diagnostics", None)
+    diag_val = getattr(diagnostics, "value", None) if diagnostics else None
+    if not isinstance(diag_val, dict):
+        return None
+    cleanup = diag_val.get("cleanup")
+    if not isinstance(cleanup, dict):
+        return None
+    phase1 = cleanup.get("phase1")
+    if not isinstance(phase1, dict):
+        return None
+    admin_cleanup = phase1.get("adminCleanup")
+    if not isinstance(admin_cleanup, dict):
+        return None
+    digest = admin_cleanup.get("cleanupDigest")
+    return digest.strip() if isinstance(digest, str) and digest.strip() else None
 
 
 async def delete_execution(execution_id: str, *, delete_namespace: bool = True) -> None:
@@ -1184,14 +1247,19 @@ async def delete_execution(execution_id: str, *, delete_namespace: bool = True) 
     ``delete_namespace`` is false, the Kubernetes namespace and its workloads
     are left running and only Prism's own records are dropped.
     """
+    from llm_d_lens.deploy.runtime.composition import RuntimeConfigurationError
+
+    auth_errors = _auth_error_types()
     async with _execution_lock(execution_id):
         context = get_execution_context(execution_id)
         reason = active_usage_reason(execution_id)
         if reason:
             raise DeploymentExecutionConflictError(reason, code="deployment_in_use")
         try:
-            worker = deployment_run_manager.worker_for_run(context.run_id)
+            worker = _get_run_manager().worker_for_run(context.run_id)
             await worker.delete_case_execution(context.run_id, context.case_id, delete_namespace=delete_namespace)
+        except auth_errors:
+            raise
         except RuntimeConfigurationError as error:
             raise DeploymentExecutionConflictError(
                 f"deployment runtime is unavailable, so cluster resources cannot be cleaned: {error}",
@@ -1200,6 +1268,108 @@ async def delete_execution(execution_id: str, *, delete_namespace: bool = True) 
         except ValueError as error:
             raise DeploymentExecutionConflictError(str(error)) from error
     _execution_locks.pop(execution_id, None)
+
+
+async def verify_execution_cleanup(
+    execution_id: str,
+    *,
+    cleanup_digest: str | None = None,
+    delete_record_on_verify: bool = True,
+    force_delete_record: bool = False,
+) -> dict[str, Any]:
+    """Verify Phase-2 Orchestration administrator namespace cleanup and optionally delete Lens records."""
+    from llm_d_lens.deploy.orphans import OrphanCleanupError, verify_deployment_cleanup
+
+    auth_errors = _auth_error_types()
+    async with _execution_lock(execution_id):
+        store = _get_store()
+        context = get_execution_context(execution_id)
+        reason = active_usage_reason(execution_id)
+        if reason:
+            raise DeploymentExecutionConflictError(reason, code="deployment_in_use")
+        if not context.namespace or not context.cluster_id:
+            if delete_record_on_verify or force_delete_record:
+                if context.run_id:
+                    worker = _get_run_manager().worker_for_run(context.run_id)
+                    await worker.delete_case_execution(context.run_id, context.case_id, delete_namespace=False)
+                else:
+                    store.delete_execution(execution_id)
+                _execution_locks.pop(execution_id, None)
+                return {
+                    "verified": True,
+                    "deleted": True,
+                    "status": "deleted",
+                    "message": "Deployment record deleted.",
+                    "remainingOperations": [],
+                    "marker": {"namespace": None, "name": None, "status": "missing", "verified": True},
+                    "canVerifyMarker": False,
+                    "warnings": [],
+                }
+            return {
+                "verified": True,
+                "deleted": False,
+                "status": "verified",
+                "message": "Deployment has no namespace to clean.",
+                "remainingOperations": [],
+                "marker": {"namespace": None, "name": None, "status": "missing", "verified": True},
+                "canVerifyMarker": False,
+                "warnings": [],
+            }
+
+        execution = None if execution_id.startswith("pending:") else store.get_execution(execution_id)
+        stored_digest = _stored_cleanup_digest(execution)
+        cleaned_input_digest = (
+            cleanup_digest.strip() if isinstance(cleanup_digest, str) and cleanup_digest.strip() else None
+        )
+        if cleaned_input_digest and stored_digest and cleaned_input_digest != stored_digest:
+            raise DeploymentExecutionConflictError(
+                "Provided cleanupDigest does not match the recorded Phase-1 cleanup digest.",
+                code="deployment_cleanup_invalid",
+            )
+        effective_digest = cleaned_input_digest or stored_digest
+
+        try:
+            verification = await verify_deployment_cleanup(
+                execution_id=execution_id,
+                cluster_id=context.cluster_id,
+                namespace=context.namespace,
+                cleanup_digest=effective_digest,
+            )
+        except auth_errors:
+            raise
+        except OrphanCleanupError as error:
+            raise DeploymentExecutionConflictError(str(error), code="deployment_cleanup_invalid") from error
+
+        if force_delete_record and verification["canVerifyMarker"]:
+            raise DeploymentExecutionConflictError(
+                "Orchestration administrator cleanup marker verification is required before deleting this record.",
+                code="cleanup_marker_verification_required",
+            )
+
+        should_delete = (verification["verified"] and delete_record_on_verify) or (
+            force_delete_record and not verification["canVerifyMarker"]
+        )
+        if not should_delete:
+            return {**verification, "deleted": False}
+
+        try:
+            if context.run_id:
+                worker = _get_run_manager().worker_for_run(context.run_id)
+                await worker.delete_case_execution(context.run_id, context.case_id, delete_namespace=False)
+            else:
+                store.delete_execution(execution_id)
+        except auth_errors:
+            raise
+        except ValueError as error:
+            raise DeploymentExecutionConflictError(str(error)) from error
+    _execution_locks.pop(execution_id, None)
+    return {
+        **verification,
+        "verified": True,
+        "deleted": True,
+        "status": "deleted",
+        "message": f"Deployment {execution_id} deleted after Orchestration administrator cleanup verification.",
+    }
 
 
 async def ensure_execution_endpoint(execution_id: str):

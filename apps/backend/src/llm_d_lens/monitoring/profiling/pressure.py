@@ -17,15 +17,17 @@ from dataclasses import dataclass, field
 import httpx
 
 from llm_d_lens.monitoring.deployment.service import DeploymentMonitoringError
+from llm_d_lens.monitoring.prometheus import create_prometheus_client
 
 from .service import (
     _deployment_target,
     _discover_components,
-    _prometheus_local_port,
+    _prometheus_endpoint,
     _query,
     _query_range,
     _range_series,
     _re2_escape,
+    _safe_promql_namespace,
     _scalar,
 )
 
@@ -198,7 +200,8 @@ def _level(instances: list[PressureInstance], error_rate: float | None, outcomes
 
 
 async def _error_ratio(client: httpx.AsyncClient, namespace: str, pod_re: str) -> tuple[float | None, int | None]:
-    matcher = f'namespace="{namespace}", pod=~"{pod_re}"'
+    safe_ns = _safe_promql_namespace(namespace)
+    matcher = f'namespace="{safe_ns}", pod=~"{pod_re}"'
     error_result, outcome_result = await asyncio.gather(
         _query(
             client,
@@ -263,20 +266,21 @@ async def _collect_execution_pressure(execution_id: str, cluster_id: str | None)
             reason="no_model_server_instances",
         )
     role_by_pod = {pod: role for role in ("prefill", "decode") for pod in instances_by_role.get(role, [])}
-    local_port = await _prometheus_local_port(resolved_cluster_id)
-    if local_port is None:
+    endpoint = await _prometheus_endpoint(resolved_cluster_id)
+    if endpoint is None:
         return ExecutionPressure(
             execution_id=execution_id,
             cluster_id=resolved_cluster_id,
             namespace=namespace,
             reason="prometheus_unreachable",
         )
+    safe_ns = _safe_promql_namespace(namespace)
     pod_re = "|".join(_re2_escape(pod) for pod in pods)
-    matcher = f'namespace="{namespace}", pod=~"{pod_re}"'
+    matcher = f'namespace="{safe_ns}", pod=~"{pod_re}"'
     end = time.time()
     start = end - PRESSURE_WINDOW_SECONDS
     expected_samples = int(PRESSURE_WINDOW_SECONDS // PRESSURE_STEP_SECONDS) + 1
-    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{local_port}", timeout=10.0) as client:
+    async with create_prometheus_client(endpoint, timeout=10.0) as client:
         waiting_results, kv_results, error_metrics = await asyncio.gather(
             _query_range(
                 client,

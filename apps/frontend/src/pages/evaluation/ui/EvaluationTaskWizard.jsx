@@ -36,7 +36,7 @@ import { matchesEvaluationSetup, retainCompatibleConfigurations } from "../model
 import { clearEvaluationIntent, readEvaluationIntent, storeEvaluationIntent } from "../model/transfer";
 import { useAuth } from "../../auth";
 import { MODELS } from '@repo/shared/catalog';
-import { acceleratorVariantForHardware, DEFAULT_RUNTIME_IMAGES, isDefaultRuntimeImage } from "./benchmark-results/acceleratorDisplay";
+import { acceleratorVariantForHardware, DEFAULT_RUNTIME_IMAGES } from "./benchmark-results/acceleratorDisplay";
 
 const EVALUATION_STEPS = ["Evaluation Setup", "Configurations", "Benchmark", "Execution plan"];
 const inputClass = "mt-1 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-xs text-slate-100 outline-none focus:border-cyan-400";
@@ -361,7 +361,15 @@ export default function EvaluationTaskWizard({ onNavigate }) {
     const [deploymentName, setDeploymentName] = useState(() => returningIntent?.deployment_name || `evaluation-serving-${shortUuid()}`);
     const [deploymentDescription, setDeploymentDescription] = useState(returningIntent?.deployment_description || "");
     const [imageMode] = useState("use-upstream-image");
-    const [runtimeImage, setRuntimeImage] = useState('');
+    const [runtimeImage, setRuntimeImage] = useState(
+        () => returningIntent?.runtime?.image || returningIntent?.runtime?.build_image_name || "",
+    );
+    const [imageTouched, setImageTouched] = useState(
+        () => Boolean(
+            (returningIntent?.runtime?.image || returningIntent?.runtime?.build_image_name)
+            && (returningIntent?.runtime?.image_override ?? true),
+        ),
+    );
     const [buildSourceUrl] = useState("");
     const [clusters, setClusters] = useState([]);
     const [selectedClusterId, setSelectedClusterId] = useState(() => returningIntent?.cluster_id || sessionStorage.getItem("prism_cluster_server_id") || "");
@@ -437,19 +445,46 @@ export default function EvaluationTaskWizard({ onNavigate }) {
         if (benchmarkOnly && targetMode !== "existing") setTargetMode("existing");
     }, [benchmarkOnly, targetMode]);
 
-    // Align the default runtime image with the selected cluster's hardware once
-    // its profile is discovered: a GPU cluster must not stay on the XPU image, or
-    // no saved configuration ever matches (``matchesEvaluationSetup`` compares it).
-    // Swap only between the known per-vendor defaults so a custom image survives.
+    // Align the default runtime image with the selected cluster's configured
+    // `vllmImage` or discovered hardware-profile default. Explicit user/artifact
+    // edits (`imageTouched`) are never clobbered by polling, and switching
+    // clusters resets `imageTouched` so the new cluster's default applies.
+    const selectedClusterRecord = clusters.find((item) => item.id === selectedClusterId) || null;
+    const clusterVllmImage = (connectedCluster?.id === selectedClusterId ? connectedCluster?.vllmImage : null)
+        || selectedClusterRecord?.vllmImage
+        || null;
+    const hardwareVariant = acceleratorVariantForHardware(clusterHardware);
+    const effectiveDefaultImage = clusterVllmImage || (hardwareVariant ? DEFAULT_RUNTIME_IMAGES[hardwareVariant] || "" : "");
+    const runtimeImageOverride = Boolean(imageTouched && runtimeImage.trim() && runtimeImage.trim() !== effectiveDefaultImage);
+
+    const prevClusterIdRef = useRef(selectedClusterId);
+    const seededIntentClusterRef = useRef(
+        imageTouched ? (returningIntent?.cluster_id || selectedClusterId || "") : null,
+    );
     useEffect(() => {
-        const variant = acceleratorVariantForHardware(clusterHardware);
-        if (!variant) return;
-        setRuntimeImage((current) => (
-            (!current || isDefaultRuntimeImage(current)) && current !== DEFAULT_RUNTIME_IMAGES[variant]
-                ? DEFAULT_RUNTIME_IMAGES[variant]
-                : current
-        ));
-    }, [clusterHardware, hardwareProfiles]);
+        const previousClusterId = prevClusterIdRef.current;
+        if (previousClusterId !== selectedClusterId) {
+            prevClusterIdRef.current = selectedClusterId;
+            const seededClusterId = seededIntentClusterRef.current;
+            if (
+                seededClusterId !== null
+                && (
+                    seededClusterId === selectedClusterId
+                    || (previousClusterId === "" && seededClusterId === "")
+                )
+            ) {
+                seededIntentClusterRef.current = null;
+                return;
+            }
+            seededIntentClusterRef.current = null;
+            setImageTouched(false);
+            setRuntimeImage(clusterVllmImage || "");
+            return;
+        }
+        if (imageTouched) return;
+        if (!effectiveDefaultImage) return;
+        setRuntimeImage((current) => (current === effectiveDefaultImage ? current : effectiveDefaultImage));
+    }, [imageTouched, clusterVllmImage, effectiveDefaultImage, selectedClusterId, hardwareProfiles]);
 
     useEffect(() => {
         if (!openMenuId) return undefined;
@@ -615,7 +650,7 @@ export default function EvaluationTaskWizard({ onNavigate }) {
         : cachedModelsLoading ? { state: 'loading' }
         : modelCacheMismatch ? { state: 'model-mismatch', message: `${trimmedSharedModel} was not found in this Model Cache storage.` }
         : { state: 'ready' };
-    const sharedContext = { entrySource, cluster: clusterLoading ? {} : cluster, clusterHardware, refreshClusterHardware, cachedRuntimeImages, model: sharedModel, modelSource, modelPath: modelSource === 'auto-cache' ? storageVolumes.find((item) => item.id === storageVolumeId)?.localDisk?.hostPath || '' : modelPath, storageVolumeId, modelServer: sharedRuntime, deploymentName, imageMode, image: runtimeImage, buildSourceUrl, storageVolume: storageVolumes.find((item) => item.id === storageVolumeId), cacheValidation, replicas: returningIntent?.workloads?.[0]?.replicas, tensorParallelSize: returningIntent?.workloads?.[0]?.tensor_parallel_size, maxModelLen: returningIntent?.runtime?.max_model_len };
+    const sharedContext = { entrySource, cluster: clusterLoading ? {} : cluster, clusterHardware, refreshClusterHardware, cachedRuntimeImages, model: sharedModel, modelSource, modelPath: modelSource === 'auto-cache' ? storageVolumes.find((item) => item.id === storageVolumeId)?.localDisk?.hostPath || '' : modelPath, storageVolumeId, modelServer: sharedRuntime, deploymentName, imageMode, image: runtimeImage, imageTouched, imageOverride: runtimeImageOverride, buildSourceUrl, storageVolume: storageVolumes.find((item) => item.id === storageVolumeId), cacheValidation, replicas: returningIntent?.workloads?.[0]?.replicas, tensorParallelSize: returningIntent?.workloads?.[0]?.tensor_parallel_size, maxModelLen: returningIntent?.runtime?.max_model_len };
     const compatibleSavedArtifacts = artifacts.filter((item) => matchesEvaluationSetup(item, sharedContext));
     const modelOptions = [...new Set([...MODELS.map((item) => item.repository), ...cachedModelIds])].filter(Boolean).sort();
     const recommendedBenchmark = benchmarkFor(provider);
@@ -681,7 +716,7 @@ export default function EvaluationTaskWizard({ onNavigate }) {
             : step === 2 ? tests.length > 0 && !benchmarkErrors.length : true;
 
     const openConfiguration = (guideId = template, mode = "defaults") => {
-        storeEvaluationIntent({ entrySource, operation: "create-evaluation", return_target: "optimization-evaluate-new", name, deployment_name: deploymentName, deployment_description: deploymentDescription, cluster_id: selectedClusterId, workloads: [{ guide: guideId, model: sharedModel, mount_path: modelPath, replicas: sharedContext.replicas, tensor_parallel_size: sharedContext.tensorParallelSize }], runtime: { model_server: sharedRuntime, model_source: modelSource, mount_path: modelPath, storage_volume_id: storageVolumeId, image_mode: imageMode, image: runtimeImage, build_image_name: runtimeImage, build_source_url: buildSourceUrl, max_model_len: sharedContext.maxModelLen }, clone_from_artifact_id: mode === "clone" ? artifactIds.at(-1) : null });
+        storeEvaluationIntent({ entrySource, operation: "create-evaluation", return_target: "optimization-evaluate-new", name, deployment_name: deploymentName, deployment_description: deploymentDescription, cluster_id: selectedClusterId, workloads: [{ guide: guideId, model: sharedModel, mount_path: modelPath, replicas: sharedContext.replicas, tensor_parallel_size: sharedContext.tensorParallelSize }], runtime: { model_server: sharedRuntime, model_source: modelSource, mount_path: modelPath, storage_volume_id: storageVolumeId, image_mode: imageMode, image: runtimeImage, build_image_name: runtimeImage, image_override: runtimeImageOverride, build_source_url: buildSourceUrl, max_model_len: sharedContext.maxModelLen }, clone_from_artifact_id: mode === "clone" ? artifactIds.at(-1) : null });
         setConfigurationEditor({ guideId, mode, artifact: mode === "clone" ? selectedArtifacts.at(-1) : null, key: `${guideId}-${Date.now()}` });
     };
 
@@ -765,8 +800,12 @@ export default function EvaluationTaskWizard({ onNavigate }) {
         if (optimizationSelection) setOptimizationSelections(current => ({...current, ...Object.fromEntries(nextArtifacts.map(item => [item.artifact_id, optimizationSelection]))}));
         // Adopt the accepted configuration's runtime image so it matches exactly
         // (the editor may have used a build-from-source or non-default image).
-        const publishedImage = nextArtifacts.find((item) => artifactContent(item).runtime?.image)?.deployable_configuration.content.runtime.image;
-        if (publishedImage) setRuntimeImage(publishedImage);
+        const publishedRuntime = nextArtifacts.find((item) => artifactContent(item).runtime?.image)?.deployable_configuration.content.runtime;
+        const publishedImage = publishedRuntime?.image;
+        if (publishedImage) {
+            setRuntimeImage(publishedImage);
+            setImageTouched(Boolean(publishedRuntime?.imageOverride) || (Boolean(effectiveDefaultImage) && publishedImage !== effectiveDefaultImage));
+        }
         const nextArtifactIds = nextArtifacts.map((item) => item.artifact_id);
         setArtifacts((current) => [...nextArtifacts, ...current.filter((item) => !nextArtifacts.some((next) => next.artifact_id === item.artifact_id))]);
         setArtifactIds((current) => {
@@ -800,7 +839,7 @@ export default function EvaluationTaskWizard({ onNavigate }) {
     };
 
     const leaveSetupFor = (view) => {
-        storeEvaluationIntent({ entrySource, operation: "create-evaluation", return_target: "optimization-evaluate-new", name, deployment_name: deploymentName, deployment_description: deploymentDescription, workloads: [{ guide: template, model: sharedModel, mount_path: modelPath, replicas: sharedContext.replicas, tensor_parallel_size: sharedContext.tensorParallelSize }], runtime: { model_server: sharedRuntime, model_source: modelSource, mount_path: modelPath, storage_volume_id: storageVolumeId, image_mode: imageMode, image: runtimeImage, build_image_name: runtimeImage, build_source_url: buildSourceUrl, max_model_len: sharedContext.maxModelLen }, cluster_id: selectedClusterId });
+        storeEvaluationIntent({ entrySource, operation: "create-evaluation", return_target: "optimization-evaluate-new", name, deployment_name: deploymentName, deployment_description: deploymentDescription, workloads: [{ guide: template, model: sharedModel, mount_path: modelPath, replicas: sharedContext.replicas, tensor_parallel_size: sharedContext.tensorParallelSize }], runtime: { model_server: sharedRuntime, model_source: modelSource, mount_path: modelPath, storage_volume_id: storageVolumeId, image_mode: imageMode, image: runtimeImage, build_image_name: runtimeImage, image_override: runtimeImageOverride, build_source_url: buildSourceUrl, max_model_len: sharedContext.maxModelLen }, cluster_id: selectedClusterId });
         onNavigate(view);
     };
 
@@ -825,8 +864,12 @@ export default function EvaluationTaskWizard({ onNavigate }) {
     const selectSavedConfiguration = (artifactId) => {
         const selectedArtifact = artifacts.find((item) => item.artifact_id === artifactId);
         if (selectedArtifact && !artifactIds.length) setTemplate(selectedArtifact.deployable_configuration?.provider_ref || "");
-        const savedImage = selectedArtifact ? artifactContent(selectedArtifact).runtime?.image : "";
-        if (savedImage) setRuntimeImage(savedImage);
+        const savedRuntime = selectedArtifact ? artifactContent(selectedArtifact).runtime : null;
+        const savedImage = savedRuntime?.image || "";
+        if (savedImage) {
+            setRuntimeImage(savedImage);
+            setImageTouched(Boolean(savedRuntime?.imageOverride) || (Boolean(effectiveDefaultImage) && savedImage !== effectiveDefaultImage));
+        }
         setArtifactIds((current) => current.includes(artifactId)
             ? current.filter((id) => id !== artifactId)
             : [...current, artifactId]);
@@ -918,7 +961,7 @@ export default function EvaluationTaskWizard({ onNavigate }) {
     };
 
     const editConfiguration = (artifact) => {
-        storeEvaluationIntent({ entrySource, operation: "create-evaluation", return_target: "optimization-evaluate-new", name, deployment_name: deploymentName, deployment_description: deploymentDescription, workloads: [{ guide: artifact.deployable_configuration?.provider_ref || template, model: sharedModel, mount_path: modelPath }], runtime: { model_server: sharedRuntime, model_source: modelSource, mount_path: modelPath, storage_volume_id: storageVolumeId, image_mode: imageMode, image: runtimeImage, build_image_name: runtimeImage, build_source_url: buildSourceUrl } });
+        storeEvaluationIntent({ entrySource, operation: "create-evaluation", return_target: "optimization-evaluate-new", name, deployment_name: deploymentName, deployment_description: deploymentDescription, workloads: [{ guide: artifact.deployable_configuration?.provider_ref || template, model: sharedModel, mount_path: modelPath }], runtime: { model_server: sharedRuntime, model_source: modelSource, mount_path: modelPath, storage_volume_id: storageVolumeId, image_mode: imageMode, image: runtimeImage, build_image_name: runtimeImage, image_override: runtimeImageOverride, build_source_url: buildSourceUrl } });
         setConfigurationEditor({ guideId: artifact.deployable_configuration?.provider_ref || template, mode: "edit", artifact, key: `${artifact.artifact_id}-${Date.now()}` });
         setOpenMenuId("");
     };
