@@ -3,7 +3,11 @@ title: Deployments
 description: Find deployments, check readiness, view logs and remove unused services.
 ---
 
+Model selection and per-deployment parameter overrides use the [Model Catalog](/user-guide/model-market). Custom entries and API fields are described in the [catalog API](/api-reference/modules/model-market).
+
 Open **Deployments** to check whether a model is ready, inspect a failure, or manage an existing deployment.
+
+New llm-d Router deployments default to a complete Standalone endpoint, even when the cluster has a ready shared Gateway. Publishing adds a Gateway route; detaching preserves independent access. See [Standalone deployment and Gateway publication](/user-guide/model-services#standalone-deployment-and-gateway-publication).
 
 ## DisaggregatedSet review
 
@@ -206,6 +210,13 @@ error instead of silently disappearing; undo the conflicting selection or use
 **Discard direct edits** in the Parameters or YAML tab. Legacy snapshots without
 an edit baseline require explicit resolution when their base configuration changes.
 Disabling native CPU cache retains its capacity for re-enabling.
+Enabling **CPU RAM cache offloading** on an existing serving plan, including P/D,
+adds a native CPU cache to its workers while retaining its serving topology and
+router. Use **Edit parameters** to review the capacity per replica before applying;
+the editor uses the saved capacity or its default for a new cache. Explicitly disabled
+prefix caching must be enabled first. Applying checks the selected source adapter,
+runtime image and host-memory budget; unsupported combinations return their specific
+validation error. Selecting two complete serving Guides still reports a conflict.
 A changed source revision requires an
 explicit decision to discard source edits and adopt the current revision.
 

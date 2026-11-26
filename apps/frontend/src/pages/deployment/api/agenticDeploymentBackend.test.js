@@ -316,3 +316,12 @@ test('parseDeploymentCleanupHandoff and setup error helpers match exact 403/409 
     assert.equal(isDeploymentAdminSetupError({ status: 403, body: { detail: { code: 'deployment_admin_setup_required' } } }), true);
     assert.equal(isDeploymentAdminSetupError({ status: 403, code: 'forbidden' }), false);
 });
+
+test('catalog deployments send a version and overrides for server resolution', () => {
+    const servingOverrides = { toolCalling: false, toolParser: 'hermes', extra: '' };
+    const request = deploymentPlanningRequest({ ...draft, modelCatalogId: 'custom-1', modelCatalogVersion: 2, servingOverrides, vllmArguments: [{ name: 'tool-call-parser', value: 'old' }] }, DEFAULT_REQUIREMENTS, 'session-a', 'manual');
+    assert.equal(request.model_catalog_id, 'custom-1');
+    assert.equal(request.model_catalog_version, 2);
+    assert.deepEqual(request.serving_overrides, servingOverrides);
+    assert.deepEqual(request.vllm_arguments, []);
+});

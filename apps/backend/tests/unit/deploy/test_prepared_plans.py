@@ -1,7 +1,32 @@
+from types import SimpleNamespace
+
 import pytest
 
 from llm_d_lens.db.dao.deployment_plan import DeploymentPlanDao
 from llm_d_lens.deploy.contracts import DeployableConfiguration, DeploymentPreparedPlan, DeploymentRun
+
+
+@pytest.mark.asyncio
+async def test_verified_namespace_binding_pins_prepared_namespace_for_non_admin():
+    from llm_d_lens.deploy import capabilities
+    from llm_d_lens.deploy.application import DeploymentRunManager
+
+    capabilities.clear_verified_namespaces()
+    capabilities.record_verified_namespace("cluster", "llmd-granted", agentic_deployment_run_id="agentic-1")
+    case = SimpleNamespace(
+        create_request=SimpleNamespace(
+            provenance={}, deployment_policy=SimpleNamespace(value={"deployment_name": "demo"})
+        )
+    )
+    run = SimpleNamespace(cases=[case], provenance={})
+    request = SimpleNamespace(provenance={"agentic_deployment_run_id": "agentic-1"}, prepared_plan_id=None)
+    manager = SimpleNamespace(store=SimpleNamespace(list_executions=lambda: []))
+
+    async with DeploymentRunManager.verified_namespace_binding(manager, run, request, "cluster", None):
+        pass
+
+    assert case.create_request.deployment_policy.value["namespace_policy"] == {"exact": "llmd-granted"}
+    assert run.provenance["target_namespace"] == "llmd-granted"
 
 
 def test_plan_round_trip_and_atomic_run_creation():

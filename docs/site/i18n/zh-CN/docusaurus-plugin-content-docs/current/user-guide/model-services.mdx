@@ -8,6 +8,28 @@ description: 发布部署、创建 API 密钥并调用模型。
 将就绪的部署发布为模型服务，应用即可使用 API 密钥调用。
 调用已有服务从 **My services（我的服务）**开始；发布服务使用 **Model services（模型服务）**。
 
+## Standalone 部署与 Gateway 发布
+
+新建 llm-d Router 部署会保留自己的 Standalone Proxy、EPP 和模型工作负载。
+独立 HTTP 入口无需发布 Model Service，也不依赖共享 Gateway 运行。
+直接选择部署进行测试时使用这个入口。
+
+发布时新增通过集群共享 Gateway 访问部署 InferencePool 的 HTTPRoute。
+Standalone 入口继续可用，并使用同一个 EPP。访问已发布 Model Service 时使用
+Gateway URL、公开模型名称和 API key；直接访问 Standalone 时使用引擎的模型名称，
+该入口不经过 Model Service 的 Gateway 鉴权。
+
+从 Model Service 移除部署时，只更新或删除发布路由，保留独立入口、Proxy、EPP
+和模型工作负载。解绑本身不触发模式切换或部署重启。
+
+从创建部署开始，EPP 与独立 Proxy 使用一致的协议：Istio/agentgateway 使用明文，
+Envoy AI Gateway/GKE 使用 TLS。发布时会同步修复旧版 Envoy sidecar 配置并等待
+滚动更新完成。若独立 Proxy 工作负载需要变更协议，或使用不受支持的自定义 Proxy
+配置，调谐会在修改 EPP 前报错并要求重新部署。历史 Gateway-only 部署保留原有行为，
+需要重新部署才能获得 Standalone 入口。
+
+同样的传输修复失败也会阻止非管理员发布和验证。管理员交接脚本在应用路由前等待 EPP 就绪；如果 EPP 协议变更会影响独立代理，脚本会停止且不修改 EPP。请使用一致的协议重新部署，或使用足够权限通过 Lens 同步修复两者，然后重试交接。
+
 ## 调用已发布的模型
 
 1. 打开 **My services**。

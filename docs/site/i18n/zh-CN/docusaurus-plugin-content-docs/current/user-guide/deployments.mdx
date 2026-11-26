@@ -3,7 +3,11 @@ title: 部署
 description: 查找部署、确认就绪状态、查看日志并删除不再使用的服务。
 ---
 
+模型选择和本次部署参数覆盖使用 [Model Catalog](/user-guide/model-market)。自定义条目和 API 字段参见[目录 API](/api-reference/modules/model-market)。
+
 打开 **Deployments（部署）**，确认模型是否就绪、排查失败原因或管理已有部署。
+
+新建 llm-d Router 部署默认保留完整 Standalone 入口，即使集群已有就绪的共享 Gateway。发布会增加 Gateway 路由，解绑后仍可独立访问。详见 [Standalone 部署与 Gateway 发布](/user-guide/model-services#standalone-部署与-gateway-发布)。
 
 ## DisaggregatedSet 审核
 
@@ -138,6 +142,11 @@ Agentic 只启用预期有助于所选目标的优化，其余兼容项保持可
 冲突编辑会明确报错并阻止应用，不会静默丢弃。请撤销冲突选择，或在 Parameters / YAML 标签页使用
 **Discard direct edits（丢弃直接编辑）**。
 旧快照没有编辑基线时，基础配置变化需要明确处理。禁用原生 CPU 缓存会保留容量，供再次启用。
+在已有服务方案（包括 P/D）上启用 **CPU RAM cache offloading**，会为工作节点叠加原生 CPU 缓存，
+保留现有服务拓扑和路由。应用前可通过 **Edit parameters（编辑参数）**检查每副本容量；
+编辑器使用已保存的容量，新缓存使用编辑器默认值。如果显式禁用了前缀缓存，需要先重新启用。
+应用时会检查所选源码适配器、运行镜像和主机内存预算，不支持的组合会返回具体校验原因。
+同时选择两套完整服务 Guide 仍会提示冲突。
 源码版本变化后，
 必须明确选择丢弃源码编辑并采用当前版本，才能继续。
 

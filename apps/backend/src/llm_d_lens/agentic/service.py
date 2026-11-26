@@ -147,6 +147,9 @@ class AgenticDeploymentService:
         profile = request.planning_facts.workload_profile
         if profile and profile.concurrency is not None and profile.request_rate is not None:
             raise ValueError("Both load targets were provided; choose one and clear the other.")
+        from llm_d_lens.model_catalog.service import resolve_deployment_model
+
+        request = resolve_deployment_model(request)
         async with asyncio.timeout(request.execution_policy.max_total_duration_minutes * 60):
             return await self._create(request, on_progress, principal_id=principal_id, principal=principal)
 
@@ -619,25 +622,19 @@ class AgenticDeploymentService:
             raise ValueError("model-cache storage for deployments cannot use dynamic-pvc volumes")
         if not require_model_ready:
             return None
-        from llm_d_lens.deploy.router import _ready_model_cache_entry_exists
+        from llm_d_lens.deploy.router import _ready_model_cache_entry
         from llm_d_lens.model_cache.service import default_service as model_cache_service
 
         entries = await model_cache_service().list(
             cluster_id=cluster_id,
             storage_volume_id=request.storage_volume_id,
         )
-        if not _ready_model_cache_entry_exists(entries, request.model):
+        entry = _ready_model_cache_entry(entries, request.model, request.model_revision)
+        if entry is None:
             raise ValueError("selected model is not ready in the selected model cache storage")
         # Select the exact entry already accepted by the readiness check and
         # preserve its token source.  The old path validated the files but
         # discarded these credentials before building the deployment.
-        expected_model = request.model.strip().lower()
-        entry = next(
-            entry
-            for entry in entries
-            if str(getattr(getattr(entry.source, "huggingface", None), "repo_id", "")).strip().lower() == expected_model
-            and entry.status.value == "ready"
-        )
         token_source = entry.token_source
         # Translate Model Cache's token contract into Configuration's contract
         # at this boundary so downstream deployment code remains provider

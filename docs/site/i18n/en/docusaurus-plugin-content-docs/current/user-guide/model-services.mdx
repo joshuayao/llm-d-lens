@@ -9,6 +9,32 @@ To call an existing service, start with **My services**; to publish one, use **M
 Istio is the default Gateway provider when no provider is configured for the
 cluster. An explicitly configured provider is preserved.
 
+## Standalone deployment and Gateway publication
+
+New llm-d Router deployments retain their own Standalone Proxy, EPP and model
+workloads. The independent HTTP endpoint works without publishing a Model Service
+or running a shared Gateway. Deployment-targeted tests use this endpoint.
+
+Publishing adds an HTTPRoute through the cluster's shared Gateway to the
+deployment's InferencePool. The standalone endpoint remains available and uses
+the same EPP. Calls to the published Model Service use its Gateway URL, public
+model name and API key. Direct standalone calls use the engine's model name and
+are not protected by Model Service Gateway authorization.
+
+Removing the deployment from a Model Service updates or removes the published
+route. It keeps the standalone endpoint, Proxy, EPP and model workloads; there
+is no mode switch or deployment restart just for detachment.
+
+EPP and the standalone proxy use one transport policy from deployment creation:
+plaintext for Istio/agentgateway, TLS for Envoy AI Gateway/GKE. Publication repairs
+older Envoy sidecar configurations together and waits for rollout. A separate
+proxy workload needing a protocol change, or an unsupported custom proxy config,
+requires redeployment; reconciliation reports the problem before changing EPP.
+Existing Gateway-only deployments keep their recorded behavior and require
+redeployment to gain a standalone endpoint.
+
+The same transport failures stop the non-admin publication and verification paths. The administrator handoff script waits for EPP readiness before applying routes; if an EPP protocol change would affect an independent proxy, it stops without patching EPP. Redeploy with matching transport, or repair both through Lens with sufficient permissions, then retry the handoff.
+
 ## Browse published models and copy request examples
 
 1. Open **My services**.

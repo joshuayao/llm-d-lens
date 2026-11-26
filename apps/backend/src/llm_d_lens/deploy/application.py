@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -228,29 +229,7 @@ class DeploymentRunManager:
         # guide_source or reconstruct a cache path.
         request.provenance["deployment_source"] = cluster_deployment_source(session, deployment_source)
         run = DeploymentPlanService(self.store).build_run(request)
-        consumed_ns: str | None = None
-        agentic_run_id_str: str | None = None
-        deployment_name_str: str | None = None
-        if len(run.cases) == 1:
-            from llm_d_lens.deploy import capabilities
-
-            case = run.cases[0]
-            agentic_run_id_str, deployment_name_str = single_case_namespace_lookup(request, case)
-            consumed_ns = capabilities.consume_verified_namespace(
-                session.server_id,
-                owner_user_id=owner_user_id,
-                agentic_deployment_run_id=agentic_run_id_str,
-                deployment_name=deployment_name_str,
-                prepared_plan_id=request.prepared_plan_id,
-            )
-        try:
-            if len(run.cases) == 1:
-                verified_ns = consumed_ns
-                if verified_ns is None:
-                    verified_ns = await resolve_bootstrapped_target_namespace(session.server_id, request, case)
-                if verified_ns:
-                    ensure_namespace_not_used_by_active_execution(self.store, verified_ns)
-                bind_single_case_target_namespace(run, case, verified_ns)
+        async with self.verified_namespace_binding(run, request, session.server_id, owner_user_id):
             run = self.store.create_run(run)
             if owner_user_id:
                 from llm_d_lens.db.dao.deployment_batch import DeploymentBatchDao
@@ -258,10 +237,38 @@ class DeploymentRunManager:
                 DeploymentBatchDao().set_owner(run.id, owner_user_id=owner_user_id)
             worker = self._worker(run)
             self._run_workers[run.id] = worker
+        self._schedule_run(run.id, worker)
+        return run
+
+    @contextlib.asynccontextmanager
+    async def verified_namespace_binding(self, run, request, server_id: str, owner_user_id: str | None):
+        """Pin a single-case run to its verified target namespace; restore the binding if the body fails."""
+        if len(run.cases) != 1:
+            yield
+            return
+        from llm_d_lens.deploy import capabilities
+
+        case = run.cases[0]
+        agentic_run_id_str, deployment_name_str = single_case_namespace_lookup(request, case)
+        consumed_ns = capabilities.consume_verified_namespace(
+            server_id,
+            owner_user_id=owner_user_id,
+            agentic_deployment_run_id=agentic_run_id_str,
+            deployment_name=deployment_name_str,
+            prepared_plan_id=request.prepared_plan_id,
+        )
+        try:
+            verified_ns = consumed_ns
+            if verified_ns is None:
+                verified_ns = await resolve_bootstrapped_target_namespace(server_id, request, case)
+            if verified_ns:
+                ensure_namespace_not_used_by_active_execution(self.store, verified_ns)
+            bind_single_case_target_namespace(run, case, verified_ns)
+            yield
         except BaseException:
             if consumed_ns:
                 capabilities.record_verified_namespace(
-                    session.server_id,
+                    server_id,
                     consumed_ns,
                     owner_user_id=owner_user_id,
                     agentic_deployment_run_id=agentic_run_id_str,
@@ -269,8 +276,6 @@ class DeploymentRunManager:
                     prepared_plan_id=request.prepared_plan_id,
                 )
             raise
-        self._schedule_run(run.id, worker)
-        return run
 
     def rebind_cluster_session(self, run_id: str, session_id: str) -> None:
         run = self.store.get_run(run_id)
