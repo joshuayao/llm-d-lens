@@ -1256,8 +1256,20 @@ async def delete_execution(execution_id: str, *, delete_namespace: bool = True) 
         if reason:
             raise DeploymentExecutionConflictError(reason, code="deployment_in_use")
         try:
-            worker = _get_run_manager().worker_for_run(context.run_id)
-            await worker.delete_case_execution(context.run_id, context.case_id, delete_namespace=delete_namespace)
+            if not context.run_id and not delete_namespace:
+                _get_store().delete_execution(execution_id)
+            else:
+                try:
+                    worker = _get_run_manager().worker_for_run(context.run_id)
+                except RuntimeConfigurationError:
+                    if delete_namespace:
+                        raise
+                    from types import SimpleNamespace
+
+                    from llm_d_lens.deploy.worker import DeploymentRunWorker
+
+                    worker = DeploymentRunWorker(_get_store(), SimpleNamespace())
+                await worker.delete_case_execution(context.run_id, context.case_id, delete_namespace=delete_namespace)
         except auth_errors:
             raise
         except RuntimeConfigurationError as error:

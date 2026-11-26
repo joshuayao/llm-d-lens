@@ -1556,3 +1556,334 @@ async def test_cleanup_verify_enforces_stored_digest_and_marker_requirement(depl
     monkeypatch.setattr(orphans, "verify_deployment_cleanup", auth_401)
     with pytest.raises(DeploymentClusterAuthError):
         await deploy_executions.verify_execution_cleanup("exec-dig")
+
+
+@pytest.mark.asyncio
+async def test_rebind_cluster_session_rejects_foreign_cluster_session(deployment_store, monkeypatch):
+    from fastapi import HTTPException
+
+    from llm_d_lens.deploy import application
+
+    manager = application.DeploymentRunManager(deployment_store)
+    run = deployment_store.get_run("run-1")
+    original_session_id = str(uuid4())
+    run.provenance = {"cluster_server_id": "cluster-a", "cluster_session_id": original_session_id}
+    deployment_store.save_run(run)
+
+    foreign_session_id = str(uuid4())
+    monkeypatch.setattr(
+        application,
+        "require_active_session",
+        lambda sid: SimpleNamespace(id=sid, server_id="cluster-b"),
+    )
+    monkeypatch.setattr(router, "_store", deployment_store)
+    monkeypatch.setattr(router, "deployment_run_manager", manager)
+
+    with pytest.raises(
+        ValueError,
+        match="active cluster session is not connected to this deployment's original cluster",
+    ):
+        manager.rebind_cluster_session("run-1", foreign_session_id)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await router.rebind_cluster_session(
+            "run-1",
+            router.RebindClusterSessionRequest(cluster_session_id=foreign_session_id),
+        )
+    assert exc_info.value.status_code == 409
+    assert "active cluster session is not connected to this deployment's original cluster" in exc_info.value.detail
+    persisted = deployment_store.get_run("run-1")
+    assert persisted.provenance["cluster_server_id"] == "cluster-a"
+    assert persisted.provenance["cluster_session_id"] == original_session_id
+
+
+@pytest.mark.asyncio
+async def test_delete_execution_recovers_stale_or_missing_session_from_registered_cluster(
+    deployment_store, tmp_path, monkeypatch
+):
+    from pathlib import Path
+
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.cluster import sessions as cluster_sessions
+    from llm_d_lens.deploy import application
+
+    monkeypatch.setattr(cluster_sessions, "_sessions", {})
+    monkeypatch.setattr(cluster_sessions, "_SESSION_DIRECTORY", tmp_path / "sessions")
+    monkeypatch.setattr(
+        cluster_registry,
+        "cluster_settings",
+        SimpleNamespace(
+            session_directory=tmp_path / "sessions",
+            namespace_prefix=cluster_registry.cluster_settings.namespace_prefix,
+            data_directory=tmp_path / "cluster_data",
+        ),
+    )
+
+    cluster = ClusterDao().create("registered-cluster", "", "apiVersion: v1\nkind: Config")
+    repo_dir = tmp_path / "llm-d"
+    (repo_dir / "guides").mkdir(parents=True)
+
+    for label, stale_session_id in [("stale", str(uuid4())), ("missing", None)]:
+        run_id = f"run-restart-{label}"
+        exec_id = f"exec-restart-{label}"
+        prov = {
+            "cluster_server_id": cluster.id,
+            "deployment_source": {"resolved_repository": str(repo_dir)},
+        }
+        if stale_session_id is not None:
+            prov["cluster_session_id"] = stale_session_id
+        case = _case(run_id, 0, exec_id, DeploymentCaseStatus.READY).model_copy(update={"id": f"case-{run_id}"})
+        run = DeploymentRun(
+            id=run_id,
+            status=DeploymentRunStatus.SUCCEEDED,
+            cases=[case],
+            source_configurations=[
+                DeployableConfiguration(
+                    type="optimized-baseline", format="helm", provider_ref="optimized-baseline", checksum="checksum"
+                )
+            ],
+            provenance=prov,
+        )
+        deployment_store.create_run(run)
+        exec_rec = _execution(exec_id, DeploymentStatus.READY, f"ns-{label}").model_copy(
+            update={"provenance": dict(prov)}
+        )
+        deployment_store.save_execution(exec_rec)
+
+        captured_envs: list[dict[str, str] | None] = []
+        service = FakeDeploymentService()
+
+        def build_service(env, _captured=captured_envs, _svc=service):
+            _captured.append(env)
+            return (_svc, None)
+
+        manager = application.DeploymentRunManager(deployment_store)
+        # Seed a stale cached worker with a lifecycle_error to prove worker_for_run refreshes it.
+        manager._run_workers[run_id] = SimpleNamespace(_lifecycle_error="cluster session is no longer active")
+        monkeypatch.setattr(application, "build_deployment_service_from_environment", build_service)
+        monkeypatch.setattr(executions, "deployment_run_manager", manager)
+        monkeypatch.setattr("llm_d_lens.cluster.service.resolve_proxy_env", lambda _cid: {})
+
+        response = await router.delete_execution(exec_id)
+
+        assert response.status_code == 204
+        assert service.cleaned == [exec_id]
+        assert deployment_store.get_execution(exec_id) is None
+        assert deployment_store.get_run(run_id) is None
+        assert len(captured_envs) == 1
+        kubeconfig_path = Path(captured_envs[0]["KUBECONFIG"])
+        assert kubeconfig_path.is_file()
+        assert kubeconfig_path.parent == (tmp_path / "sessions").resolve()
+        assert captured_envs[0]["LLM_D_ROOT"] == str(repo_dir)
+
+
+@pytest.mark.asyncio
+async def test_delete_execution_refuses_when_cluster_unregistered_and_session_is_gone(
+    deployment_store, tmp_path, monkeypatch
+):
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.cluster import sessions as cluster_sessions
+    from llm_d_lens.deploy import application
+    from llm_d_lens.deploy.executions import DeploymentExecutionConflictError
+
+    monkeypatch.setattr(cluster_sessions, "_sessions", {})
+    monkeypatch.setattr(cluster_sessions, "_SESSION_DIRECTORY", tmp_path / "sessions")
+    monkeypatch.setattr(
+        cluster_registry,
+        "cluster_settings",
+        SimpleNamespace(
+            session_directory=tmp_path / "sessions",
+            namespace_prefix=cluster_registry.cluster_settings.namespace_prefix,
+            data_directory=tmp_path / "cluster_data",
+        ),
+    )
+
+    repo_dir = tmp_path / "llm-d"
+    (repo_dir / "guides").mkdir(parents=True)
+
+    run_id = "run-unregistered"
+    exec_id = "exec-unregistered"
+    prov = {
+        "cluster_server_id": "cluster-missing",
+        "cluster_session_id": str(uuid4()),
+        "deployment_source": {"resolved_repository": str(repo_dir)},
+    }
+    case = _case(run_id, 0, exec_id, DeploymentCaseStatus.READY).model_copy(update={"id": f"case-{run_id}"})
+    run = DeploymentRun(
+        id=run_id,
+        status=DeploymentRunStatus.SUCCEEDED,
+        cases=[case],
+        source_configurations=[
+            DeployableConfiguration(
+                type="optimized-baseline", format="helm", provider_ref="optimized-baseline", checksum="checksum"
+            )
+        ],
+        provenance=prov,
+    )
+    deployment_store.create_run(run)
+    deployment_store.save_execution(
+        _execution(exec_id, DeploymentStatus.READY, "ns-unreg").model_copy(update={"provenance": dict(prov)})
+    )
+
+    service = FakeDeploymentService()
+    manager = application.DeploymentRunManager(deployment_store)
+    monkeypatch.setattr(application, "build_deployment_service_from_environment", lambda _env: (service, None))
+    monkeypatch.setattr(executions, "deployment_run_manager", manager)
+    monkeypatch.setattr("llm_d_lens.cluster.service.resolve_proxy_env", lambda _cid: {})
+
+    with pytest.raises(DeploymentExecutionConflictError, match="cluster session is no longer active"):
+        await executions.delete_execution(exec_id)
+
+    response = await router.delete_execution(exec_id)
+    assert response.status_code == 409
+    body = _payload(response)
+    assert body["code"] == "deployment_conflict"
+    assert "cluster session is no longer active" in body["detail"]
+    assert service.cleaned == []
+    assert deployment_store.get_execution(exec_id) is not None
+    assert deployment_store.get_run(run_id) is not None
+
+    # Dropping only the Prism record (delete_namespace=False) still succeeds without an active cluster session
+    keep_ns_response = await router.delete_execution(exec_id, delete_namespace=False)
+    assert keep_ns_response.status_code == 204
+    assert service.cleaned == []
+    assert deployment_store.get_execution(exec_id) is None
+    assert deployment_store.get_run(run_id) is None
+
+
+@pytest.mark.asyncio
+async def test_unsafe_kubeconfig_permissions_not_swallowed_on_recovery_or_cached_worker(
+    deployment_store, tmp_path, monkeypatch
+):
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.cluster import sessions as cluster_sessions
+    from llm_d_lens.deploy import application
+    from llm_d_lens.deploy.executions import DeploymentExecutionConflictError
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True)
+    monkeypatch.setattr(cluster_sessions, "_sessions", {})
+    monkeypatch.setattr(cluster_sessions, "_SESSION_DIRECTORY", sessions_dir)
+    monkeypatch.setattr(
+        cluster_registry,
+        "cluster_settings",
+        SimpleNamespace(
+            session_directory=sessions_dir,
+            namespace_prefix=cluster_registry.cluster_settings.namespace_prefix,
+            data_directory=tmp_path / "cluster_data",
+        ),
+    )
+
+    kubeconfig_text = "apiVersion: v1\nkind: Config"
+    cluster = ClusterDao().create("unsafe-perm-cluster", "", kubeconfig_text)
+    repo_dir = tmp_path / "llm-d"
+    (repo_dir / "guides").mkdir(parents=True)
+
+    # Durable session file on disk with unsafe 0o644 permissions
+    durable_session_id = str(uuid4())
+    durable_kubeconfig = cluster_sessions.session_kubeconfig_path(durable_session_id)
+    durable_kubeconfig.write_text(kubeconfig_text)
+    durable_kubeconfig.chmod(0o644)
+
+    run_id = "run-unsafe"
+    exec_id = "exec-unsafe"
+    prov = {
+        "cluster_server_id": cluster.id,
+        "cluster_session_id": str(uuid4()),
+        "deployment_source": {"resolved_repository": str(repo_dir)},
+    }
+    case = _case(run_id, 0, exec_id, DeploymentCaseStatus.READY).model_copy(update={"id": f"case-{run_id}"})
+    deployment_store.create_run(
+        DeploymentRun(
+            id=run_id,
+            status=DeploymentRunStatus.SUCCEEDED,
+            cases=[case],
+            source_configurations=[
+                DeployableConfiguration(
+                    type="optimized-baseline", format="helm", provider_ref="optimized-baseline", checksum="checksum"
+                )
+            ],
+            provenance=prov,
+        )
+    )
+    deployment_store.save_execution(
+        _execution(exec_id, DeploymentStatus.READY, "ns-unsafe").model_copy(update={"provenance": dict(prov)})
+    )
+
+    manager = application.DeploymentRunManager(deployment_store)
+    monkeypatch.setattr(executions, "deployment_run_manager", manager)
+    monkeypatch.setattr("llm_d_lens.cluster.service.resolve_proxy_env", lambda _cid: {})
+
+    # 1. Registered-cluster recovery must surface unsafe permissions instead of bypassing chmod checks
+    with pytest.raises(DeploymentExecutionConflictError, match="unsafe permissions"):
+        await executions.delete_execution(exec_id)
+
+    # 2. Cached worker check must also surface unsafe permissions when the cached session file becomes 0o644
+    run = deployment_store.get_run(run_id)
+    run.provenance["cluster_session_id"] = durable_session_id
+    deployment_store.save_run(run)
+    manager._run_workers[run_id] = SimpleNamespace(_lifecycle_error=None)
+    with pytest.raises(ValueError, match="unsafe permissions"):
+        manager.worker_for_run(run_id)
+
+
+@pytest.mark.asyncio
+async def test_worker_for_run_preserves_active_inflight_worker_and_delete_handles_disabled_runtime(
+    deployment_store, tmp_path, monkeypatch
+):
+    import asyncio
+
+    from llm_d_lens.cluster import sessions as cluster_sessions
+    from llm_d_lens.deploy import application
+
+    monkeypatch.setattr(cluster_sessions, "_sessions", {})
+    monkeypatch.setattr(cluster_sessions, "_SESSION_DIRECTORY", tmp_path / "sessions")
+
+    run_id = "run-inflight"
+    exec_id = "exec-inflight"
+    prov = {
+        "cluster_server_id": "cluster-missing",
+        "cluster_session_id": str(uuid4()),
+    }
+    case = _case(run_id, 0, exec_id, DeploymentCaseStatus.READY).model_copy(update={"id": f"case-{run_id}"})
+    deployment_store.create_run(
+        DeploymentRun(
+            id=run_id,
+            status=DeploymentRunStatus.SUCCEEDED,
+            cases=[case],
+            source_configurations=[
+                DeployableConfiguration(
+                    type="optimized-baseline", format="helm", provider_ref="optimized-baseline", checksum="checksum"
+                )
+            ],
+            provenance=prov,
+        )
+    )
+    deployment_store.save_execution(
+        _execution(exec_id, DeploymentStatus.READY, "ns-inflight").model_copy(update={"provenance": dict(prov)})
+    )
+
+    manager = application.DeploymentRunManager(deployment_store)
+    inflight_worker = SimpleNamespace(_lifecycle_error=None)
+    manager._run_workers[run_id] = inflight_worker
+    gate = asyncio.Event()
+    task = asyncio.create_task(gate.wait())
+    manager._run_tasks[run_id] = task
+    try:
+        # Session is inactive, but the run is actively executing -> keep the in-flight worker instance
+        assert manager.worker_for_run(run_id) is inflight_worker
+    finally:
+        gate.set()
+        await task
+
+    # With runtime disabled (build_deployment_service_from_environment -> None),
+    # delete_namespace=False still drops Prism records via the RuntimeConfigurationError fallback.
+    manager._run_workers.clear()
+    monkeypatch.setattr(application, "build_deployment_service_from_environment", lambda _env: None)
+    monkeypatch.setattr(executions, "deployment_run_manager", manager)
+    monkeypatch.setattr("llm_d_lens.cluster.service.resolve_proxy_env", lambda _cid: {})
+
+    response = await router.delete_execution(exec_id, delete_namespace=False)
+    assert response.status_code == 204
+    assert deployment_store.get_execution(exec_id) is None
+    assert deployment_store.get_run(run_id) is None

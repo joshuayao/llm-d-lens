@@ -176,10 +176,31 @@ class DeploymentRunManager:
             )
         )
 
+    def _cached_worker_session_is_active(self, run_id: str) -> bool:
+        if not callable(getattr(self.store, "get_run", None)):
+            return True
+        run = self.store.get_run(run_id)
+        if run is None:
+            return True
+        session_id = run.provenance.get("cluster_session_id")
+        if not session_id:
+            return not run.provenance.get("cluster_server_id")
+        try:
+            deployment_runtime_overrides(session_id)
+        except ValueError as error:
+            if str(error) == "cluster session is no longer active":
+                return False
+            raise
+        return True
+
     def worker_for_run(self, run_id: str) -> DeploymentRunWorker:
         cached = self._run_workers.get(run_id)
         if cached is not None:
-            return cached
+            if not getattr(cached, "_lifecycle_error", None) and (
+                self.is_run_active(run_id) or self._cached_worker_session_is_active(run_id)
+            ):
+                return cached
+            self._run_workers.pop(run_id, None)
         run = self.store.get_run(run_id)
         if run is None:
             raise ValueError("deployment run not found")
@@ -338,27 +359,76 @@ class DeploymentRunManager:
         repository = source.get("resolved_repository") if isinstance(source, dict) else None
         return not repository or Path(str(repository)).is_dir()
 
+    def _rebind_session_for_registered_cluster(self, run, cluster_server_id: str) -> dict[str, str] | None:
+        from llm_d_lens.cluster.errors import ClusterOverviewError
+        from llm_d_lens.cluster.service import get_cluster_session
+
+        try:
+            _cluster, session = get_cluster_session(cluster_server_id)
+        except (ClusterOverviewError, ValueError, OSError):
+            return None
+        if getattr(session, "server_id", None) != cluster_server_id:
+            return None
+        try:
+            runtime_overrides = deployment_runtime_overrides(session.id)
+        except ValueError as error:
+            if str(error) == "cluster session is no longer active":
+                return None
+            raise
+        run.provenance["cluster_session_id"] = session.id
+        run_id = getattr(run, "id", None)
+        if (
+            run_id
+            and callable(getattr(self.store, "get_run", None))
+            and callable(getattr(self.store, "save_run", None))
+        ):
+            persisted = self.store.get_run(run_id)
+            if persisted is not None:
+                persisted.provenance["cluster_session_id"] = session.id
+                self.store.save_run(persisted)
+                self._run_workers.pop(run_id, None)
+        return runtime_overrides
+
+    def _resolve_run_runtime_overrides(self, run) -> tuple[dict[str, str], str | None]:
+        if run is None:
+            return {}, None
+        session_id = run.provenance.get("cluster_session_id")
+        cluster_server_id = run.provenance.get("cluster_server_id")
+        if session_id:
+            try:
+                return deployment_runtime_overrides(session_id), None
+            except ValueError as error:
+                if str(error) != "cluster session is no longer active":
+                    raise
+        elif not cluster_server_id:
+            return {}, None
+
+        if cluster_server_id:
+            recovered = self._rebind_session_for_registered_cluster(run, str(cluster_server_id))
+            if recovered is not None:
+                return recovered, None
+
+        return (
+            {"KUBECONFIG": current_host().null_device},
+            "cluster session is no longer active; reconnect the original cluster before changing this deployment",
+        )
+
     def _worker(self, run=None) -> DeploymentRunWorker:
         source = run.provenance.get("deployment_source") if run else None
         resolved_repository = source.get("resolved_repository") if isinstance(source, dict) else None
-        session_id = run.provenance.get("cluster_session_id") if run else None
         if run is not None and not resolved_repository:
             cluster_server_id = run.provenance.get("cluster_server_id")
             if cluster_server_id:
-                resolved_repository = cluster_deployment_source(
-                    SimpleNamespace(server_id=cluster_server_id),
-                    source if isinstance(source, dict) else None,
-                )["resolved_repository"]
-        lifecycle_error = None
-        try:
-            runtime_overrides = deployment_runtime_overrides(session_id)
-        except ValueError as error:
-            if not session_id or str(error) != "cluster session is no longer active":
-                raise
-            lifecycle_error = (
-                "cluster session is no longer active; reconnect the original cluster before changing this deployment"
-            )
-            runtime_overrides = {"KUBECONFIG": current_host().null_device}
+                from llm_d_lens.cluster.errors import ClusterOverviewError
+
+                try:
+                    resolved_repository = cluster_deployment_source(
+                        SimpleNamespace(server_id=cluster_server_id),
+                        source if isinstance(source, dict) else None,
+                    )["resolved_repository"]
+                except ClusterOverviewError:
+                    resolved_repository = None
+        runtime_overrides, lifecycle_error = self._resolve_run_runtime_overrides(run)
         accelerator = _deploy_accelerator(run)
         accelerator_env = {"PRISM_DEPLOY_ACCELERATOR": accelerator} if accelerator else {}
         # The cluster's saved proxy configuration is authoritative for anything
