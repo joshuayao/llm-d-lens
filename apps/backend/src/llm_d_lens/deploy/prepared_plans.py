@@ -396,9 +396,7 @@ async def prepare(manager, request, *, owner_user_id: str | None = None) -> Depl
         frozen["manifest_checksum"] = text_checksum(manifest)
         artifacts.append({"artifact": frozen, "manifest": manifest, "context": context})
     raw_target_ns = request.provenance.get("target_namespace")
-    requested_target_ns = (
-        raw_target_ns.strip() if isinstance(raw_target_ns, str) and raw_target_ns.strip() else None
-    )
+    requested_target_ns = raw_target_ns.strip() if isinstance(raw_target_ns, str) and raw_target_ns.strip() else None
     payload = {
         "schemaVersion": "deployment-plan.v1",
         "requestIdentity": identity,
@@ -481,9 +479,7 @@ async def _ensure_consume_permissions(
         storage_volume_id = runtime.get("storageVolumeId")
         uses_storage = bool(storage_volume_id or contract.get("preparedStorage"))
         documents = plan_documents(plan, index)
-        uses_lws = bool(disaggregated_sets(documents)) or any(
-            doc.get("kind") == "LeaderWorkerSet" for doc in documents
-        )
+        uses_lws = bool(disaggregated_sets(documents)) or any(doc.get("kind") == "LeaderWorkerSet" for doc in documents)
         manifest_parts = [entry.get("manifest") or ""]
         if bundle:
             frozen_manifest = (bundle.get("frozen") or {}).get("manifest")
@@ -497,9 +493,7 @@ async def _ensure_consume_permissions(
             request.provenance.get("deployment_name")
             or case_prov.get("deployment_name")
             or (
-                (case.create_request.deployment_policy.value or {}).get("deployment_name")
-                if case is not None
-                else None
+                (case.create_request.deployment_policy.value or {}).get("deployment_name") if case is not None else None
             )
         )
         agentic_run_id = request.provenance.get("agentic_deployment_run_id") or case_prov.get(
@@ -533,9 +527,7 @@ async def consume(manager, request, *, owner_user_id: str | None = None):
         raise ValueError("Configuration, runtime binding or cluster changed; prepare a new plan")
     artifacts = plan.payload.get("artifacts") or []
     raw_target_ns = request.provenance.get("target_namespace")
-    requested_target_ns = (
-        raw_target_ns.strip() if isinstance(raw_target_ns, str) and raw_target_ns.strip() else None
-    )
+    requested_target_ns = raw_target_ns.strip() if isinstance(raw_target_ns, str) and raw_target_ns.strip() else None
     if requested_target_ns is not None:
         frozen_single_ns = artifacts[0]["context"]["namespace"] if len(artifacts) == 1 else None
         allowed_target_ns = {

@@ -1590,7 +1590,9 @@ async def test_deploy_and_agentic_approve_map_admin_setup_required_to_403_and_al
         },
     )
     svc._runs[svc_run.id] = svc_run
-    monkeypatch.setattr(agentic_service_mod, "require_active_session", lambda sid: SimpleNamespace(id=sid, server_id="cluster-nonadmin"))
+    monkeypatch.setattr(
+        agentic_service_mod, "require_active_session", lambda sid: SimpleNamespace(id=sid, server_id="cluster-nonadmin")
+    )
     monkeypatch.setattr(svc, "_validate_model_cache", lambda *_args: asyncio.sleep(0, result=None))
     monkeypatch.setattr(
         agentic_service_mod,
@@ -1626,6 +1628,7 @@ async def test_deploy_and_agentic_approve_map_admin_setup_required_to_403_and_al
         capabilities.DeploymentCapabilityUnavailableError("SSAR unavailable"),
         capabilities.DeploymentClusterAuthError("401 Unauthorized"),
     ):
+
         async def fail_reviewed(*_args, _err=recoverable_err, **_kwargs):
             raise _err
 

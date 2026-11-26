@@ -896,9 +896,7 @@ async def test_prepare_honors_verified_and_bootstrapped_target_namespace_and_rej
     worker = SimpleNamespace(prepare_case=AsyncMock(side_effect=fake_prepare_case))
 
     # 1. Verified namespace via peek_verified_namespace (non-destructive; still available for consume)
-    capabilities.record_verified_namespace(
-        "cluster-a", "llmd-peeked-ns", agentic_deployment_run_id="agentic-1"
-    )
+    capabilities.record_verified_namespace("cluster-a", "llmd-peeked-ns", agentic_deployment_run_id="agentic-1")
     req1, run1 = build_request_and_run(agentic_run_id="agentic-1")
     monkeypatch.setattr(prepared_plans.DeploymentPlanService, "build_run", lambda *_args: run1)
     manager1 = SimpleNamespace(
@@ -912,10 +910,7 @@ async def test_prepare_honors_verified_and_bootstrapped_target_namespace_and_rej
         "namespace_policy": {"exact": "llmd-peeked-ns"},
         "target_namespace": "llmd-peeked-ns",
     }
-    assert (
-        capabilities.peek_verified_namespace("cluster-a", agentic_deployment_run_id="agentic-1")
-        == "llmd-peeked-ns"
-    )
+    assert capabilities.peek_verified_namespace("cluster-a", agentic_deployment_run_id="agentic-1") == "llmd-peeked-ns"
 
     # 2. Fallback to explicit target_namespace + is_bootstrap_marker_present when not in memory map
     async def marker_present(cluster_id, namespace, **_kwargs):
@@ -1099,7 +1094,9 @@ async def test_consume_enforces_non_admin_permission_gate_and_consumes_verified_
     )
     monkeypatch.setattr(cluster_registry, "cluster_kubeconfig_namespace", lambda _cid: None)
     monkeypatch.setattr(
-        prepared_plans, "require_active_session", lambda _sid: SimpleNamespace(id="sess-1", server_id="cluster-nonadmin")
+        prepared_plans,
+        "require_active_session",
+        lambda _sid: SimpleNamespace(id="sess-1", server_id="cluster-nonadmin"),
     )
     monkeypatch.setattr(application, "cluster_deployment_source", lambda *_args: {})
     monkeypatch.setattr(prepared_plans, "preflight", AsyncMock(return_value={"status": "pass"}))
@@ -1160,7 +1157,9 @@ async def test_consume_enforces_non_admin_permission_gate_and_consumes_verified_
         },
     )
     worker = SimpleNamespace(
-        prepare_case=AsyncMock(return_value=(artifact, {"namespace": "llmd-pd-target", "runtime": {"storageVolumeId": "vol-1"}}))
+        prepare_case=AsyncMock(
+            return_value=(artifact, {"namespace": "llmd-pd-target", "runtime": {"storageVolumeId": "vol-1"}})
+        )
     )
     stored_runs: dict[str, DeploymentRun] = {}
 
@@ -1215,9 +1214,7 @@ async def test_consume_enforces_non_admin_permission_gate_and_consumes_verified_
     assert seen_perm_requests[0].prepared_plan_id == plan.id
     assert DeploymentPlanDao().get(plan.id).status == "prepared"
     manager._schedule_run.assert_not_called()
-    assert (
-        capabilities.peek_verified_namespace("cluster-nonadmin", prepared_plan_id=plan.id) is None
-    )
+    assert capabilities.peek_verified_namespace("cluster-nonadmin", prepared_plan_id=plan.id) is None
     assert (
         capabilities.consume_verified_namespace("cluster-nonadmin", agentic_deployment_run_id="agentic-gate-1")
         == "llmd-other-verified"
@@ -1309,7 +1306,9 @@ async def test_consume_target_namespace_reconciles_between_prepare_and_consume(m
             manifest_ref=str(manifest_file),
             deployment_contract={},
         )
-        worker = SimpleNamespace(prepare_case=AsyncMock(return_value=(artifact, {"namespace": frozen_ns, "runtime": {}})))
+        worker = SimpleNamespace(
+            prepare_case=AsyncMock(return_value=(artifact, {"namespace": frozen_ns, "runtime": {}}))
+        )
         stored: dict[str, DeploymentRun] = {}
 
         def create_run_fn(new_run):

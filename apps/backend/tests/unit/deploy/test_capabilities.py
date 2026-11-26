@@ -821,7 +821,12 @@ def test_verify_prepared_bootstrap_marker_accepts_empty_and_matching_prepared_re
     assert (
         asyncio.run(
             make_adapter(
-                {"status": "completed", "clusterId": "cluster-a", "namespace": "llmd-ns", "preparedRequest": "req-fresh"}
+                {
+                    "status": "completed",
+                    "clusterId": "cluster-a",
+                    "namespace": "llmd-ns",
+                    "preparedRequest": "req-fresh",
+                }
             )._verify_prepared_bootstrap_marker("llmd-ns", expected, cluster_id="cluster-a")
         )
         is True
@@ -830,7 +835,12 @@ def test_verify_prepared_bootstrap_marker_accepts_empty_and_matching_prepared_re
     assert (
         asyncio.run(
             make_adapter(
-                {"status": "completed", "clusterId": "cluster-a", "namespace": "llmd-ns", "preparedRequest": "req-stale"}
+                {
+                    "status": "completed",
+                    "clusterId": "cluster-a",
+                    "namespace": "llmd-ns",
+                    "preparedRequest": "req-stale",
+                }
             )._verify_prepared_bootstrap_marker("llmd-ns", expected, cluster_id="cluster-a")
         )
         is False
@@ -884,10 +894,12 @@ def test_verify_prepared_bootstrap_marker_accepts_empty_and_matching_prepared_re
         == "llmd-ns-plan"
     )
     assert (
-        caps.consume_verified_namespace("cluster-a", owner_user_id="alice", prepared_plan_id="plan-1")
-        == "llmd-ns-plan"
+        caps.consume_verified_namespace("cluster-a", owner_user_id="alice", prepared_plan_id="plan-1") == "llmd-ns-plan"
     )
-    assert caps.peek_verified_namespace("cluster-a", owner_user_id="alice", agentic_deployment_run_id="run-1") == "llmd-ns-run"
+    assert (
+        caps.peek_verified_namespace("cluster-a", owner_user_id="alice", agentic_deployment_run_id="run-1")
+        == "llmd-ns-run"
+    )
     assert (
         caps.consume_verified_namespace("cluster-a", owner_user_id="alice", agentic_deployment_run_id="run-1")
         == "llmd-ns-run"
@@ -936,7 +948,12 @@ def test_generate_bootstrap_script_resolves_prepared_request_from_prepared_plan(
             "clusterId": req.cluster_id,
             "namespace": req.namespace,
             "namespaceLabels": {},
-            "identity": {"kind": "ServiceAccount", "name": "sa", "namespace": "lens", "subject": "system:serviceaccount:lens:sa"},
+            "identity": {
+                "kind": "ServiceAccount",
+                "name": "sa",
+                "namespace": "lens",
+                "subject": "system:serviceaccount:lens:sa",
+            },
             "adminOperations": [{"id": "deploy.namespace"}],
             "eppServiceAccounts": [],
             "usesRouter": False,
