@@ -189,6 +189,7 @@ def configuration_snapshot(run: dict) -> tuple[DeployableConfiguration, Candidat
     topology = configuration.provider_ref
     cpu_cache = (content.get("guideComposition") or {}).get("nativeCpuCacheGiB")
     prefix_routing = content.get("prefixRouting")
+    precise_routing = False
     if configuration.provider_ref == "source-composition":
         import yaml
 
@@ -228,9 +229,10 @@ def configuration_snapshot(run: dict) -> tuple[DeployableConfiguration, Candidat
         if topology is None:
             raise ValueError("Source evidence requires an unambiguous source recipe matching the rendered roles")
         cpu_cache = next(iter(cache_capacities)) if len(cache_capacities) == 1 else None
-        prefix_routing = any(
-            item["id"] == "affinity" and item["state"] == "configured"
-            for item in rendered_optimizations(parsed, source.get("commit", ""))["features"]
+        rendered_features = rendered_optimizations(parsed, source.get("commit", ""))["features"]
+        prefix_routing = any(item["id"] == "affinity" and item["state"] == "configured" for item in rendered_features)
+        precise_routing = topology in {"optimized-baseline", "pd-disaggregation"} and any(
+            item["id"] == "index" and item["state"] == "configured" for item in rendered_features
         )
     candidate = CandidateConfiguration.model_validate(
         {
@@ -240,7 +242,7 @@ def configuration_snapshot(run: dict) -> tuple[DeployableConfiguration, Candidat
             "prefill_tp": prefill.get("tensorParallelSize"),
             "prefill_replicas": prefill.get("replicaCount"),
             "optimizations": tuple(filter(None, [content.get("guideVariant")]))
-            + composition_markers(cpu_cache, prefix_routing),
+            + composition_markers(cpu_cache, prefix_routing, precise_routing=precise_routing),
         },
         strict=True,
     )

@@ -153,6 +153,54 @@ def test_source_evidence_keeps_recipe_and_requires_referenced_router_config(run,
         evidence.configuration_snapshot(run)
 
 
+def test_source_recipe_identity_and_markers_support_pd_precise_donor():
+    from llm_d_lens.agentic import benchmark_evidence as agentic_evidence
+
+    assert (
+        agentic_evidence.source_recipe_identity(
+            [
+                "guides/pd-disaggregation/modelserver/gpu/vllm/base",
+                "guides/precise-prefix-cache-routing/modelserver/gpu/vllm/base",
+                "guides/precise-prefix-cache-routing/router/precise-prefix-cache-routing.values.yaml",
+            ],
+            has_prefill=True,
+        )
+        == "pd-disaggregation"
+    )
+    assert (
+        agentic_evidence.source_recipe_identity(
+            [
+                "guides/optimized-baseline/modelserver/gpu/vllm/base",
+                "guides/precise-prefix-cache-routing/modelserver/gpu/vllm/base",
+            ],
+            has_prefill=False,
+        )
+        == "optimized-baseline"
+    )
+    assert (
+        agentic_evidence.source_recipe_identity(
+            [
+                "guides/optimized-baseline/modelserver/gpu/vllm/base",
+                "guides/pd-disaggregation/modelserver/gpu/vllm/base",
+            ],
+            has_prefill=True,
+        )
+        is None
+    )
+    markers = agentic_evidence.composition_markers(4, True, precise_routing=True)
+    assert markers == ("native-cpu-cache:4GiB", "prefix-routing:on", "precise-routing:on")
+    pd_approx = agentic_evidence.CandidateConfiguration(
+        topology="pd-disaggregation",
+        decode_tp=2,
+        decode_replicas=1,
+        prefill_tp=1,
+        prefill_replicas=2,
+        optimizations=agentic_evidence.composition_markers(4, True, precise_routing=False),
+    )
+    pd_precise = pd_approx.model_copy(update={"optimizations": markers})
+    assert agentic_evidence.composition_identity(pd_approx) != agentic_evidence.composition_identity(pd_precise)
+
+
 def test_uses_actual_p95_fraction_and_original_time_not_medians_or_current_facts(run):
     records, issues = evidence.normalize_evaluate_run(run)
     assert not issues

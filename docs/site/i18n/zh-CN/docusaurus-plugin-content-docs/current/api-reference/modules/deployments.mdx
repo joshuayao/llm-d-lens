@@ -248,7 +248,7 @@ Manual 收到平均 `inputTokens` 和 `outputTokens` 时，比较 AIC 对 P/D �
 `ttftMs`/`tpotMs`，再看吞吐），并将结果写入 `requirements.workload.aicPrefillDecode` 和
 `aicPrefillDecodeReason`；没有 AIC 结果时 P/D 保持开启。Manual 还会根据同一拓扑的 AIC 预测设置每个候选的
 `slo_status`，先按 SLA 状态、再按 P/D 决策、再按勾选的优化排序；不满足 SLA 的候选排在最后而不是报错，
-且不会选择 `precise-prefix-cache-routing`。提供负载目标时，两种模式在 AIC 支持当前模型与硬件时都用 AIC 确定拓扑规模。
+并在源码渲染阶段将 `precise-prefix-cache-routing` 组合到兼容服务拓扑上，而不保留独立的精确路由种子候选。提供负载目标时，两种模式在 AIC 支持当前模型与硬件时都用 AIC 确定拓扑规模。
 
 **`POST /api/agentic-deployments/optimizations/preview`** 根据 `requirements` 请求体和可选的
 调用方上报 `available_accelerators` 返回相同的 `optimization_choices`。该接口为纯计算，

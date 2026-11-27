@@ -59,6 +59,7 @@
     ["cache-implementation", "OffloadingConnector|LMCacheConnector|MooncakeConnector|--enable-hierarchical-cache\\b|TPURaidenOffloadingConnector"],
     ["cpu-affinity", "lruCapacityPerServer|cpu-prefix-cache|cpu-cache-scorer"],
     ["turn-priority", "turn-priority"],
+    ["index", "precise-prefix-cache-producer"],
     ["affinity", "prefix-cache-affinity-filter"],
     ["load-routing", "token-load-scorer"]
   ],

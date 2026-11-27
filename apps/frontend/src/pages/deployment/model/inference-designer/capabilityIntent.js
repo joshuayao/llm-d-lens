@@ -90,6 +90,29 @@ export function expandCapabilityIntent(catalog, guides, options) {
         const owned = capabilities.filter(cap => cap.guide === guide && !cap.id.startsWith('guide:') && !engineOptions.has(cap.id));
         return !owned.length || owned.some(cap => enabled.has(cap.id));
     });
-    const omitted = expanded.filter(id => !retained.includes(id));
-    return { guides: retained, wholeGuides, variables, choices: choices.filter(choice => !omitted.includes(choice.guide)), errors: errors.filter(error => !omitted.some(id => error.startsWith(`${id}:`))), enabled: [...enabled], overrides };
+    if (enabled.has('index')) {
+        if (overrides.prefix === false) errors.push('Enable prefix caching before enabling precise prefix-cache routing.');
+        if (overrides.affinity === false) errors.push('Enable prefix-cache affinity before enabling precise prefix-cache routing.');
+    }
+    let composedGuides = retained;
+    const primaryServing = retained.includes('pd-disaggregation') ? 'pd-disaggregation'
+        : retained.includes('optimized-baseline') && !wholeGuides.includes('precise-prefix-cache-routing') ? 'optimized-baseline' : null;
+    if (primaryServing && retained.includes('precise-prefix-cache-routing')) {
+        const preciseGuide = catalog.guides.find(item => item.id === 'precise-prefix-cache-routing');
+        if (!preciseGuide) errors.push('Guide precise-prefix-cache-routing is absent from the selected source revision.');
+        else {
+            const support = preciseGuide.support?.accelerators?.[options.accelerator];
+            const modelServer = variables[primaryServing]?.MODEL_SERVER || options.variables?.[primaryServing]?.MODEL_SERVER || 'vllm';
+            if (modelServer !== 'vllm') errors.push('Precise routing composition requires the vLLM model server.');
+            else if (preciseGuide.support?.accelerators) {
+                const engine = support?.engines?.vllm;
+                if (!support || !engine || engine === 'unsupported' || engine.status === 'unsupported') {
+                    errors.push(`precise-prefix-cache-routing: ${options.accelerator || 'unset hardware'} / vllm is not supported by this source revision.`);
+                }
+            }
+        }
+        composedGuides = retained.filter(id => id !== 'precise-prefix-cache-routing');
+    }
+    const omitted = expanded.filter(id => !composedGuides.includes(id));
+    return { guides: composedGuides, wholeGuides, variables, choices: choices.filter(choice => !omitted.includes(choice.guide)), errors: errors.filter(error => !omitted.some(id => error.startsWith(`${id}:`) && !(id === 'precise-prefix-cache-routing' && retained.includes('precise-prefix-cache-routing')))), enabled: [...enabled], overrides };
 }

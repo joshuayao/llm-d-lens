@@ -87,8 +87,8 @@ it. Prefill / Decode separation is on by default with at least two usable accele
 With mean input and output tokens, AIC compares its best P/D and combined-serving
 predictions, preferring the one that meets the SLA and then higher throughput; when AIC
 cannot evaluate the model and hardware, P/D stays on. Topologies that miss the SLA are
-ranked last. Manual does not use precise prefix-cache routing; prefix-aware routing is
-used instead.
+ranked last. Compatible precise prefix-cache routing is composed automatically onto
+P/D and combined serving topologies during source checks.
 
 | Goal | Topology preference when no measured or AIC evidence exists |
 | --- | --- |

@@ -59,12 +59,36 @@ test('manual includes compatible additions; agentic keeps only objective-relevan
 });
 
 test('manual uses one fixed priority while agentic follows the objective', () => {
-    assert.deepEqual(MANUAL_PRIORITY.slice(0, 5), ['prefix', 'chunked', 'affinity', 'load-routing', 'cache']);
-    assert.ok(!MANUAL_PRIORITY.includes('index'));
+    assert.deepEqual(MANUAL_PRIORITY.slice(0, 6), ['prefix', 'chunked', 'affinity', 'index', 'load-routing', 'cache']);
+    assert.ok(MANUAL_PRIORITY.includes('index'));
     assert.equal(objectivePriority({ objective: 'throughput', scenario: 'chat' })[0], 'chunked');
     assert.ok(objectivePriority({ objective: 'reliability', scenario: 'chat' }).includes('flow-control'));
     assert.ok(!objectivePriority({ objective: 'latency', scenario: 'chat' }).includes('flow-control'));
     assert.equal(objectivePriority({ objective: 'latency', scenario: 'agent' })[0], 'prefix');
+});
+
+test('manual and agentic automatically enable precise routing alongside P/D disaggregation when supported', () => {
+    const pd = { id: 'pd-disaggregation', title: 'P/D', variables: {}, steps: { deploy: {
+        worker: [{ run: 'kubectl apply -k SOURCE/guides/pd-disaggregation/modelserver/base' }],
+        router: [{ run: 'helm upgrade --install pd-disaggregation oci://example/llm-d-router-standalone -f SOURCE/guides/pd-disaggregation/router/values.yaml' }],
+    } } };
+    const precise = { id: 'precise-prefix-cache-routing', title: 'Precise', variables: {}, support: { accelerators: { fixture: { engines: { vllm: 'validated' } } } }, steps: { deploy: {
+        worker: [{ run: 'kubectl apply -k SOURCE/guides/precise-prefix-cache-routing/modelserver/base' }],
+    } } };
+    const source = { ...catalog, guides: [...catalog.guides, pd, precise], assets: [...catalog.assets,
+        { path: 'guides/pd-disaggregation/modelserver/base', guide: 'pd-disaggregation', kind: 'kustomize' },
+        { path: 'guides/pd-disaggregation/router/values.yaml', guide: 'pd-disaggregation', kind: 'values', content: 'router:\n  epp:\n    pluginsConfigFile: pd.yaml\n    pluginsCustomConfig:\n      pd.yaml: |\n        plugins:\n          - type: prefix-cache-affinity-filter\n          - type: token-load-scorer\n' },
+        { path: 'guides/precise-prefix-cache-routing/modelserver/base', guide: 'precise-prefix-cache-routing', kind: 'kustomize' },
+    ] };
+    for (const planningMode of ['manual', 'agentic']) {
+        const result = recommendOptimizations(source, {
+            ...draft(), planningMode, selectedGuides: ['pd-disaggregation'],
+            runtimeConfiguration: { tp: 1, replicas: 1, prefillTp: 1, prefillReplicas: 1 },
+        }, profile);
+        assert.deepEqual(result.selectedGuides, ['pd-disaggregation']);
+        assert.equal(result.capabilityOverrides.index, true);
+        assert.equal(result.optimizationDecisions.find(item => item.id === 'index').state, 'selected');
+    }
 });
 
 test('slice topology keys run narrow to wide and P/D display reads DisaggregatedSet roles', () => {

@@ -770,7 +770,7 @@ def apply_runtime(parsed: list[dict], runtime: dict, model: str) -> None:
             claim_sizes[identity] = tp
             set_accelerator_request(engines[0], claim, tp, accelerator=profile.id)
         for container in engines:
-            configure_model_server(container, model, tp, model, False)
+            configure_model_server(container, model, tp, model, True)
             apply_runtime_overrides(container, [row for row in rows if row.get("target") in {"both", role}])
             for group in ("requests", "limits"):
                 for key in container.get("resources", {}).get(group, {}):
@@ -1527,6 +1527,62 @@ async def compose(request, body: dict, shared: dict | None = None) -> dict:
         raise GuideError("Optimization overrides must be booleans.")
     router_controls(parsed, catalog, overrides)
     engine_controls(parsed, overrides, intent)
+    from llm_d_lens.configuration.guide_composition import (
+        compose_precise_routing,
+        has_precise_router_policy,
+        reconcile_precise_routing,
+    )
+
+    if overrides.get("index") is True and not has_precise_router_policy(parsed):
+        if overrides.get("prefix") is False:
+            raise GuideError("Enable prefix caching before enabling precise prefix-cache routing.")
+        if overrides.get("affinity") is False:
+            raise GuideError("Enable prefix-cache affinity before enabling precise prefix-cache routing.")
+        variant = (body.get("guideSelection") or {}).get("accelerator")
+        precise_candidates = [
+            asset
+            for asset in catalog["assets"]
+            if asset["kind"] == "kustomize"
+            and asset["guide"] == "precise-prefix-cache-routing"
+            and f"/{variant}/" in asset["path"]
+            and re.search(r"/vllm(?:/base)?$", asset["path"])
+        ]
+        precise_donor = next(
+            (item for item in precise_candidates if item["path"].endswith(("/vllm/base", f"/{variant}/vllm"))),
+            precise_candidates[0] if precise_candidates else None,
+        )
+        router_candidates = [
+            asset
+            for asset in catalog["assets"]
+            if asset["kind"] == "values" and asset["guide"] == "precise-prefix-cache-routing"
+        ]
+        router_donor = next(
+            (item for item in router_candidates if item["path"].endswith("/precise-prefix-cache-routing.values.yaml")),
+            router_candidates[0] if router_candidates else None,
+        )
+        if precise_donor is None or router_donor is None:
+            raise GuideError("The pinned source has no precise prefix-cache routing adapter for this accelerator.")
+        rendered_precise = await render_unit(
+            root,
+            catalog,
+            {
+                "path": precise_donor["path"],
+                "namespace": body["namespace"],
+                "runtimeImage": effective_unit_image,
+                "variables": (body.get("variables") or {}).get("precise-prefix-cache-routing"),
+            },
+        )
+        router_values_docs = documents(router_donor["content"])
+        parsed = compose_precise_routing(
+            parsed,
+            rendered_precise["documents"],
+            router_values_docs[0] if router_values_docs else {},
+            model=binding["model"],
+            namespace=body["namespace"],
+        )
+        provenance.append({"path": precise_donor["path"], "checksum": checksum(rendered_precise["content"])})
+        provenance.append({"path": router_donor["path"], "checksum": router_donor["checksum"]})
+        lap("precise_routing")
     if body.get("nativeCpuCacheGiB") is not None:
         from llm_d_lens.configuration.guide_composition import compose_native_cpu_cache
 
@@ -1567,6 +1623,7 @@ async def compose(request, body: dict, shared: dict | None = None) -> dict:
         lap("cpu_cache")
     bind_model(parsed, binding, explicit_image if explicit_override else cluster_vllm_image)
     apply_runtime(parsed, body.get("runtimeConfiguration"), binding["model"])
+    reconcile_precise_routing(parsed, binding["model"])
     slice_layout = await resolve_slice_layout(request, body, parsed)
     lap("slice_layout")
     validate_engine_parameters(parsed)
@@ -1598,7 +1655,7 @@ async def compose(request, body: dict, shared: dict | None = None) -> dict:
                     raise GuideError(str(error)) from error
     resource_references(parsed)
     facts = rendered_optimizations(parsed, catalog["commit"])
-    for identifier in ("prefix", "chunked", "affinity", "load-routing"):
+    for identifier in ("prefix", "chunked", "affinity", "load-routing", "index"):
         if identifier not in overrides:
             continue
         state = next(item["state"] for item in facts["features"] if item["id"] == identifier)

@@ -49,7 +49,7 @@ const confirmation = {
 };
 
 /** Fixed Manual order: earlier entries win when two optimizations are mutually exclusive. */
-export const MANUAL_PRIORITY = ['prefix', 'chunked', 'affinity', 'load-routing', 'cache', 'flow-control'];
+export const MANUAL_PRIORITY = ['prefix', 'chunked', 'affinity', 'index', 'load-routing', 'cache', 'flow-control'];
 /** Agentic only turns on optimizations expected to help the selected objective. */
 export function objectivePriority(intent) {
     if (intent.scenario === 'agent') return ['prefix', 'affinity', 'index', 'chunked', 'load-routing', 'cache'];
@@ -117,7 +117,6 @@ export function recommendOptimizations(catalog, draft, profile, { strictTopology
         if (option.maturity === 'deprecated' || option.maturity === 'experimental') reason = `${option.maturity}: explicit review required.`;
         else if (['requires-adapter', 'external-operation', 'unavailable'].includes(option.generation)) reason = option.reason;
         else if (option.selection === 'recipe' || option.selection === 'parameter') reason = 'Controlled by source parameters, not an independent switch.';
-        else if (manual && id === 'index') reason = 'Not offered in Manual; prefix-aware routing is used instead. Enable it here to override.';
         else if (confirmation[id] && (!manual || !['transfer', 'coordinator'].includes(id))) reason = confirmation[id];
         else if (!manual && id === 'cache') reason = 'Confirm available host RAM and the cache connector before allocating an offload tier.';
         else if ((editedEngine && ['prefix', 'chunked'].includes(id)) || (editedRouter && ['affinity', 'load-routing', 'index'].includes(id)) || draft.finalConfiguration) reason = 'Preserved manually edited configuration.';
@@ -125,7 +124,7 @@ export function recommendOptimizations(catalog, draft, profile, { strictTopology
         const next = planFor({ ...overrides, [id]: true });
         const nextServing = next.units.filter(isServingSourceUnit).map(unit => unit.path).sort().join('\n');
         const pdChange = next.enabledCapabilities?.includes('transfer') !== current.enabledCapabilities.includes('transfer');
-        if (draft.runtimeConfiguration && nextServing !== servingPaths && (strictTopology || pdChange || !SAME_SHAPE_SWAPS.has(id))) {
+        if (draft.runtimeConfiguration && (nextServing !== servingPaths || (strictTopology && id === 'index')) && (strictTopology || pdChange || !SAME_SHAPE_SWAPS.has(id))) {
             decisions.push({ id, state: 'blocked', reason: pdChange ? 'Changes the prefill/decode topology. Compare the P/D plan or enable it here; replicas and TP are then sized per role.'
                 : id === 'cache' && current.enabledCapabilities.includes('transfer') ? 'Enable CPU KV cache and set its per-replica capacity to preserve the current P/D topology.'
                 : 'This changes the sized serving topology. Compare a separate candidate or explicitly edit the topology.' });

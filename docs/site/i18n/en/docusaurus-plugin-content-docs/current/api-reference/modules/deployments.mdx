@@ -282,8 +282,9 @@ predictions (meeting `ttftMs`/`tpotMs` first, then throughput) and records the r
 `requirements.workload.aicPrefillDecode` and `aicPrefillDecodeReason`; without an AIC
 result P/D stays on. Manual also sets each candidate's `slo_status` from the AIC prediction
 for that exact topology. It ranks candidates by SLA status, then the P/D decision, then
-checked optimizations, keeps SLA misses (ranked last) instead of failing, and never selects
-`precise-prefix-cache-routing`. With a load target, both modes size topologies from AIC
+checked optimizations, keeps SLA misses (ranked last) instead of failing, and composes
+`precise-prefix-cache-routing` onto compatible serving topologies during source rendering
+rather than retaining a standalone precise seed. With a load target, both modes size topologies from AIC
 when it supports the model and hardware.
 
 **`POST /api/agentic-deployments/optimizations/preview`** returns the same

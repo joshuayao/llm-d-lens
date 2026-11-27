@@ -200,3 +200,50 @@ test('recipe-only and external optimizations are inspectable but not independent
         { id: 'rollouts', generation: 'external-operation' },
     ]) assert.equal(capabilityTogglePatch(capability, {}), null);
 });
+
+test('P/D disaggregation and precise prefix-cache routing compose without topology or router conflicts', () => {
+    const guides = ['optimized-baseline', 'pd-disaggregation', 'precise-prefix-cache-routing'].map(id => ({ ...serving(id), steps: { deploy: {
+        worker: { run: `kubectl apply -k SOURCE/guides/${id}/modelserver/cpu` },
+        router: { run: `helm upgrade --install ${id} oci://example/llm-d-router-standalone -f SOURCE/guides/${id}/router/values.yaml` },
+    } } }));
+    const fixture = { ...catalog, guides, assets: guides.flatMap(({ id }) => [
+        { path: `guides/${id}/modelserver/cpu`, guide: id, kind: 'kustomize' },
+        { path: `guides/${id}/router/values.yaml`, guide: id, kind: 'values', content: `router:
+  epp:
+    pluginsConfigFile: default.yaml
+    pluginsCustomConfig:
+      default.yaml: |
+        plugins:
+          - type: prefix-cache-affinity-filter
+          - type: token-load-scorer
+` },
+    ]) };
+
+    const pdInitial = resolveCompositionDraft(fixture, { ...createBlueprint(), sourceMode: true, selectedGuides: ['pd-disaggregation'], capabilityOverrides: {} });
+    const enablePrecisePatch = capabilityTogglePatch({ id: 'index', enabled: false }, pdInitial);
+    assert.deepEqual(selectionConflicts(fixture, pdInitial, enablePrecisePatch), []);
+    const pdWithPrecise = resolveCompositionDraft(fixture, { ...pdInitial, ...enablePrecisePatch });
+    assert.deepEqual(pdWithPrecise.sourcePlan.guides, ['pd-disaggregation']);
+    assert.equal(pdWithPrecise.sourceRouter.release, 'pd-disaggregation');
+    assert.ok(pdWithPrecise.sourcePlan.enabledCapabilities.includes('transfer'));
+    assert.ok(pdWithPrecise.sourcePlan.enabledCapabilities.includes('index'));
+    const scene = inferenceScene(pdWithPrecise);
+    assert.equal(scene.capabilities.find(cap => cap.id === 'transfer').enabled, true);
+    assert.equal(scene.capabilities.find(cap => cap.id === 'index').enabled, true);
+    assert.equal(compositionRequest(pdWithPrecise, 'session').guideSelection.capabilities.index, true);
+
+    const preciseInitial = resolveCompositionDraft(fixture, { ...createBlueprint(), sourceMode: true, selectedGuides: ['precise-prefix-cache-routing'], capabilityOverrides: {} });
+    const enablePdPatch = capabilityTogglePatch({ id: 'transfer', enabled: false }, preciseInitial);
+    assert.deepEqual(selectionConflicts(fixture, preciseInitial, enablePdPatch), []);
+    const preciseWithPd = resolveCompositionDraft(fixture, { ...preciseInitial, ...enablePdPatch });
+    assert.deepEqual(preciseWithPd.sourcePlan.guides, ['pd-disaggregation']);
+    assert.ok(preciseWithPd.sourcePlan.enabledCapabilities.includes('transfer'));
+    assert.ok(preciseWithPd.sourcePlan.enabledCapabilities.includes('index'));
+
+    const disabledPrecise = resolveCompositionDraft(fixture, { ...pdWithPrecise, ...capabilityTogglePatch({ id: 'index', enabled: true }, pdWithPrecise) });
+    assert.deepEqual(disabledPrecise.sourcePlan.guides, ['pd-disaggregation']);
+    assert.ok(!disabledPrecise.sourcePlan.enabledCapabilities.includes('index'));
+
+    assert.match(selectionConflicts(fixture, { ...pdInitial, capabilityOverrides: { prefix: false } }, { capabilityOverrides: { prefix: false, index: true } }).join(' '), /Enable prefix caching/);
+    assert.match(selectionConflicts(fixture, { ...pdInitial, capabilityOverrides: { affinity: false } }, { capabilityOverrides: { affinity: false, index: true } }).join(' '), /Enable prefix-cache affinity/);
+});

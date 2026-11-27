@@ -94,5 +94,5 @@ export function selectionConflicts(catalog, draft, patch = {}) {
         capabilities: next.capabilityOverrides, guideChoices: next.guideChoices,
         mode: next.sourceRouter?.mode, accelerator: next.accelerator,
         units: next.sourceUnits, routerValues: next.sourceRouter?.values, finalConfiguration: next.finalConfiguration,
-    }).errors.filter(message => /^(Competing serving topologies:|Conflicting router releases:|Mutually exclusive source variants:)/.test(message))];
+    }).errors.filter(message => /^(Competing serving topologies:|Conflicting router releases:|Mutually exclusive source variants:|Enable prefix|Precise routing composition requires)/.test(message))];
 }

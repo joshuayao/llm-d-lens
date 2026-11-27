@@ -41,6 +41,10 @@ test('P/D Envoy traffic entry is selected despite sharing the EPP Service name',
         return { value: `${serviceName}:${port}`, serviceName, port };
     });
     assert.equal(defaultInferenceEndpoint(endpoints), 'pd-disaggregation-epp:80');
+    assert.equal(defaultInferenceEndpoint([
+        ...endpoints,
+        { value: 'pd-disaggregation-render:8000', serviceName: 'pd-disaggregation-render', port: 8000 },
+    ]), 'pd-disaggregation-epp:80');
     assert.equal(defaultInferenceEndpoint([{ value: 'metrics:80', serviceName: 'metrics', port: 80 }]), '');
 });
 

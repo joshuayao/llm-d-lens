@@ -91,17 +91,20 @@ class CandidateConfiguration(BaseModel):
 
 _CPU_CACHE_MARKER = "native-cpu-cache:"
 _PREFIX_ROUTING_MARKER = "prefix-routing:"
+_PRECISE_ROUTING_MARKER = "precise-routing:"
 
 
 def source_recipe_identity(paths: list[str], *, has_prefill: bool) -> str | None:
     recipes = {"optimized-baseline", "pd-disaggregation", "precise-prefix-cache-routing", "tiered-prefix-cache"}
     found = {part for path in paths for part in path.split("/") if part in recipes}
+    has_base_recipe = bool(found & {"optimized-baseline", "pd-disaggregation"})
     primary = {
         part
         for path in paths
         if not (
             "tiered-prefix-cache" in path.split("/") and path.rstrip("/").endswith(("/native/cpu", "/native/cpu/base"))
         )
+        and not (has_base_recipe and "precise-prefix-cache-routing" in path.split("/"))
         for part in path.split("/")
         if part in recipes
     }
@@ -113,21 +116,32 @@ def source_recipe_identity(paths: list[str], *, has_prefill: bool) -> str | None
     return recipe if (recipe == "pd-disaggregation") == has_prefill else None
 
 
-def composition_markers(native_cpu_cache_gib: float | None, prefix_routing: bool | None) -> tuple[str, ...]:
+def composition_markers(
+    native_cpu_cache_gib: float | None,
+    prefix_routing: bool | None,
+    *,
+    precise_routing: bool = False,
+) -> tuple[str, ...]:
     """Optimization markers that identify a serving composition in benchmark records and queries."""
     markers = (f"{_CPU_CACHE_MARKER}{native_cpu_cache_gib:g}GiB",) if native_cpu_cache_gib else ()
     if prefix_routing is not None:
         markers += (f"{_PREFIX_ROUTING_MARKER}{'on' if prefix_routing else 'off'}",)
+    if precise_routing:
+        markers += (f"{_PRECISE_ROUTING_MARKER}on",)
     return markers
 
 
-def composition_identity(configuration: CandidateConfiguration) -> tuple[bool, str | None]:
+def composition_identity(configuration: CandidateConfiguration) -> tuple[bool, str | None, bool]:
     """CPU-cache presence and prefix-routing choice; measurements are only comparable when these match."""
     routing = next(
         (item for item in configuration.optimizations if item.startswith(_PREFIX_ROUTING_MARKER)),
         None,
     )
-    return any(item.startswith(_CPU_CACHE_MARKER) for item in configuration.optimizations), routing
+    return (
+        any(item.startswith(_CPU_CACHE_MARKER) for item in configuration.optimizations),
+        routing,
+        any(item.startswith(_PRECISE_ROUTING_MARKER) for item in configuration.optimizations),
+    )
 
 
 class BenchmarkMetrics(BaseModel):

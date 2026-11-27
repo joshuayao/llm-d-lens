@@ -7,7 +7,7 @@ export function defaultInferenceEndpoint(endpoints = []) {
     const score = item => {
         const name = String(item.serviceName || item.value || '').toLowerCase();
         const port = Number(item.port);
-        if (/metrics|monitor/.test(name) || CONTROL_PORTS.has(port)
+        if (/metrics|monitor/.test(name) || /(^|-)render($|-)/.test(name) || CONTROL_PORTS.has(port)
             || (/(^|-)epp($|-)/.test(name) && ![80, 443].includes(port))) return -Infinity;
         let value = 0;
         if (/gateway|router/.test(name)) value += 40;

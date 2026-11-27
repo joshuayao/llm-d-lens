@@ -90,7 +90,7 @@ export function InferenceDesigner({ initialDraft, initialResult, clusterName, di
         || (item?.id === 'cache' && (draft.nativeCpuCacheGiB != null || enableable(item)))
         || (isDisaggregatedDraft(draft) && item?.id === 'transfer')
         || (Boolean(draft.runtimeConfiguration) && (item?.enabled || item?.inPlan || enableable(item))
-            && (item?.kind === 'capability' ? Boolean(nodeResourceKinds(item)) || item.id === 'cache'
+            && (item?.kind === 'capability' ? Boolean(nodeResourceKinds(item)) || ['cache', 'index'].includes(item.id)
                 : ['prefill', 'decode', 'prefill-worker', 'decode-worker', 'serving-worker', 'pods'].includes(item?.id)));
     const change = (patch, automatic = false, { silent = false } = {}) => {
         if (locked) return false;
@@ -126,7 +126,8 @@ export function InferenceDesigner({ initialDraft, initialResult, clusterName, di
         select(id);
         const cap = graph.capabilities.find(item => item.id === id);
         if (!cap || locked) return;
-        if (id !== 'cache' && toggleRequirement(id, !cap.enabled)) return;
+        const keepPreciseComposition = id === 'transfer' && graph.capabilities.some(item => item.id === 'index' && item.enabled) && draft.capabilityOverrides?.transfer !== false;
+        if (id !== 'cache' && !keepPreciseComposition && toggleRequirement(id, !cap.enabled)) return;
         if (blocked[id]) { setError(blocked[id]); return false; }
         const patch = capabilityTogglePatch(cap, draft, catalog);
         return patch ? change(patch) : false;
@@ -135,7 +136,8 @@ export function InferenceDesigner({ initialDraft, initialResult, clusterName, di
         select(id);
         const item = [...graph.nodes, ...graph.capabilities].find(item => item.id === id);
         const open = !locked && item && !item.unavailable && canConfigure(item) && (enable || !enableable(item));
-        if (open && enableable(item) && id !== 'cache' && toggleRequirement(id, true)) return;
+        const keepPreciseComposition = id === 'transfer' && graph.capabilities.some(cap => cap.id === 'index' && cap.enabled) && draft.capabilityOverrides?.transfer !== false;
+        if (open && enableable(item) && id !== 'cache' && !keepPreciseComposition && toggleRequirement(id, true)) return;
         if (open && enableable(item) && !change(capabilityTogglePatch(item, draft))) return;
         setParameters(open ? 'node' : null);
     };
