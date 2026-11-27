@@ -8,12 +8,14 @@ import logging
 import os
 import re
 import shutil
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+import yaml
 from kubernetes.aio.config.config_exception import ConfigException
 from kubernetes.aio.config.kube_config import KubeConfigMerger
 from yaml import YAMLError
@@ -710,10 +712,16 @@ class RegisteredGuideCommandRunner:
             result = await self._kubectl(command)
             self._evidence.extend(self._take_kubectl_evidence())
             return result
-        self._validate_helm(command)
+        plugins_dir = self._validate_helm(command)
+        helm_env = self._kubectl._environment
+        if plugins_dir is not None:
+            helm_env = {
+                **(self._kubectl._environment if self._kubectl._environment is not None else os.environ),
+                "HELM_PLUGINS": str(plugins_dir),
+            }
         process = await spawn(
             [str(self._helm_path), *command[1:]],
-            env=self._kubectl._environment,
+            env=helm_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -879,7 +887,7 @@ class RegisteredGuideCommandRunner:
         if prefix not in allowed:
             raise RuntimeConfigurationError("Kubernetes command operation is outside the registered Guide plan")
 
-    def _validate_helm(self, command: list[str]) -> None:
+    def _validate_helm(self, command: list[str]) -> Path | None:
         namespace = _argument_after(command, "--namespace")
         if namespace is None or not self._kubectl.allows_namespace(namespace):
             raise RuntimeConfigurationError("Helm command namespace is outside the configured allowlist")
@@ -928,10 +936,139 @@ class RegisteredGuideCommandRunner:
                 for provider in ("istio", "gke")
             ),
         )
-        if command != uninstall and not any(
-            command == [*base, *suffix] for base in (install, neutral_install) for suffix in suffixes
-        ):
+        if command == uninstall:
+            return None
+        candidate_command = command
+        plugins_dir: Path | None = None
+        if len(command) >= 2 and command[-2] == "--post-renderer":
+            plugins_dir = self._validate_post_renderer(command[-1])
+            candidate_command = command[:-2]
+        if not any(candidate_command == [*base, *suffix] for base in (install, neutral_install) for suffix in suffixes):
             raise RuntimeConfigurationError("Helm command operation is outside the registered Guide plan")
+        return plugins_dir
+
+    @staticmethod
+    def _validate_post_renderer(candidate: str) -> Path | None:
+        from llm_d_lens.deploy.providers.deployment_bundle import (
+            active_helm_post_renderer_plugins_dir,
+            helm_post_renderer_root,
+        )
+
+        root = helm_post_renderer_root().resolve()
+        if candidate == "strip-metrics-auth-rbac":
+            plugins_dir = active_helm_post_renderer_plugins_dir()
+            if plugins_dir is None:
+                raise RuntimeConfigurationError(
+                    "Helm post-renderer plugin directory is outside the registered Guide plan"
+                )
+            tmpdir = plugins_dir.parent
+            if tmpdir.is_symlink() or plugins_dir.is_symlink():
+                raise RuntimeConfigurationError(
+                    "Helm post-renderer plugin directory is outside the registered Guide plan"
+                )
+            try:
+                resolved_tmpdir = tmpdir.resolve(strict=True)
+                tmpdir_mode = os.lstat(tmpdir).st_mode
+                resolved_plugins_dir = plugins_dir.resolve(strict=True)
+                plugins_mode = os.lstat(plugins_dir).st_mode
+            except OSError as error:
+                raise RuntimeConfigurationError("Helm post-renderer plugin directory is unavailable") from error
+            if (
+                not stat.S_ISDIR(tmpdir_mode)
+                or (tmpdir_mode & 0o077) != 0
+                or not resolved_tmpdir.is_relative_to(root)
+                or resolved_tmpdir == root
+                or not stat.S_ISDIR(plugins_mode)
+                or (plugins_mode & 0o077) != 0
+                or resolved_plugins_dir != resolved_tmpdir / plugins_dir.name
+                or not resolved_plugins_dir.is_relative_to(root)
+                or resolved_plugins_dir == root
+            ):
+                raise RuntimeConfigurationError(
+                    "Helm post-renderer plugin directory is outside the registered Guide plan"
+                )
+
+            plugin_dir = plugins_dir / "strip-metrics-auth-rbac"
+            plugin_yaml = plugin_dir / "plugin.yaml"
+            if plugin_dir.is_symlink() or plugin_yaml.is_symlink():
+                raise RuntimeConfigurationError(
+                    "Helm post-renderer plugin manifest is outside the registered Guide plan"
+                )
+            try:
+                resolved_plugin_dir = plugin_dir.resolve(strict=True)
+                plugin_dir_mode = os.lstat(plugin_dir).st_mode
+                resolved_plugin_yaml = plugin_yaml.resolve(strict=True)
+                plugin_yaml_mode = os.lstat(plugin_yaml).st_mode
+            except OSError as error:
+                raise RuntimeConfigurationError("Helm post-renderer plugin manifest is unavailable") from error
+            if (
+                not stat.S_ISDIR(plugin_dir_mode)
+                or (plugin_dir_mode & 0o077) != 0
+                or resolved_plugin_dir != resolved_plugins_dir / "strip-metrics-auth-rbac"
+                or not stat.S_ISREG(plugin_yaml_mode)
+                or (plugin_yaml_mode & 0o077) != 0
+                or resolved_plugin_yaml != resolved_plugin_dir / "plugin.yaml"
+            ):
+                raise RuntimeConfigurationError(
+                    "Helm post-renderer plugin manifest is outside the registered Guide plan"
+                )
+
+            try:
+                manifest = yaml.safe_load(plugin_yaml.read_text(encoding="utf-8"))
+            except (OSError, YAMLError) as error:
+                raise RuntimeConfigurationError("Helm post-renderer plugin manifest is invalid") from error
+            runtime_config = manifest.get("runtimeConfig") if isinstance(manifest, dict) else None
+            platform_commands = runtime_config.get("platformCommand") if isinstance(runtime_config, dict) else None
+            if (
+                not isinstance(manifest, dict)
+                or set(manifest.keys()) != {"apiVersion", "type", "name", "version", "runtime", "runtimeConfig"}
+                or manifest.get("apiVersion") != "v1"
+                or manifest.get("type") != "postrenderer/v1"
+                or manifest.get("name") != "strip-metrics-auth-rbac"
+                or not isinstance(manifest.get("version"), str)
+                or not manifest["version"].strip()
+                or manifest.get("runtime") != "subprocess"
+                or not isinstance(runtime_config, dict)
+                or set(runtime_config.keys()) != {"platformCommand"}
+                or not isinstance(platform_commands, list)
+                or len(platform_commands) != 1
+                or not isinstance(platform_commands[0], dict)
+                or set(platform_commands[0].keys()) != {"command"}
+                or not isinstance(platform_commands[0].get("command"), str)
+            ):
+                raise RuntimeConfigurationError(
+                    "Helm post-renderer plugin manifest is outside the registered Guide plan"
+                )
+
+            wrapper = Path(platform_commands[0]["command"])
+            if wrapper.is_symlink() or wrapper.name != "strip-metrics-auth-rbac":
+                raise RuntimeConfigurationError("Helm post-renderer script is outside the registered Guide plan")
+            try:
+                resolved_wrapper = wrapper.resolve(strict=True)
+                wrapper_mode = os.lstat(wrapper).st_mode
+            except OSError as error:
+                raise RuntimeConfigurationError("Helm post-renderer script is unavailable") from error
+            if (
+                not stat.S_ISREG(wrapper_mode)
+                or (wrapper_mode & 0o077) != 0
+                or (wrapper_mode & stat.S_IXUSR) == 0
+                or resolved_wrapper != resolved_tmpdir / "strip-metrics-auth-rbac"
+                or not resolved_wrapper.is_relative_to(root)
+            ):
+                raise RuntimeConfigurationError("Helm post-renderer script is outside the registered Guide plan")
+            return resolved_plugins_dir
+
+        path = Path(candidate)
+        if path.is_symlink() or path.name != "strip-metrics-auth-rbac":
+            raise RuntimeConfigurationError("Helm post-renderer script is outside the registered Guide plan")
+        try:
+            resolved = path.resolve(strict=True)
+            mode = os.lstat(path).st_mode
+        except OSError as error:
+            raise RuntimeConfigurationError("Helm post-renderer script is unavailable") from error
+        if not stat.S_ISREG(mode) or not resolved.is_relative_to(root) or resolved == root or (mode & 0o077) != 0:
+            raise RuntimeConfigurationError("Helm post-renderer script is outside the registered Guide plan")
+        return None
 
     def _take_kubectl_evidence(self) -> list[CommandEvidence]:
         refs = self._kubectl.take_evidence_refs()

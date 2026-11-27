@@ -356,6 +356,48 @@ def _deployment_not_found(message: str) -> bool:
     return "deployments.apps" in normalized and "not found" in normalized
 
 
+async def _cleanup_failed_deployment(
+    adapter: GuideAdapter,
+    provider_execution: dict[str, Any],
+    provider_artifact: GuideDeploymentArtifact,
+    *,
+    cluster_id: str | None,
+    namespace: str | None,
+) -> dict[str, Any]:
+    """Run adapter cleanup and fall back to Phase-1 in-namespace deletion on 403 namespace delete."""
+    cleanup = await adapter.cleanup(provider_execution, provider_artifact)
+    if not isinstance(cleanup, dict) or cleanup.get("cleaned_up", False):
+        return cleanup
+    if not cluster_id or not namespace:
+        return cleanup
+
+    from llm_d_lens.cluster.service import _is_forbidden_output
+    from llm_d_lens.deploy.orphans import (
+        cleanup_in_namespace_resources,
+        is_deletable_deployment_namespace,
+    )
+    from llm_d_lens.infrastructure.process import CommandResult
+
+    error_text = str(cleanup.get("error") or cleanup.get("output") or "")
+    error_res = CommandResult(argv=("kubectl",), returncode=1, stdout="", stderr=error_text)
+    if not (_is_forbidden_output(error_res) and is_deletable_deployment_namespace(namespace, cluster_id=cluster_id)):
+        return cleanup
+    try:
+        deleted_in_namespace = await cleanup_in_namespace_resources(cluster_id, namespace)
+    except Exception as in_ns_error:
+        return {
+            **cleanup,
+            "in_namespace_cleaned": False,
+            "in_namespace_error": str(in_ns_error),
+        }
+    return {
+        **cleanup,
+        "cleaned_up": False,
+        "in_namespace_cleaned": True,
+        "deleted_in_namespace": deleted_in_namespace,
+    }
+
+
 class DeploymentService(Protocol):
     """Public deploy command and observation boundary."""
 
@@ -553,7 +595,11 @@ class GuideAdapterDeploymentService:
             if prepared_context:
                 if data_plane != prepared_context["data_plane"]:
                     raise ValueError("Data plane changed after plan review; prepare a new plan")
-                await adapter.validate_prepared_router(provider_artifact, namespace)
+                await adapter.validate_prepared_router(
+                    provider_artifact,
+                    namespace,
+                    cluster_id=request.provenance.get("cluster_server_id"),
+                )
             if data_plane_warning:
                 logger.warning("Deployment %s: %s", execution_id, data_plane_warning)
             artifact = self._deployment_artifact(request, artifact_input, provider_artifact)
@@ -662,7 +708,17 @@ class GuideAdapterDeploymentService:
                 diagnostics = await adapter.diagnostics(provider_execution)
                 self._log_archive.append_snapshot(execution_id, "readiness_failed", diagnostics)
                 still_deploying = _readiness_is_transient(readiness.reasons, diagnostics)
-                cleanup = None if still_deploying else await adapter.cleanup(provider_execution, provider_artifact)
+                cleanup = (
+                    None
+                    if still_deploying
+                    else await _cleanup_failed_deployment(
+                        adapter,
+                        provider_execution,
+                        provider_artifact,
+                        cluster_id=cluster_id,
+                        namespace=namespace,
+                    )
+                )
                 execution = DeploymentExecution(
                     execution_id=execution_id,
                     request_id=request.request_id,
@@ -721,7 +777,13 @@ class GuideAdapterDeploymentService:
                 try:
                     diagnostics = await adapter.diagnostics(provider_execution)
                     self._log_archive.append_snapshot(execution_id, "create_failed", diagnostics)
-                    cleanup = await adapter.cleanup(provider_execution, provider_artifact)
+                    cleanup = await _cleanup_failed_deployment(
+                        adapter,
+                        provider_execution,
+                        provider_artifact,
+                        cluster_id=request.provenance.get("cluster_server_id"),
+                        namespace=namespace,
+                    )
                 except Exception as cleanup_error:
                     cleanup = {"cleaned_up": False, "error": str(cleanup_error)}
             failed = self._store(
@@ -763,7 +825,13 @@ class GuideAdapterDeploymentService:
         try:
             diagnostics = await adapter.diagnostics(provider_execution)
             self._archive_snapshot(execution.execution_id, "killed", diagnostics)
-            cleanup = await adapter.cleanup(provider_execution, provider_artifact)
+            cleanup = await _cleanup_failed_deployment(
+                adapter,
+                provider_execution,
+                provider_artifact,
+                cluster_id=(execution.provenance or {}).get("cluster_server_id"),
+                namespace=execution.namespace,
+            )
         except Exception as error:
             return self._store(
                 execution.model_copy(
@@ -899,6 +967,43 @@ class GuideAdapterDeploymentService:
                 and execution.namespace
                 and is_deletable_deployment_namespace(execution.namespace, cluster_id=cluster_id)
             ):
+                existing_diag = (
+                    execution.diagnostics.value
+                    if execution.diagnostics is not None and isinstance(execution.diagnostics.value, dict)
+                    else {}
+                )
+                existing_cleanup = (
+                    existing_diag.get("cleanup") if isinstance(existing_diag.get("cleanup"), dict) else {}
+                )
+                existing_phase1 = (
+                    existing_cleanup.get("phase1") if isinstance(existing_cleanup.get("phase1"), dict) else None
+                )
+                if (
+                    existing_phase1 is not None
+                    and existing_phase1.get("phase1Completed") is True
+                    and existing_phase1.get("namespace") == execution.namespace
+                    and existing_phase1.get("clusterId") == cluster_id
+                    and isinstance(existing_phase1.get("adminCleanup"), dict)
+                ):
+                    if execution.status not in {
+                        DeploymentStatus.ROLLED_BACK,
+                        DeploymentStatus.CLEANED,
+                        DeploymentStatus.CLEANED_UP,
+                    }:
+                        self._store(
+                            execution.model_copy(
+                                update={
+                                    "status": DeploymentStatus.ROLLED_BACK,
+                                    "endpoint": None,
+                                    "updated_at": datetime.now(UTC),
+                                }
+                            )
+                        )
+                    detail = str(
+                        existing_phase1["adminCleanup"].get("detail")
+                        or "Namespace cleanup requires Orchestration administrator privileges."
+                    )
+                    raise DeploymentCleanupPermissionDenied(detail, payload=existing_phase1)
                 storage_volume_id: str | None = None
                 if execution.configuration_artifacts:
                     try:
@@ -916,9 +1021,17 @@ class GuideAdapterDeploymentService:
                     router_rbac=router_rbac,
                     storage_volume_id=storage_volume_id,
                 )
+                phase1_completed = handoff.get("phase1Completed") is True
                 self._store(
                     execution.model_copy(
                         update={
+                            "status": (
+                                DeploymentStatus.ROLLED_BACK
+                                if phase1_completed
+                                and execution.status not in {DeploymentStatus.CLEANED, DeploymentStatus.CLEANED_UP}
+                                else execution.status
+                            ),
+                            "endpoint": None if phase1_completed else execution.endpoint,
                             "diagnostics": VersionedPayload(
                                 schema_version="deploy-diagnostics.v1",
                                 value={"snapshot": diagnostics, "cleanup": {**sanitized_cleanup, "phase1": handoff}},

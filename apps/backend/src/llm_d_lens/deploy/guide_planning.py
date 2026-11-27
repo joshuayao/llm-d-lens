@@ -500,6 +500,7 @@ def plan_documents(
     def selected_value(role, suffix, flat):
         return float(requested.get(role + suffix) or (requested.get(flat) if role == "serving" or not dual else 0) or 0)
 
+    unverified_device_classes: set[str] = set()
     for document_index, document in enumerate(documents):
         if document.get("kind") != "ResourceClaimTemplate":
             continue
@@ -516,8 +517,15 @@ def plan_documents(
                 continue
             device_class = exactly.get("deviceClassName", "")
             pointer = f"/documents/{document_index}/spec/spec/devices/requests/{request_index}/exactly"
-            if cluster and device_class and device_class not in cluster.get("deviceClasses", []):
-                errors.append(f"DRA device class {device_class} is not available in the selected cluster.")
+            if cluster and device_class and device_class not in (cluster.get("deviceClasses") or []):
+                if cluster.get("deviceClassesVerified") is not False:
+                    errors.append(f"DRA device class {device_class} is not available in the selected cluster.")
+                elif device_class not in unverified_device_classes:
+                    unverified_device_classes.add(device_class)
+                    warnings.append(
+                        f"Could not verify DRA device class {device_class} in the selected cluster "
+                        "(cluster-scoped DeviceClass read returned 403 Forbidden)."
+                    )
             if profile and device_class == profile.dranet_device_class:
                 nic_requests += 1
                 if "rdmaNicCount" in settings:

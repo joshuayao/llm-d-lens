@@ -77,10 +77,13 @@ class EvaluationCaseResponse(EvaluationResponse):
     deployment_case_id: str | None = None
     execution_id: str | None = None
     evaluation_run_id: str | None = None
+    target_namespace: str | None = None
     configuration: dict[str, Any] | None = None
     metrics: dict[str, Any] | None = None
     error: str | None = None
     cleanup_error: str | None = None
+    cleanup_status: str | None = None
+    cleanup_handoff: dict[str, Any] | None = None
 
 
 class EvaluationWorkflowResponse(EvaluationResponse):
@@ -97,6 +100,7 @@ class EvaluationWorkflowResponse(EvaluationResponse):
     deployment_run_id: str | None = None
     evaluation_run_id: str | None = None
     cases: list[EvaluationCaseResponse] | None = None
+    pending_admin_cleanups: list[dict[str, Any]] | None = None
     report: dict[str, Any] | None = None
     error: str | None = None
 

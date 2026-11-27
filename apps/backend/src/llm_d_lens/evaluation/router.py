@@ -19,29 +19,40 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 import yaml
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Body, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 
+from llm_d_lens.api.problems import problem
 from llm_d_lens.auth.access import (
     current_principal,
     owner_for_create,
     require_cluster_access,
     resource_readable,
 )
+from llm_d_lens.auth.policy import authorize
 from llm_d_lens.cluster import deployment_runtime_overrides, require_active_session, sessions
 from llm_d_lens.cluster import registry as cluster_registry
 from llm_d_lens.cluster.deployment_source import resolve_cluster_benchmark_source
 from llm_d_lens.configuration.manifest_facts import _invocation_tokens, _option, workload_roles
 from llm_d_lens.configuration.service import get_configuration_artifact
+from llm_d_lens.core.exceptions import ForbiddenError
 from llm_d_lens.db.dao.evaluate_run import EvaluateRunDao
 from llm_d_lens.db.dao.evaluate_workflow import EvaluateWorkflowDao
 from llm_d_lens.db.evaluate_persistence_models import EvaluateRunRecord, EvaluateWorkflowRecord
+from llm_d_lens.deploy import capabilities
 from llm_d_lens.deploy.application import cluster_deployment_source, deployment_run_manager
-from llm_d_lens.deploy.capabilities import provider_supports
+from llm_d_lens.deploy.capabilities import (
+    DeploymentAdminSetupRequiredError,
+    DeploymentCapabilityUnavailableError,
+    DeploymentCapabilityValidationError,
+    DeploymentClusterAuthError,
+    provider_supports,
+)
 from llm_d_lens.deploy.contracts import (
     DeployableConfiguration,
     DeploymentRunCreateRequest,
@@ -49,6 +60,8 @@ from llm_d_lens.deploy.contracts import (
     RuntimeBinding,
 )
 from llm_d_lens.deploy.data_plane import deployment_uses_shared_gateway
+from llm_d_lens.deploy.executions import DeploymentCleanupPermissionDenied
+from llm_d_lens.deploy.slice_capacity import ClusterInventoryAuthError
 from llm_d_lens.deploy.usage import exempt_usage, register_usage_probe
 from llm_d_lens.evaluation.api_models import (
     BenchmarkArtifactListResponse,
@@ -85,6 +98,7 @@ from llm_d_lens.evaluation.models import (
     EvaluateWorkflowRequest,
     EvaluationCreateRequest,
     EvaluationPlanConfirmation,
+    EvaluationRetryRequest,
     SharedPrefixWorkloadSpec,
     WorkloadMatrixPoint,
     validate_inline_workload,
@@ -1300,7 +1314,34 @@ def _apply_diagnosis(record: dict) -> bool:
     return changed
 
 
+def _has_phase1_cleanup(execution: Any) -> bool:
+    if execution is None:
+        return False
+    diagnostics = getattr(execution, "diagnostics", None)
+    diag_val = getattr(diagnostics, "value", None) if diagnostics is not None else None
+    if not isinstance(diag_val, dict):
+        return False
+    cleanup = diag_val.get("cleanup")
+    if not isinstance(cleanup, dict):
+        return False
+    phase1 = cleanup.get("phase1")
+    return isinstance(phase1, dict) and bool(phase1.get("phase1Completed"))
+
+
+def _namespace_has_active_execution(namespace: str) -> bool:
+    list_executions = getattr(_store, "list_executions", None)
+    if not callable(list_executions):
+        return False
+    return any(
+        execution.namespace == namespace
+        and execution.status not in {DeploymentStatus.CLEANED, DeploymentStatus.CLEANED_UP}
+        for execution in list_executions()
+    )
+
+
 def _ready_deployment_case(workflow_id: str, evaluation_case: dict):
+    if evaluation_case.get("cleanup_status") == "pending_admin_cleanup":
+        return None, None
     # Evaluation-created runs already have a durable direct link. Older runs
     # may not carry evaluation IDs in each deployment request's provenance.
     candidate_run_ids = [evaluation_case["deployment_run_id"]] if evaluation_case.get("deployment_run_id") else []
@@ -1324,6 +1365,7 @@ def _ready_deployment_case(workflow_id: str, evaluation_case: dict):
             and item.execution_id
             and (execution := _store.get_execution(item.execution_id)) is not None
             and execution.status == DeploymentStatus.READY
+            and not _has_phase1_cleanup(execution)
         ]
         ready_case = max(ready_cases, key=lambda item: item.attempt, default=None)
         if ready_case is not None:
@@ -1816,6 +1858,401 @@ async def _run_case_benchmark(workflow, case, execution_id, *, use_baseline_endp
         _save(workflow)
 
 
+def _record_case_cleanup_handoff(
+    workflow: dict,
+    case: dict,
+    error: DeploymentCleanupPermissionDenied,
+) -> None:
+    payload = dict(error.payload) if isinstance(getattr(error, "payload", None), dict) else {}
+    case["cleanup_status"] = "pending_admin_cleanup"
+    case["cleanup_handoff"] = payload
+    case["cleanup_error"] = None
+    pending = workflow.setdefault("pending_admin_cleanups", [])
+    execution_id = payload.get("executionId") or case.get("execution_id")
+    summary = {
+        "case_id": case.get("id"),
+        "executionId": execution_id,
+        "clusterId": payload.get("clusterId") or workflow.get("cluster_id"),
+        "namespace": payload.get("namespace") or case.get("namespace"),
+        "phase1Completed": bool(payload.get("phase1Completed", True)),
+        "adminCleanup": payload.get("adminCleanup"),
+    }
+    existing_idx = next(
+        (
+            idx
+            for idx, item in enumerate(pending)
+            if isinstance(item, dict)
+            and (
+                (execution_id and item.get("executionId") == execution_id)
+                or (not execution_id and item.get("case_id") == case.get("id"))
+            )
+        ),
+        None,
+    )
+    if existing_idx is None:
+        pending.append(summary)
+    else:
+        pending[existing_idx] = summary
+
+
+def _clear_owned_case_namespace(
+    workflow: dict,
+    case: dict,
+    requested_namespaces: Mapping[str, str],
+) -> None:
+    group_id = case.get("deployment_group_id") or case["id"]
+    target_ns = case.get("target_namespace")
+    had_cleanup_handoff = case.get("cleanup_status") == "pending_admin_cleanup"
+    has_active_ns = (
+        isinstance(target_ns, str) and bool(target_ns.strip()) and _namespace_has_active_execution(target_ns.strip())
+    )
+    clear_namespace = group_id not in requested_namespaces and (had_cleanup_handoff or has_active_ns)
+    for sibling in workflow.get("cases", []):
+        if sibling is not case and sibling.get("status") == "succeeded":
+            continue
+        sibling_group = sibling.get("deployment_group_id") or sibling["id"]
+        if sibling_group != group_id:
+            continue
+        sibling.pop("cleanup_status", None)
+        sibling.pop("cleanup_handoff", None)
+        sibling.pop("cleanup_error", None)
+        if clear_namespace:
+            sibling.pop("target_namespace", None)
+
+
+def _permission_preflight_error_response(error: Exception) -> JSONResponse | None:
+    if isinstance(error, DeploymentAdminSetupRequiredError):
+        return JSONResponse(status_code=403, content=error.to_response_payload())
+    if isinstance(error, (DeploymentClusterAuthError, ClusterInventoryAuthError)):
+        return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+    if isinstance(error, DeploymentCapabilityValidationError):
+        return problem(
+            error.status_code,
+            "Invalid deployment namespace or permission check",
+            str(error),
+            error.code,
+        )
+    if isinstance(error, DeploymentCapabilityUnavailableError):
+        return problem(503, "Cluster permission check unavailable", str(error), error.code)
+    return None
+
+
+def _epp_service_accounts_from_bundle(bundle: Any) -> list[str]:
+    if not isinstance(bundle, Mapping):
+        return []
+    helm = bundle.get("helm")
+    if not isinstance(helm, Mapping):
+        return []
+    release_name = helm.get("releaseName")
+    if isinstance(release_name, str) and release_name.strip():
+        return [f"{release_name.strip().lower()[:40]}-epp"]
+    return []
+
+
+def _manifest_has_lws(manifest: str | None) -> bool:
+    if not isinstance(manifest, str) or not manifest.strip():
+        return False
+    try:
+        return any(
+            isinstance(doc, Mapping) and doc.get("kind") == "LeaderWorkerSet" for doc in yaml.safe_load_all(manifest)
+        )
+    except yaml.YAMLError:
+        return False
+
+
+def _validate_requested_target_namespaces(
+    requested_namespaces: Mapping[str, str] | None,
+    *,
+    cluster_id: str | None,
+    cases: list[dict],
+) -> dict[str, str]:
+    if not requested_namespaces:
+        return {}
+    valid_keys: set[str] = set()
+    for case in cases:
+        if case.get("baseline_type") == "kubernetes-service":
+            continue
+        group_id = case.get("deployment_group_id") or case["id"]
+        valid_keys.add(group_id)
+        if case.get("prepared_plan_id"):
+            valid_keys.add(f"{group_id}:{case['prepared_plan_id']}")
+    validated: dict[str, str] = {}
+    seen_namespaces: set[str] = set()
+    for raw_key, raw_ns in requested_namespaces.items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise DeploymentCapabilityValidationError(
+                "target_namespaces keys must be non-empty strings",
+                code="invalid_target_namespace_key",
+                status_code=422,
+            )
+        key = raw_key.strip()
+        if key not in valid_keys:
+            raise DeploymentCapabilityValidationError(
+                f"target_namespaces key {key!r} does not match any deployment group in this evaluation",
+                code="invalid_target_namespace_key",
+                status_code=422,
+            )
+        validated_ns = capabilities.validate_deployment_namespace(raw_ns, cluster_id=cluster_id)
+        if validated_ns in seen_namespaces:
+            raise DeploymentCapabilityValidationError(
+                f"duplicate target namespace {validated_ns!r} across deployment groups",
+                code="duplicate_namespace",
+                status_code=422,
+            )
+        seen_namespaces.add(validated_ns)
+        validated[key] = validated_ns
+    return validated
+
+
+def _apply_requested_target_namespaces(
+    workflow: dict,
+    requested_namespaces: Mapping[str, str] | None,
+    *,
+    cluster_id: str | None,
+    include_prepared_plans: bool = True,
+    only_pending: bool = False,
+) -> dict[str, str]:
+    validated = _validate_requested_target_namespaces(
+        requested_namespaces,
+        cluster_id=cluster_id,
+        cases=workflow.get("cases", []),
+    )
+    if not validated:
+        return {}
+    for case in workflow.get("cases", []):
+        if case.get("baseline_type") == "kubernetes-service" or case.get("status") == "succeeded":
+            continue
+        if not include_prepared_plans and case.get("prepared_plan_id"):
+            continue
+        if only_pending and _ready_deployment_case(workflow["id"], case)[1] is not None:
+            continue
+        group_id = case.get("deployment_group_id") or case["id"]
+        plan_key = f"{group_id}:{case['prepared_plan_id']}" if case.get("prepared_plan_id") else None
+        target_ns = validated.get(plan_key) if plan_key and plan_key in validated else validated.get(group_id)
+        if target_ns:
+            case["target_namespace"] = target_ns
+    return validated
+
+
+def _deployment_group_permission_targets(
+    workflow: dict,
+    *,
+    requested_namespaces: Mapping[str, str] | None = None,
+    include_prepared_plans: bool = True,
+    only_pending: bool = False,
+) -> list[Any]:
+    from llm_d_lens.configuration.disaggregated_set import disaggregated_sets
+    from llm_d_lens.db.dao.deployment_plan import DeploymentPlanDao
+    from llm_d_lens.deploy.prepared_plans import plan_documents
+
+    targets: list[Any] = []
+    seen_dedupe: set[str] = set()
+    seen_target_keys: set[str] = set()
+    requested = requested_namespaces or {}
+
+    for case in _ordered_evaluation_cases(workflow.get("cases", [])):
+        if case.get("baseline_type") == "kubernetes-service" or case.get("status") == "succeeded":
+            continue
+        if only_pending and _ready_deployment_case(workflow["id"], case)[1] is not None:
+            continue
+        plan_id = case.get("prepared_plan_id")
+        if plan_id and not include_prepared_plans:
+            continue
+        group_id = case.get("deployment_group_id") or case["id"]
+        dedupe_key = f"prepared:{plan_id}" if plan_id else group_id
+        if dedupe_key in seen_dedupe:
+            continue
+        seen_dedupe.add(dedupe_key)
+        target_key = group_id if group_id not in seen_target_keys else f"{group_id}:{plan_id}"
+        seen_target_keys.add(target_key)
+
+        configuration = _case_configuration(workflow, case)
+        deployment_name = configuration.provenance.get("deployment_name")
+        provider_ref = configuration.provider_ref
+        content = configuration.content or {}
+        official_guide = content.get("officialGuide") if isinstance(content.get("officialGuide"), Mapping) else {}
+
+        if plan_id:
+            plan = DeploymentPlanDao().get(plan_id)
+            if plan is None:
+                raise HTTPException(status_code=409, detail="Prepared Evaluation plan is unavailable")
+            artifacts = (plan.payload or {}).get("artifacts") or []
+            entry = artifacts[0] if artifacts else {}
+            frozen_ns = (entry.get("context") or {}).get("namespace")
+            explicit_ns = requested.get(target_key) or requested.get(group_id)
+            if explicit_ns and frozen_ns and explicit_ns != frozen_ns:
+                raise DeploymentCapabilityValidationError(
+                    f"target_namespaces[{target_key!r}] does not match prepared plan namespace {frozen_ns!r}",
+                    code="invalid_namespace",
+                    status_code=422,
+                )
+            contract = (entry.get("artifact") or {}).get("deployment_contract") or {}
+            bundle = contract.get("deploymentBundle")
+            runtime = (entry.get("context") or {}).get("runtime") or {}
+            storage_volume_id = runtime.get("storageVolumeId")
+            uses_storage = bool(storage_volume_id or contract.get("preparedStorage"))
+            documents = plan_documents(plan, 0) if artifacts else []
+            uses_lws = bool(disaggregated_sets(documents)) or any(
+                doc.get("kind") == "LeaderWorkerSet" for doc in documents
+            )
+            manifest_parts = [entry.get("manifest") or ""]
+            if bundle:
+                frozen_manifest = (bundle.get("frozen") or {}).get("manifest")
+                if frozen_manifest:
+                    manifest_parts.append(frozen_manifest)
+                for asset in bundle.get("resources") or ():
+                    if asset.get("content"):
+                        manifest_parts.append(asset["content"])
+            combined_manifest = "\n---\n".join(part for part in manifest_parts if part.strip()) or None
+            prepared_ns = contract.get("preparedNamespace") or {}
+            prepared_labels = (prepared_ns.get("metadata") or {}).get("labels") or {}
+            prepared_request_id = prepared_labels.get("lens.io/prepared-request")
+            namespace_labels = prepared_labels or (
+                runtime.get("namespaceLabels") if isinstance(runtime.get("namespaceLabels"), Mapping) else None
+            )
+            epp_service_accounts = _epp_service_accounts_from_bundle(bundle) or _epp_service_accounts_from_bundle(
+                official_guide.get("deploymentBundle")
+            )
+            targets.append(
+                capabilities.DeploymentPermissionTarget(
+                    key=target_key,
+                    namespace=frozen_ns or explicit_ns,
+                    deployment_name=str(deployment_name) if deployment_name else None,
+                    provider_ref=provider_ref,
+                    prepared_plan_id=plan_id,
+                    prepared_request_id=prepared_request_id,
+                    uses_storage=uses_storage,
+                    storage_volume_id=storage_volume_id,
+                    uses_lws=uses_lws,
+                    uses_router=bool(bundle),
+                    epp_service_accounts=epp_service_accounts,
+                    manifest=combined_manifest,
+                    namespace_labels=dict(namespace_labels) if isinstance(namespace_labels, Mapping) else None,
+                )
+            )
+            continue
+
+        runtime = content.get("runtime") if isinstance(content.get("runtime"), Mapping) else {}
+        manifest = official_guide.get("renderedManifest") or None
+        storage_volume_id = runtime.get("storageVolumeId")
+        namespace = requested.get(target_key) or case.get("target_namespace")
+        namespace_labels = runtime.get("namespaceLabels")
+        targets.append(
+            capabilities.DeploymentPermissionTarget(
+                key=target_key,
+                namespace=namespace,
+                deployment_name=str(deployment_name) if deployment_name else None,
+                provider_ref=provider_ref,
+                prepared_plan_id=None,
+                prepared_request_id=None,
+                uses_storage=bool(storage_volume_id),
+                storage_volume_id=storage_volume_id,
+                uses_lws=_manifest_has_lws(manifest),
+                uses_router=provider_ref != "baseline-vllm",
+                epp_service_accounts=_epp_service_accounts_from_bundle(official_guide.get("deploymentBundle")),
+                manifest=manifest,
+                namespace_labels=dict(namespace_labels) if isinstance(namespace_labels, Mapping) else None,
+            )
+        )
+    return targets
+
+
+def _has_stale_bootstrap_marker(report: Mapping[str, Any] | None) -> bool:
+    """Return True when a permission report or any target carries a stale bootstrap marker."""
+    if not isinstance(report, Mapping):
+        return False
+    marker = report.get("marker")
+    if isinstance(marker, Mapping) and marker.get("status") == "stale":
+        return True
+    for item in report.get("targets") or ():
+        if not isinstance(item, Mapping):
+            continue
+        item_marker = item.get("marker")
+        if isinstance(item_marker, Mapping) and item_marker.get("status") == "stale":
+            return True
+    return False
+
+
+async def _preflight_evaluation_permissions(
+    workflow: dict,
+    *,
+    cluster_id: str | None,
+    owner_user_id: str | None,
+    requested_namespaces: Mapping[str, str] | None = None,
+    include_prepared_plans: bool = True,
+    only_pending: bool = False,
+) -> dict[str, str]:
+    validated = _validate_requested_target_namespaces(
+        requested_namespaces,
+        cluster_id=cluster_id,
+        cases=workflow.get("cases", []),
+    )
+    if not cluster_id or cluster_registry.get_cluster(cluster_id) is None:
+        return _apply_requested_target_namespaces(
+            workflow,
+            validated,
+            cluster_id=cluster_id,
+            include_prepared_plans=include_prepared_plans,
+            only_pending=only_pending,
+        )
+    targets = _deployment_group_permission_targets(
+        workflow,
+        requested_namespaces=validated,
+        include_prepared_plans=include_prepared_plans,
+        only_pending=only_pending,
+    )
+    if not targets:
+        return {}
+    report = await capabilities.check_deployment_permissions(
+        capabilities.DeploymentPermissionCheckRequest(cluster_id=cluster_id, targets=targets)
+    )
+    if not report.get("sufficient") or _has_stale_bootstrap_marker(report):
+        raise DeploymentAdminSetupRequiredError(report)
+
+    resolved_by_key = {
+        item["key"]: item["namespace"]
+        for item in (report.get("targets") or [])
+        if isinstance(item, Mapping) and item.get("key") and item.get("namespace")
+    }
+    if not resolved_by_key and len(targets) == 1 and report.get("namespace"):
+        resolved_by_key = {targets[0].key: report["namespace"]}
+
+    can_create_ns = bool(report.get("canCreateNamespaces"))
+    for case in workflow.get("cases", []):
+        if case.get("baseline_type") == "kubernetes-service" or case.get("status") == "succeeded":
+            continue
+        if only_pending and _ready_deployment_case(workflow["id"], case)[1] is not None:
+            continue
+        plan_id = case.get("prepared_plan_id")
+        if plan_id and not include_prepared_plans:
+            continue
+        group_id = case.get("deployment_group_id") or case["id"]
+        plan_key = f"{group_id}:{plan_id}" if plan_id else None
+        resolved_ns = (
+            resolved_by_key.get(plan_key) if plan_key and plan_key in resolved_by_key else resolved_by_key.get(group_id)
+        )
+        if not resolved_ns:
+            continue
+        explicitly_requested = group_id in validated or (plan_key is not None and plan_key in validated)
+        if not can_create_ns or explicitly_requested:
+            case["target_namespace"] = resolved_ns
+            if plan_id:
+                capabilities.record_verified_namespace(
+                    cluster_id,
+                    resolved_ns,
+                    owner_user_id=owner_user_id,
+                    prepared_plan_id=plan_id,
+                )
+            elif explicitly_requested:
+                capabilities.record_verified_namespace(
+                    cluster_id,
+                    resolved_ns,
+                    owner_user_id=owner_user_id,
+                    agentic_deployment_run_id=f"eval:{workflow['id']}:{case['id']}",
+                )
+    return resolved_by_key
+
+
 async def _execute_shared_pods_baseline_case(workflow: dict, case: dict) -> None:
     """Benchmark a `kubernetes-service` baseline by reusing its sibling Guide case's already-
     ready deployment execution and hitting the Guide's registered baseline endpoint (a plain
@@ -1886,28 +2323,38 @@ async def _execute_shared_pods_baseline_case(workflow: dict, case: dict) -> None
                     await deployment_run_manager.worker_for_run(deployment_run_id).delete_case_execution(
                         deployment_run_id,
                         deployment_case_id,
+                        remove_records_on_phase1_handoff=True,
                     )
+            except DeploymentCleanupPermissionDenied as cleanup_handoff_error:
+                _record_case_cleanup_handoff(workflow, guide_case, cleanup_handoff_error)
+                _save(workflow)
             except Exception as cleanup_error:
                 guide_case["cleanup_error"] = str(cleanup_error)
                 _save(workflow)
 
 
 def _evaluation_deployment_request(workflow: dict, case: dict) -> DeploymentRunCreateRequest:
+    configuration = _case_configuration(workflow, case)
+    runtime_binding = _runtime_binding(workflow)
+    target_ns = case.get("target_namespace")
+    provenance: dict[str, Any] = {
+        "cluster_session_id": workflow["cluster_session_id"],
+        "cluster_server_id": workflow.get("cluster_id"),
+        "deployment_source": {"kind": "evaluation-cluster-source"},
+        "evaluate_workflow": True,
+        "evaluation_id": workflow["id"],
+        "evaluation_case_id": case["id"],
+        "preserve_deployment": bool(case.get("preserve_deployment")),
+    }
+    if isinstance(target_ns, str) and target_ns.strip() and not case.get("prepared_plan_id"):
+        provenance["target_namespace"] = target_ns.strip()
     return DeploymentRunCreateRequest(
-        configurations=[_case_configuration(workflow, case)],
-        runtime_binding=_runtime_binding(workflow),
+        configurations=[configuration],
+        runtime_binding=runtime_binding,
         prepared_plan_id=case.get("prepared_plan_id"),
         expected_plan_digest=case.get("prepared_plan_digest"),
         acknowledge_unknown=bool(workflow.get("acknowledge_unknown")),
-        provenance={
-            "cluster_session_id": workflow["cluster_session_id"],
-            "cluster_server_id": workflow.get("cluster_id"),
-            "deployment_source": {"kind": "evaluation-cluster-source"},
-            "evaluate_workflow": True,
-            "evaluation_id": workflow["id"],
-            "evaluation_case_id": case["id"],
-            "preserve_deployment": bool(case.get("preserve_deployment")),
-        },
+        provenance=provenance,
     )
 
 
@@ -1970,7 +2417,7 @@ async def _execute_evaluation(workflow_id: str) -> None:
             ready_case = None
             owns_deployment = False
             benchmark_succeeded = False
-            if case.get("deployment_run_id"):
+            if case.get("deployment_run_id") and case.get("cleanup_status") != "pending_admin_cleanup":
                 deployment = _store.get_run(case["deployment_run_id"])
                 if deployment is not None:
                     ready_cases = [
@@ -1980,6 +2427,7 @@ async def _execute_evaluation(workflow_id: str) -> None:
                         and item.execution_id
                         and (execution := _store.get_execution(item.execution_id)) is not None
                         and execution.status == DeploymentStatus.READY
+                        and not _has_phase1_cleanup(execution)
                     ]
                     ready_case = max(ready_cases, key=lambda item: item.attempt, default=None)
                     if ready_case is not None:
@@ -2015,8 +2463,38 @@ async def _execute_evaluation(workflow_id: str) -> None:
             _save(workflow)
             try:
                 if ready_case is None:
+                    deploy_req = _evaluation_deployment_request(workflow, case)
+                    target_ns = case.get("target_namespace")
+                    if isinstance(target_ns, str) and target_ns.strip() and not case.get("prepared_plan_id"):
+                        target_ns = target_ns.strip()
+                        binding_id = f"eval:{workflow['id']}:{case['id']}"
+                        deploy_req.provenance["agentic_deployment_run_id"] = binding_id
+                        deploy_req.provenance["target_namespace"] = target_ns
+                        cluster_id = workflow.get("cluster_id")
+                        if cluster_id and cluster_registry.get_cluster(cluster_id) is not None:
+                            marker_ok = await capabilities.is_bootstrap_marker_present(cluster_id, target_ns)
+                            if not marker_ok:
+                                live_targets = _deployment_group_permission_targets(
+                                    {**workflow, "cases": [case]},
+                                    requested_namespaces={case.get("deployment_group_id") or case["id"]: target_ns},
+                                    include_prepared_plans=False,
+                                )
+                                live_report = await capabilities.check_deployment_permissions(
+                                    capabilities.DeploymentPermissionCheckRequest(
+                                        cluster_id=cluster_id,
+                                        targets=live_targets,
+                                    )
+                                )
+                                if not live_report.get("sufficient") or _has_stale_bootstrap_marker(live_report):
+                                    raise DeploymentAdminSetupRequiredError(live_report)
+                            capabilities.record_verified_namespace(
+                                cluster_id,
+                                target_ns,
+                                owner_user_id=workflow.get("owner_user_id"),
+                                agentic_deployment_run_id=binding_id,
+                            )
                     deployment = await deployment_run_manager.start_run(
-                        _evaluation_deployment_request(workflow, case),
+                        deploy_req,
                         owner_user_id=workflow.get("owner_user_id"),
                     )
                     owns_deployment = True
@@ -2072,8 +2550,13 @@ async def _execute_evaluation(workflow_id: str) -> None:
                     try:
                         with _deployment_cleanup_guard(ready_case.execution_id):
                             await deployment_run_manager.worker_for_run(deployment.id).delete_case_execution(
-                                deployment.id, ready_case.id
+                                deployment.id,
+                                ready_case.id,
+                                remove_records_on_phase1_handoff=True,
                             )
+                    except DeploymentCleanupPermissionDenied as cleanup_handoff_error:
+                        _record_case_cleanup_handoff(workflow, case, cleanup_handoff_error)
+                        _save(workflow)
                     except Exception as cleanup_error:
                         case["cleanup_error"] = str(cleanup_error)
                         _save(workflow)
@@ -2271,6 +2754,28 @@ def _evaluate_record_readable(principal, record: dict, *, permission: str, resou
 def _require_evaluate_record(principal, record: dict, *, permission: str, resource_type: str, detail: str) -> None:
     if not _evaluate_record_readable(principal, record, permission=permission, resource_type=resource_type):
         raise HTTPException(status_code=403, detail=detail)
+
+
+def _require_workflow_action_access(
+    principal,
+    workflow: dict,
+    *,
+    permission: str,
+    detail: str,
+) -> None:
+    cluster_id = workflow.get("cluster_id")
+    require_cluster_access(principal, cluster_id)
+    if principal is None or not principal.role_permissions:
+        return
+    if cluster_id and not authorize(principal, permission, target_cluster_id=cluster_id).allowed:
+        raise ForbiddenError("cluster is not accessible")
+    _require_evaluate_record(
+        principal,
+        workflow,
+        permission=permission,
+        resource_type="evaluate_workflow",
+        detail=detail,
+    )
 
 
 # Legacy records are migrated only by the explicit storage migration command.
@@ -6436,6 +6941,16 @@ async def create_evaluation(request: EvaluationCreateRequest, http_request: Requ
     try:
         deployment_runtime_overrides(request.cluster_session_id)
         session = require_active_session(request.cluster_session_id)
+        principal = current_principal(http_request)
+        cluster_id = getattr(session, "server_id", None)
+        require_cluster_access(principal, cluster_id)
+        if (
+            principal is not None
+            and principal.role_permissions
+            and cluster_id
+            and not authorize(principal, "evaluate:workflow:create", target_cluster_id=cluster_id).allowed
+        ):
+            raise ForbiddenError("cluster is not accessible")
         deployment_source = cluster_deployment_source(session)
         benchmark_runtime = _cluster_benchmark_runtime(request.cluster_session_id)
         artifacts = {}
@@ -6502,12 +7017,31 @@ async def create_evaluation(request: EvaluationCreateRequest, http_request: Requ
             raise HTTPException(status_code=409, detail=str(error)) from error
         case["deployment_configuration"] = baseline.model_dump(mode="json")
     try:
+        _apply_requested_target_namespaces(
+            workflow,
+            request.target_namespaces,
+            cluster_id=workflow.get("cluster_id"),
+            include_prepared_plans=False,
+        )
         await _prepare_evaluation_plans(workflow)
+        if workflow["status"] != "awaiting_review":
+            await _preflight_evaluation_permissions(
+                workflow,
+                cluster_id=workflow.get("cluster_id"),
+                owner_user_id=workflow.get("owner_user_id"),
+                requested_namespaces=request.target_namespaces,
+                include_prepared_plans=False,
+            )
         _save(workflow)
         if workflow["status"] != "awaiting_review":
             _workflow_tasks[workflow["id"]] = asyncio.create_task(_execute_evaluation(workflow["id"]))
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        raise HTTPException(status_code=503, detail=f"evaluation could not be queued: {error}") from error
+    except Exception as error:
+        handled = _permission_preflight_error_response(error)
+        if handled is not None:
+            return handled
+        if isinstance(error, (OSError, RuntimeError, TypeError, ValueError)):
+            raise HTTPException(status_code=503, detail=f"evaluation could not be queued: {error}") from error
+        raise
     return workflow
 
 
@@ -6524,19 +7058,28 @@ async def create_evaluation(request: EvaluationCreateRequest, http_request: Requ
     ),
     response_model=EvaluationWorkflowResponse,
     response_model_exclude_unset=True,
-    responses=evaluation_problem_responses(401, 403, 404, 409, 422),
+    responses=evaluation_problem_responses(401, 403, 404, 409, 422, 503),
 )
 @owned_control("workflow")
 async def confirm_evaluation_plans(workflow_id: str, request: EvaluationPlanConfirmation, http_request: Request):
     from llm_d_lens.db.dao.deployment_plan import DeploymentPlanDao
 
-    workflow = _get("workflow", workflow_id)
-    if workflow is None:
+    stored = _get("workflow", workflow_id)
+    if stored is None:
         raise HTTPException(status_code=404, detail="Evaluation not found")
+    workflow = deepcopy(stored)
     principal = current_principal(http_request)
     if workflow.get("owner_user_id") != owner_for_create(principal):
         raise HTTPException(status_code=403, detail="Only the plan owner can confirm this Evaluation")
-    require_cluster_access(principal, workflow.get("cluster_id"))
+    cluster_id = workflow.get("cluster_id")
+    require_cluster_access(principal, cluster_id)
+    if (
+        principal is not None
+        and principal.role_permissions
+        and cluster_id
+        and not authorize(principal, "evaluate:workflow:create", target_cluster_id=cluster_id).allowed
+    ):
+        raise ForbiddenError("cluster is not accessible")
     _require_evaluate_record(
         principal,
         workflow,
@@ -6564,10 +7107,26 @@ async def confirm_evaluation_plans(workflow_id: str, request: EvaluationPlanConf
             and not request.acknowledge_unknown
         ):
             raise HTTPException(status_code=409, detail="Preflight failed or unknown constraints were not acknowledged")
+    try:
+        await _preflight_evaluation_permissions(
+            workflow,
+            cluster_id=workflow.get("cluster_id"),
+            owner_user_id=workflow.get("owner_user_id"),
+            requested_namespaces=request.target_namespaces,
+            include_prepared_plans=True,
+        )
+    except Exception as error:
+        handled = _permission_preflight_error_response(error)
+        if handled is not None:
+            return handled
+        raise
     workflow.update(status="queued", acknowledge_unknown=request.acknowledge_unknown)
     _save(workflow)
     _workflow_tasks[workflow_id] = asyncio.create_task(_execute_evaluation(workflow_id))
     return workflow
+
+
+_DEFAULT_EVALUATION_RETRY_REQUEST = EvaluationRetryRequest()
 
 
 @router.post(
@@ -6581,15 +7140,31 @@ async def confirm_evaluation_plans(workflow_id: str, request: EvaluationPlanConf
         "workflow is queued. Preparation failure returns 409 without replacing the historical workflow."
     ),
     operation_id="retry_evaluation_workflow",
-    responses=evaluation_problem_responses(401, 403, 404, 409, 422),
+    responses=evaluation_problem_responses(401, 403, 404, 409, 422, 503),
     response_model=EvaluationWorkflowResponse,
     response_model_exclude_unset=True,
 )
 @owned_control("workflow")
-async def retry_workflow_run(workflow_id: str) -> dict:
+async def retry_workflow_run(
+    workflow_id: str,
+    request: Annotated[EvaluationRetryRequest, Body()] = _DEFAULT_EVALUATION_RETRY_REQUEST,
+    http_request: Request = None,
+) -> dict:
     workflow = deepcopy(_get("workflow", workflow_id))
     if workflow is None:
         raise HTTPException(status_code=404, detail="evaluate workflow run not found")
+    principal = current_principal(http_request)
+    if not workflow.get("cluster_id") and workflow.get("cluster_session_id"):
+        bound_session = sessions.get_session(workflow["cluster_session_id"])
+        if bound_session and getattr(bound_session, "server_id", None):
+            workflow["cluster_id"] = bound_session.server_id
+    if workflow.get("cluster_id"):
+        _require_workflow_action_access(
+            principal,
+            workflow,
+            permission="evaluate:run:retry",
+            detail="evaluate workflow run is not accessible",
+        )
     if workflow.get("status") not in {"failed", "cancelled"} or "cases" not in workflow:
         raise HTTPException(
             status_code=409, detail="only failed or cancelled multi-workload evaluations can be retried"
@@ -6598,6 +7173,28 @@ async def retry_workflow_run(workflow_id: str) -> dict:
         _rebind_retry_session(workflow)
     except ValueError as error:
         raise HTTPException(status_code=409, detail=f"Evaluation cannot be retried: {error}") from error
+    if not workflow.get("cluster_id") and workflow.get("cluster_session_id"):
+        rebound = sessions.get_session(workflow["cluster_session_id"])
+        if rebound and getattr(rebound, "server_id", None):
+            workflow["cluster_id"] = rebound.server_id
+    _require_workflow_action_access(
+        principal,
+        workflow,
+        permission="evaluate:run:retry",
+        detail="evaluate workflow run is not accessible",
+    )
+    retry_request = request if isinstance(request, EvaluationRetryRequest) else EvaluationRetryRequest()
+    try:
+        requested_namespaces = _validate_requested_target_namespaces(
+            retry_request.target_namespaces,
+            cluster_id=workflow.get("cluster_id"),
+            cases=workflow.get("cases", []),
+        )
+    except Exception as error:
+        handled = _permission_preflight_error_response(error)
+        if handled is not None:
+            return handled
+        raise
     for case in workflow["cases"]:
         case.pop("cancel_requested", None)
     # A failed same-pod baseline can only resume without rerunning its candidate when that
@@ -6614,7 +7211,10 @@ async def retry_workflow_run(workflow_id: str) -> dict:
             None,
         )
         execution = _store.get_execution(guide.get("execution_id")) if guide and guide.get("execution_id") else None
-        if guide and (execution is None or execution.status != DeploymentStatus.READY):
+        if guide and (
+            execution is None or execution.status != DeploymentStatus.READY or _has_phase1_cleanup(execution)
+        ):
+            _clear_owned_case_namespace(workflow, guide, requested_namespaces)
             guide.update(
                 status="queued",
                 cancel_requested=False,
@@ -6663,6 +7263,7 @@ async def retry_workflow_run(workflow_id: str) -> dict:
                         "the historical run has not been changed."
                     ),
                 ) from error
+            _clear_owned_case_namespace(workflow, case, requested_namespaces)
             case.update(
                 status="queued",
                 cancel_requested=False,
@@ -6676,9 +7277,30 @@ async def retry_workflow_run(workflow_id: str) -> dict:
             )
     workflow.update(status="queued", error=None, report=None, finished_at=None)
     try:
+        _apply_requested_target_namespaces(
+            workflow,
+            requested_namespaces,
+            cluster_id=workflow.get("cluster_id"),
+            include_prepared_plans=False,
+            only_pending=True,
+        )
         await _prepare_evaluation_plans(workflow)
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=f"Evaluation retry requires a new plan: {error}") from error
+        if workflow["status"] != "awaiting_review":
+            await _preflight_evaluation_permissions(
+                workflow,
+                cluster_id=workflow.get("cluster_id"),
+                owner_user_id=workflow.get("owner_user_id"),
+                requested_namespaces=requested_namespaces,
+                include_prepared_plans=False,
+                only_pending=True,
+            )
+    except Exception as error:
+        handled = _permission_preflight_error_response(error)
+        if handled is not None:
+            return handled
+        if isinstance(error, ValueError):
+            raise HTTPException(status_code=409, detail=f"Evaluation retry requires a new plan: {error}") from error
+        raise
     _save(workflow)
     if workflow["status"] != "awaiting_review":
         _workflow_tasks[workflow_id] = asyncio.create_task(_execute_evaluation(workflow_id))
@@ -6771,6 +7393,17 @@ async def _cancel_evaluation(workflow: dict, case_id: str | None = None) -> dict
         }
         errors = []
         for deployment_id in deployment_ids:
+            matching_owned_cases = [
+                case
+                for case in targets
+                if case.get("deployment_run_id") == deployment_id and _deployment_owned(workflow, case)
+            ]
+            if (
+                matching_owned_cases
+                and any(case.get("cleanup_status") == "pending_admin_cleanup" for case in matching_owned_cases)
+                and _store.get_run(deployment_id) is None
+            ):
+                continue
             try:
                 # The cancelling cases and runs are still unfinished here and would make the evaluate
                 # usage probe block the very cleanup this cancellation performs.
@@ -6778,6 +7411,15 @@ async def _cancel_evaluation(workflow: dict, case_id: str | None = None) -> dict
                     await deployment_run_manager.worker_for_run(deployment_id).cancel_evaluation_deployment(
                         deployment_id
                     )
+            except DeploymentCleanupPermissionDenied as cleanup_handoff_error:
+                matching_cases = [
+                    case
+                    for case in targets
+                    if case.get("deployment_run_id") == deployment_id
+                    and case.get("baseline_type") != "kubernetes-service"
+                ]
+                for target_case in matching_cases or targets[:1]:
+                    _record_case_cleanup_handoff(workflow, target_case, cleanup_handoff_error)
             except Exception as error:
                 errors.append(f"{deployment_id}: {error}")
         for case in targets:
@@ -6889,6 +7531,14 @@ async def delete_workflow_run(workflow_id: str, request: Request = None) -> None
             continue
         try:
             await deployment_run_manager.worker_for_run(deployment_run_id).delete_run(deployment_run_id)
+        except DeploymentCleanupPermissionDenied as cleanup_handoff_error:
+            return problem(
+                409,
+                "Deployment cleanup requires Orchestration administrator action",
+                str(cleanup_handoff_error),
+                "deployment_cleanup_permission_denied",
+                extra=cleanup_handoff_error.payload,
+            )
         except ValueError as error:
             raise HTTPException(
                 status_code=409,
@@ -6902,6 +7552,7 @@ async def delete_workflow_run(workflow_id: str, request: Request = None) -> None
     for evaluation_id in evaluation_ids:
         _delete_benchmark_history(evaluation_id)
     _delete("workflow", workflow_id)
+    return None
 
 
 @router.on_event("startup")

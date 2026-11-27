@@ -2,9 +2,13 @@
 
 import asyncio
 import json
+import os
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from llm_d_lens.configuration.models import ModelSecretConfiguration
@@ -619,3 +623,253 @@ async def test_published_deployment_names_scope_commands(tmp_path):
         )
     with pytest.raises(RuntimeConfigurationError):
         runner.register_published_deployments("default", ["published-decode"])
+
+
+def test_registered_guide_helm_validates_post_renderer_allowlist(tmp_path: Path, monkeypatch):
+    from llm_d_lens.deploy.providers import deployment_bundle
+
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", lambda _helm_bin="helm": 3)
+    namespace = "llm-d-bench-router"
+    guide = RegisteredGuideRuntime(
+        guide_id="optimized-baseline",
+        source_ref="main",
+        content_hash="test",
+        maturity="supported",
+        manifest_path=tmp_path / "kustomization.yaml",
+        router_chart="oci://charts/router",
+        router_chart_version="1.0.0",
+        router_release_name="optimized-baseline",
+        router_base_values_path=tmp_path / "base.yaml",
+        router_values_path=tmp_path / "optimized.yaml",
+        neutral_router_values_path=tmp_path / "neutral.yaml",
+    )
+    runner = RegisteredGuideCommandRunner(
+        kubectl_path=tmp_path / "kubectl",
+        helm_path=tmp_path / "helm",
+        namespace_prefix="llm-d-bench-",
+        guide=guide,
+        timeout_seconds=30,
+        rendered_overlay_root=tmp_path,
+    )
+    install = [
+        "helm",
+        "upgrade",
+        "--install",
+        guide.router_release_name,
+        guide.router_chart,
+        "--namespace",
+        namespace,
+        "--version",
+        guide.router_chart_version,
+        "--values",
+        str(guide.router_base_values_path),
+        "--values",
+        str(guide.router_values_path),
+    ]
+    neutral_install = [*install[:-1], str(guide.neutral_router_values_path)]
+    uninstall = ["helm", "uninstall", guide.router_release_name, "--namespace", namespace]
+
+    with deployment_bundle.helm_metrics_auth_post_renderer(namespace) as post_renderer:
+        script = post_renderer.script_path
+        runner._validate_helm([*install, "--post-renderer", str(post_renderer)])
+        runner._validate_helm(
+            [*neutral_install, "--values", str(PLAINTEXT_EPP_VALUES_PATH), "--post-renderer", str(post_renderer)]
+        )
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*uninstall, "--post-renderer", str(post_renderer)])
+
+        # World-readable permissions rejected
+        script.chmod(0o755)
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*install, "--post-renderer", str(post_renderer)])
+        script.chmod(0o700)
+
+        # Symlink inside post-renderer root rejected
+        symlink_script = script.parent.parent / "symlink-dir"
+        symlink_script.mkdir(exist_ok=True)
+        symlink_path = symlink_script / "strip-metrics-auth-rbac"
+        symlink_path.symlink_to("/bin/sh")
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*install, "--post-renderer", str(symlink_path)])
+
+        # Helm v4 plugin name rejected when no bound plugins_dir is active
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*install, "--post-renderer", "strip-metrics-auth-rbac"])
+
+    # Arbitrary / outside-root / nonexistent scripts rejected
+    outside = tmp_path / "strip-metrics-auth-rbac"
+    outside.write_text("#!/bin/sh\n", encoding="utf-8")
+    outside.chmod(0o700)
+    with pytest.raises(RuntimeConfigurationError):
+        runner._validate_helm([*install, "--post-renderer", str(outside)])
+    with pytest.raises(RuntimeConfigurationError):
+        runner._validate_helm([*install, "--post-renderer", "/bin/sh"])
+    with pytest.raises(RuntimeConfigurationError):
+        runner._validate_helm(
+            [*install, "--post-renderer", str(tmp_path / "post-renderers/missing/strip-metrics-auth-rbac")]
+        )
+
+
+@pytest.mark.asyncio
+async def test_registered_guide_helm_v4_validates_plugin_and_passes_env(tmp_path: Path, monkeypatch):
+    from llm_d_lens.deploy.providers import deployment_bundle
+    from llm_d_lens.deploy.runtime import composition
+
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", lambda _helm_bin="helm": 4)
+    monkeypatch.delenv("HELM_PLUGINS", raising=False)
+
+    spawned: list[tuple[list[str], dict[str, str] | None]] = []
+
+    async def fake_spawn(command, **kwargs):
+        spawned.append((command, kwargs.get("env")))
+        return SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(b"ok", b"")))
+
+    monkeypatch.setattr(composition, "spawn", fake_spawn)
+
+    namespace = "llm-d-bench-router"
+    guide = RegisteredGuideRuntime(
+        guide_id="optimized-baseline",
+        source_ref="main",
+        content_hash="test",
+        maturity="supported",
+        manifest_path=tmp_path / "kustomization.yaml",
+        router_chart="oci://charts/router",
+        router_chart_version="1.0.0",
+        router_release_name="optimized-baseline",
+        router_base_values_path=tmp_path / "base.yaml",
+        router_values_path=tmp_path / "optimized.yaml",
+        neutral_router_values_path=tmp_path / "neutral.yaml",
+    )
+    kubeconfig_path = str(tmp_path / "kubeconfig")
+    runner = RegisteredGuideCommandRunner(
+        kubectl_path=tmp_path / "kubectl",
+        helm_path=tmp_path / "helm",
+        namespace_prefix="llm-d-bench-",
+        guide=guide,
+        timeout_seconds=30,
+        rendered_overlay_root=tmp_path,
+        kubeconfig=kubeconfig_path,
+    )
+    install = [
+        "helm",
+        "upgrade",
+        "--install",
+        guide.router_release_name,
+        guide.router_chart,
+        "--namespace",
+        namespace,
+        "--version",
+        guide.router_chart_version,
+        "--values",
+        str(guide.router_base_values_path),
+        "--values",
+        str(guide.router_values_path),
+    ]
+    uninstall = ["helm", "uninstall", guide.router_release_name, "--namespace", namespace]
+
+    # Outside active context, v4 plugin name is rejected
+    with pytest.raises(RuntimeConfigurationError):
+        runner._validate_helm([*install, "--post-renderer", "strip-metrics-auth-rbac"])
+
+    with deployment_bundle.helm_metrics_auth_post_renderer(namespace, helm_bin=runner._helm_path) as post_renderer:
+        assert str(post_renderer) == "strip-metrics-auth-rbac"
+        plugins_dir = post_renderer.plugins_dir
+        assert plugins_dir is not None
+
+        # Valid v4 call passes validation and receives per-invocation HELM_PLUGINS
+        status, _, _ = await runner([*install, *post_renderer.helm_args()])
+        assert status == 0
+        assert spawned[-1][0][-2:] == ["--post-renderer", "strip-metrics-auth-rbac"]
+        assert spawned[-1][1] is not None
+        assert spawned[-1][1]["HELM_PLUGINS"] == str(plugins_dir)
+        assert spawned[-1][1]["KUBECONFIG"] == kubeconfig_path
+        assert "HELM_PLUGINS" not in (runner._kubectl._environment or {})
+        assert "HELM_PLUGINS" not in os.environ
+
+        # Non-post-renderer helm command inside active context does not receive HELM_PLUGINS
+        await runner(install)
+        assert spawned[-1][1] is runner._kubectl._environment
+        assert "HELM_PLUGINS" not in (spawned[-1][1] or {})
+
+        # Arbitrary plugin name and uninstall with --post-renderer are rejected
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*install, "--post-renderer", "arbitrary-plugin"])
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*uninstall, "--post-renderer", "strip-metrics-auth-rbac"])
+
+        # Loose permissions on plugins_dir, plugin_dir, plugin.yaml, and wrapper are rejected
+        plugin_dir = plugins_dir / "strip-metrics-auth-rbac"
+        plugin_yaml = plugin_dir / "plugin.yaml"
+        for target, restore_mode in (
+            (plugins_dir, 0o700),
+            (plugin_dir, 0o700),
+            (plugin_yaml, 0o600),
+            (post_renderer.script_path, 0o700),
+        ):
+            target.chmod(0o755)
+            with pytest.raises(RuntimeConfigurationError):
+                runner._validate_helm([*install, "--post-renderer", "strip-metrics-auth-rbac"])
+            target.chmod(restore_mode)
+
+        # Tampered plugin.yaml (wrong type or outside command) is rejected
+        original_manifest = plugin_yaml.read_text(encoding="utf-8")
+        outside = tmp_path / "strip-metrics-auth-rbac"
+        outside.write_text("#!/bin/sh\n", encoding="utf-8")
+        outside.chmod(0o700)
+        tampered = yaml.safe_load(original_manifest)
+        tampered["runtimeConfig"]["platformCommand"] = [{"command": str(outside)}]
+        plugin_yaml.write_text(yaml.safe_dump(tampered, sort_keys=False), encoding="utf-8")
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*install, "--post-renderer", "strip-metrics-auth-rbac"])
+
+        tampered = yaml.safe_load(original_manifest)
+        tampered["type"] = "cli/v1"
+        plugin_yaml.write_text(yaml.safe_dump(tampered, sort_keys=False), encoding="utf-8")
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*install, "--post-renderer", "strip-metrics-auth-rbac"])
+
+        # Unknown top-level keys (such as description), unknown runtimeConfig keys,
+        # and empty/whitespace/non-string version are rejected
+        tampered = yaml.safe_load(original_manifest)
+        tampered["description"] = "unexpected"
+        plugin_yaml.write_text(yaml.safe_dump(tampered, sort_keys=False), encoding="utf-8")
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*install, "--post-renderer", "strip-metrics-auth-rbac"])
+
+        tampered = yaml.safe_load(original_manifest)
+        tampered["runtimeConfig"]["extra"] = True
+        plugin_yaml.write_text(yaml.safe_dump(tampered, sort_keys=False), encoding="utf-8")
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*install, "--post-renderer", "strip-metrics-auth-rbac"])
+
+        for bad_version in ("", "   ", 1, None):
+            tampered = yaml.safe_load(original_manifest)
+            tampered["version"] = bad_version
+            plugin_yaml.write_text(yaml.safe_dump(tampered, sort_keys=False), encoding="utf-8")
+            with pytest.raises(RuntimeConfigurationError):
+                runner._validate_helm([*install, "--post-renderer", "strip-metrics-auth-rbac"])
+        plugin_yaml.write_text(original_manifest, encoding="utf-8")
+
+        # Symlink plugin.yaml rejected
+        plugin_yaml.unlink()
+        evil_yaml = tmp_path / "evil.yaml"
+        evil_yaml.write_text(original_manifest, encoding="utf-8")
+        evil_yaml.chmod(0o600)
+        plugin_yaml.symlink_to(evil_yaml)
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*install, "--post-renderer", "strip-metrics-auth-rbac"])
+        plugin_yaml.unlink()
+        plugin_yaml.write_text(original_manifest, encoding="utf-8")
+        plugin_yaml.chmod(0o600)
+
+        # Symlink plugins_dir rejected via ContextVar override
+        symlink_plugins = tmp_path / "post-renderers" / "symlink-plugins"
+        symlink_plugins.symlink_to(plugins_dir)
+        token = deployment_bundle._ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.set(symlink_plugins)
+        try:
+            with pytest.raises(RuntimeConfigurationError):
+                runner._validate_helm([*install, "--post-renderer", "strip-metrics-auth-rbac"])
+        finally:
+            deployment_bundle._ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.reset(token)

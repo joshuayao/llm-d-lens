@@ -198,9 +198,12 @@ test('remaining and done rows default closed, and both expose status icons', () 
     assert.match(html, /aria-label="Ready"/);
     assert.match(html, /Blocked/);
     assert.match(html, /Ready/);
+    assert.match(html, /data-permission-handoff=""/);
     assert.match(html, /<details class="group\/details[^"]*" open="">/);
-    assert.doesNotMatch(html, /<details class="group"[^>]*open/);
-    assert.match(html, /<details class="group">/);
+    assert.doesNotMatch(html, /<details class="group"/);
+    assert.doesNotMatch(html, /<details class="group\/handoff-op"[^>]*open/);
+    assert.match(html, /<details class="group\/handoff-op">/);
+    assert.match(html, /group-open\/handoff-op:rotate-90/);
     assert.match(html, /Expand for details/);
     assert.match(html, /Create the storage claim/);
 });
@@ -262,10 +265,12 @@ test('progressive disclosure outer details auto-expands when not passed with iso
         />,
     );
     assert.match(html, /<details class="group\/details[^"]*" open="">/);
-    assert.doesNotMatch(html, /<details class="group"[^>]*open/);
+    assert.doesNotMatch(html, /<details class="group"/);
+    assert.doesNotMatch(html, /<details class="group\/handoff-op"[^>]*open/);
     assert.match(html, /<details class="group\/details /);
     assert.match(html, /group-open\/details:rotate-90/);
-    assert.match(html, /<details class="group">/);
+    assert.match(html, /<details class="group\/handoff-op">/);
+    assert.match(html, /group-open\/handoff-op:rotate-90/);
     assert.match(html, /View operation details/);
     assert.match(html, /1\/2 Orchestration administrator done · 1 user/);
 });
@@ -571,9 +576,12 @@ test('CleanupHandoffPanel renders awaiting-admin script, expanded details, Step 
     assert.match(html, /Shared namespace preserved\./);
     assert.match(html, /Download/);
     assert.match(html, /Copy/);
+    assert.match(html, /data-permission-handoff=""/);
     assert.match(html, /<details class="group\/details[^"]*" open="">/);
-    assert.doesNotMatch(html, /<details class="group"[^>]*open/);
-    assert.match(html, /<details class="group">/);
+    assert.doesNotMatch(html, /<details class="group"/);
+    assert.doesNotMatch(html, /<details class="group\/handoff-op"[^>]*open/);
+    assert.match(html, /<details class="group\/handoff-op">/);
+    assert.match(html, /group-open\/handoff-op:rotate-90/);
     assert.match(html, /View cleanup operations &amp; script/);
     assert.match(html, /1 remaining · 1 cleaned/);
     assert.match(html, /Delete gateway namespace/);
@@ -972,8 +980,9 @@ test('PermissionHandoffPanel auto-expands outer details for all not-passed state
             <PermissionHandoffPanel {...props} onRecheck={() => {}} />,
         );
         assert.match(html, /<details class="group\/details[^"]*" open="">/, `${name}: expected outer details open`);
-        assert.doesNotMatch(html, /<details class="group"[^>]*open/, `${name}: expected inner rows closed`);
-        assert.match(html, /<details class="group">/, `${name}: expected inner OperationRow details`);
+        assert.doesNotMatch(html, /<details class="group"/, `${name}: expected no bare details.group`);
+        assert.doesNotMatch(html, /<details class="group\/handoff-op"[^>]*open/, `${name}: expected inner rows closed`);
+        assert.match(html, /<details class="group\/handoff-op">/, `${name}: expected inner OperationRow details`);
     }
 
     const verifiedHandoff = {
@@ -1032,6 +1041,7 @@ test('MonitoringAdminScriptPanel auto-expands operation details when script is p
             onRecheck={() => {}}
         />,
     );
+    assert.match(withScriptHtml, /data-permission-handoff=""/);
     assert.match(withScriptHtml, /<details class="group\/script[^"]*" open="">/);
     assert.match(withScriptHtml, /View operation details &amp; script preview/);
 
@@ -1042,5 +1052,6 @@ test('MonitoringAdminScriptPanel auto-expands operation details when script is p
             onRecheck={() => {}}
         />,
     );
+    assert.match(emptyScriptHtml, /data-permission-handoff=""/);
     assert.doesNotMatch(emptyScriptHtml, /<details/);
 });

@@ -949,6 +949,8 @@ def test_discover_local_cluster_falls_back_to_prometheus_on_403_and_raises_401(m
     assert profile["version"] == "v1.32.0"
     assert profile["allocatable"]["accelerators"] == {"nvidia.com/gpu": 2}
     assert profile["allocatable"]["memoryGiB"] == 64
+    assert profile["deviceClasses"] == []
+    assert profile["deviceClassesVerified"] is False
 
     async def kubectl_401(argv, **kwargs):
         return SimpleNamespace(ok=False, stdout="", stderr="Unauthorized")
@@ -956,6 +958,216 @@ def test_discover_local_cluster_falls_back_to_prometheus_on_403_and_raises_401(m
     monkeypatch.setattr(guide_sources, "run_kubectl", kubectl_401)
     with pytest.raises(GuideError) as exc:
         asyncio.run(guide_sources.discover_local_cluster(None, "session-1"))
+    assert exc.value.status == 401
+
+
+@pytest.mark.parametrize(
+    ("deviceclasses_result", "expected_verified"),
+    [
+        (SimpleNamespace(ok=True, stdout='{"items": []}', stderr=""), True),
+        (
+            SimpleNamespace(
+                ok=False,
+                stdout="",
+                stderr='error: the server doesn\'t have a resource type "deviceclasses"',
+            ),
+            True,
+        ),
+        (
+            SimpleNamespace(ok=False, stdout="", stderr="Error from server (Forbidden): deviceclasses is forbidden"),
+            False,
+        ),
+    ],
+)
+def test_discover_local_cluster_device_classes_verification_states(
+    monkeypatch, deviceclasses_result, expected_verified
+):
+    from llm_d_lens.deploy import guide_sources
+
+    async def fake_kubectl(argv, **kwargs):
+        if argv[0] == "version":
+            return SimpleNamespace(ok=True, stdout='{"serverVersion": {"gitVersion": "v1.35.0"}}', stderr="")
+        if argv[:2] == ["get", "nodes"]:
+            return SimpleNamespace(
+                ok=True,
+                stdout=json.dumps(
+                    {
+                        "items": [
+                            {
+                                "metadata": {"name": "worker-1"},
+                                "status": {"allocatable": {"cpu": "16", "memory": "64Gi"}},
+                            }
+                        ]
+                    }
+                ),
+                stderr="",
+            )
+        if argv[:2] == ["get", "deviceclasses.resource.k8s.io"]:
+            return deviceclasses_result
+        return SimpleNamespace(ok=True, stdout='{"items": []}', stderr="")
+
+    monkeypatch.setattr(guide_sources, "run_kubectl", fake_kubectl)
+    profile = asyncio.run(guide_sources.discover_local_cluster(None))
+    assert profile is not None
+    assert profile["deviceClasses"] == []
+    assert profile["deviceClassesVerified"] is expected_verified
+
+
+def test_discover_local_cluster_pure_dra_nodes_200_merges_prometheus_only_on_slices_403(monkeypatch):
+    from llm_d_lens.cluster.service import PrometheusNodeInventory
+    from llm_d_lens.deploy import guide_sources, slice_capacity
+
+    inv = PrometheusNodeInventory(
+        reachable=True,
+        all_nodes=[
+            {
+                "name": "worker-1",
+                "role": "worker",
+                "version": "v1.35.0",
+                "ready": True,
+                "schedulingDisabled": False,
+                "cpu": 16,
+                "memoryBytes": 64 * 1024 * 1024 * 1024,
+                "gpuByProfile": {"intel-xpu": 4},
+                "gpuModelsByProfile": {},
+            }
+        ],
+        allocatable_by_node={
+            "worker-1": {"cpu": 16, "memoryBytes": 64 * 1024 * 1024 * 1024, "gpuByProfile": {"intel-xpu": 4}}
+        },
+        allocated_gpu_by_node={},
+    )
+    prometheus_calls = 0
+
+    async def fake_fetch_prometheus(_cluster_id):
+        nonlocal prometheus_calls
+        prometheus_calls += 1
+        return inv
+
+    monkeypatch.setattr(guide_sources, "require_active_session", lambda _sid: SimpleNamespace(server_id="cluster-1"))
+    monkeypatch.setattr(guide_sources, "current_principal", lambda _req: None)
+    monkeypatch.setattr(guide_sources, "require_cluster_access", lambda _p, _c: None)
+    monkeypatch.setattr(guide_sources, "require_internal_permission", lambda _req, _path: asyncio.sleep(0))
+    monkeypatch.setattr(slice_capacity, "fetch_prometheus_node_inventory", fake_fetch_prometheus)
+
+    node_payload = {
+        "items": [
+            {
+                "metadata": {"name": "worker-1", "labels": {"topology.kubernetes.io/zone": "az-1"}},
+                "spec": {"taints": [{"key": "dedicated", "value": "gpu", "effect": "NoSchedule"}]},
+                "status": {"allocatable": {"cpu": "32", "memory": "128Gi"}},
+            }
+        ]
+    }
+
+    async def kubectl_slices_403(argv, **kwargs):
+        if argv[0] == "version":
+            return SimpleNamespace(ok=True, stdout='{"serverVersion": {"gitVersion": "v1.35.0"}}', stderr="")
+        if argv[:2] == ["get", "nodes"]:
+            return SimpleNamespace(ok=True, stdout=json.dumps(node_payload), stderr="")
+        if argv[:2] == ["get", "deviceclasses.resource.k8s.io"]:
+            return SimpleNamespace(ok=False, stdout="", stderr="deviceclasses.resource.k8s.io is forbidden")
+        if argv[:2] == ["get", "resourceslices.resource.k8s.io"]:
+            return SimpleNamespace(ok=False, stdout="", stderr="resourceslices.resource.k8s.io is forbidden")
+        return SimpleNamespace(ok=True, stdout='{"items": []}', stderr="")
+
+    monkeypatch.setattr(guide_sources, "run_kubectl", kubectl_slices_403)
+    profile = asyncio.run(guide_sources.discover_local_cluster(None, "session-1"))
+    assert profile is not None
+    assert prometheus_calls == 1
+    assert profile["deviceClassesVerified"] is False
+    assert profile["nodes"][0]["labels"] == {"topology.kubernetes.io/zone": "az-1"}
+    assert profile["nodes"][0]["taints"] == [{"key": "dedicated", "value": "gpu", "effect": "NoSchedule"}]
+    assert profile["allocatable"]["cpu"] == 32
+    assert profile["allocatable"]["memoryGiB"] == 128
+    assert profile["allocatable"]["accelerators"] == {"gpu.intel.com/i915": 4}
+
+    prometheus_calls = 0
+
+    async def kubectl_slices_404(argv, **kwargs):
+        if argv[:2] == ["get", "resourceslices.resource.k8s.io"]:
+            return SimpleNamespace(
+                ok=False,
+                stdout="",
+                stderr='error: the server doesn\'t have a resource type "resourceslices"',
+            )
+        return await kubectl_slices_403(argv, **kwargs)
+
+    monkeypatch.setattr(guide_sources, "run_kubectl", kubectl_slices_404)
+    profile_404 = asyncio.run(guide_sources.discover_local_cluster(None, "session-1"))
+    assert profile_404 is not None
+    assert prometheus_calls == 0
+    assert profile_404["allocatable"]["accelerators"] == {}
+
+
+def test_discover_remote_environment_device_classes_verification_and_401(monkeypatch, tmp_path):
+    import os
+    import stat
+    import subprocess
+
+    from llm_d_lens.deploy import guide_sources
+
+    kubectl_bin = tmp_path / "kubectl"
+
+    def install_fake_kubectl(deviceclasses_body: str):
+        kubectl_bin.write_text(
+            "#!/bin/sh\n"
+            'case "$*" in\n'
+            '  "version -o json")\n'
+            '    printf \'{"serverVersion": {"gitVersion": "v1.35.0"}}\\n\'\n'
+            "    exit 0 ;;\n"
+            '  "get nodes -o json")\n'
+            '    printf \'{"items": [{"metadata": {"name": "remote-1"}, "status": {"allocatable": {"cpu": "16", "memory": "64Gi"}}}]}\\n\'\n'
+            "    exit 0 ;;\n"
+            '  "get deviceclasses.resource.k8s.io -o json")\n'
+            f"{deviceclasses_body}\n"
+            "    ;;\n"
+            '  "get resourceslices.resource.k8s.io -o json")\n'
+            "    printf '{\"items\": []}\\n'\n"
+            "    exit 0 ;;\n"
+            "esac\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        kubectl_bin.chmod(kubectl_bin.stat().st_mode | stat.S_IXUSR)
+
+    async def fake_execute(_target, _credentials, command):
+        env = dict(os.environ, PATH=f"{tmp_path}:{os.environ.get('PATH', '')}")
+        completed = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True, env=env, check=False)
+        return {"stdout": completed.stdout, "stderr": completed.stderr}
+
+    monkeypatch.setattr(guide_sources, "execute_remote_inspection", fake_execute)
+
+    install_fake_kubectl(
+        '    printf "Error from server (Forbidden): deviceclasses.resource.k8s.io is forbidden\\n" >&2\n    exit 1'
+    )
+    forbidden = asyncio.run(guide_sources.discover_remote_environment("host", {}))
+    assert forbidden["cluster"]["deviceClasses"] == []
+    assert forbidden["cluster"]["deviceClassesVerified"] is False
+
+    install_fake_kubectl(
+        '    printf "error: the server doesn\'t have a resource type \\"deviceclasses\\"\\n" >&2\n    exit 1'
+    )
+    missing_crd = asyncio.run(guide_sources.discover_remote_environment("host", {}))
+    assert missing_crd["cluster"]["deviceClasses"] == []
+    assert missing_crd["cluster"]["deviceClassesVerified"] is True
+
+    install_fake_kubectl(
+        '    printf "Warning: test stderr notice\\n" >&2\n'
+        '    printf \'{"items": [{"metadata": {"name": "gpu.intel.com"}}]}\\n\'\n'
+        "    exit 0"
+    )
+    valid = asyncio.run(guide_sources.discover_remote_environment("host", {}))
+    assert valid["cluster"]["deviceClasses"] == ["gpu.intel.com"]
+    assert valid["cluster"]["deviceClassesVerified"] is True
+
+    install_fake_kubectl(
+        "    printf 'Error from server (Forbidden): deviceclasses.resource.k8s.io is forbidden: "
+        'User "system:anonymous" cannot list resource "deviceclasses" in API group "resource.k8s.io" at the cluster scope\\n\' >&2\n'
+        "    exit 1"
+    )
+    with pytest.raises(GuideError) as exc:
+        asyncio.run(guide_sources.discover_remote_environment("host", {}))
     assert exc.value.status == 401
 
 

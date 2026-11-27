@@ -264,6 +264,23 @@ class EvaluationPlanConfirmation(BaseModel):
     acknowledge_unknown: bool = Field(
         default=False, description="Acknowledge every listed unverified preflight constraint."
     )
+    target_namespaces: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Optional verified deployment target namespaces keyed by deployment_group_id "
+            "for non-prepared or reviewed evaluation cases."
+        ),
+    )
+
+
+class EvaluationRetryRequest(BaseModel):
+    target_namespaces: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Optional verified deployment target namespaces keyed by deployment_group_id "
+            "to apply when retrying failed or cancelled cases."
+        ),
+    )
 
 
 class EvaluationCreateRequest(BaseModel):
@@ -277,6 +294,13 @@ class EvaluationCreateRequest(BaseModel):
         description=(
             "When multiple candidate configurations are in one Evaluation, generate pairwise "
             "absolute/matrix comparison rows in addition to each candidate's explicit baselines."
+        ),
+    )
+    target_namespaces: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Optional verified deployment target namespaces keyed by deployment_group_id "
+            "(for example, 'setup-1:guide' or 'setup-1:baseline:direct-vllm')."
         ),
     )
 

@@ -7,13 +7,17 @@ import {
     DEFAULT_REQUIREMENTS,
     deploymentPermissionPayload,
     deploymentPlanningRequest,
+    formatHandoffNamespace,
     generateDeploymentBootstrapScript,
     isDeploymentAdminSetupError,
     isDeploymentCleanupHandoffError,
+    mergeBootstrapRemediationTargets,
+    parseDeploymentAdminSetupError,
     parseDeploymentCleanupHandoff,
     requirementsFromRun,
     streamAgenticRecommendation,
     streamAgenticRefinement,
+    verifiedTargetNamespacesMap,
     verifyDeploymentBootstrap,
     verifyDeploymentCleanup,
 } from './agenticDeploymentBackend.js';
@@ -324,4 +328,120 @@ test('catalog deployments send a version and overrides for server resolution', (
     assert.equal(request.model_catalog_version, 2);
     assert.deepEqual(request.serving_overrides, servingOverrides);
     assert.deepEqual(request.vllm_arguments, []);
+});
+
+test('multi-target deploymentPermissionPayload, verify, remediation, and parsing preserve per-target digests and namespaces', async (t) => {
+    const payload = deploymentPermissionPayload({
+        clusterId: 'c1',
+        expectedDigest: 'combined-should-be-omitted',
+        targets: [
+            {
+                key: 'setup-1:guide',
+                namespace: 'llmd-eval-1',
+                deploymentName: 'eval-a',
+                providerRef: 'optimized-baseline',
+                storageVolumeId: 'vol-1',
+                usesRouter: true,
+                eppServiceAccounts: ['eval-a-epp'],
+                expectedDigest: 'digest-1',
+            },
+            {
+                key: 'setup-1:baseline:direct-vllm',
+                namespace: 'llmd-eval-2',
+                deployment_name: 'eval-b',
+                provider_ref: 'baseline-vllm',
+                uses_storage: false,
+                uses_router: false,
+                expected_digest: 'digest-2',
+            },
+        ],
+    });
+    assert.equal('expected_digest' in payload, false);
+    assert.deepEqual(payload.targets, [
+        {
+            key: 'setup-1:guide',
+            namespace: 'llmd-eval-1',
+            deployment_name: 'eval-a',
+            provider_ref: 'optimized-baseline',
+            storage_volume_id: 'vol-1',
+            uses_storage: true,
+            uses_router: true,
+            epp_service_accounts: ['eval-a-epp'],
+            expected_digest: 'digest-1',
+        },
+        {
+            key: 'setup-1:baseline:direct-vllm',
+            namespace: 'llmd-eval-2',
+            deployment_name: 'eval-b',
+            provider_ref: 'baseline-vllm',
+            uses_storage: false,
+            uses_router: false,
+            expected_digest: 'digest-2',
+        },
+    ]);
+
+    const calls = [];
+    t.mock.method(globalThis, 'fetch', async (url, options) => {
+        calls.push({ url, body: JSON.parse(options.body) });
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    });
+
+    await generateDeploymentBootstrapScript({
+        cluster_id: 'c1',
+        targets: [
+            { key: 'setup-1:guide', namespace: 'llmd-eval-1', usesRouter: true },
+            { key: 'setup-2:guide', namespace: 'llmd-eval-2', usesRouter: false },
+        ],
+    });
+    await verifyDeploymentBootstrap({
+        cluster_id: 'c1',
+        expected_digest: 'combined-digest',
+        targets: [
+            { key: 'setup-1:guide', namespace: 'llmd-eval-1', bootstrapDigest: 'digest-1', alreadySufficient: false },
+            { key: 'setup-2:guide', namespace: 'llmd-eval-2', bootstrapDigest: null, expectedDigest: 'old-digest', alreadySufficient: true },
+        ],
+    });
+
+    assert.equal(calls[0].url, '/api/v1/deployments/permission-remediation');
+    assert.equal(calls[0].body.targets.length, 2);
+    assert.equal(calls[1].url, '/api/v1/deployments/admin-handoff/verify');
+    assert.equal('expected_digest' in calls[1].body, false);
+    assert.equal(calls[1].body.targets[0].expected_digest, 'digest-1');
+    assert.equal('expected_digest' in calls[1].body.targets[1], false);
+
+    const parsed = parseDeploymentAdminSetupError({
+        status: 409,
+        body: {
+            code: 'deployment_admin_setup_required',
+            detail: 'Setup needed',
+            clusterId: 'c1',
+            namespace: 'llmd-eval-1',
+            namespaces: ['llmd-eval-1', 'llmd-eval-2'],
+            targets: [
+                { key: 'setup-1:guide', namespace: 'llmd-eval-1', sufficient: false },
+                { key: 'setup-2:guide', namespace: 'llmd-eval-2', sufficient: false, expected_digest: 'stale-digest' },
+            ],
+        },
+    });
+    assert.equal(parsed.namespace, 'llmd-eval-1');
+    assert.deepEqual(parsed.namespaces, ['llmd-eval-1', 'llmd-eval-2']);
+    assert.deepEqual(parsed.targetNamespaces, {
+        'setup-1:guide': 'llmd-eval-1',
+        'setup-2:guide': 'llmd-eval-2',
+    });
+    assert.equal(formatHandoffNamespace(parsed), 'llmd-eval-1 (+1 more)');
+    assert.equal(formatHandoffNamespace({ namespace: 'llmd-single' }), 'llmd-single');
+    assert.equal(formatHandoffNamespace(null), '');
+
+    const merged = mergeBootstrapRemediationTargets(parsed.targets, [
+        { key: 'setup-1:guide', namespace: 'llmd-eval-1', bootstrapDigest: 'd1', alreadySufficient: false },
+        { key: 'setup-2:guide', namespace: 'llmd-eval-2', bootstrapDigest: null, alreadySufficient: true },
+    ]);
+    assert.equal(merged[0].bootstrapDigest, 'd1');
+    assert.equal(merged[1].bootstrapDigest, null);
+    assert.equal('expected_digest' in merged[1], false);
+    assert.deepEqual(verifiedTargetNamespacesMap({ targets: merged }), {
+        'setup-1:guide': 'llmd-eval-1',
+        'setup-2:guide': 'llmd-eval-2',
+    });
 });

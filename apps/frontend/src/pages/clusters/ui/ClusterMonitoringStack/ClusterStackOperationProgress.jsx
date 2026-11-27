@@ -308,6 +308,7 @@ export function MonitoringAdminScriptPanel({
         <Panel
             padding="sm"
             tone="soft"
+            data-permission-handoff=""
             className="border-l-4 border-l-amber-500 shadow-none"
             title={(
                 <span className="flex items-center gap-2">

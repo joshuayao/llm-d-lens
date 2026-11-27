@@ -64,6 +64,7 @@ from llm_d_lens.deploy.executions import (
 )
 from llm_d_lens.deploy.orphans import (
     OrphanCleanupError,
+    OrphanScanPermissionDeniedError,
     clean_orphan_namespaces,
     namespace_prefix,
     scan_orphan_namespaces,
@@ -979,6 +980,88 @@ def _resolve_execution_cluster_id(context) -> str | None:
     return None
 
 
+def _has_phase1_cleanup_completed(context) -> bool:
+    """Return True when execution diagnostics record completed Phase 1 namespace cleanup."""
+    execution = getattr(context, "execution", None)
+    if execution is None and getattr(context, "execution_id", None):
+        execution = _store.get_execution(context.execution_id)
+    diagnostics = (
+        getattr(execution, "diagnostics", None) if execution is not None else getattr(context, "diagnostics", None)
+    )
+    if isinstance(diagnostics, dict):
+        diag_val = diagnostics
+    else:
+        diag_val = getattr(diagnostics, "value", None) if diagnostics is not None else None
+    if not isinstance(diag_val, dict):
+        return False
+    cleanup = diag_val.get("cleanup")
+    if not isinstance(cleanup, dict):
+        return False
+    phase1 = cleanup.get("phase1")
+    if not isinstance(phase1, dict):
+        return False
+    return phase1.get("phase1Completed") is True
+
+
+def _map_k8s_pod_item(item: dict) -> dict:
+    """Map a Kubernetes or synthetic Prometheus Pod dict into the execution pods schema."""
+    metadata = item.get("metadata") or {}
+    status = item.get("status") or {}
+    spec = item.get("spec") or {}
+    conditions = status.get("conditions") or []
+    container_statuses = status.get("containerStatuses") or status.get("container_statuses") or []
+    init_statuses = status.get("initContainerStatuses") or []
+
+    ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
+    restarts = sum(cs.get("restartCount", 0) for cs in container_statuses) + sum(
+        cs.get("restartCount", 0) for cs in init_statuses
+    )
+
+    status_reason = status.get("phase", "Unknown")
+    for cs in container_statuses + init_statuses:
+        state = cs.get("state") or {}
+        if "waiting" in state:
+            status_reason = state["waiting"].get("reason") or status_reason
+        elif "terminated" in state and state["terminated"].get("reason"):
+            status_reason = state["terminated"].get("reason")
+
+    containers = []
+    for cs in container_statuses:
+        state_map = cs.get("state") or {}
+        c_state = (
+            "running"
+            if "running" in state_map
+            else "waiting"
+            if "waiting" in state_map
+            else "terminated"
+            if "terminated" in state_map
+            else "unknown"
+        )
+        containers.append(
+            {
+                "name": cs.get("name"),
+                "image": cs.get("image"),
+                "ready": bool(cs.get("ready")),
+                "restart_count": cs.get("restartCount", 0),
+                "state": c_state,
+            }
+        )
+
+    return {
+        "name": metadata.get("name"),
+        "namespace": metadata.get("namespace"),
+        "labels": metadata.get("labels") or {},
+        "phase": status.get("phase", "Unknown"),
+        "ready": ready,
+        "pod_ip": status.get("podIP"),
+        "node_name": spec.get("nodeName"),
+        "restarts": restarts,
+        "status_reason": status_reason,
+        "containers": containers,
+        "creation_timestamp": metadata.get("creationTimestamp"),
+    }
+
+
 @router.get(
     "/executions/{execution_id}/pods",
     summary="Get live pod status for all pods in a deployment execution\\'s namespace.",
@@ -1000,7 +1083,7 @@ async def get_execution_pods(execution_id: str, request: Request = None):
         return {"execution_id": execution_id, "namespace": None, "pods": []}
 
     cluster_id = _resolve_execution_cluster_id(context)
-    from llm_d_lens.cluster.service import _is_unauthorized_output
+    from llm_d_lens.cluster.service import _is_forbidden_output, _is_unauthorized_output
     from llm_d_lens.infrastructure.kubernetes import run_kubectl
 
     try:
@@ -1026,6 +1109,43 @@ async def get_execution_pods(execution_id: str, request: Request = None):
             "kubeconfig_unauthorized",
         )
     if result.returncode != 0:
+        if _is_forbidden_output(result):
+            if _has_phase1_cleanup_completed(context):
+                return {
+                    "execution_id": execution_id,
+                    "namespace": context.namespace,
+                    "pods": [],
+                }
+            if cluster_id:
+                from llm_d_lens.deploy.slice_capacity import prometheus_inventory_nodes_and_pods
+
+                try:
+                    _nodes, prom_pods = await prometheus_inventory_nodes_and_pods(cluster_id)
+                except Exception as error:
+                    logger.debug(
+                        "Prometheus pod fallback failed for execution %s (%s): %s",
+                        execution_id,
+                        cluster_id,
+                        redact_kubectl_error(str(error)),
+                    )
+                else:
+                    mapped_pods = [
+                        _map_k8s_pod_item(item)
+                        for item in prom_pods
+                        if isinstance(item, dict) and (item.get("metadata") or {}).get("namespace") == context.namespace
+                    ]
+                    if mapped_pods:
+                        return {
+                            "execution_id": execution_id,
+                            "namespace": context.namespace,
+                            "pods": mapped_pods,
+                        }
+            return {
+                "execution_id": execution_id,
+                "namespace": context.namespace,
+                "pods": [],
+                "error": "Pod status is restricted by cluster RBAC permissions for this namespace.",
+            }
         return {
             "execution_id": execution_id,
             "namespace": context.namespace,
@@ -1039,65 +1159,7 @@ async def get_execution_pods(execution_id: str, request: Request = None):
         return {"execution_id": execution_id, "namespace": context.namespace, "pods": [], "error": "invalid JSON"}
 
     items = payload.get("items") or []
-    pods = []
-    for item in items:
-        metadata = item.get("metadata") or {}
-        status = item.get("status") or {}
-        spec = item.get("spec") or {}
-        conditions = status.get("conditions") or []
-        container_statuses = status.get("containerStatuses") or status.get("container_statuses") or []
-        init_statuses = status.get("initContainerStatuses") or []
-
-        ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
-
-        restarts = sum(cs.get("restartCount", 0) for cs in container_statuses) + sum(
-            cs.get("restartCount", 0) for cs in init_statuses
-        )
-
-        status_reason = status.get("phase", "Unknown")
-        for cs in container_statuses + init_statuses:
-            state = cs.get("state") or {}
-            if "waiting" in state:
-                status_reason = state["waiting"].get("reason") or status_reason
-            elif "terminated" in state and state["terminated"].get("reason"):
-                status_reason = state["terminated"].get("reason")
-
-        containers = []
-        for cs in container_statuses:
-            c_state = (
-                "running"
-                if "running" in cs.get("state", {})
-                else "waiting"
-                if "waiting" in cs.get("state", {})
-                else "terminated"
-                if "terminated" in cs.get("state", {})
-                else "unknown"
-            )
-            containers.append(
-                {
-                    "name": cs.get("name"),
-                    "image": cs.get("image"),
-                    "ready": bool(cs.get("ready")),
-                    "restart_count": cs.get("restartCount", 0),
-                    "state": c_state,
-                }
-            )
-
-        pods.append(
-            {
-                "name": metadata.get("name"),
-                "namespace": metadata.get("namespace"),
-                "labels": metadata.get("labels") or {},
-                "phase": status.get("phase", "Unknown"),
-                "ready": ready,
-                "pod_ip": status.get("podIP"),
-                "node_name": spec.get("nodeName"),
-                "restarts": restarts,
-                "status_reason": status_reason,
-                "containers": containers,
-                "creation_timestamp": metadata.get("creationTimestamp"),
-            }
-        )
+    pods = [_map_k8s_pod_item(item) for item in items]
 
     return {
         "execution_id": execution_id,
@@ -1132,7 +1194,7 @@ async def get_execution_pod_logs(
         raise HTTPException(status_code=422, detail="deployment has no namespace")
 
     cluster_id = _resolve_execution_cluster_id(context)
-    from llm_d_lens.cluster.service import _is_unauthorized_output
+    from llm_d_lens.cluster.service import _is_forbidden_output, _is_unauthorized_output
     from llm_d_lens.infrastructure.kubernetes import run_kubectl
 
     cmd = ["logs", pod_name, "--namespace", context.namespace, f"--tail={tail}"]
@@ -1153,9 +1215,16 @@ async def get_execution_pod_logs(
             "Kubernetes cluster rejected kubeconfig credentials (401 Unauthorized).",
             "kubeconfig_unauthorized",
         )
-    logs = (
-        result.stdout if result.returncode == 0 else redact_kubectl_error(result.stderr or result.stdout or "")
-    ).strip()
+    if result.returncode != 0 and _is_forbidden_output(result):
+        logs = (
+            "Pod logs are unavailable because in-namespace workloads for this deployment were already cleaned up."
+            if _has_phase1_cleanup_completed(context)
+            else "Pod log access is restricted by cluster RBAC permissions for this namespace."
+        )
+    else:
+        logs = (
+            result.stdout if result.returncode == 0 else redact_kubectl_error(result.stderr or result.stdout or "")
+        ).strip()
     return {
         "execution_id": execution_id,
         "namespace": context.namespace,
@@ -1418,8 +1487,14 @@ async def list_orphan_namespaces(cluster_id: str, request: Request = None) -> di
     require_cluster_access(principal, cluster_id)
     try:
         orphans = await scan_orphan_namespaces(cluster_id)
+    except OrphanScanPermissionDeniedError as error:
+        return problem(403, "Orphan scan forbidden", str(error), "orphan_scan_forbidden")
     except OrphanCleanupError as error:
         return problem(502, "Orphan scan failed", str(error), "orphan_scan_failed")
+    except Exception as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        raise
     return {
         "clusterId": cluster_id,
         "prefix": namespace_prefix(),
@@ -1693,10 +1768,23 @@ async def clean_case(run_id: str, case_id: str, request: CleanCaseRequest, http_
         case, execution = await deployment_run_manager.worker_for_run(run_id).clean_case(
             run_id, case_id, preserve_rendered_overlay=request.preserve_rendered_overlay
         )
+    except DeploymentCleanupPermissionDenied as error:
+        logger.info("event=deployment_case_clean_admin_handoff run_id=%s case_id=%s", run_id, case_id)
+        return problem(
+            409,
+            "Deployment cleanup requires Orchestration administrator action",
+            str(error),
+            "deployment_cleanup_permission_denied",
+            extra=error.payload,
+        )
     except DeploymentInUseError as error:
         return problem(409, "Deployment is in use", str(error), "deployment_in_use")
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+    except Exception as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        if isinstance(error, ValueError):
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        raise
     return _case_response(case, execution)
 
 

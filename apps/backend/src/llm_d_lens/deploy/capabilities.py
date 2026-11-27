@@ -10,6 +10,7 @@ import re
 import shlex
 import threading
 import time
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -443,19 +444,75 @@ class DeploymentAdminSetupRequiredError(Exception):
     def __init__(self, report: dict[str, Any], message: str | None = None) -> None:
         self.report = dict(report)
         namespace = self.report.get("namespace")
-        default_message = (
-            f"Deployment namespace {namespace} requires Orchestration administrator bootstrap."
-            if namespace
-            else "Deployment requires Orchestration administrator bootstrap."
-        )
+        namespaces = self.report.get("namespaces")
+        if isinstance(namespaces, list) and len(namespaces) > 1:
+            default_message = (
+                f"Deployment namespaces ({len(namespaces)}: {', '.join(str(ns) for ns in namespaces)}) "
+                "require Orchestration administrator bootstrap."
+            )
+        elif namespace:
+            default_message = f"Deployment namespace {namespace} requires Orchestration administrator bootstrap."
+        else:
+            default_message = "Deployment requires Orchestration administrator bootstrap."
         super().__init__(message or default_message)
 
     def to_response_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             **self.report,
             "code": self.code,
             "detail": str(self),
         }
+        targets = self.report.get("targets")
+        if isinstance(targets, list) and targets:
+            if "namespaces" not in payload:
+                payload["namespaces"] = [
+                    str(item["namespace"]) for item in targets if isinstance(item, Mapping) and item.get("namespace")
+                ]
+            if "target_namespaces" not in payload:
+                payload["target_namespaces"] = {
+                    str(item["key"]): str(item["namespace"])
+                    for item in targets
+                    if isinstance(item, Mapping) and item.get("key") and item.get("namespace")
+                }
+        return payload
+
+
+class DeploymentPermissionTarget(BaseModel):
+    """Per-target permission check / bootstrap / verification specification."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    key: str
+    namespace: str | None = None
+    deployment_name: str | None = Field(
+        default=None, validation_alias=AliasChoices("deployment_name", "deploymentName")
+    )
+    provider_ref: str | None = Field(default=None, validation_alias=AliasChoices("provider_ref", "providerRef"))
+    prepared_plan_id: str | None = Field(
+        default=None, validation_alias=AliasChoices("prepared_plan_id", "preparedPlanId")
+    )
+    prepared_request_id: str | None = Field(
+        default=None, validation_alias=AliasChoices("prepared_request_id", "preparedRequestId")
+    )
+    uses_storage: bool = Field(default=False, validation_alias=AliasChoices("uses_storage", "usesStorage"))
+    storage_volume_id: str | None = Field(
+        default=None, validation_alias=AliasChoices("storage_volume_id", "storageVolumeId")
+    )
+    uses_lws: bool = Field(default=False, validation_alias=AliasChoices("uses_lws", "usesLws"))
+    uses_router: bool = Field(default=True, validation_alias=AliasChoices("uses_router", "usesRouter"))
+    epp_service_accounts: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("epp_service_accounts", "eppServiceAccounts"),
+    )
+    manifest: str | None = None
+    namespace_labels: dict[str, Any] | None = Field(
+        default=None,
+        validation_alias=AliasChoices("namespace_labels", "namespaceLabels"),
+    )
+    expected_digest: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("expected_digest", "expectedDigest", "bootstrap_digest", "bootstrapDigest"),
+    )
 
 
 class DeploymentPermissionCheckRequest(BaseModel):
@@ -498,6 +555,7 @@ class DeploymentPermissionCheckRequest(BaseModel):
         default=None,
         validation_alias=AliasChoices("namespace_labels", "namespaceLabels"),
     )
+    targets: list[DeploymentPermissionTarget] | None = Field(default=None, max_length=256)
 
 
 class DeploymentBootstrapVerifyRequest(DeploymentPermissionCheckRequest):
@@ -558,6 +616,18 @@ def _protected_namespaces(cluster_id: str | None = None) -> frozenset[str]:
     return frozenset(protected)
 
 
+def _active_execution_namespaces() -> set[str]:
+    from llm_d_lens.deploy.contracts import DeploymentStatus
+    from llm_d_lens.deploy.executions import _get_store
+
+    store = _get_store()
+    return {
+        execution.namespace
+        for execution in store.list_executions()
+        if execution.namespace and execution.status not in {DeploymentStatus.CLEANED, DeploymentStatus.CLEANED_UP}
+    }
+
+
 def _ensure_namespace_not_owned(namespace: str) -> None:
     from llm_d_lens.deploy.contracts import DeploymentStatus
     from llm_d_lens.deploy.executions import _get_store
@@ -578,6 +648,57 @@ def _ensure_namespace_not_owned(namespace: str) -> None:
             code="namespace_in_use",
             status_code=409,
         )
+
+
+def _resolve_target_namespace_for_entry(
+    cluster_id: str,
+    target: DeploymentPermissionTarget,
+    *,
+    existing_namespaces: Sequence[str] | set[str] | frozenset[str] = (),
+    prefix: str | None = None,
+) -> str:
+    """Resolve and strictly validate a single target entry's deployment namespace."""
+    active_prefix = prefix or _namespace_prefix()
+    if target.namespace is not None and any(ch in target.namespace for ch in ("\r", "\n", "\x00")):
+        raise DeploymentCapabilityValidationError(
+            "namespace must be a non-empty single-line string",
+            code="invalid_namespace",
+        )
+    if target.namespace is not None and target.namespace.strip():
+        validated_ns = validate_deployment_namespace(target.namespace, cluster_id=cluster_id, prefix=active_prefix)
+        _ensure_namespace_not_owned(validated_ns)
+        if validated_ns in existing_namespaces:
+            raise DeploymentCapabilityValidationError(
+                f"duplicate target namespace {validated_ns!r}",
+                code="duplicate_namespace",
+                status_code=422,
+            )
+        return validated_ns
+
+    seed_source = target.key or target.prepared_plan_id or target.deployment_name or target.provider_ref or "deployment"
+    slug = re.sub(r"[^a-z0-9-]+", "-", seed_source.lower()).strip("-") or "deploy"
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "cluster_id": cluster_id,
+                "target_key": target.key,
+                "prepared_plan_id": target.prepared_plan_id,
+                "deployment_name": target.deployment_name,
+                "provider_ref": target.provider_ref,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:8]
+    reserved = set(existing_namespaces) | _active_execution_namespaces() | _protected_namespaces(cluster_id)
+    attempt = 1
+    while True:
+        suffix = "" if attempt == 1 else f"-{attempt}"
+        max_slug = max(1, 63 - len(active_prefix) - len(digest) - len(suffix) - 1)
+        trimmed_slug = slug[:max_slug].rstrip("-") or "d"
+        candidate = f"{active_prefix}{trimmed_slug}-{digest}{suffix}"
+        if candidate not in reserved:
+            return validate_deployment_namespace(candidate, cluster_id=cluster_id, prefix=active_prefix)
+        attempt += 1
 
 
 def validate_dns1123_label(value: Any, field: str, *, code: str = "invalid_namespace") -> str:
@@ -781,7 +902,7 @@ def _parse_manifest_hints(manifest: str | None) -> dict[str, Any]:
         kind = str(doc.get("kind") or "")
         if kind in {"LeaderWorkerSet", "DisaggregatedSet"}:
             uses_lws = True
-        if kind in {"InferencePool", "InferenceModelRewrite", "HTTPRoute", "ReferenceGrant"}:
+        if kind in {"InferencePool", "InferenceObjective", "InferenceModelRewrite", "HTTPRoute", "ReferenceGrant"}:
             uses_router = True
         if kind == "PersistentVolumeClaim":
             uses_storage = True
@@ -806,7 +927,10 @@ def _parse_manifest_hints(manifest: str | None) -> dict[str, Any]:
 
 
 def _resolve_epp_service_accounts(
-    request: DeploymentPermissionCheckRequest, manifest_hints: Mapping[str, Any], *, uses_router: bool
+    request: DeploymentPermissionCheckRequest | DeploymentPermissionTarget,
+    manifest_hints: Mapping[str, Any],
+    *,
+    uses_router: bool,
 ) -> list[str]:
     if not uses_router:
         return []
@@ -1230,6 +1354,7 @@ async def read_bootstrap_marker(
     marker_status = data.get("status") if isinstance(data.get("status"), str) else ""
     bootstrap_digest = data.get("bootstrapDigest") if isinstance(data.get("bootstrapDigest"), str) else None
     epp_auth_delegator = data.get("eppAuthDelegator") if isinstance(data.get("eppAuthDelegator"), str) else None
+    epp_subject_scope = data.get("eppSubjectScope") if isinstance(data.get("eppSubjectScope"), str) else None
     prepared_request = data.get("preparedRequest") if isinstance(data.get("preparedRequest"), str) else None
     subject_kind = data.get("subjectKind") if isinstance(data.get("subjectKind"), str) else None
     subject_name = data.get("subjectName") if isinstance(data.get("subjectName"), str) else None
@@ -1240,7 +1365,8 @@ async def read_bootstrap_marker(
         else []
     )
     cluster_mismatch = marker_cluster is not None and (
-        not isinstance(marker_cluster, str) or (bool(marker_cluster) and marker_cluster != cluster_id)
+        not isinstance(marker_cluster, str)
+        or (bool(cluster_id) and bool(marker_cluster) and marker_cluster != cluster_id)
     )
     namespace_mismatch = marker_namespace is not None and (
         not isinstance(marker_namespace, str) or (bool(marker_namespace) and marker_namespace != namespace)
@@ -1263,6 +1389,7 @@ async def read_bootstrap_marker(
         "verified": present,
         "bootstrapDigest": bootstrap_digest,
         "eppAuthDelegator": epp_auth_delegator,
+        "eppSubjectScope": epp_subject_scope,
         "eppServiceAccounts": epp_sas,
         "preparedRequest": prepared_request,
         "subjectKind": subject_kind,
@@ -1426,7 +1553,10 @@ def _ssar_operation_specs(
     if uses_router:
         marker_epp_applied = bool(marker.get("present")) and marker.get("eppAuthDelegator") == "applied"
         marker_sas = set(marker.get("eppServiceAccounts") or ())
-        all_epp_covered = marker_epp_applied and (not marker_sas or set(epp_service_accounts).issubset(marker_sas))
+        marker_ns_wide = marker.get("eppSubjectScope") == "namespace_serviceaccounts"
+        all_epp_covered = marker_epp_applied and (
+            marker_ns_wide or not marker_sas or set(epp_service_accounts).issubset(marker_sas)
+        )
         operations.append(
             {
                 "id": "deploy.epp_auth_delegator",
@@ -1464,12 +1594,296 @@ def _rule_dict(key: tuple[str, ...]) -> dict[str, Any]:
     return entry
 
 
+def _evaluate_ssar_operations(
+    op_specs: Sequence[Mapping[str, Any]],
+    answers: Mapping[tuple[str, ...], bool],
+    *,
+    op_id_prefix: str = "",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    admin_operations: list[dict[str, Any]] = []
+    user_operations: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    for spec in op_specs:
+        op_id = f"{op_id_prefix}{spec['id']}" if op_id_prefix else spec["id"]
+        denied_rules = [_rule_dict(key) for key in spec["keys"] if answers.get(key) is False]
+        if spec["required"] and denied_rules:
+            admin_operations.append(
+                {
+                    "id": op_id,
+                    "step": spec["step"],
+                    "title": spec["title"],
+                    "executor": "admin",
+                    "missing": denied_rules,
+                }
+            )
+            for rule in denied_rules:
+                missing.append({"operationId": op_id, **rule})
+        else:
+            user_operations.append(
+                {
+                    "id": op_id,
+                    "step": spec["step"],
+                    "title": spec["title"],
+                    "executor": "user",
+                }
+            )
+    return admin_operations, user_operations, missing
+
+
+def _resolve_multi_target_entries(
+    cluster_id: str,
+    targets: Sequence[DeploymentPermissionTarget],
+    *,
+    prefix: str | None = None,
+) -> list[tuple[str, DeploymentPermissionTarget, str]]:
+    """Validate target keys/namespaces and resolve each entry's deployment namespace."""
+    active_prefix = prefix or _namespace_prefix()
+    seen_keys: set[str] = set()
+    clean_keys: list[str] = []
+    for target in targets:
+        clean_key = _single_line_text(target.key, "targets[].key", code="invalid_target")
+        if clean_key in seen_keys:
+            raise DeploymentCapabilityValidationError(
+                f"duplicate target key {clean_key!r}",
+                code="duplicate_target_key",
+                status_code=422,
+            )
+        seen_keys.add(clean_key)
+        clean_keys.append(clean_key)
+
+    explicit_namespaces: set[str] = set()
+    resolved_explicit: dict[int, str] = {}
+    for idx, target in enumerate(targets):
+        if target.namespace is not None and any(ch in target.namespace for ch in ("\r", "\n", "\x00")):
+            raise DeploymentCapabilityValidationError(
+                "namespace must be a non-empty single-line string",
+                code="invalid_namespace",
+            )
+        if target.namespace is not None and target.namespace.strip():
+            ns = _resolve_target_namespace_for_entry(
+                cluster_id,
+                target,
+                existing_namespaces=explicit_namespaces,
+                prefix=active_prefix,
+            )
+            explicit_namespaces.add(ns)
+            resolved_explicit[idx] = ns
+
+    assigned_namespaces: set[str] = set(explicit_namespaces)
+    resolved: list[tuple[str, DeploymentPermissionTarget, str]] = []
+    for idx, (clean_key, target) in enumerate(zip(clean_keys, targets, strict=True)):
+        if idx in resolved_explicit:
+            ns = resolved_explicit[idx]
+        else:
+            ns = _resolve_target_namespace_for_entry(
+                cluster_id,
+                target,
+                existing_namespaces=assigned_namespaces,
+                prefix=active_prefix,
+            )
+            assigned_namespaces.add(ns)
+        resolved.append((clean_key, target, ns))
+    return resolved
+
+
+async def _check_multi_target_deployment_permissions(
+    request: DeploymentPermissionCheckRequest,
+    *,
+    runner: Any = None,
+) -> dict[str, Any]:
+    """Evaluate batched per-namespace SSAR permissions across multiple targets."""
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.cluster.egress import EgressBlockedError, validate_stored_cluster_egress
+
+    cluster_id = _single_line_text(request.cluster_id, "cluster_id")
+    if runner is None:
+        try:
+            validate_stored_cluster_egress(cluster_id)
+        except EgressBlockedError as error:
+            raise DeploymentCapabilityValidationError(str(error), code="kubeconfig_egress_blocked") from error
+
+    targets = request.targets or []
+    resolved_targets = _resolve_multi_target_entries(cluster_id, targets)
+
+    prepared_specs: list[dict[str, Any]] = []
+    for clean_key, target, namespace in resolved_targets:
+        labels = validate_namespace_labels(target.namespace_labels)
+        manifest_hints = _parse_manifest_hints(target.manifest)
+        uses_storage = bool(target.uses_storage or target.storage_volume_id or manifest_hints["uses_storage"])
+        uses_lws = bool(target.uses_lws or manifest_hints["uses_lws"])
+        uses_router = bool(target.uses_router or manifest_hints["uses_router"])
+        epp_service_accounts = _resolve_epp_service_accounts(target, manifest_hints, uses_router=uses_router)
+        prepared_specs.append(
+            {
+                "key": clean_key,
+                "target": target,
+                "namespace": namespace,
+                "labels": labels,
+                "uses_storage": uses_storage,
+                "uses_lws": uses_lws,
+                "uses_router": uses_router,
+                "epp_service_accounts": epp_service_accounts,
+            }
+        )
+
+    active_runner = runner if runner is not None else scoped_runner(cluster_id)
+    identity = await detect_kubeconfig_identity(
+        cluster_id,
+        subject_override=request.subject_override,
+        runner=active_runner,
+    )
+
+    all_keys: list[tuple[str, ...]] = []
+    for entry in prepared_specs:
+        namespace = entry["namespace"]
+        target = entry["target"]
+        ns_exists = await _namespace_exists(cluster_id, namespace, runner=active_runner)
+        marker = (
+            await read_bootstrap_marker(cluster_id, namespace, runner=active_runner)
+            if ns_exists
+            else {
+                "namespace": namespace,
+                "name": BOOTSTRAP_MARKER_NAME,
+                "present": False,
+                "status": "missing",
+                "verified": False,
+            }
+        )
+        satellite_storage = await _resolve_satellite_storage(
+            cluster_id, target.storage_volume_id, namespace, runner=active_runner
+        )
+        op_specs = _ssar_operation_specs(
+            namespace=namespace,
+            uses_storage=entry["uses_storage"],
+            uses_router=entry["uses_router"],
+            uses_lws=entry["uses_lws"],
+            namespace_exists=ns_exists,
+            marker=marker,
+            epp_service_accounts=entry["epp_service_accounts"],
+            satellite_storage=satellite_storage,
+        )
+        entry["ns_exists"] = ns_exists
+        entry["marker"] = marker
+        entry["satellite_storage"] = satellite_storage
+        entry["op_specs"] = op_specs
+        for spec in op_specs:
+            all_keys.extend(spec["keys"])
+
+    cluster = cluster_registry.get_cluster(request.cluster_id)
+    hf_secret_key: tuple[str, ...] | None = None
+    if cluster is not None and cluster.hf_token_secret_namespace and cluster.hf_token_secret_name:
+        hf_secret_key = _ssar_key("get", "", "secrets", cluster.hf_token_secret_namespace, cluster.hf_token_secret_name)
+    if hf_secret_key is not None:
+        all_keys.append(hf_secret_key)
+
+    answers = await _run_ssar_checks(all_keys, runner=active_runner)
+
+    multi = len(prepared_specs) > 1
+    aggregated_admin_ops: list[dict[str, Any]] = []
+    aggregated_user_ops: list[dict[str, Any]] = []
+    aggregated_missing: list[dict[str, Any]] = []
+    target_reports: list[dict[str, Any]] = []
+
+    for entry in prepared_specs:
+        target = entry["target"]
+        namespace = entry["namespace"]
+        t_admin_ops, t_user_ops, t_missing = _evaluate_ssar_operations(entry["op_specs"], answers)
+        t_sufficient = len(t_admin_ops) == 0
+        target_reports.append(
+            {
+                "key": entry["key"],
+                "namespace": namespace,
+                "providerRef": target.provider_ref,
+                "deploymentName": target.deployment_name,
+                "preparedPlanId": target.prepared_plan_id,
+                "preparedRequestId": target.prepared_request_id,
+                "storageVolumeId": target.storage_volume_id,
+                "usesStorage": entry["uses_storage"],
+                "usesLws": entry["uses_lws"],
+                "usesRouter": entry["uses_router"],
+                "eppServiceAccounts": entry["epp_service_accounts"],
+                "namespaceLabels": entry["labels"],
+                "satelliteStorage": entry["satellite_storage"],
+                "sufficient": t_sufficient,
+                "status": "sufficient" if t_sufficient else "admin_required",
+                "namespaceExists": entry["ns_exists"],
+                "adminOperations": t_admin_ops,
+                "userOperations": t_user_ops,
+                "missing": t_missing,
+                "marker": entry["marker"],
+            }
+        )
+        agg_admin, agg_user, agg_missing = _evaluate_ssar_operations(
+            entry["op_specs"],
+            answers,
+            op_id_prefix=f"{namespace}:" if multi else "",
+        )
+        aggregated_admin_ops.extend(agg_admin)
+        aggregated_user_ops.extend(agg_user)
+        aggregated_missing.extend(agg_missing)
+
+    warnings: list[str] = []
+    if hf_secret_key is not None and answers.get(hf_secret_key) is False:
+        warnings.append(
+            f"The kubeconfig cannot read source HF_TOKEN Secret "
+            f"{cluster.hf_token_secret_namespace}/{cluster.hf_token_secret_name}; "
+            "public models work, while gated models require Secret read access or a per-deployment token."
+        )
+    if identity.get("overrideRequired") and aggregated_admin_ops:
+        warnings.append(
+            "Kubernetes identity could not be auto-detected from this kubeconfig; "
+            "specify a ServiceAccount or User/Group subject before generating the Orchestration administrator script."
+        )
+    warnings = list(dict.fromkeys(warnings))
+
+    sufficient = all(item["sufficient"] for item in target_reports)
+    if len(target_reports) == 1:
+        marker_summary = target_reports[0]["marker"]
+    else:
+        all_present = all(bool(item["marker"].get("present")) for item in target_reports)
+        any_stale = any(item["marker"].get("status") == "stale" for item in target_reports)
+        marker_summary = {
+            "name": BOOTSTRAP_MARKER_NAME,
+            "present": all_present,
+            "status": "stale" if any_stale else ("completed" if all_present else "missing"),
+            "verified": all(bool(item["marker"].get("verified")) for item in target_reports),
+        }
+
+    return {
+        "status": "sufficient" if sufficient else "admin_required",
+        "sufficient": sufficient,
+        "canCreateNamespaces": bool(answers.get(_ssar_key("create", "", "namespaces"))),
+        "clusterId": request.cluster_id,
+        "namespace": target_reports[0]["namespace"],
+        "namespaces": [item["namespace"] for item in target_reports],
+        "target_namespaces": {item["key"]: item["namespace"] for item in target_reports},
+        "namespaceExists": all(item["namespaceExists"] for item in target_reports),
+        "namespaceLabels": target_reports[0]["namespaceLabels"],
+        "identity": identity,
+        "adminOperations": aggregated_admin_ops,
+        "userOperations": aggregated_user_ops,
+        "missing": aggregated_missing,
+        "warnings": warnings,
+        "marker": marker_summary,
+        "eppServiceAccounts": target_reports[0]["eppServiceAccounts"],
+        "usesStorage": any(item["usesStorage"] for item in target_reports),
+        "usesLws": any(item["usesLws"] for item in target_reports),
+        "usesRouter": any(item["usesRouter"] for item in target_reports),
+        "satelliteStorage": target_reports[0]["satelliteStorage"],
+        "targets": target_reports,
+        "checkedAt": datetime.now(UTC).isoformat(),
+    }
+
+
 async def check_deployment_permissions(
     request: DeploymentPermissionCheckRequest,
     *,
     runner: Any = None,
 ) -> dict[str, Any]:
-    """Evaluate per-namespace SSAR permissions for a deployment target."""
+    """Evaluate per-namespace SSAR permissions for one or more deployment targets."""
+    if request.targets:
+        return await _check_multi_target_deployment_permissions(request, runner=runner)
+
     from llm_d_lens.cluster import registry as cluster_registry
     from llm_d_lens.cluster.egress import EgressBlockedError, validate_stored_cluster_egress
 
@@ -1531,33 +1945,7 @@ async def check_deployment_permissions(
         all_keys.append(hf_secret_key)
 
     answers = await _run_ssar_checks(all_keys, runner=active_runner)
-
-    admin_operations: list[dict[str, Any]] = []
-    user_operations: list[dict[str, Any]] = []
-    missing: list[dict[str, Any]] = []
-    for spec in op_specs:
-        denied_rules = [_rule_dict(key) for key in spec["keys"] if answers.get(key) is False]
-        if spec["required"] and denied_rules:
-            admin_operations.append(
-                {
-                    "id": spec["id"],
-                    "step": spec["step"],
-                    "title": spec["title"],
-                    "executor": "admin",
-                    "missing": denied_rules,
-                }
-            )
-            for rule in denied_rules:
-                missing.append({"operationId": spec["id"], **rule})
-        else:
-            user_operations.append(
-                {
-                    "id": spec["id"],
-                    "step": spec["step"],
-                    "title": spec["title"],
-                    "executor": "user",
-                }
-            )
+    admin_operations, user_operations, missing = _evaluate_ssar_operations(op_specs, answers)
 
     warnings: list[str] = []
     if hf_secret_key is not None and answers.get(hf_secret_key) is False:
@@ -1642,6 +2030,7 @@ def _deployment_role_manifest(namespace: str) -> dict[str, Any]:
                 "apiGroups": [""],
                 "resources": [
                     "configmaps",
+                    "endpoints",
                     "events",
                     "persistentvolumeclaims",
                     "pods",
@@ -1676,6 +2065,7 @@ def _deployment_role_manifest(namespace: str) -> dict[str, Any]:
                     "monitoring.coreos.com",
                     "keda.sh",
                     "autoscaling",
+                    "coordination.k8s.io",
                 ],
                 "resources": ["*"],
                 "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"],
@@ -1711,6 +2101,16 @@ def _deployment_role_binding_manifest(namespace: str, identity: Mapping[str, Any
 def _epp_auth_delegator_crb_manifest(namespace: str, service_accounts: Sequence[str]) -> dict[str, Any]:
     from llm_d_lens.monitoring.deployment.service import AUTH_DELEGATOR_ROLE, _epp_auth_delegator_binding_name
 
+    subjects: list[dict[str, Any]] = [
+        {"kind": "ServiceAccount", "name": sa_name, "namespace": namespace} for sa_name in service_accounts
+    ]
+    subjects.append(
+        {
+            "kind": "Group",
+            "apiGroup": "rbac.authorization.k8s.io",
+            "name": f"system:serviceaccounts:{namespace}",
+        }
+    )
     return {
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "ClusterRoleBinding",
@@ -1727,31 +2127,11 @@ def _epp_auth_delegator_crb_manifest(namespace: str, service_accounts: Sequence[
             "kind": "ClusterRole",
             "name": AUTH_DELEGATOR_ROLE,
         },
-        "subjects": [
-            {"kind": "ServiceAccount", "name": sa_name, "namespace": namespace} for sa_name in service_accounts
-        ],
+        "subjects": subjects,
     }
 
 
-def render_deployment_bootstrap_script(
-    *,
-    cluster_id: str,
-    namespace: str,
-    identity: Mapping[str, Any],
-    namespace_labels: Mapping[str, str] | None = None,
-    epp_service_accounts: Sequence[str] = (),
-    uses_router: bool = True,
-    uses_lws: bool = False,
-    uses_storage: bool = False,
-    satellite_storage: Mapping[str, Any] | None = None,
-    prepared_request_id: str | None = None,
-    admin_operations: Sequence[str] = (),
-    warnings: Sequence[str] = (),
-) -> dict[str, Any]:
-    """Render a self-contained, idempotent bash Orchestration administrator bootstrap script for ``namespace``."""
-    clean_cluster_id = _single_line_text(cluster_id, "cluster_id")
-    validated_ns = validate_deployment_namespace(namespace, cluster_id=clean_cluster_id)
-    validated_labels = validate_namespace_labels(namespace_labels)
+def _validate_bootstrap_identity(identity: Mapping[str, Any]) -> dict[str, str]:
     if identity.get("overrideRequired") or identity.get("kind") not in {"ServiceAccount", "User", "Group"}:
         raise DeploymentCapabilityValidationError(
             "Kubernetes identity is unknown; provide subjectOverride to render the bootstrap script.",
@@ -1765,6 +2145,24 @@ def render_deployment_bootstrap_script(
         }
     )
     assert validated_identity is not None
+    return validated_identity
+
+
+def _build_target_bootstrap_spec(
+    *,
+    clean_cluster_id: str,
+    validated_identity: Mapping[str, str],
+    namespace: str,
+    namespace_labels: Mapping[str, str] | None = None,
+    epp_service_accounts: Sequence[str] = (),
+    uses_router: bool = True,
+    uses_lws: bool = False,
+    uses_storage: bool = False,
+    satellite_storage: Mapping[str, Any] | None = None,
+    prepared_request_id: str | None = None,
+) -> dict[str, Any]:
+    validated_ns = validate_deployment_namespace(namespace, cluster_id=clean_cluster_id)
+    validated_labels = validate_namespace_labels(namespace_labels)
     validated_sas = [
         validate_dns1123_label(sa, "epp_service_accounts[]", code="invalid_subject") for sa in epp_service_accounts
     ]
@@ -1816,79 +2214,98 @@ def render_deployment_bootstrap_script(
         ],
         sort_keys=False,
     )
+    epp_yaml = (
+        yaml.safe_dump(_epp_auth_delegator_crb_manifest(validated_ns, validated_sas), sort_keys=False)
+        if uses_router
+        else None
+    )
+    storage_yaml = (
+        yaml.safe_dump_all([satellite_storage["pvManifest"], satellite_storage["pvcManifest"]], sort_keys=False)
+        if satellite_storage is not None
+        else None
+    )
+    return {
+        "namespace": validated_ns,
+        "bootstrapDigest": bootstrap_digest,
+        "validatedSas": validated_sas,
+        "preparedRequestId": clean_prepared_req,
+        "usesRouter": uses_router,
+        "satelliteStorage": satellite_storage,
+        "nsYaml": ns_yaml,
+        "rbacYaml": rbac_yaml,
+        "eppYaml": epp_yaml,
+        "storageYaml": storage_yaml,
+    }
 
-    lines: list[str] = [
-        "#!/usr/bin/env bash",
-        "# Lens Orchestration administrator deployment namespace bootstrap script.",
-        f"# cluster: {clean_cluster_id}",
-        f"# namespace: {validated_ns}",
-        f"# bootstrapDigest: {bootstrap_digest}",
-        "#",
-        "# Run once with an Orchestration administrator kubeconfig. Idempotent and secret-free.",
-        "",
-        "set -euo pipefail",
-        "set -f",
-        "umask 077",
-        "",
-        f"CLUSTER_ID={shlex.quote(clean_cluster_id)}",
-        f"CLUSTER_LABEL={shlex.quote(_sanitize_cluster_label(clean_cluster_id))}",
-        f"TARGET_NAMESPACE={shlex.quote(validated_ns)}",
-        f"BOOTSTRAP_DIGEST={shlex.quote(bootstrap_digest)}",
-        f"BOOTSTRAP_DIGEST16={shlex.quote(bootstrap_digest[:16])}",
-        f"MARKER_NAME={shlex.quote(BOOTSTRAP_MARKER_NAME)}",
-        f"SUBJECT_KIND={shlex.quote(validated_identity['kind'])}",
-        f"SUBJECT_NAME={shlex.quote(validated_identity['subject'])}",
-        f"EPP_AUTH_DELEGATOR={shlex.quote('applied' if (uses_router and validated_sas) else 'not_required')}",
-        f"EPP_SERVICE_ACCOUNTS={shlex.quote(','.join(validated_sas))}",
-        f"SATELLITE_STORAGE={shlex.quote('applied' if satellite_storage else 'not_required')}",
-        f"PREPARED_REQUEST={shlex.quote(clean_prepared_req)}",
-        "",
-    ]
 
-    ns_delim = _unique_heredoc_delimiter("LENS_NS_EOF", ns_yaml)
+def _append_target_bootstrap_commands(
+    lines: list[str],
+    spec: Mapping[str, Any],
+    *,
+    delim_suffix: str = "",
+) -> None:
+    validated_ns = spec["namespace"]
+    bootstrap_digest = spec["bootstrapDigest"]
+    validated_sas = spec["validatedSas"]
+    clean_prepared_req = spec["preparedRequestId"]
+    uses_router = bool(spec["usesRouter"])
+    satellite_storage = spec["satelliteStorage"]
+
+    lines.extend(
+        [
+            f"TARGET_NAMESPACE={shlex.quote(validated_ns)}",
+            f"BOOTSTRAP_DIGEST={shlex.quote(bootstrap_digest)}",
+            f"BOOTSTRAP_DIGEST16={shlex.quote(bootstrap_digest[:16])}",
+            f"EPP_AUTH_DELEGATOR={shlex.quote('applied' if uses_router else 'not_required')}",
+            f"EPP_SUBJECT_SCOPE={shlex.quote('namespace_serviceaccounts' if uses_router else 'none')}",
+            f"EPP_SERVICE_ACCOUNTS={shlex.quote(','.join(validated_sas))}",
+            f"SATELLITE_STORAGE={shlex.quote('applied' if satellite_storage else 'not_required')}",
+            f"PREPARED_REQUEST={shlex.quote(clean_prepared_req)}",
+            "",
+        ]
+    )
+
+    ns_delim = _unique_heredoc_delimiter(f"LENS_NS{delim_suffix}_EOF", spec["nsYaml"])
     lines.extend(
         [
             "# Step 1: Ensure dedicated deployment Namespace exists",
             f"kubectl apply -f - <<'{ns_delim}'",
-            ns_yaml.rstrip("\n"),
+            spec["nsYaml"].rstrip("\n"),
             ns_delim,
             "",
         ]
     )
 
-    rbac_delim = _unique_heredoc_delimiter("LENS_RBAC_EOF", rbac_yaml)
+    rbac_delim = _unique_heredoc_delimiter(f"LENS_RBAC{delim_suffix}_EOF", spec["rbacYaml"])
     lines.extend(
         [
             "# Step 2: Grant namespace-scoped deployment RBAC to the Lens kubeconfig identity",
             f"kubectl apply -f - <<'{rbac_delim}'",
-            rbac_yaml.rstrip("\n"),
+            spec["rbacYaml"].rstrip("\n"),
             rbac_delim,
             "",
         ]
     )
 
-    if uses_router and validated_sas:
-        epp_yaml = yaml.safe_dump(_epp_auth_delegator_crb_manifest(validated_ns, validated_sas), sort_keys=False)
-        epp_delim = _unique_heredoc_delimiter("LENS_EPP_EOF", epp_yaml)
+    if spec["eppYaml"] is not None:
+        epp_delim = _unique_heredoc_delimiter(f"LENS_EPP{delim_suffix}_EOF", spec["eppYaml"])
         lines.extend(
             [
                 "# Step 3: Authorize EPP ServiceAccount(s) for authenticated /metrics TokenReview/SAR",
                 f"kubectl apply -f - <<'{epp_delim}'",
-                epp_yaml.rstrip("\n"),
+                spec["eppYaml"].rstrip("\n"),
                 epp_delim,
                 "",
             ]
         )
 
-    if satellite_storage is not None:
-        storage_docs = [satellite_storage["pvManifest"], satellite_storage["pvcManifest"]]
-        storage_yaml = yaml.safe_dump_all(storage_docs, sort_keys=False)
-        storage_delim = _unique_heredoc_delimiter("LENS_STORAGE_EOF", storage_yaml)
+    if spec["storageYaml"] is not None:
+        storage_delim = _unique_heredoc_delimiter(f"LENS_STORAGE{delim_suffix}_EOF", spec["storageYaml"])
         lines.extend(
             [
                 "# Step 4: Bind static Model Cache storage PV/PVC in the deployment namespace",
                 f"kubectl apply -f - <<'{storage_delim}'",
-                storage_yaml.rstrip("\n"),
+                spec["storageYaml"].rstrip("\n"),
                 storage_delim,
                 "",
             ]
@@ -1906,6 +2323,7 @@ def render_deployment_bootstrap_script(
             '  --from-literal="subjectKind=$SUBJECT_KIND" \\',
             '  --from-literal="subjectName=$SUBJECT_NAME" \\',
             '  --from-literal="eppAuthDelegator=$EPP_AUTH_DELEGATOR" \\',
+            '  --from-literal="eppSubjectScope=$EPP_SUBJECT_SCOPE" \\',
             '  --from-literal="eppServiceAccounts=$EPP_SERVICE_ACCOUNTS" \\',
             '  --from-literal="satelliteStorage=$SATELLITE_STORAGE" \\',
             '  --from-literal="preparedRequest=$PREPARED_REQUEST" \\',
@@ -1924,6 +2342,62 @@ def render_deployment_bootstrap_script(
             "",
         ]
     )
+
+
+def render_deployment_bootstrap_script(
+    *,
+    cluster_id: str,
+    namespace: str,
+    identity: Mapping[str, Any],
+    namespace_labels: Mapping[str, str] | None = None,
+    epp_service_accounts: Sequence[str] = (),
+    uses_router: bool = True,
+    uses_lws: bool = False,
+    uses_storage: bool = False,
+    satellite_storage: Mapping[str, Any] | None = None,
+    prepared_request_id: str | None = None,
+    admin_operations: Sequence[str] = (),
+    warnings: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Render a self-contained, idempotent bash Orchestration administrator bootstrap script for ``namespace``."""
+    clean_cluster_id = _single_line_text(cluster_id, "cluster_id")
+    validated_identity = _validate_bootstrap_identity(identity)
+    spec = _build_target_bootstrap_spec(
+        clean_cluster_id=clean_cluster_id,
+        validated_identity=validated_identity,
+        namespace=namespace,
+        namespace_labels=namespace_labels,
+        epp_service_accounts=epp_service_accounts,
+        uses_router=uses_router,
+        uses_lws=uses_lws,
+        uses_storage=uses_storage,
+        satellite_storage=satellite_storage,
+        prepared_request_id=prepared_request_id,
+    )
+    validated_ns = spec["namespace"]
+    bootstrap_digest = spec["bootstrapDigest"]
+    validated_sas = spec["validatedSas"]
+
+    lines: list[str] = [
+        "#!/usr/bin/env bash",
+        "# Lens Orchestration administrator deployment namespace bootstrap script.",
+        f"# cluster: {clean_cluster_id}",
+        f"# namespace: {validated_ns}",
+        f"# bootstrapDigest: {bootstrap_digest}",
+        "#",
+        "# Run once with an Orchestration administrator kubeconfig. Idempotent and secret-free.",
+        "",
+        "set -euo pipefail",
+        "set -f",
+        "umask 077",
+        "",
+        f"CLUSTER_ID={shlex.quote(clean_cluster_id)}",
+        f"CLUSTER_LABEL={shlex.quote(_sanitize_cluster_label(clean_cluster_id))}",
+        f"MARKER_NAME={shlex.quote(BOOTSTRAP_MARKER_NAME)}",
+        f"SUBJECT_KIND={shlex.quote(validated_identity['kind'])}",
+        f"SUBJECT_NAME={shlex.quote(validated_identity['subject'])}",
+    ]
+    _append_target_bootstrap_commands(lines, spec)
 
     script = "\n".join(lines)
     _assert_no_secret_leak(script)
@@ -1976,14 +2450,189 @@ def _resolve_prepared_plan_request_id(
     return None
 
 
+def _render_multi_target_bootstrap_script(
+    request: DeploymentPermissionCheckRequest,
+    report: Mapping[str, Any],
+    *,
+    owner_user_id: str | None = None,
+) -> dict[str, Any]:
+    """Render one combined idempotent bash script across multiple permission targets."""
+    clean_cluster_id = _single_line_text(report["clusterId"], "cluster_id")
+    identity = report["identity"]
+    validated_identity = _validate_bootstrap_identity(identity)
+
+    target_reports = list(report.get("targets") or ())
+    request_targets = list(request.targets or ())
+    targets_by_key = {t.key.strip(): t for t in request_targets}
+
+    pending_keys = {
+        item["key"]
+        for item in target_reports
+        if not item.get("sufficient") or (item.get("marker") or {}).get("status") == "stale"
+    }
+    render_keys = pending_keys if pending_keys else {item["key"] for item in target_reports}
+
+    rendered_specs: list[dict[str, Any]] = []
+    target_entries: list[dict[str, Any]] = []
+
+    for t_report in target_reports:
+        key = t_report["key"]
+        req_target = targets_by_key.get(key)
+        ns = t_report["namespace"]
+        if key not in render_keys:
+            target_entries.append(
+                {
+                    "key": key,
+                    "namespace": ns,
+                    "bootstrapDigest": None,
+                    "alreadySufficient": True,
+                    "preparedPlanId": t_report.get("preparedPlanId"),
+                    "preparedRequestId": None,
+                    "eppServiceAccounts": list(t_report.get("eppServiceAccounts") or ()),
+                    "marker": t_report.get("marker"),
+                }
+            )
+            continue
+
+        prepared_req = req_target.prepared_request_id if req_target is not None else None
+        prepared_plan_id = req_target.prepared_plan_id if req_target is not None else t_report.get("preparedPlanId")
+        if not prepared_req and prepared_plan_id:
+            prepared_req = (
+                _resolve_prepared_plan_request_id(
+                    prepared_plan_id,
+                    cluster_id=clean_cluster_id,
+                    namespace=ns,
+                    owner_user_id=owner_user_id,
+                )
+                or prepared_plan_id
+            )
+
+        spec = _build_target_bootstrap_spec(
+            clean_cluster_id=clean_cluster_id,
+            validated_identity=validated_identity,
+            namespace=ns,
+            namespace_labels=t_report.get("namespaceLabels"),
+            epp_service_accounts=t_report.get("eppServiceAccounts") or (),
+            uses_router=bool(t_report.get("usesRouter")),
+            uses_lws=bool(t_report.get("usesLws")),
+            uses_storage=bool(t_report.get("usesStorage")),
+            satellite_storage=t_report.get("satelliteStorage"),
+            prepared_request_id=prepared_req,
+        )
+        rendered_specs.append(spec)
+        target_entries.append(
+            {
+                "key": key,
+                "namespace": ns,
+                "bootstrapDigest": spec["bootstrapDigest"],
+                "alreadySufficient": False,
+                "preparedPlanId": prepared_plan_id,
+                "preparedRequestId": spec["preparedRequestId"] or None,
+                "eppServiceAccounts": list(spec["validatedSas"]),
+                "marker": {
+                    "namespace": ns,
+                    "name": BOOTSTRAP_MARKER_NAME,
+                    "bootstrapDigest": spec["bootstrapDigest"],
+                },
+            }
+        )
+
+    rendered_count = len(rendered_specs)
+    if rendered_count == 1:
+        combined_digest = rendered_specs[0]["bootstrapDigest"]
+        filename = f"lens-deploy-bootstrap-{rendered_specs[0]['namespace']}.sh"
+        ns_header = f"# namespace: {rendered_specs[0]['namespace']}"
+        instructions = (
+            f"Ask an Orchestration administrator to run this idempotent script once for namespace "
+            f"{rendered_specs[0]['namespace']}, then re-check in Lens."
+        )
+    else:
+        combined_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "clusterId": clean_cluster_id,
+                    "targets": [(spec["namespace"], spec["bootstrapDigest"]) for spec in rendered_specs],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        filename = f"lens-deploy-bootstrap-batch-{combined_digest[:8]}.sh"
+        ns_list = ", ".join(spec["namespace"] for spec in rendered_specs)
+        ns_header = f"# namespaces: {ns_list}"
+        instructions = (
+            f"Ask an Orchestration administrator to run this idempotent script once for {rendered_count} namespaces "
+            f"({ns_list}), then re-check in Lens."
+        )
+
+    lines: list[str] = [
+        "#!/usr/bin/env bash",
+        "# Lens Orchestration administrator deployment namespace bootstrap script.",
+        f"# cluster: {clean_cluster_id}",
+        ns_header,
+        f"# bootstrapDigest: {combined_digest}",
+        "#",
+        "# Run once with an Orchestration administrator kubeconfig. Idempotent and secret-free.",
+        "",
+        "set -euo pipefail",
+        "set -f",
+        "umask 077",
+        "",
+        f"CLUSTER_ID={shlex.quote(clean_cluster_id)}",
+        f"CLUSTER_LABEL={shlex.quote(_sanitize_cluster_label(clean_cluster_id))}",
+        f"MARKER_NAME={shlex.quote(BOOTSTRAP_MARKER_NAME)}",
+        f"SUBJECT_KIND={shlex.quote(validated_identity['kind'])}",
+        f"SUBJECT_NAME={shlex.quote(validated_identity['subject'])}",
+    ]
+    if rendered_count == 1:
+        _append_target_bootstrap_commands(lines, rendered_specs[0])
+    else:
+        lines.append("")
+        for idx, spec in enumerate(rendered_specs, start=1):
+            lines.append(f"# === Target {idx}/{rendered_count}: {spec['namespace']} ===")
+            _append_target_bootstrap_commands(lines, spec, delim_suffix=f"_{idx}")
+
+    script = "\n".join(lines)
+    _assert_no_secret_leak(script)
+    primary_ns = rendered_specs[0]["namespace"] if rendered_specs else report["namespace"]
+    return {
+        "filename": filename,
+        "scriptFilename": filename,
+        "script": script,
+        "instructions": instructions,
+        "bootstrapDigest": combined_digest,
+        "digest": combined_digest,
+        "namespace": primary_ns,
+        "namespaces": [item["namespace"] for item in target_entries],
+        "target_namespaces": {item["key"]: item["namespace"] for item in target_entries},
+        "clusterId": report["clusterId"],
+        "identity": dict(identity),
+        "adminOperations": [item["id"] for item in report["adminOperations"]],
+        "marker": (
+            target_entries[0]["marker"]
+            if len(target_entries) == 1
+            else {
+                "namespace": primary_ns,
+                "name": BOOTSTRAP_MARKER_NAME,
+                "bootstrapDigest": combined_digest,
+            }
+        ),
+        "eppServiceAccounts": list(report.get("eppServiceAccounts") or ()),
+        "warnings": list(report["warnings"]),
+        "targets": target_entries,
+    }
+
+
 async def generate_deployment_bootstrap_script(
     request: DeploymentPermissionCheckRequest,
     *,
     owner_user_id: str | None = None,
     runner: Any = None,
 ) -> dict[str, Any]:
-    """Run SSAR preflight and render the Orchestration administrator bootstrap script for the target namespace."""
+    """Run SSAR preflight and render the Orchestration administrator bootstrap script for target namespace(s)."""
     report = await check_deployment_permissions(request, runner=runner)
+    if request.targets:
+        return _render_multi_target_bootstrap_script(request, report, owner_user_id=owner_user_id)
     prepared_req = request.prepared_request_id
     if not prepared_req and request.prepared_plan_id:
         prepared_req = (
@@ -2139,6 +2788,186 @@ def clear_verified_namespaces() -> None:
         _VERIFIED_NAMESPACES.clear()
 
 
+def _validate_expected_digest(raw_digest: str | None) -> str | None:
+    if raw_digest is None or not raw_digest.strip():
+        return None
+    cleaned = _single_line_text(raw_digest, "expectedDigest", code="invalid_digest")
+    if not _DIGEST_RE.fullmatch(cleaned):
+        raise DeploymentCapabilityValidationError(
+            "expectedDigest must be a valid 64-char SHA-256 hex digest", code="invalid_digest"
+        )
+    return cleaned
+
+
+def _evaluate_bootstrap_target_verification(
+    t_report: Mapping[str, Any],
+    *,
+    expected_digest: str | None,
+) -> tuple[bool, str, dict[str, Any], list[str]]:
+    namespace = str(t_report["namespace"])
+    marker = dict(t_report["marker"])
+    extra_warnings: list[str] = []
+
+    stale_marker = marker.get("status") == "stale"
+    if expected_digest is not None and marker.get("present"):
+        observed_digest = marker.get("bootstrapDigest")
+        if not isinstance(observed_digest, str) or observed_digest != expected_digest:
+            stale_marker = True
+            marker["status"] = "stale"
+            marker["verified"] = False
+            extra_warnings.append(
+                f"The cluster's bootstrap marker digest for {namespace} does not match the current deployment "
+                "specification; re-generate and run the latest Orchestration administrator bootstrap script."
+            )
+
+    marker_ok = True
+    if expected_digest is not None:
+        marker_ok = bool(marker.get("present")) and not stale_marker
+    elif marker.get("status") == "unconfirmed":
+        marker_ok = bool(t_report["sufficient"])
+
+    verified = bool(t_report["sufficient"]) and marker_ok and not stale_marker
+    if verified:
+        status = "verified"
+    elif stale_marker:
+        status = "stale"
+    else:
+        status = "pending"
+    return verified, status, marker, extra_warnings
+
+
+async def _verify_multi_target_deployment_bootstrap(
+    request: DeploymentBootstrapVerifyRequest,
+    *,
+    owner_user_id: str | None = None,
+    runner: Any = None,
+) -> dict[str, Any]:
+    """Re-check live SSAR and completion markers across multiple bootstrap targets."""
+    _single_line_text(request.cluster_id, "cluster_id")
+    targets = list(request.targets or ())
+    top_expected = _validate_expected_digest(request.expected_digest)
+    expected_by_idx: list[str | None] = []
+    for target in targets:
+        t_expected = _validate_expected_digest(target.expected_digest)
+        if t_expected is None and len(targets) == 1:
+            t_expected = top_expected
+        expected_by_idx.append(t_expected)
+
+    report = await check_deployment_permissions(request, runner=runner)
+    target_reports = list(report.get("targets") or ())
+    targets_by_key = {t.key.strip(): t for t in targets}
+    dep_name_counts = Counter(
+        t.deployment_name.strip() for t in targets if isinstance(t.deployment_name, str) and t.deployment_name.strip()
+    )
+
+    warnings = list(report["warnings"])
+    target_results: list[dict[str, Any]] = []
+    for idx, t_report in enumerate(target_reports):
+        key = t_report["key"]
+        req_target = targets_by_key[key]
+        ns = t_report["namespace"]
+        t_verified, t_status, t_marker, t_warnings = _evaluate_bootstrap_target_verification(
+            t_report,
+            expected_digest=expected_by_idx[idx],
+        )
+        warnings.extend(t_warnings)
+        if t_verified:
+            raw_dep_name = (
+                req_target.deployment_name.strip()
+                if isinstance(req_target.deployment_name, str) and req_target.deployment_name.strip()
+                else None
+            )
+            unique_dep_name = (
+                raw_dep_name if (raw_dep_name is not None and dep_name_counts[raw_dep_name] == 1) else None
+            )
+            record_verified_namespace(
+                report["clusterId"],
+                ns,
+                owner_user_id=owner_user_id,
+                agentic_deployment_run_id=request.agentic_deployment_run_id if len(targets) == 1 else None,
+                deployment_name=unique_dep_name,
+                prepared_plan_id=req_target.prepared_plan_id,
+            )
+        target_results.append(
+            {
+                "key": key,
+                "namespace": ns,
+                "verified": t_verified,
+                "sufficient": bool(t_report["sufficient"]),
+                "status": t_status,
+                "bootstrapDigest": t_marker.get("bootstrapDigest"),
+                "marker": t_marker,
+                "remainingOperations": list(t_report["adminOperations"]),
+                "missing": list(t_report["missing"]),
+                "preparedPlanId": t_report.get("preparedPlanId"),
+                "deploymentName": t_report.get("deploymentName"),
+                "providerRef": t_report.get("providerRef"),
+            }
+        )
+
+    warnings = list(dict.fromkeys(warnings))
+    verified = all(item["verified"] for item in target_results)
+    if verified:
+        status = "verified"
+        message = (
+            f"Deployment namespace {target_results[0]['namespace']} is verified and ready."
+            if len(target_results) == 1
+            else f"All {len(target_results)} deployment namespaces are verified and ready."
+        )
+    elif any(item["status"] == "stale" for item in target_results):
+        status = "stale"
+        stale_namespaces = ", ".join(item["namespace"] for item in target_results if item["status"] == "stale")
+        message = f"Bootstrap marker for namespace {stale_namespaces} is stale."
+    elif any(item["verified"] for item in target_results):
+        status = "partial"
+        verified_count = sum(1 for item in target_results if item["verified"])
+        pending_namespaces = ", ".join(item["namespace"] for item in target_results if not item["verified"])
+        message = (
+            f"{verified_count} of {len(target_results)} namespaces verified; "
+            f"remaining namespaces require Orchestration administrator bootstrap: {pending_namespaces}."
+        )
+    else:
+        status = "pending"
+        message = (
+            f"Namespace {target_results[0]['namespace']} still requires Orchestration administrator bootstrap "
+            "before deployment."
+            if len(target_results) == 1
+            else (
+                f"{len(target_results)} namespaces still require Orchestration administrator "
+                "bootstrap before deployment."
+            )
+        )
+
+    if len(target_results) == 1:
+        top_marker = target_results[0]["marker"]
+    else:
+        all_present = all(bool(item["marker"].get("present")) for item in target_results)
+        any_stale = any(item["status"] == "stale" for item in target_results)
+        top_marker = {
+            "name": BOOTSTRAP_MARKER_NAME,
+            "present": all_present,
+            "status": "stale" if any_stale else ("completed" if all_present else status),
+            "verified": verified,
+        }
+
+    return {
+        "verified": verified,
+        "sufficient": bool(report["sufficient"]),
+        "status": status,
+        "clusterId": report["clusterId"],
+        "namespace": report["namespace"],
+        "namespaces": [item["namespace"] for item in target_results],
+        "target_namespaces": {item["key"]: item["namespace"] for item in target_results},
+        "identity": report["identity"],
+        "marker": top_marker,
+        "remainingOperations": list(report["adminOperations"]),
+        "missing": report["missing"],
+        "warnings": warnings,
+        "message": message,
+        "targets": target_results,
+    }
+
+
 async def verify_deployment_bootstrap(
     request: DeploymentBootstrapVerifyRequest,
     *,
@@ -2146,39 +2975,32 @@ async def verify_deployment_bootstrap(
     runner: Any = None,
 ) -> dict[str, Any]:
     """Re-check live SSAR and completion marker after Orchestration administrator bootstrap."""
+    if request.targets:
+        return await _verify_multi_target_deployment_bootstrap(
+            request,
+            owner_user_id=owner_user_id,
+            runner=runner,
+        )
+
     _single_line_text(request.cluster_id, "cluster_id")
-    cleaned_expected: str | None = None
-    if request.expected_digest is not None and request.expected_digest.strip():
-        cleaned_expected = _single_line_text(request.expected_digest, "expectedDigest", code="invalid_digest")
-        if not _DIGEST_RE.fullmatch(cleaned_expected):
-            raise DeploymentCapabilityValidationError(
-                "expectedDigest must be a valid 64-char SHA-256 hex digest", code="invalid_digest"
-            )
+    cleaned_expected = _validate_expected_digest(request.expected_digest)
 
     report = await check_deployment_permissions(request, runner=runner)
-    marker = dict(report["marker"])
-    warnings = list(report["warnings"])
     remaining = list(report["adminOperations"])
-
-    stale_marker = marker.get("status") == "stale"
-    if cleaned_expected is not None and marker.get("present"):
-        observed_digest = marker.get("bootstrapDigest")
-        if not isinstance(observed_digest, str) or observed_digest != cleaned_expected:
-            stale_marker = True
-            marker["status"] = "stale"
-            marker["verified"] = False
+    verified, status, marker, extra_warnings = _evaluate_bootstrap_target_verification(
+        report,
+        expected_digest=cleaned_expected,
+    )
+    warnings = list(report["warnings"])
+    for warning in extra_warnings:
+        if "does not match the current deployment specification" in warning:
             warnings.append(
                 "The cluster's bootstrap marker digest does not match the current deployment specification; "
                 "re-generate and run the latest Orchestration administrator bootstrap script."
             )
+        else:
+            warnings.append(warning)
 
-    marker_ok = True
-    if cleaned_expected is not None:
-        marker_ok = bool(marker.get("present")) and not stale_marker
-    elif marker.get("status") == "unconfirmed":
-        marker_ok = bool(report["sufficient"])
-
-    verified = bool(report["sufficient"]) and marker_ok and not stale_marker
     if verified:
         record_verified_namespace(
             report["clusterId"],
@@ -2188,13 +3010,10 @@ async def verify_deployment_bootstrap(
             deployment_name=request.deployment_name,
             prepared_plan_id=request.prepared_plan_id,
         )
-        status = "verified"
         message = f"Deployment namespace {report['namespace']} is verified and ready."
-    elif stale_marker:
-        status = "stale"
+    elif status == "stale":
         message = f"Bootstrap marker for namespace {report['namespace']} is stale."
     else:
-        status = "pending"
         message = (
             f"Namespace {report['namespace']} still requires Orchestration administrator bootstrap before deployment."
         )

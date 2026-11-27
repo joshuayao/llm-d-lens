@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shutil
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from llm_d_lens.configuration.manifest_facts import workload_roles
 from llm_d_lens.configuration.router_compatibility import compatible_router_values
 from llm_d_lens.core.hashing import stable_hash
 from llm_d_lens.deploy.data_plane import _deep_merge, router_data_plane_args, router_data_plane_effective_values
+from llm_d_lens.deploy.providers import deployment_bundle
 from llm_d_lens.deploy.providers.deployment_bundle import (
     install_deployment_bundle,
     subprocess_bundle_runner,
@@ -267,6 +269,15 @@ class PdDisaggregationAdapter:
         model_secret = (context.get("deployment_policy") or {}).get("model_secret") or {}
         if "endpoint" not in artifact.deployment_contract and model_secret.get("mode") == "existing-secret":
             await self._runner.copy_model_secret(namespace, model_secret["sourceNamespace"], model_secret["sourceName"])
+        provenance = context.get("provenance")
+        cluster_id = provenance.get("cluster_server_id") if isinstance(provenance, Mapping) else None
+        environment, kubectl_path = deployment_bundle.adapter_kubectl_context(self)
+        strip_rbac = await deployment_bundle.resolve_helm_rbac_mode(
+            namespace,
+            cluster_id=cluster_id,
+            environment=environment,
+            kubectl_path=kubectl_path,
+        )
         bundle = artifact.deployment_contract.get("deploymentBundle")
         reproducibility = {}
         if bundle is not None:
@@ -281,6 +292,7 @@ class PdDisaggregationAdapter:
                     bundle["helm"]["values"][-1]["content"], context
                 ),
                 effective_values_name="router-effective-pd-disaggregation.yaml",
+                strip_metrics_auth_rbac=strip_rbac,
             )
         else:
             base_values = self._guide_root / "guides/recipes/router/base.values.yaml"
@@ -293,7 +305,7 @@ class PdDisaggregationAdapter:
             if compatible != values:
                 pd_values = Path(artifact.manifest_ref).parent / "router-compatible-pd.yaml"
                 pd_values.write_text(yaml.safe_dump(compatible, sort_keys=False), encoding="utf-8")
-            helm = await asyncio.create_subprocess_exec(
+            helm_command = [
                 str(self._helm_path),
                 "upgrade",
                 "--install",
@@ -308,11 +320,27 @@ class PdDisaggregationAdapter:
                 "--values",
                 str(pd_values),
                 *router_data_plane_args(context),
-                env=self._environment,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            helm_stdout, helm_stderr = await helm.communicate()
+            ]
+            if strip_rbac:
+                with deployment_bundle.helm_metrics_auth_post_renderer(
+                    namespace, helm_bin=self._helm_path
+                ) as post_renderer:
+                    helm = await asyncio.create_subprocess_exec(
+                        *helm_command,
+                        *post_renderer.helm_args(),
+                        env=post_renderer.subprocess_env(environment),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    helm_stdout, helm_stderr = await helm.communicate()
+            else:
+                helm = await asyncio.create_subprocess_exec(
+                    *helm_command,
+                    env=environment,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                helm_stdout, helm_stderr = await helm.communicate()
             if helm.returncode:
                 raise RuntimeError((helm_stderr or helm_stdout).decode(errors="replace").strip())
         status, stdout, stderr = await self._runner(

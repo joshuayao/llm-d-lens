@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 from datetime import UTC, datetime
@@ -15,6 +16,7 @@ from llm_d_lens.deploy.contracts import (
     DeploymentRunStatus,
     DeploymentStatus,
     ProblemDetails,
+    VersionedPayload,
 )
 from llm_d_lens.deploy.run_store import JsonDeploymentRunStore
 from llm_d_lens.deploy.service import DeploymentCreationCancelled, DeploymentService
@@ -96,13 +98,73 @@ class DeploymentRunWorker:
                 return
             await asyncio.sleep(0.05)
 
+    @staticmethod
+    def _is_phase1_cleanup_handoff(error: Exception) -> bool:
+        payload = getattr(error, "payload", None)
+        return isinstance(payload, dict) and payload.get("phase1Completed") is True
+
+    async def _persist_phase1_stopped_state(self, run, case, execution, phase1_payload: dict) -> None:
+        """Persist stopped status and Phase-1 diagnostics when workloads are deleted but namespace remains."""
+        updated_execution = None
+        get_exec = getattr(self._service, "get", None)
+        if callable(get_exec):
+            with contextlib.suppress(Exception):
+                updated_execution = await get_exec(execution.execution_id)
+        target = updated_execution if updated_execution is not None else execution
+        if hasattr(target, "model_copy"):
+            existing_diag = (
+                target.diagnostics.value
+                if getattr(target, "diagnostics", None) is not None and isinstance(target.diagnostics.value, dict)
+                else {}
+            )
+            existing_cleanup = existing_diag.get("cleanup") if isinstance(existing_diag.get("cleanup"), dict) else {}
+            updates: dict[str, object] = {}
+            if target.status not in {
+                DeploymentStatus.ROLLED_BACK,
+                DeploymentStatus.CLEANED,
+                DeploymentStatus.CLEANED_UP,
+            }:
+                updates["status"] = DeploymentStatus.ROLLED_BACK
+                updates["endpoint"] = None
+            elif getattr(target, "endpoint", None) is not None and target.status == DeploymentStatus.ROLLED_BACK:
+                updates["endpoint"] = None
+            existing_phase1 = existing_cleanup.get("phase1")
+            if not isinstance(existing_phase1, dict) or existing_phase1.get("phase1Completed") is not True:
+                updates["diagnostics"] = VersionedPayload(
+                    schema_version="deploy-diagnostics.v1",
+                    value={**existing_diag, "cleanup": {**existing_cleanup, "phase1": phase1_payload}},
+                )
+            if updates or updated_execution is None:
+                updates["updated_at"] = datetime.now(UTC)
+                target = target.model_copy(update=updates)
+            self._store.save_execution(target)
+        elif updated_execution is not None:
+            self._store.save_execution(updated_execution)
+        if case.status not in {DeploymentCaseStatus.CLEANED, DeploymentCaseStatus.CLEANED_UP}:
+            case.status = DeploymentCaseStatus.STOPPED
+        self._aggregate(run)
+        self._store.save_run(run)
+
+    def _drop_run_records(self, run_id: str, run) -> None:
+        """Remove a run and its executions from the store and revoke their shares."""
+        execution_ids = [item.execution_id for item in run.cases]
+        for execution_id in execution_ids:
+            if execution_id:
+                require_unused(execution_id)
+        self._store.delete_run(run_id)
+        self._revoke_execution_shares(execution_ids)
+        self._revoke_run_shares(run_id)
+
     async def cancel_evaluation_deployment(self, run_id: str) -> None:
         """Settle provisioning, then remove resources owned by a cancelled evaluation."""
+        from llm_d_lens.deploy.executions import DeploymentCleanupPermissionDenied
+
         await self._cancel_and_wait(run_id)
         run = self._store.get_run(run_id)
         if run is None:
             return
-        errors = []
+        errors: list[str] = []
+        permission_denied: list[DeploymentCleanupPermissionDenied] = []
         for case in list(run.cases):
             if not case.execution_id or case.status in {
                 DeploymentCaseStatus.CLEANED,
@@ -120,10 +182,20 @@ class DeploymentRunWorker:
                 _case, cleaned = await self.clean_case(run_id, case.id)
                 if cleaned.status not in {DeploymentStatus.CLEANED, DeploymentStatus.CLEANED_UP}:
                     raise ValueError("cleanup did not confirm resource removal")
+            except DeploymentCleanupPermissionDenied as error:
+                permission_denied.append(error)
             except Exception as error:
                 errors.append(f"deployment case {case.id}: {error}")
         if errors:
             raise ValueError("; ".join(errors))
+        if permission_denied:
+            if all(self._is_phase1_cleanup_handoff(err) for err in permission_denied) and callable(
+                getattr(self._store, "delete_run", None)
+            ):
+                latest_run = self._store.get_run(run_id)
+                if latest_run is not None:
+                    self._drop_run_records(run_id, latest_run)
+            raise permission_denied[0]
         run = self._store.get_run(run_id)
         if run is not None:
             run.status = DeploymentRunStatus.CANCELLED
@@ -431,12 +503,19 @@ class DeploymentRunWorker:
         return case, stopped
 
     async def clean_case(self, run_id: str, case_id: str, *, preserve_rendered_overlay: bool = False):
+        from llm_d_lens.deploy.executions import DeploymentCleanupPermissionDenied
+
         self._require_active_cluster_session()
         run, case, execution = self._case_execution(run_id, case_id)
         if case.status in {DeploymentCaseStatus.CLEANED, DeploymentCaseStatus.CLEANED_UP}:
             raise ValueError("deployment case is already cleaned")
         require_unused(execution.execution_id)
-        cleaned = await self._service.clean(execution, preserve_rendered_overlay=preserve_rendered_overlay)
+        try:
+            cleaned = await self._service.clean(execution, preserve_rendered_overlay=preserve_rendered_overlay)
+        except DeploymentCleanupPermissionDenied as error:
+            if self._is_phase1_cleanup_handoff(error):
+                await self._persist_phase1_stopped_state(run, case, execution, error.payload)
+            raise
         self._store.save_execution(cleaned)
         if cleaned.status == DeploymentStatus.CLEANED:
             case.status = DeploymentCaseStatus.CLEANED
@@ -570,19 +649,33 @@ class DeploymentRunWorker:
         self._revoke_execution_shares(execution_ids)
         self._revoke_run_shares(run_id)
 
-    async def delete_case_execution(self, run_id: str, case_id: str, *, delete_namespace: bool = True) -> None:
+    async def delete_case_execution(
+        self,
+        run_id: str,
+        case_id: str,
+        *,
+        delete_namespace: bool = True,
+        remove_records_on_phase1_handoff: bool = False,
+    ) -> None:
         """Optionally clean one deployment's cluster resources, then drop its records.
 
         When ``delete_namespace`` is true, cluster cleanup happens first: a
         persisted record is the only handle Prism keeps on a live namespace,
         so it is removed after the resources it points at are gone, never
-        before. When false, the namespace and its workloads are left running
-        and only Prism's own records are dropped.
+        before. When ``remove_records_on_phase1_handoff`` is true and Phase-1
+        cleanup removed every in-namespace resource while cluster-scoped
+        namespace deletion returned 403, the deployment records are dropped
+        before re-raising ``DeploymentCleanupPermissionDenied`` so callers can
+        record the admin cleanup handoff without leaving ghost deployments.
+        When ``delete_namespace`` is false, the namespace and its workloads are
+        left running and only Prism's own records are dropped.
 
         A deployment that's still being created (or already being cancelled)
         is cancelled first rather than rejected, so the user isn't forced to
         separately cancel and wait before they can delete it.
         """
+        from llm_d_lens.deploy.executions import DeploymentCleanupPermissionDenied
+
         run = self._store.get_run(run_id)
         case = self._store.get_case(run_id, case_id)
         if run is None or case is None:
@@ -600,11 +693,19 @@ class DeploymentRunWorker:
             if run is None or case is None:
                 raise ValueError("deployment case not found")
         cleaned_statuses = {DeploymentCaseStatus.CLEANED, DeploymentCaseStatus.CLEANED_UP}
+        phase1_handoff_error: DeploymentCleanupPermissionDenied | None = None
         if delete_namespace and case.execution_id is not None and case.status not in cleaned_statuses:
-            await self.clean_case(run_id, case_id)
-            updated_case = self._store.get_case(run_id, case_id)
-            if updated_case and updated_case.status not in cleaned_statuses:
-                raise ValueError("failed to delete Kubernetes namespace; deployment record retained")
+            try:
+                await self.clean_case(run_id, case_id)
+            except DeploymentCleanupPermissionDenied as err:
+                if remove_records_on_phase1_handoff and self._is_phase1_cleanup_handoff(err):
+                    phase1_handoff_error = err
+                else:
+                    raise
+            else:
+                updated_case = self._store.get_case(run_id, case_id)
+                if updated_case and updated_case.status not in cleaned_statuses:
+                    raise ValueError("failed to delete Kubernetes namespace; deployment record retained")
         run = self._store.get_run(run_id)
         if run is None:
             raise ValueError("deployment run not found")
@@ -616,12 +717,11 @@ class DeploymentRunWorker:
             if case.execution_id is not None:
                 self._store.delete_execution(case.execution_id)
                 self._revoke_execution_shares([case.execution_id])
-            return
-        # The run only existed to own this deployment, so it goes with it.
-        execution_ids = [item.execution_id for item in run.cases]
-        self._store.delete_run(run_id)
-        self._revoke_execution_shares(execution_ids)
-        self._revoke_run_shares(run_id)
+        else:
+            # The run only existed to own this deployment, so it goes with it.
+            self._drop_run_records(run_id, run)
+        if phase1_handoff_error is not None:
+            raise phase1_handoff_error
 
     def _require_active_cluster_session(self) -> None:
         if self._lifecycle_error:

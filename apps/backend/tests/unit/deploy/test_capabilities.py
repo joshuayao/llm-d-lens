@@ -1093,3 +1093,692 @@ def test_deployment_service_and_adapter_propagate_provenance_to_check_prepared_n
     assert restored_state["provenance"] == {"cluster_server_id": "cluster-a", "_prepared_plan_id": "plan-1"}
     with pytest.raises(ValueError, match="not owned by this prepared execution"):
         asyncio.run(adapter.cleanup(restored_state, artifact))
+
+
+def test_multi_target_permission_check_validation_batching_and_error_payload(monkeypatch) -> None:
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    import pytest
+
+    from llm_d_lens.cluster import egress as cluster_egress
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.deploy import capabilities as caps
+    from llm_d_lens.deploy import executions as deploy_executions
+    from llm_d_lens.deploy.contracts import DeploymentStatus
+    from llm_d_lens.infrastructure.process import CommandResult
+
+    monkeypatch.setenv("LLM_D_BENCH_NAMESPACE_PREFIX", "llmd-")
+    monkeypatch.setattr(cluster_egress, "validate_stored_cluster_egress", lambda _cid: None)
+    monkeypatch.setattr(cluster_registry, "get_cluster", lambda _cid: None)
+    monkeypatch.setattr(cluster_registry, "cluster_kubeconfig_namespace", lambda _cid: None)
+    monkeypatch.setattr(deploy_executions, "_store", SimpleNamespace(list_executions=lambda: []))
+
+    # 1. Validation: duplicate key, empty key, duplicate namespace, protected namespace, active ownership
+    with pytest.raises(caps.DeploymentCapabilityValidationError) as dup_key_err:
+        asyncio.run(
+            caps.check_deployment_permissions(
+                caps.DeploymentPermissionCheckRequest(
+                    cluster_id="cluster-a",
+                    targets=[
+                        caps.DeploymentPermissionTarget(key="setup-1:guide"),
+                        caps.DeploymentPermissionTarget(key="setup-1:guide"),
+                    ],
+                ),
+                runner=_FakeBootstrapRunner(),
+            )
+        )
+    assert dup_key_err.value.code == "duplicate_target_key"
+    assert dup_key_err.value.status_code == 422
+
+    with pytest.raises(caps.DeploymentCapabilityValidationError) as empty_key_err:
+        asyncio.run(
+            caps.check_deployment_permissions(
+                caps.DeploymentPermissionCheckRequest(
+                    cluster_id="cluster-a",
+                    targets=[caps.DeploymentPermissionTarget(key="   ")],
+                ),
+                runner=_FakeBootstrapRunner(),
+            )
+        )
+    assert empty_key_err.value.status_code == 422
+
+    with pytest.raises(caps.DeploymentCapabilityValidationError) as dup_ns_err:
+        asyncio.run(
+            caps.check_deployment_permissions(
+                caps.DeploymentPermissionCheckRequest(
+                    cluster_id="cluster-a",
+                    targets=[
+                        caps.DeploymentPermissionTarget(key="a", namespace="llmd-shared"),
+                        caps.DeploymentPermissionTarget(key="b", namespace="llmd-shared"),
+                    ],
+                ),
+                runner=_FakeBootstrapRunner(),
+            )
+        )
+    assert dup_ns_err.value.code == "duplicate_namespace"
+    assert dup_ns_err.value.status_code == 422
+
+    with pytest.raises(caps.DeploymentCapabilityValidationError) as prot_err:
+        asyncio.run(
+            caps.check_deployment_permissions(
+                caps.DeploymentPermissionCheckRequest(
+                    cluster_id="cluster-a",
+                    targets=[caps.DeploymentPermissionTarget(key="a", namespace="kube-system")],
+                ),
+                runner=_FakeBootstrapRunner(),
+            )
+        )
+    assert prot_err.value.code == "protected_namespace"
+    assert prot_err.value.status_code == 422
+
+    # 2. Auto-derivation skips active execution namespaces deterministically with -2 suffix
+    base_ns = caps._resolve_target_namespace_for_entry(
+        "cluster-a",
+        caps.DeploymentPermissionTarget(key="setup-1:guide", provider_ref="optimized-baseline"),
+    )
+    active_exec = SimpleNamespace(execution_id="exec-1", namespace=base_ns, status=DeploymentStatus.READY)
+    monkeypatch.setattr(deploy_executions, "_store", SimpleNamespace(list_executions=lambda: [active_exec]))
+    derived_next = caps._resolve_target_namespace_for_entry(
+        "cluster-a",
+        caps.DeploymentPermissionTarget(key="setup-1:guide", provider_ref="optimized-baseline"),
+    )
+    assert derived_next != base_ns
+    assert derived_next.endswith("-2")
+
+    with pytest.raises(caps.DeploymentCapabilityValidationError) as busy_err:
+        asyncio.run(
+            caps.check_deployment_permissions(
+                caps.DeploymentPermissionCheckRequest(
+                    cluster_id="cluster-a",
+                    targets=[caps.DeploymentPermissionTarget(key="setup-1:guide", namespace=base_ns)],
+                ),
+                runner=_FakeBootstrapRunner(),
+            )
+        )
+    assert busy_err.value.code == "namespace_in_use"
+    assert busy_err.value.status_code == 409
+
+    monkeypatch.setattr(deploy_executions, "_store", SimpleNamespace(list_executions=lambda: []))
+
+    # 3. 401 fails loudly without swallowing
+    with pytest.raises(caps.DeploymentClusterAuthError):
+        asyncio.run(
+            caps.check_deployment_permissions(
+                caps.DeploymentPermissionCheckRequest(
+                    cluster_id="cluster-a",
+                    targets=[
+                        caps.DeploymentPermissionTarget(key="setup-1:guide", namespace="llmd-ns-1"),
+                        caps.DeploymentPermissionTarget(key="setup-2:guide", namespace="llmd-ns-2"),
+                    ],
+                ),
+                runner=_FakeBootstrapRunner(unauthorized=True),
+            )
+        )
+
+    # 4. Batched SSAR + single identity detection: admin sufficient vs non-admin denied
+    targets = [
+        caps.DeploymentPermissionTarget(
+            key="setup-1:guide",
+            namespace="llmd-guide-1",
+            provider_ref="optimized-baseline",
+            uses_router=True,
+        ),
+        caps.DeploymentPermissionTarget(
+            key="setup-1:baseline:direct-vllm",
+            namespace="llmd-base-1",
+            provider_ref="baseline-vllm",
+            uses_router=False,
+        ),
+    ]
+    admin_runner = _FakeBootstrapRunner()
+    admin_report = asyncio.run(
+        caps.check_deployment_permissions(
+            caps.DeploymentPermissionCheckRequest(cluster_id="cluster-a", targets=targets),
+            runner=admin_runner,
+        )
+    )
+    assert admin_report["sufficient"] is True
+    assert admin_report["status"] == "sufficient"
+    assert admin_report["namespace"] == "llmd-guide-1"
+    assert admin_report["namespaces"] == ["llmd-guide-1", "llmd-base-1"]
+    assert admin_report["target_namespaces"] == {
+        "setup-1:guide": "llmd-guide-1",
+        "setup-1:baseline:direct-vllm": "llmd-base-1",
+    }
+    assert len(admin_report["targets"]) == 2
+    # Identity SelfSubjectReview ran only once across all targets
+    ssr_calls = [call for call in admin_runner.calls if call[:4] == ["kubectl", "create", "-o", "json"]]
+    # 1 SelfSubjectReview + batched SSAR chunks (total >50 keys -> 2 chunks)
+    assert len(ssr_calls) >= 2
+
+    non_admin_runner = _FakeBootstrapRunner(allowed_fn=lambda _attrs: False)
+    denied_report = asyncio.run(
+        caps.check_deployment_permissions(
+            caps.DeploymentPermissionCheckRequest(cluster_id="cluster-a", targets=targets),
+            runner=non_admin_runner,
+        )
+    )
+    assert denied_report["sufficient"] is False
+    assert denied_report["status"] == "admin_required"
+    assert [t["sufficient"] for t in denied_report["targets"]] == [False, False]
+    assert [op["id"] for op in denied_report["targets"][0]["adminOperations"]] == [
+        "deploy.namespace",
+        "deploy.rbac",
+        "deploy.epp_auth_delegator",
+    ]
+    # direct-vllm baseline has uses_router=False so no EPP CRB op
+    assert [op["id"] for op in denied_report["targets"][1]["adminOperations"]] == [
+        "deploy.namespace",
+        "deploy.rbac",
+    ]
+    assert "llmd-guide-1:deploy.epp_auth_delegator" in [op["id"] for op in denied_report["adminOperations"]]
+    assert "llmd-base-1:deploy.rbac" in [op["id"] for op in denied_report["adminOperations"]]
+
+    err_payload = caps.DeploymentAdminSetupRequiredError(denied_report).to_response_payload()
+    assert err_payload["code"] == "deployment_admin_setup_required"
+    assert err_payload["namespace"] == "llmd-guide-1"
+    assert err_payload["namespaces"] == ["llmd-guide-1", "llmd-base-1"]
+    assert err_payload["target_namespaces"] == {
+        "setup-1:guide": "llmd-guide-1",
+        "setup-1:baseline:direct-vllm": "llmd-base-1",
+    }
+    assert len(err_payload["targets"]) == 2
+    assert isinstance(json.dumps(err_payload), str)
+
+    # Verify Role/lens-deployment-operator includes benchmark-required resources
+    role_rules = caps._deployment_role_manifest("llmd-guide-1")["rules"]
+    core_resources = set(role_rules[0]["resources"])
+    assert {"configmaps", "endpoints", "persistentvolumeclaims", "pods", "pods/exec", "pods/log", "services"}.issubset(
+        core_resources
+    )
+    all_groups = {grp for rule in role_rules for grp in rule["apiGroups"]}
+    assert {"apps", "batch", "monitoring.coreos.com"}.issubset(all_groups)
+
+    # Suppress unused CommandResult lint if needed
+    assert CommandResult is not None
+
+
+def test_multi_target_bootstrap_script_and_verification_lifecycle(monkeypatch) -> None:
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    from llm_d_lens.cluster import egress as cluster_egress
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.db.dao.deployment_plan import DeploymentPlanDao
+    from llm_d_lens.deploy import capabilities as caps
+    from llm_d_lens.deploy import executions as deploy_executions
+    from llm_d_lens.deploy.contracts import DeploymentPreparedPlan
+    from llm_d_lens.infrastructure.process import CommandResult
+
+    monkeypatch.setenv("LLM_D_BENCH_NAMESPACE_PREFIX", "llmd-")
+    monkeypatch.setattr(cluster_egress, "validate_stored_cluster_egress", lambda _cid: None)
+    monkeypatch.setattr(cluster_registry, "get_cluster", lambda _cid: None)
+    monkeypatch.setattr(cluster_registry, "cluster_kubeconfig_namespace", lambda _cid: None)
+    monkeypatch.setattr(deploy_executions, "_store", SimpleNamespace(list_executions=lambda: []))
+    caps.clear_verified_namespaces()
+
+    plan = DeploymentPlanDao().create(
+        DeploymentPreparedPlan(
+            cluster_id="cluster-a",
+            digest="sha256:test",
+            payload={
+                "artifacts": [
+                    {
+                        "context": {"namespace": "llmd-ds-1"},
+                        "artifact": {
+                            "deployment_contract": {
+                                "preparedNamespace": {
+                                    "metadata": {
+                                        "name": "llmd-ds-1",
+                                        "labels": {"lens.io/prepared-request": "req-ds-1"},
+                                    }
+                                }
+                            }
+                        },
+                    }
+                ]
+            },
+            preflight={},
+        )
+    )
+
+    class _MultiTargetRunner:
+        def __init__(self) -> None:
+            self.existing_ns: set[str] = set()
+            self.sufficient_ns: set[str] = set()
+            self.markers: dict[str, dict] = {}
+
+        async def run(self, argv, *, input=None, timeout=15):  # noqa: A002
+            if argv[:4] == ["kubectl", "create", "-o", "json"] and input:
+                body = json.loads(input)
+                if body.get("kind") == "SelfSubjectReview":
+                    return CommandResult(
+                        tuple(argv),
+                        0,
+                        json.dumps({"status": {"userInfo": {"username": "system:serviceaccount:lens-edit:lens-user"}}}),
+                        "",
+                    )
+                if body.get("kind") == "List":
+                    items = []
+                    for item in body["items"]:
+                        attrs = item["spec"]["resourceAttributes"]
+                        ns = attrs.get("namespace") or ""
+                        allowed = bool(ns and ns in self.sufficient_ns)
+                        items.append({**item, "status": {"allowed": allowed}})
+                    return CommandResult(tuple(argv), 0, json.dumps({"kind": "List", "items": items}), "")
+            if argv[:3] == ["kubectl", "get", "namespace"]:
+                ns = argv[3]
+                if ns in self.existing_ns:
+                    return CommandResult(tuple(argv), 0, json.dumps({"metadata": {"name": ns}}), "")
+                return CommandResult(tuple(argv), 0, "", "")
+            if argv[:4] == ["kubectl", "get", "configmap", caps.BOOTSTRAP_MARKER_NAME]:
+                ns = argv[5]
+                doc = self.markers.get(ns)
+                if doc is None:
+                    return CommandResult(tuple(argv), 0, "", "")
+                return CommandResult(tuple(argv), 0, json.dumps(doc), "")
+            return CommandResult(tuple(argv), 0, "", "")
+
+    runner = _MultiTargetRunner()
+    # Both targets share the same deployment_name to verify shared-name collision protection
+    req = caps.DeploymentPermissionCheckRequest(
+        cluster_id="cluster-a",
+        targets=[
+            caps.DeploymentPermissionTarget(
+                key="setup-1:guide",
+                namespace="llmd-ds-1",
+                deployment_name="shared-model",
+                provider_ref="pd-disaggregation",
+                prepared_plan_id=plan.id,
+                uses_lws=True,
+                uses_router=True,
+            ),
+            caps.DeploymentPermissionTarget(
+                key="setup-1:baseline:direct-vllm",
+                namespace="llmd-base-1",
+                deployment_name="shared-model",
+                provider_ref="baseline-vllm",
+                uses_router=False,
+            ),
+        ],
+    )
+
+    remediation = asyncio.run(caps.generate_deployment_bootstrap_script(req, runner=runner))
+    script = remediation["script"]
+    assert remediation["filename"].startswith("lens-deploy-bootstrap-batch-")
+    assert "# === Target 1/2: llmd-ds-1 ===" in script
+    assert "# === Target 2/2: llmd-base-1 ===" in script
+    assert "lens.io/prepared-request: req-ds-1" in script
+    assert "llm-d-prism-epp-auth-delegator-llmd-ds-1" in script
+    assert "llm-d-prism-epp-auth-delegator-llmd-base-1" not in script
+    assert "HF_TOKEN" not in script
+    assert "kind: Secret" not in script
+    assert len(remediation["targets"]) == 2
+    assert remediation["targets"][0]["alreadySufficient"] is False
+    assert remediation["targets"][1]["alreadySufficient"] is False
+    digest_1 = remediation["targets"][0]["bootstrapDigest"]
+    digest_2 = remediation["targets"][1]["bootstrapDigest"]
+    assert digest_1 and digest_2 and digest_1 != digest_2
+    assert remediation["bootstrapDigest"] != digest_1
+
+    # Partial sufficiency on remediation: target 1 already sufficient, target 2 pending
+    runner.existing_ns.add("llmd-ds-1")
+    runner.sufficient_ns.add("llmd-ds-1")
+    runner.markers["llmd-ds-1"] = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": caps.BOOTSTRAP_MARKER_NAME, "namespace": "llmd-ds-1"},
+        "data": {
+            "clusterId": "cluster-a",
+            "namespace": "llmd-ds-1",
+            "bootstrapDigest": digest_1,
+            "eppAuthDelegator": "applied",
+            "eppServiceAccounts": "pd-disaggregation-epp",
+            "status": "completed",
+        },
+    }
+    partial_remediation = asyncio.run(caps.generate_deployment_bootstrap_script(req, runner=runner))
+    assert len(partial_remediation["targets"]) == 2
+    assert partial_remediation["targets"][0]["alreadySufficient"] is True
+    assert partial_remediation["targets"][0]["bootstrapDigest"] is None
+    assert partial_remediation["targets"][1]["alreadySufficient"] is False
+    assert partial_remediation["targets"][1]["bootstrapDigest"] == digest_2
+    assert "llmd-base-1" in partial_remediation["script"]
+    assert "TARGET_NAMESPACE=llmd-ds-1" not in partial_remediation["script"]
+
+    # Reset runner for pending -> partial -> stale -> verified lifecycle
+    runner2 = _MultiTargetRunner()
+    verify_req = caps.DeploymentBootstrapVerifyRequest(
+        cluster_id="cluster-a",
+        # Pass combined digest at top-level to verify per-target expected_digest is used, NOT combined digest!
+        expected_digest=remediation["bootstrapDigest"],
+        targets=[
+            caps.DeploymentPermissionTarget(
+                key="setup-1:guide",
+                namespace="llmd-ds-1",
+                deployment_name="shared-model",
+                provider_ref="pd-disaggregation",
+                prepared_plan_id=plan.id,
+                uses_lws=True,
+                uses_router=True,
+                expected_digest=digest_1,
+            ),
+            caps.DeploymentPermissionTarget(
+                key="setup-1:baseline:direct-vllm",
+                namespace="llmd-base-1",
+                deployment_name="shared-model",
+                uses_router=False,
+                expected_digest=digest_2,
+            ),
+        ],
+    )
+    pending_res = asyncio.run(caps.verify_deployment_bootstrap(verify_req, owner_user_id="alice", runner=runner2))
+    assert pending_res["verified"] is False
+    assert pending_res["status"] == "pending"
+
+    # Only target 1 bootstrapped -> partial
+    runner2.existing_ns.add("llmd-ds-1")
+    runner2.sufficient_ns.add("llmd-ds-1")
+    runner2.markers["llmd-ds-1"] = runner.markers["llmd-ds-1"]
+    partial_res = asyncio.run(caps.verify_deployment_bootstrap(verify_req, owner_user_id="alice", runner=runner2))
+    assert partial_res["verified"] is False
+    assert partial_res["status"] == "partial"
+    assert partial_res["targets"][0]["verified"] is True
+    assert partial_res["targets"][1]["verified"] is False
+
+    # Target 2 has wrong digest -> stale
+    runner2.existing_ns.add("llmd-base-1")
+    runner2.sufficient_ns.add("llmd-base-1")
+    runner2.markers["llmd-base-1"] = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": caps.BOOTSTRAP_MARKER_NAME, "namespace": "llmd-base-1"},
+        "data": {
+            "clusterId": "cluster-a",
+            "namespace": "llmd-base-1",
+            "bootstrapDigest": "f" * 64,
+            "status": "completed",
+        },
+    }
+    stale_res = asyncio.run(caps.verify_deployment_bootstrap(verify_req, owner_user_id="alice", runner=runner2))
+    assert stale_res["verified"] is False
+    assert stale_res["status"] == "stale"
+    assert stale_res["marker"]["status"] == "stale"
+    assert stale_res["marker"]["verified"] is False
+    assert stale_res["targets"][1]["status"] == "stale"
+
+    # Both match per-target digests -> verified; shared deployment_name NOT bound, prepared_plan_id IS bound
+    caps.clear_verified_namespaces()
+    runner2.markers["llmd-base-1"]["data"]["bootstrapDigest"] = digest_2
+    verified_res = asyncio.run(caps.verify_deployment_bootstrap(verify_req, owner_user_id="alice", runner=runner2))
+    assert verified_res["verified"] is True
+    assert verified_res["status"] == "verified"
+    assert verified_res["target_namespaces"] == {
+        "setup-1:guide": "llmd-ds-1",
+        "setup-1:baseline:direct-vllm": "llmd-base-1",
+    }
+    assert caps.consume_verified_namespace("cluster-a", owner_user_id="alice", deployment_name="shared-model") is None
+    assert caps.consume_verified_namespace("cluster-a", owner_user_id="alice", prepared_plan_id=plan.id) == "llmd-ds-1"
+
+
+def test_multi_target_bootstrap_script_includes_stale_marker_even_when_sufficient(monkeypatch) -> None:
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    from llm_d_lens.cluster import egress as cluster_egress
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.deploy import capabilities as caps
+    from llm_d_lens.deploy import executions as deploy_executions
+    from llm_d_lens.infrastructure.process import CommandResult
+
+    monkeypatch.setenv("LLM_D_BENCH_NAMESPACE_PREFIX", "llmd-")
+    monkeypatch.setattr(cluster_egress, "validate_stored_cluster_egress", lambda _cid: None)
+    monkeypatch.setattr(cluster_registry, "get_cluster", lambda _cid: None)
+    monkeypatch.setattr(cluster_registry, "cluster_kubeconfig_namespace", lambda _cid: None)
+    monkeypatch.setattr(deploy_executions, "_store", SimpleNamespace(list_executions=lambda: []))
+
+    class _StaleMarkerRunner:
+        async def run(self, argv, *, input=None, timeout=15):  # noqa: A002
+            if argv[:4] == ["kubectl", "create", "-o", "json"] and input:
+                body = json.loads(input)
+                if body.get("kind") == "SelfSubjectReview":
+                    return CommandResult(
+                        tuple(argv),
+                        0,
+                        json.dumps({"status": {"userInfo": {"username": "system:serviceaccount:lens-edit:lens-user"}}}),
+                        "",
+                    )
+                if body.get("kind") == "List":
+                    items = [{**item, "status": {"allowed": True}} for item in body["items"]]
+                    return CommandResult(tuple(argv), 0, json.dumps({"kind": "List", "items": items}), "")
+            if argv[:3] == ["kubectl", "get", "namespace"]:
+                return CommandResult(tuple(argv), 0, json.dumps({"metadata": {"name": argv[3]}}), "")
+            if argv[:4] == ["kubectl", "get", "configmap", caps.BOOTSTRAP_MARKER_NAME]:
+                ns = argv[5]
+                if ns == "llmd-valid-ns":
+                    doc = {
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {"name": caps.BOOTSTRAP_MARKER_NAME, "namespace": ns},
+                        "data": {"clusterId": "cluster-a", "namespace": ns, "status": "completed"},
+                    }
+                else:
+                    # Stale cross-cluster marker replayed onto cluster-a
+                    doc = {
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {"name": caps.BOOTSTRAP_MARKER_NAME, "namespace": ns},
+                        "data": {"clusterId": "other-cluster", "namespace": ns, "status": "completed"},
+                    }
+                return CommandResult(tuple(argv), 0, json.dumps(doc), "")
+            return CommandResult(tuple(argv), 0, "", "")
+
+    req = caps.DeploymentPermissionCheckRequest(
+        cluster_id="cluster-a",
+        targets=[
+            caps.DeploymentPermissionTarget(
+                key="setup-1:valid",
+                namespace="llmd-valid-ns",
+                provider_ref="baseline-vllm",
+                uses_router=False,
+            ),
+            caps.DeploymentPermissionTarget(
+                key="setup-1:stale",
+                namespace="llmd-stale-ns",
+                provider_ref="baseline-vllm",
+                uses_router=False,
+            ),
+        ],
+    )
+
+    remediation = asyncio.run(caps.generate_deployment_bootstrap_script(req, runner=_StaleMarkerRunner()))
+    assert len(remediation["targets"]) == 2
+    valid_target, stale_target = remediation["targets"]
+    assert valid_target["alreadySufficient"] is True
+    assert valid_target["bootstrapDigest"] is None
+    assert stale_target["alreadySufficient"] is False
+    assert isinstance(stale_target["bootstrapDigest"], str) and len(stale_target["bootstrapDigest"]) == 64
+    assert stale_target["marker"]["bootstrapDigest"] == stale_target["bootstrapDigest"]
+    assert "TARGET_NAMESPACE=llmd-stale-ns" in remediation["script"]
+    assert "TARGET_NAMESPACE=llmd-valid-ns" not in remediation["script"]
+
+
+def test_epp_auth_delegator_namespace_group_bootstrap_digest_compat_and_hints(monkeypatch) -> None:
+    import asyncio
+    import hashlib
+    import json
+    from types import SimpleNamespace
+
+    from llm_d_lens.cluster import egress as cluster_egress
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.deploy import capabilities as caps
+    from llm_d_lens.deploy import executions as deploy_executions
+    from llm_d_lens.infrastructure.process import CommandResult
+
+    monkeypatch.setenv("LLM_D_BENCH_NAMESPACE_PREFIX", "llmd-")
+    monkeypatch.setattr(cluster_egress, "validate_stored_cluster_egress", lambda _cid: None)
+    monkeypatch.setattr(cluster_registry, "get_cluster", lambda _cid: None)
+    monkeypatch.setattr(cluster_registry, "cluster_kubeconfig_namespace", lambda _cid: None)
+    monkeypatch.setattr(deploy_executions, "_store", SimpleNamespace(list_executions=lambda: []))
+
+    # 1. _epp_auth_delegator_crb_manifest keeps explicit ServiceAccounts AND appends namespace SA Group
+    crb_with_sa = caps._epp_auth_delegator_crb_manifest("llmd-ns", ["custom-epp"])
+    assert crb_with_sa["subjects"] == [
+        {"kind": "ServiceAccount", "name": "custom-epp", "namespace": "llmd-ns"},
+        {
+            "kind": "Group",
+            "apiGroup": "rbac.authorization.k8s.io",
+            "name": "system:serviceaccounts:llmd-ns",
+        },
+    ]
+    crb_empty_sa = caps._epp_auth_delegator_crb_manifest("llmd-ns", ())
+    assert crb_empty_sa["subjects"] == [
+        {
+            "kind": "Group",
+            "apiGroup": "rbac.authorization.k8s.io",
+            "name": "system:serviceaccounts:llmd-ns",
+        }
+    ]
+
+    # 2. _deployment_role_manifest permits coordination.k8s.io (for HA leader-election leases)
+    role_manifest = caps._deployment_role_manifest("llmd-ns")
+    assert any("coordination.k8s.io" in rule.get("apiGroups", []) for rule in role_manifest["rules"])
+
+    # 3. _parse_manifest_hints treats InferenceObjective as uses_router=True
+    hints = caps._parse_manifest_hints(
+        "apiVersion: llm-d.ai/v1alpha1\nkind: InferenceObjective\nmetadata:\n  name: obj-1\n"
+    )
+    assert hints["uses_router"] is True
+
+    # 4. bootstrapDigest stays identical to pre-t121 canonical payload even with eppSubjectScope
+    identity = {"kind": "User", "name": "alice", "subject": "alice", "overrideRequired": False}
+    expected_canonical = {
+        "clusterId": "cluster-a",
+        "namespace": "llmd-ns",
+        "namespaceLabels": {},
+        "subject": "alice",
+        "eppServiceAccounts": ["optimized-baseline-epp"],
+        "usesRouter": True,
+        "usesLws": False,
+        "usesStorage": False,
+        "satelliteVolumeId": None,
+        "preparedRequest": "",
+    }
+    expected_digest = hashlib.sha256(
+        json.dumps(expected_canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    rendered_router = caps.render_deployment_bootstrap_script(
+        cluster_id="cluster-a",
+        namespace="llmd-ns",
+        identity=identity,
+        epp_service_accounts=["optimized-baseline-epp"],
+        uses_router=True,
+    )
+    assert rendered_router["bootstrapDigest"] == expected_digest
+    assert "EPP_AUTH_DELEGATOR=applied" in rendered_router["script"]
+    assert "EPP_SUBJECT_SCOPE=namespace_serviceaccounts" in rendered_router["script"]
+    assert '--from-literal="eppSubjectScope=$EPP_SUBJECT_SCOPE"' in rendered_router["script"]
+    assert "name: system:serviceaccounts:llmd-ns" in rendered_router["script"]
+
+    # uses_router=True with empty epp_service_accounts still emits eppYaml and namespace_serviceaccounts scope
+    rendered_empty_sa = caps.render_deployment_bootstrap_script(
+        cluster_id="cluster-a",
+        namespace="llmd-ns",
+        identity=identity,
+        epp_service_accounts=(),
+        uses_router=True,
+    )
+    assert "EPP_AUTH_DELEGATOR=applied" in rendered_empty_sa["script"]
+    assert "EPP_SUBJECT_SCOPE=namespace_serviceaccounts" in rendered_empty_sa["script"]
+    assert "<<'LENS_EPP_EOF'" in rendered_empty_sa["script"]
+
+    rendered_non_router = caps.render_deployment_bootstrap_script(
+        cluster_id="cluster-a",
+        namespace="llmd-ns",
+        identity=identity,
+        uses_router=False,
+    )
+    assert "EPP_AUTH_DELEGATOR=not_required" in rendered_non_router["script"]
+    assert "EPP_SUBJECT_SCOPE=none" in rendered_non_router["script"]
+
+    # 5. read_bootstrap_marker parses eppSubjectScope and allows empty cluster_id fallback
+    class _ScopeMarkerRunner:
+        def __init__(self, marker_data):
+            self.marker_data = marker_data
+
+        async def run(self, argv, *, input=None, timeout=15):  # noqa: A002
+            return CommandResult(tuple(argv), 0, json.dumps({"data": self.marker_data}), "")
+
+    scope_data = {
+        "status": "completed",
+        "clusterId": "cluster-a",
+        "namespace": "llmd-ns",
+        "eppAuthDelegator": "applied",
+        "eppSubjectScope": "namespace_serviceaccounts",
+        "eppServiceAccounts": "optimized-baseline-epp",
+    }
+    parsed = asyncio.run(caps.read_bootstrap_marker("", "llmd-ns", runner=_ScopeMarkerRunner(scope_data)))
+    assert parsed["present"] is True
+    assert parsed["eppSubjectScope"] == "namespace_serviceaccounts"
+
+    mismatch = asyncio.run(caps.read_bootstrap_marker("cluster-b", "llmd-ns", runner=_ScopeMarkerRunner(scope_data)))
+    assert mismatch["present"] is False
+    assert mismatch["status"] == "stale"
+
+    # 6. _ssar_operation_specs: namespace_serviceaccounts covers arbitrary truncated SA; legacy marker checks SA list
+    ns_wide_ops = caps._ssar_operation_specs(
+        namespace="llmd-ns",
+        uses_storage=False,
+        uses_router=True,
+        uses_lws=False,
+        namespace_exists=True,
+        marker={
+            "present": True,
+            "eppAuthDelegator": "applied",
+            "eppSubjectScope": "namespace_serviceaccounts",
+            "eppServiceAccounts": ["optimized-baseline-epp"],
+        },
+        epp_service_accounts=["very-long-truncated-release-name-epp"],
+        satellite_storage=None,
+    )
+    epp_op = next(op for op in ns_wide_ops if op["id"] == "deploy.epp_auth_delegator")
+    assert epp_op["required"] is False
+    # leases are NOT added to SSAR specs so existing bootstrapped namespaces remain sufficient
+    rbac_op = next(op for op in ns_wide_ops if op["id"] == "deploy.rbac")
+    assert all(key[2] != "leases" for key in rbac_op["keys"])
+
+    legacy_match_ops = caps._ssar_operation_specs(
+        namespace="llmd-ns",
+        uses_storage=False,
+        uses_router=True,
+        uses_lws=False,
+        namespace_exists=True,
+        marker={
+            "present": True,
+            "eppAuthDelegator": "applied",
+            "eppServiceAccounts": ["optimized-baseline-epp"],
+        },
+        epp_service_accounts=["optimized-baseline-epp"],
+        satellite_storage=None,
+    )
+    assert next(op for op in legacy_match_ops if op["id"] == "deploy.epp_auth_delegator")["required"] is False
+
+    legacy_mismatch_ops = caps._ssar_operation_specs(
+        namespace="llmd-ns",
+        uses_storage=False,
+        uses_router=True,
+        uses_lws=False,
+        namespace_exists=True,
+        marker={
+            "present": True,
+            "eppAuthDelegator": "applied",
+            "eppServiceAccounts": ["optimized-baseline-epp"],
+        },
+        epp_service_accounts=["other-epp"],
+        satellite_storage=None,
+    )
+    assert next(op for op in legacy_mismatch_ops if op["id"] == "deploy.epp_auth_delegator")["required"] is True

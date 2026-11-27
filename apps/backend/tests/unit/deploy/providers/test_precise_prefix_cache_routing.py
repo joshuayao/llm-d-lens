@@ -765,3 +765,102 @@ async def test_readiness_fails_when_live_calibration_fails():
     assert not result.accepted
     assert result.reasons == ["peakPrefillThroughput calibration failed: measurement failed"]
     assert "endpoint_url" not in execution
+
+
+@pytest.mark.asyncio
+async def test_precise_routing_deploy_and_calibration_wire_post_renderer(tmp_path: Path, monkeypatch):
+    import llm_d_lens.deploy.providers.precise_prefix_cache_routing as precise
+    from llm_d_lens.deploy.providers import deployment_bundle
+
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
+    helm_commands: list[tuple[str, ...]] = []
+    helm_envs: list[dict[str, str] | None] = []
+
+    async def fake_exec(*command, **kwargs):
+        helm_commands.append(command)
+        helm_envs.append(kwargs.get("env"))
+        proc = Mock(returncode=0)
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        return proc
+
+    monkeypatch.setattr(precise.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(deployment_bundle, "resolve_helm_rbac_mode", AsyncMock(return_value=True))
+
+    values_path = tmp_path / "router-effective.yaml"
+    _write_router_values(values_path, "Qwen/Saved")
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text(yaml.safe_dump_all(_upstream_deployment_documents()), encoding="utf-8")
+
+    # __new__-constructed adapter without _environment
+    adapter = PrecisePrefixCacheRoutingAdapter.__new__(PrecisePrefixCacheRoutingAdapter)
+    adapter._runner = _ReadinessRunner()
+    adapter._namespace_prefix = "llmd-"
+    adapter._helm_path = Path("helm")
+    adapter._render_source = tmp_path
+    adapter._baseline_source = tmp_path
+    adapter._router_base_values = values_path
+    adapter._router_values = values_path
+    artifact = GuideDeploymentArtifact("precise-prefix-cache-routing", "hash", manifest_ref=str(manifest))
+
+    execution = await adapter.deploy(
+        artifact,
+        {"namespace": "llmd-run", "provenance": {"cluster_server_id": "cluster-pp"}},
+    )
+    assert "--post-renderer" in helm_commands[0]
+    deployment_bundle.resolve_helm_rbac_mode.assert_awaited_with(
+        "llmd-run",
+        cluster_id="cluster-pp",
+        environment=None,
+        kubectl_path=None,
+    )
+
+    # Direct calibration upgrade path
+    helm_commands.clear()
+    await adapter._apply_calibrated_router_values(execution, 9876)
+    assert "--post-renderer" in helm_commands[0]
+
+    # Bundle calibration upgrade path
+    bundle_commands: list[list[str]] = []
+
+    async def bundle_runner(command):
+        bundle_commands.append(command)
+        if command[1:3] == ["get", "manifest"]:
+            return 0, "kind: Deployment\n", ""
+        return 0, "kind: Deployment\n", ""
+
+    adapter._bundle_command_runner = bundle_runner
+    bundle_exec = {
+        "namespace": "llmd-run",
+        "model": "Qwen/Saved",
+        "router_values_path": str(values_path),
+        "router_chart": "saved-chart",
+        "router_version": "v1.0.0",
+        "router_release_name": "precise-prefix-cache-routing",
+        "provenance": {"cluster_server_id": "cluster-pp-bundle"},
+    }
+    await adapter._apply_calibrated_router_values(bundle_exec, 5432)
+    template_cmd = next(cmd for cmd in bundle_commands if cmd[1] == "template")
+    upgrade_cmd = next(cmd for cmd in bundle_commands if cmd[1] == "upgrade")
+    assert "--post-renderer" not in template_cmd
+    assert "--post-renderer" in upgrade_cmd
+    deployment_bundle.resolve_helm_rbac_mode.assert_awaited_with(
+        "llmd-run",
+        cluster_id="cluster-pp-bundle",
+        environment=None,
+        kubectl_path=None,
+    )
+
+    # Helm v4 direct deploy + calibration wire plugin name + HELM_PLUGINS env
+    helm_commands.clear()
+    helm_envs.clear()
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", lambda _helm_bin="helm": 4)
+    v4_exec = await adapter.deploy(artifact, {"namespace": "llmd-run"})
+    assert helm_commands[0][-2:] == ("--post-renderer", "strip-metrics-auth-rbac")
+    assert helm_envs[0] is not None
+    assert "HELM_PLUGINS" in helm_envs[0]
+    helm_commands.clear()
+    helm_envs.clear()
+    await adapter._apply_calibrated_router_values(v4_exec, 4321)
+    assert helm_commands[0][-2:] == ("--post-renderer", "strip-metrics-auth-rbac")
+    assert helm_envs[0] is not None
+    assert "HELM_PLUGINS" in helm_envs[0]

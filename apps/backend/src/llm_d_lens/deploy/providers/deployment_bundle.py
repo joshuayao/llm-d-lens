@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import contextvars
+import functools
 import hashlib
 import json
+import os
 import re
+import shlex
+import stat
+import subprocess
+import sys
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,12 +24,18 @@ from typing import Any
 import yaml
 
 from llm_d_lens.configuration.router_compatibility import compatible_router_values
-from llm_d_lens.infrastructure.process import spawn
+from llm_d_lens.infrastructure.process import CommandResult, shell, spawn
 from llm_d_lens.infrastructure.storage.paths import prism_temp_root
 
 CommandRunner = Callable[[list[str]], Awaitable[tuple[int, str, str]]]
 _SCHEMA_VERSION = "guide-deployment-bundle.v1"
 _SAFE_ASSET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_DNS1123_LABEL = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
+_CLUSTER_RBAC_SSAR_KEYS: tuple[tuple[str, str, str, str, str], ...] = tuple(
+    (verb, "rbac.authorization.k8s.io", resource, "", "")
+    for resource in ("clusterroles", "clusterrolebindings")
+    for verb in ("get", "create", "patch", "delete")
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +53,38 @@ _METRICS_AUTH_RULES = {
     ("authorization.k8s.io", "subjectaccessreviews"),
 }
 
+_REVIEW_ALLOWED_NAMESPACED: dict[str, set[str]] = {
+    "v1": {"Pod", "Service", "ServiceAccount", "ConfigMap", "PersistentVolumeClaim", "Endpoints"},
+    "apps/v1": {"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet"},
+    "batch/v1": {"Job", "CronJob"},
+    "rbac.authorization.k8s.io/v1": {"Role", "RoleBinding"},
+    "policy/v1": {"PodDisruptionBudget"},
+    "networking.k8s.io/v1": {"NetworkPolicy", "Ingress"},
+    "discovery.k8s.io/v1": {"EndpointSlice"},
+    "gateway.networking.k8s.io/v1": {"Gateway", "HTTPRoute", "GRPCRoute"},
+    "gateway.networking.k8s.io/v1beta1": {"ReferenceGrant", "Gateway", "HTTPRoute"},
+    "inference.networking.k8s.io/v1": {"InferencePool"},
+    "inference.networking.x-k8s.io/v1alpha2": {"InferencePool", "InferenceModel"},
+    "disaggregatedset.x-k8s.io/v1": {"DisaggregatedSet"},
+    "leaderworkerset.x-k8s.io/v1": {"LeaderWorkerSet"},
+    "resource.k8s.io/v1": {"ResourceClaimTemplate", "ResourceClaim"},
+    "resource.k8s.io/v1beta2": {"ResourceClaimTemplate", "ResourceClaim"},
+    "resource.k8s.io/v1beta1": {"ResourceClaimTemplate", "ResourceClaim"},
+}
+
+_POST_RENDERER_ALLOWED_NAMESPACED: dict[str, set[str]] = {
+    **_REVIEW_ALLOWED_NAMESPACED,
+    "v1": {*_REVIEW_ALLOWED_NAMESPACED["v1"], "Secret"},
+    "autoscaling/v1": {"HorizontalPodAutoscaler"},
+    "autoscaling/v2": {"HorizontalPodAutoscaler"},
+    "monitoring.coreos.com/v1": {"ServiceMonitor", "PodMonitor"},
+    "monitoring.googleapis.com/v1": {"PodMonitoring"},
+    "llm-d.ai/v1alpha1": {"InferenceObjective", "InferenceModelRewrite"},
+    "llm-d.ai/v1alpha2": {"InferenceObjective", "InferenceModelRewrite"},
+    "inference.networking.k8s.io/v1alpha2": {"InferencePool"},
+    "coordination.k8s.io/v1": {"Lease"},
+}
+
 
 def _flatten(documents: list) -> list:
     flat = []
@@ -50,57 +96,571 @@ def _flatten(documents: list) -> list:
     return flat
 
 
+def _is_token_or_sar_rule(rule: Any) -> bool:
+    if not isinstance(rule, dict):
+        return False
+    api_groups = rule.get("apiGroups")
+    resources = rule.get("resources")
+    return (
+        rule.get("verbs") == ["create"]
+        and not rule.get("resourceNames")
+        and not rule.get("nonResourceURLs")
+        and isinstance(api_groups, list)
+        and bool(api_groups)
+        and all(isinstance(group, str) for group in api_groups)
+        and isinstance(resources, list)
+        and bool(resources)
+        and all(isinstance(resource, str) for resource in resources)
+        and {(group, resource) for group in api_groups for resource in resources} <= _METRICS_AUTH_RULES
+    )
+
+
+def _is_prometheus_metrics_rule(rule: Any) -> bool:
+    if not isinstance(rule, dict):
+        return False
+    return (
+        rule.get("verbs") == ["get"]
+        and rule.get("nonResourceURLs") == ["/metrics"]
+        and not rule.get("apiGroups")
+        and not rule.get("resources")
+        and not rule.get("resourceNames")
+    )
+
+
 def _is_metrics_auth_role(document: dict) -> bool:
-    """The EPP chart's metrics-auth ClusterRole: only TokenReview/SubjectAccessReview create."""
-    rules = document.get("rules") or []
+    """The EPP chart's metrics-auth ClusterRole: TokenReview/SAR create plus optional /metrics get."""
+    rules = document.get("rules")
     return (
         document.get("apiVersion") == "rbac.authorization.k8s.io/v1"
         and document.get("kind") == "ClusterRole"
         and not document.get("aggregationRule")
+        and isinstance(rules, list)
         and bool(rules)
-        and all(
-            rule.get("verbs") == ["create"]
-            and not rule.get("resourceNames")
-            and not rule.get("nonResourceURLs")
-            and {(group, resource) for group in rule.get("apiGroups") or [] for resource in rule.get("resources") or []}
-            <= _METRICS_AUTH_RULES
-            for rule in rules
-        )
+        and any(_is_token_or_sar_rule(rule) for rule in rules)
+        and all(_is_token_or_sar_rule(rule) or _is_prometheus_metrics_rule(rule) for rule in rules)
     )
 
 
 def _is_metrics_auth_binding(document: dict, namespace: str, roles: set[str]) -> bool:
-    subjects = document.get("subjects") or []
-    role_ref = document.get("roleRef") or {}
+    subjects = document.get("subjects")
+    role_ref = document.get("roleRef")
     return (
         document.get("apiVersion") == "rbac.authorization.k8s.io/v1"
         and document.get("kind") == "ClusterRoleBinding"
+        and isinstance(role_ref, dict)
         and role_ref.get("kind") == "ClusterRole"
+        and role_ref.get("apiGroup") in {"rbac.authorization.k8s.io", None, ""}
         and role_ref.get("name") in roles
+        and isinstance(subjects, list)
         and bool(subjects)
-        and all(item.get("kind") == "ServiceAccount" and item.get("namespace") == namespace for item in subjects)
+        and all(
+            isinstance(item, dict)
+            and item.get("kind") == "ServiceAccount"
+            and item.get("apiGroup", "") in {"", None}
+            and item.get("namespace") == namespace
+            and isinstance(item.get("name"), str)
+            and bool(item["name"])
+            for item in subjects
+        )
+    )
+
+
+def strip_validated_metrics_auth_rbac(
+    documents: list[Any], namespace: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Strip validated EPP metrics-auth RBAC and fail closed on any other cluster-scoped/unclassified kind."""
+    flat = [doc for doc in _flatten(documents) if doc is not None]
+    metrics_roles = {
+        doc["metadata"]["name"]
+        for doc in flat
+        if isinstance(doc, dict)
+        and _is_metrics_auth_role(doc)
+        and isinstance((doc.get("metadata") or {}).get("name"), str)
+        and bool((doc.get("metadata") or {}).get("name"))
+    }
+    kept: list[dict[str, Any]] = []
+    stripped: list[dict[str, Any]] = []
+    for document in flat:
+        if not isinstance(document, dict):
+            raise ValueError("Helm manifest documents must be Kubernetes objects")
+        api_version = document.get("apiVersion")
+        kind = document.get("kind")
+        if not isinstance(api_version, str) or not api_version or not isinstance(kind, str) or not kind:
+            raise ValueError("Helm manifest documents must declare string apiVersion and kind")
+        metadata = document.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError(f"Helm manifest resource {kind} has invalid metadata")
+        name = (metadata or {}).get("name") or "<unnamed>"
+        if _is_metrics_auth_role(document) or _is_metrics_auth_binding(document, namespace, metrics_roles):
+            stripped.append(document)
+            continue
+        if kind in {"ClusterRole", "ClusterRoleBinding"}:
+            raise ValueError(f"Non-admin Helm post-renderer rejected unexpected cluster-scoped RBAC: {kind}/{name}")
+        if kind not in _POST_RENDERER_ALLOWED_NAMESPACED.get(api_version, set()):
+            raise ValueError(f"Non-admin Helm post-renderer rejected unsupported resource: {api_version}/{kind}")
+        doc_namespace = (metadata or {}).get("namespace")
+        if doc_namespace is not None and doc_namespace != namespace:
+            raise ValueError(
+                f"Non-admin Helm post-renderer rejected cross-namespace resource: {kind}/{name} ({doc_namespace})"
+            )
+        kept.append(document)
+    if not kept:
+        raise ValueError("Non-admin Helm post-renderer rejected manifest with no remaining resources")
+    return kept, stripped
+
+
+def filter_helm_manifest_yaml(manifest_yaml: str, namespace: str) -> str:
+    """Parse rendered Helm YAML, strip validated metrics-auth RBAC, and fail closed on anything unexpected."""
+    try:
+        documents = [doc for doc in yaml.safe_load_all(manifest_yaml) if doc is not None]
+    except yaml.YAMLError as error:
+        raise ValueError(f"Non-admin Helm post-renderer received invalid YAML: {error}") from error
+    kept, _ = strip_validated_metrics_auth_rbac(documents, namespace)
+    return yaml.safe_dump_all(kept, sort_keys=False)
+
+
+def helm_post_renderer_root() -> Path:
+    """Controlled scratch root where temporary Helm post-renderer wrappers live."""
+    return prism_temp_root("helm-post-renderers")
+
+
+def _build_post_renderer_filter_script(namespace: str, last_error_path: Path | None = None) -> str:
+    allowed_json = json.dumps({key: sorted(value) for key, value in _POST_RENDERER_ALLOWED_NAMESPACED.items()})
+    rules_json = json.dumps([list(item) for item in sorted(_METRICS_AUTH_RULES)])
+    namespace_json = json.dumps(namespace)
+    last_error_literal = "None" if last_error_path is None else json.dumps(str(last_error_path))
+    return f"""import json
+import os
+import sys
+import yaml
+
+TARGET_NAMESPACE = {namespace_json}
+LAST_ERROR_PATH = {last_error_literal}
+ALLOWED_NAMESPACED = {{k: set(v) for k, v in json.loads({allowed_json!r}).items()}}
+METRICS_AUTH_RULES = {{tuple(item) for item in json.loads({rules_json!r})}}
+
+
+def _flatten(documents):
+    flat = []
+    for document in documents:
+        if isinstance(document, dict) and document.get("kind") == "List":
+            flat.extend(_flatten(document.get("items") or []))
+        else:
+            flat.append(document)
+    return flat
+
+
+def _is_token_or_sar_rule(rule):
+    if not isinstance(rule, dict):
+        return False
+    api_groups = rule.get("apiGroups")
+    resources = rule.get("resources")
+    return (
+        rule.get("verbs") == ["create"]
+        and not rule.get("resourceNames")
+        and not rule.get("nonResourceURLs")
+        and isinstance(api_groups, list)
+        and bool(api_groups)
+        and all(isinstance(group, str) for group in api_groups)
+        and isinstance(resources, list)
+        and bool(resources)
+        and all(isinstance(resource, str) for resource in resources)
+        and {{(group, resource) for group in api_groups for resource in resources}} <= METRICS_AUTH_RULES
+    )
+
+
+def _is_prometheus_metrics_rule(rule):
+    if not isinstance(rule, dict):
+        return False
+    return (
+        rule.get("verbs") == ["get"]
+        and rule.get("nonResourceURLs") == ["/metrics"]
+        and not rule.get("apiGroups")
+        and not rule.get("resources")
+        and not rule.get("resourceNames")
+    )
+
+
+def _is_metrics_auth_role(document):
+    rules = document.get("rules")
+    return (
+        document.get("apiVersion") == "rbac.authorization.k8s.io/v1"
+        and document.get("kind") == "ClusterRole"
+        and not document.get("aggregationRule")
+        and isinstance(rules, list)
+        and bool(rules)
+        and any(_is_token_or_sar_rule(rule) for rule in rules)
+        and all(_is_token_or_sar_rule(rule) or _is_prometheus_metrics_rule(rule) for rule in rules)
+    )
+
+
+def _is_metrics_auth_binding(document, namespace, roles):
+    subjects = document.get("subjects")
+    role_ref = document.get("roleRef")
+    return (
+        document.get("apiVersion") == "rbac.authorization.k8s.io/v1"
+        and document.get("kind") == "ClusterRoleBinding"
+        and isinstance(role_ref, dict)
+        and role_ref.get("kind") == "ClusterRole"
+        and role_ref.get("apiGroup") in {{"rbac.authorization.k8s.io", None, ""}}
+        and role_ref.get("name") in roles
+        and isinstance(subjects, list)
+        and bool(subjects)
+        and all(
+            isinstance(item, dict)
+            and item.get("kind") == "ServiceAccount"
+            and item.get("apiGroup", "") in {{"", None}}
+            and item.get("namespace") == namespace
+            and isinstance(item.get("name"), str)
+            and bool(item["name"])
+            for item in subjects
+        )
+    )
+
+
+def filter_manifest(raw_yaml):
+    try:
+        documents = [doc for doc in yaml.safe_load_all(raw_yaml) if doc is not None]
+    except yaml.YAMLError as error:
+        raise ValueError(f"Non-admin Helm post-renderer received invalid YAML: {{error}}") from error
+    flat = [doc for doc in _flatten(documents) if doc is not None]
+    metrics_roles = {{
+        doc["metadata"]["name"]
+        for doc in flat
+        if isinstance(doc, dict)
+        and _is_metrics_auth_role(doc)
+        and isinstance((doc.get("metadata") or {{}}).get("name"), str)
+        and bool((doc.get("metadata") or {{}}).get("name"))
+    }}
+    kept = []
+    for document in flat:
+        if not isinstance(document, dict):
+            raise ValueError("Helm manifest documents must be Kubernetes objects")
+        api_version = document.get("apiVersion")
+        kind = document.get("kind")
+        if not isinstance(api_version, str) or not api_version or not isinstance(kind, str) or not kind:
+            raise ValueError("Helm manifest documents must declare string apiVersion and kind")
+        metadata = document.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError(f"Helm manifest resource {{kind}} has invalid metadata")
+        name = (metadata or {{}}).get("name") or "<unnamed>"
+        if _is_metrics_auth_role(document) or _is_metrics_auth_binding(document, TARGET_NAMESPACE, metrics_roles):
+            continue
+        if kind in {{"ClusterRole", "ClusterRoleBinding"}}:
+            raise ValueError(
+                f"Non-admin Helm post-renderer rejected unexpected cluster-scoped RBAC: {{kind}}/{{name}}"
+            )
+        if kind not in ALLOWED_NAMESPACED.get(api_version, set()):
+            raise ValueError(
+                f"Non-admin Helm post-renderer rejected unsupported resource: {{api_version}}/{{kind}}"
+            )
+        doc_namespace = (metadata or {{}}).get("namespace")
+        if doc_namespace is not None and doc_namespace != TARGET_NAMESPACE:
+            raise ValueError(
+                f"Non-admin Helm post-renderer rejected cross-namespace resource: {{kind}}/{{name}} ({{doc_namespace}})"
+            )
+        kept.append(document)
+    if not kept:
+        raise ValueError("Non-admin Helm post-renderer rejected manifest with no remaining resources")
+    return yaml.safe_dump_all(kept, sort_keys=False)
+
+
+def _fail(message):
+    if LAST_ERROR_PATH and not os.path.islink(LAST_ERROR_PATH):
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(LAST_ERROR_PATH, flags, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                handle = os.fdopen(fd, "w", encoding="utf-8")
+            except Exception:
+                os.close(fd)
+                raise
+            with handle:
+                handle.write(message)
+        except OSError:
+            pass
+    sys.stderr.write(f"{{message}}\\n")
+    return 1
+
+
+def main():
+    if LAST_ERROR_PATH:
+        try:
+            if os.path.lexists(LAST_ERROR_PATH) and not os.path.islink(LAST_ERROR_PATH):
+                os.unlink(LAST_ERROR_PATH)
+        except OSError:
+            pass
+    try:
+        sys.stdout.write(filter_manifest(sys.stdin.read()))
+    except Exception as error:
+        return _fail(str(error))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+
+_ACTIVE_HELM_POST_RENDERER: contextvars.ContextVar[HelmPostRenderer | None] = contextvars.ContextVar(
+    "_ACTIVE_HELM_POST_RENDERER",
+    default=None,
+)
+_ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "_ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR",
+    default=None,
+)
+
+
+def active_helm_post_renderer() -> HelmPostRenderer | None:
+    """Return the active task-local Helm post-renderer handle when active."""
+    return _ACTIVE_HELM_POST_RENDERER.get()
+
+
+def active_helm_post_renderer_plugins_dir() -> Path | None:
+    """Return the task-local Helm v4 post-renderer plugins directory when active."""
+    return _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.get()
+
+
+def _parse_helm_major_version(raw: str) -> int | None:
+    match = re.search(r"(?:^|\bv)(\d+)\.\d+", raw.strip())
+    if match:
+        return int(match.group(1))
+    return None
+
+
+@functools.lru_cache(maxsize=16)
+def _helm_major_version_cached(helm_bin: str) -> int:
+    for args in (["version", "--template={{.Version}}"], ["version", "--short"]):
+        try:
+            completed = subprocess.run(
+                [helm_bin, *args],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if completed.returncode == 0:
+            major = _parse_helm_major_version(completed.stdout or "")
+            if major is not None:
+                return major
+    return 3
+
+
+def _helm_major_version(helm_bin: str | Path = "helm") -> int:
+    """Detect and cache the Helm CLI major version (defaults to 3 when unavailable)."""
+    normalized = str(helm_bin or "helm").strip() or "helm"
+    return _helm_major_version_cached(normalized)
+
+
+_helm_major_version.cache_clear = _helm_major_version_cached.cache_clear  # type: ignore[attr-defined]
+_helm_major_version.cache_info = _helm_major_version_cached.cache_info  # type: ignore[attr-defined]
+
+
+@dataclass(frozen=True)
+class HelmPostRenderer:
+    """Handle for an active Helm metrics-auth RBAC post-renderer (Helm v3 path or Helm v4 plugin)."""
+
+    argument: str
+    script_path: Path
+    plugins_dir: Path | None = None
+    major_version: int = 3
+    error_path: Path | None = None
+
+    def __str__(self) -> str:
+        return self.argument
+
+    def helm_args(self) -> list[str]:
+        return ["--post-renderer", self.argument]
+
+    def last_error(self) -> str | None:
+        """Return the recorded post-renderer failure message, if any, without following symlinks."""
+        if self.error_path is None:
+            return None
+        try:
+            if self.error_path.is_symlink():
+                return None
+            fd = os.open(self.error_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            return None
+        try:
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                return None
+            with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
+                fd = -1
+                text = handle.read().strip()
+        except OSError:
+            return None
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        return text or None
+
+    def subprocess_env(self, base_env: Mapping[str, str] | None = None) -> dict[str, str] | None:
+        """Return per-invocation env with ``HELM_PLUGINS`` isolated to ``plugins_dir`` on Helm v4.
+
+        Strictly sets ``HELM_PLUGINS`` to ``str(self.plugins_dir)`` instead of
+        appending external directories so no ambient plugin can shadow
+        ``strip-metrics-auth-rbac``. Never mutates ``os.environ`` or ``base_env``.
+        """
+        if self.plugins_dir is None:
+            return dict(base_env) if base_env is not None else None
+        env = dict(os.environ if base_env is None else base_env)
+        env["HELM_PLUGINS"] = str(self.plugins_dir)
+        return env
+
+
+@contextlib.contextmanager
+def helm_metrics_auth_post_renderer(namespace: str, *, helm_bin: str | Path = "helm") -> Iterator[HelmPostRenderer]:
+    """Yield an owner-only Helm ``--post-renderer`` handle scoped to ``namespace``."""
+    if not isinstance(namespace, str) or not _DNS1123_LABEL.fullmatch(namespace):
+        raise ValueError("Helm post-renderer namespace must be a valid DNS-1123 label")
+    root = helm_post_renderer_root()
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    with tempfile.TemporaryDirectory(prefix="rbac-strip-", dir=root) as directory:
+        tmpdir = Path(directory)
+        os.chmod(tmpdir, 0o700)
+        last_error_path = tmpdir / "last-error.txt"
+        filter_py = tmpdir / "filter.py"
+        filter_py.write_text(
+            _build_post_renderer_filter_script(namespace, last_error_path=last_error_path),
+            encoding="utf-8",
+        )
+        os.chmod(filter_py, 0o600)
+        wrapper = tmpdir / "strip-metrics-auth-rbac"
+        wrapper.write_text(
+            f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(filter_py))}\n",
+            encoding="utf-8",
+        )
+        os.chmod(wrapper, 0o700)
+        major = _helm_major_version(helm_bin)
+        plugins_dir: Path | None = None
+        argument = str(wrapper)
+        if major >= 4:
+            plugins_dir = tmpdir / "plugins"
+            plugins_dir.mkdir(mode=0o700)
+            os.chmod(plugins_dir, 0o700)
+            plugin_dir = plugins_dir / "strip-metrics-auth-rbac"
+            plugin_dir.mkdir(mode=0o700)
+            os.chmod(plugin_dir, 0o700)
+            plugin_yaml = plugin_dir / "plugin.yaml"
+            plugin_manifest = {
+                "apiVersion": "v1",
+                "type": "postrenderer/v1",
+                "name": "strip-metrics-auth-rbac",
+                "version": "0.1.0",
+                "runtime": "subprocess",
+                "runtimeConfig": {"platformCommand": [{"command": str(wrapper)}]},
+            }
+            plugin_yaml.write_text(yaml.safe_dump(plugin_manifest, sort_keys=False), encoding="utf-8")
+            os.chmod(plugin_yaml, 0o600)
+            argument = "strip-metrics-auth-rbac"
+
+        post_renderer = HelmPostRenderer(
+            argument=argument,
+            script_path=wrapper,
+            plugins_dir=plugins_dir,
+            major_version=major,
+            error_path=last_error_path,
+        )
+        plugins_token = _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.set(plugins_dir)
+        renderer_token = _ACTIVE_HELM_POST_RENDERER.set(post_renderer)
+        try:
+            yield post_renderer
+        finally:
+            _ACTIVE_HELM_POST_RENDERER.reset(renderer_token)
+            _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.reset(plugins_token)
+
+
+class _KubectlSubprocessRunner:
+    """Adapter exposing ``run(argv, input=..., timeout=...)`` for explicit kubeconfig environments."""
+
+    def __init__(self, kubectl_path: Path | None, environment: Mapping[str, str] | None) -> None:
+        self._kubectl_path = str(kubectl_path) if kubectl_path is not None else "kubectl"
+        self._environment = dict(environment) if environment is not None else None
+
+    async def run(
+        self,
+        argv: list[str],
+        *,
+        input: str | bytes | None = None,  # noqa: A002 - CommandRunner contract
+        timeout: float | None = 15,
+    ) -> CommandResult:
+        command = [self._kubectl_path, *argv[1:]] if argv and argv[0] == "kubectl" else list(argv)
+        return await shell.run(command, env=self._environment, input=input, timeout=timeout)
+
+
+def adapter_kubectl_context(adapter: Any) -> tuple[Mapping[str, str] | None, Path | None]:
+    """Safely extract ``(environment, kubectl_path)`` from an adapter, including ``__new__`` test instances."""
+    runner = getattr(adapter, "_runner", getattr(adapter, "_command_runner", adapter))
+    kubectl_target = getattr(runner, "_kubectl", runner)
+    environment = getattr(adapter, "_environment", None)
+    if environment is None:
+        environment = getattr(kubectl_target, "_environment", None)
+    raw_kubectl = getattr(adapter, "_kubectl_path", None)
+    if raw_kubectl is None:
+        raw_kubectl = getattr(kubectl_target, "_kubectl_path", None)
+    kubectl_path = Path(raw_kubectl) if raw_kubectl is not None else None
+    return environment, kubectl_path
+
+
+async def resolve_helm_rbac_mode(
+    namespace: str,
+    *,
+    cluster_id: str | None = None,
+    environment: Mapping[str, str] | None = None,
+    kubectl_path: Path | None = None,
+    ssar_runner: Any = None,
+) -> bool:
+    """Return True when Helm must strip metrics-auth cluster RBAC via ``--post-renderer``.
+
+    Admin callers (all 8 cluster RBAC SSAR checks allowed) return False. Non-admin
+    callers require a verified bootstrap marker with ``eppAuthDelegator=applied``;
+    otherwise fail closed with ``RuntimeError``. Isolated unit tests with no
+    ``ssar_runner``, no registered cluster, and no explicit kubeconfig/in-cluster
+    ``environment`` return False without touching ambient ``os.environ``.
+    """
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.deploy import capabilities
+    from llm_d_lens.infrastructure.kubernetes import scoped_runner
+
+    clean_cluster_id = str(cluster_id or "").strip() or None
+    active_runner = ssar_runner
+    if active_runner is None and clean_cluster_id and cluster_registry.get_cluster(clean_cluster_id) is not None:
+        active_runner = scoped_runner(clean_cluster_id)
+    if (
+        active_runner is None
+        and environment is not None
+        and (
+            bool(str(environment.get("KUBECONFIG") or "").strip())
+            or bool(str(environment.get("KUBERNETES_SERVICE_HOST") or "").strip())
+        )
+    ):
+        active_runner = _KubectlSubprocessRunner(kubectl_path, environment)
+    if active_runner is None:
+        return False
+
+    answers = await capabilities._run_ssar_checks(_CLUSTER_RBAC_SSAR_KEYS, runner=active_runner)
+    if all(answers.get(key) is True for key in _CLUSTER_RBAC_SSAR_KEYS):
+        return False
+
+    marker = await capabilities.read_bootstrap_marker(clean_cluster_id or "", namespace, runner=active_runner)
+    if marker.get("present") is True and marker.get("eppAuthDelegator") == "applied":
+        return True
+    raise RuntimeError(
+        f"Namespace {namespace} lacks cluster-scoped RBAC permissions (clusterroles/clusterrolebindings) "
+        "for Helm router installation and does not have a verified Orchestration administrator bootstrap "
+        f"marker with eppAuthDelegator=applied. Run the Orchestration administrator deployment bootstrap script "
+        f"for {namespace} first."
     )
 
 
 def validate_review_resources(documents: list[dict], namespace: str) -> None:
-    allowed = {
-        "v1": {"Pod", "Service", "ServiceAccount", "ConfigMap", "PersistentVolumeClaim", "Endpoints"},
-        "apps/v1": {"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet"},
-        "batch/v1": {"Job", "CronJob"},
-        "rbac.authorization.k8s.io/v1": {"Role", "RoleBinding"},
-        "policy/v1": {"PodDisruptionBudget"},
-        "networking.k8s.io/v1": {"NetworkPolicy", "Ingress"},
-        "discovery.k8s.io/v1": {"EndpointSlice"},
-        "gateway.networking.k8s.io/v1": {"Gateway", "HTTPRoute", "GRPCRoute"},
-        "gateway.networking.k8s.io/v1beta1": {"ReferenceGrant", "Gateway", "HTTPRoute"},
-        "inference.networking.k8s.io/v1": {"InferencePool"},
-        "inference.networking.x-k8s.io/v1alpha2": {"InferencePool", "InferenceModel"},
-        "disaggregatedset.x-k8s.io/v1": {"DisaggregatedSet"},
-        "leaderworkerset.x-k8s.io/v1": {"LeaderWorkerSet"},
-        "resource.k8s.io/v1": {"ResourceClaimTemplate", "ResourceClaim"},
-        "resource.k8s.io/v1beta2": {"ResourceClaimTemplate", "ResourceClaim"},
-        "resource.k8s.io/v1beta1": {"ResourceClaimTemplate", "ResourceClaim"},
-    }
     documents = _flatten(documents)
     metrics_roles = {
         (document.get("metadata") or {}).get("name")
@@ -115,7 +675,7 @@ def validate_review_resources(documents: list[dict], namespace: str) -> None:
             raise ValueError("Prepared plans must reference existing Secrets, not embed Secret payloads")
         if _is_metrics_auth_role(document) or _is_metrics_auth_binding(document, namespace, metrics_roles):
             continue
-        if kind not in allowed.get(document.get("apiVersion"), set()):
+        if kind not in _REVIEW_ALLOWED_NAMESPACED.get(document.get("apiVersion"), set()):
             raise ValueError(f"Prepared plans do not support cluster-scoped or unclassified resources: {kind}")
         if document.get("metadata", {}).get("namespace", namespace) != namespace:
             raise ValueError("Prepared resource namespace differs from the reviewed namespace")
@@ -200,34 +760,67 @@ def frozen_chart(bundle: dict, directory: Path, namespace: str) -> Path:
     return path
 
 
+def _with_post_renderer_error(
+    detail: str,
+    stderr: str,
+    stdout: str,
+    post_renderer: HelmPostRenderer,
+) -> str:
+    recorded_error = post_renderer.last_error()
+    if recorded_error and recorded_error not in stderr and recorded_error not in stdout:
+        return f"{detail} ({recorded_error})" if detail else recorded_error
+    return detail
+
+
 async def validate_frozen_bundle(
-    bundle: dict, *, guide: str, source_commit: str, namespace: str, command_runner: CommandRunner
+    bundle: dict,
+    *,
+    guide: str,
+    source_commit: str,
+    namespace: str,
+    command_runner: CommandRunner,
+    strip_metrics_auth_rbac: bool = False,
 ) -> None:
     materialized = materialize_deployment_bundle(bundle, guide, source_commit)
     archive = frozen_chart(bundle, materialized.effective_values.parent, namespace)
-    status, stdout, stderr = await command_runner(
-        [
-            "helm",
-            "install",
-            materialized.release_name,
-            str(archive),
-            "--namespace",
-            namespace,
-            "--values",
-            str(materialized.effective_values),
-            "--dry-run=server",
-            "--skip-crds",
-            "--output",
-            "json",
-        ]
-    )
-    if status:
-        raise ValueError(f"Prepared Router server dry run failed: {(stderr or stdout).strip()}")
+    command = [
+        "helm",
+        "install",
+        materialized.release_name,
+        str(archive),
+        "--namespace",
+        namespace,
+        "--values",
+        str(materialized.effective_values),
+        "--dry-run=server",
+        "--skip-crds",
+        "--output",
+        "json",
+    ]
+    if strip_metrics_auth_rbac:
+        helm_bin = getattr(command_runner, "_helm_path", "helm")
+        with helm_metrics_auth_post_renderer(namespace, helm_bin=helm_bin) as post_renderer:
+            status, stdout, stderr = await command_runner([*command, *post_renderer.helm_args()])
+            if status:
+                detail = _with_post_renderer_error((stderr or stdout).strip(), stderr, stdout, post_renderer)
+                raise ValueError(f"Prepared Router server dry run failed: {detail}")
+    else:
+        status, stdout, stderr = await command_runner(command)
+        if status:
+            raise ValueError(f"Prepared Router server dry run failed: {(stderr or stdout).strip()}")
     release = json.loads(stdout)
     if release.get("hooks"):
         raise ValueError("Prepared deployments do not execute unreviewed Helm hooks")
     actual = release.get("manifest", "")
-    if list(yaml.safe_load_all(actual)) != list(yaml.safe_load_all(bundle["frozen"]["manifest"])):
+    if strip_metrics_auth_rbac:
+        actual_docs = [doc for doc in yaml.safe_load_all(actual) if doc is not None]
+        expected_docs, _ = strip_validated_metrics_auth_rbac(
+            [doc for doc in yaml.safe_load_all(bundle["frozen"]["manifest"]) if doc is not None],
+            namespace,
+        )
+        if actual_docs != expected_docs:
+            raise ValueError("Router server render differs from the reviewed plan; prepare a new plan")
+    elif list(yaml.safe_load_all(actual)) != list(yaml.safe_load_all(bundle["frozen"]["manifest"])):
         raise ValueError("Router server render differs from the reviewed plan; prepare a new plan")
 
 
@@ -240,19 +833,35 @@ def subprocess_bundle_runner(
 
     async def run(command: list[str]) -> tuple[int, str, str]:
         executable = helm_path if command[0] == "helm" else kubectl_path
+        spawn_env = environment
+        plugins_dir = active_helm_post_renderer_plugins_dir()
+        has_post_renderer = "--post-renderer" in command or any(item.startswith("--post-renderer=") for item in command)
+        if command and command[0] == "helm" and has_post_renderer and plugins_dir is not None:
+            spawn_env = {
+                **(os.environ if environment is None else environment),
+                "HELM_PLUGINS": str(plugins_dir),
+            }
         process = await spawn(
             [str(executable), *command[1:]],
-            env=environment,
+            env=spawn_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await process.communicate()
+        stdout_text = stdout.decode(errors="replace")
+        stderr_text = stderr.decode(errors="replace")
+        if command and command[0] == "helm" and has_post_renderer and process.returncode != 0:
+            post_renderer = active_helm_post_renderer()
+            recorded_error = post_renderer.last_error() if post_renderer is not None else None
+            if recorded_error and recorded_error not in stderr_text:
+                stderr_text = f"{stderr_text.rstrip()} ({recorded_error})" if stderr_text.strip() else recorded_error
         return (
             process.returncode,
-            stdout.decode(errors="replace"),
-            stderr.decode(errors="replace"),
+            stdout_text,
+            stderr_text,
         )
 
+    run._helm_path = helm_path  # type: ignore[attr-defined]
     return run
 
 
@@ -374,6 +983,7 @@ async def install_deployment_bundle(
     output_root: Path | None = None,
     effective_values_content: str | None = None,
     effective_values_name: str = "router-profile-effective.yaml",
+    strip_metrics_auth_rbac: bool = False,
 ) -> dict[str, Any]:
     """Render and install only saved bundle inputs through an injectable command boundary."""
     materialized = materialize_deployment_bundle(bundle, guide, source_commit, output_root)
@@ -430,9 +1040,18 @@ async def install_deployment_bundle(
         if status != 0:
             raise RuntimeError((stderr or stdout or "saved Guide resource apply failed").strip())
     frozen_options = ["--skip-crds", "--no-hooks"] if bundle.get("frozen") else []
-    status, stdout, stderr = await command_runner(["helm", "upgrade", "--install", *helm_common, *frozen_options])
-    if status != 0:
-        raise RuntimeError((stderr or stdout or "saved Router deployment failed").strip())
+    install_command = ["helm", "upgrade", "--install", *helm_common, *frozen_options]
+    if strip_metrics_auth_rbac:
+        helm_bin = getattr(command_runner, "_helm_path", "helm")
+        with helm_metrics_auth_post_renderer(namespace, helm_bin=helm_bin) as post_renderer:
+            status, stdout, stderr = await command_runner([*install_command, *post_renderer.helm_args()])
+            if status != 0:
+                detail = _with_post_renderer_error((stderr or stdout).strip(), stderr, stdout, post_renderer)
+                raise RuntimeError(detail or "saved Router deployment failed")
+    else:
+        status, stdout, stderr = await command_runner(install_command)
+        if status != 0:
+            raise RuntimeError((stderr or stdout or "saved Router deployment failed").strip())
     status, rendered, stderr = await command_runner(
         [
             "helm",

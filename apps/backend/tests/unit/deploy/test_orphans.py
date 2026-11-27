@@ -397,7 +397,11 @@ async def test_cleanup_security_hardening_and_marker_validation(monkeypatch):
     from llm_d_lens.deploy import orphans
     from llm_d_lens.infrastructure.process import CommandResult
 
-    # CRDs deleted before pods
+    # CRDs and batch jobs deleted before pods
+    assert "jobs.batch" in orphans._IN_NAMESPACE_RESOURCE_TYPES
+    assert orphans._IN_NAMESPACE_RESOURCE_TYPES.index("jobs.batch") < (
+        orphans._IN_NAMESPACE_RESOURCE_TYPES.index("pods")
+    )
     assert orphans._IN_NAMESPACE_RESOURCE_TYPES.index("leaderworkersets.leaderworkerset.x-k8s.io") < (
         orphans._IN_NAMESPACE_RESOURCE_TYPES.index("pods")
     )
@@ -506,3 +510,204 @@ async def test_cleanup_security_hardening_and_marker_validation(monkeypatch):
         runner=_VerifyRunner(valid_marker_doc, '{"items": null}'),
     )
     assert bad_pods_res["verified"] is False
+
+
+@pytest.mark.asyncio
+async def test_scan_orphan_namespaces_surfaces_403_and_401_and_covers_router_kinds(monkeypatch):
+    from llm_d_lens.deploy.capabilities import DeploymentClusterAuthError
+
+    monkeypatch.setenv("LLM_D_BENCH_NAMESPACE_PREFIX", "llmd-")
+
+    monkeypatch.setattr(
+        orphans,
+        "scoped_runner",
+        lambda _cid: _Runner(
+            namespaces=_Result(returncode=1, stderr='namespaces is forbidden: cannot list resource "namespaces"')
+        ),
+    )
+    with pytest.raises(orphans.OrphanScanPermissionDeniedError, match="forbidden"):
+        await orphans.scan_orphan_namespaces("cluster-a", store=_Store([]))
+
+    monkeypatch.setattr(
+        orphans,
+        "scoped_runner",
+        lambda _cid: _Runner(
+            namespaces=_Result(returncode=1, stderr="You must be logged in to the server (Unauthorized)")
+        ),
+    )
+    with pytest.raises(DeploymentClusterAuthError):
+        await orphans.scan_orphan_namespaces("cluster-a", store=_Store([]))
+
+    # Router chart in-namespace resource kinds are included, with workloads/autoscalers deleted before pods
+    pods_idx = orphans._IN_NAMESPACE_RESOURCE_TYPES.index("pods")
+    for kind in ("statefulsets.apps", "horizontalpodautoscalers.autoscaling"):
+        assert kind in orphans._IN_NAMESPACE_RESOURCE_TYPES
+        assert orphans._IN_NAMESPACE_RESOURCE_TYPES.index(kind) < pods_idx
+    assert "inferenceobjectives.llm-d.ai" in orphans._IN_NAMESPACE_RESOURCE_TYPES
+    assert "leases.coordination.k8s.io" in orphans._IN_NAMESPACE_RESOURCE_TYPES
+
+
+@pytest.mark.asyncio
+async def test_cleanup_in_namespace_resources_preserves_operator_rbac_bootstrap_and_secrets(monkeypatch):
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.infrastructure.process import CommandResult
+
+    monkeypatch.setenv("LLM_D_BENCH_NAMESPACE_PREFIX", "llmd-")
+    monkeypatch.setattr(cluster_registry, "get_cluster", lambda _cid: None)
+    monkeypatch.setattr(cluster_registry, "cluster_kubeconfig_namespace", lambda _cid: None)
+
+    recorded_calls: list[list[str]] = []
+    listed_items = {
+        "roles.rbac.authorization.k8s.io": [
+            {"metadata": {"name": "lens-deployment-operator"}},
+            {"metadata": {"name": "epp-role"}},
+            {"metadata": {"name": "invalid/role-name"}},
+        ],
+        "rolebindings.rbac.authorization.k8s.io": [
+            {"metadata": {"name": "lens-deployment-operator"}},
+            {"metadata": {"name": "epp-binding"}},
+        ],
+        "configmaps": [
+            {"metadata": {"name": "lens-deployment-bootstrap"}},
+            {"metadata": {"name": "kube-root-ca.crt"}},
+            {"metadata": {"name": "vllm-config"}},
+            {"metadata": {"name": "router-config"}},
+        ],
+    }
+
+    class _SelectiveRunner:
+        async def run(self, argv, *, timeout=60):
+            recorded_calls.append(list(argv))
+            if argv[:2] == ["kubectl", "get"] and argv[2] in listed_items:
+                return CommandResult(tuple(argv), 0, json.dumps({"items": listed_items[argv[2]]}), "")
+            return CommandResult(tuple(argv), 0, "", "")
+
+    cleaned = await orphans.cleanup_in_namespace_resources("cluster-a", "llmd-qwen-1", runner=_SelectiveRunner())
+
+    assert set(cleaned) == set(orphans._IN_NAMESPACE_RESOURCE_TYPES)
+    for protected_type in (
+        "roles.rbac.authorization.k8s.io",
+        "rolebindings.rbac.authorization.k8s.io",
+        "configmaps",
+        "secrets",
+    ):
+        assert not any(argv[:3] == ["kubectl", "delete", protected_type] and "--all" in argv for argv in recorded_calls)
+
+    assert [
+        "kubectl",
+        "delete",
+        "roles.rbac.authorization.k8s.io",
+        "epp-role",
+        "--namespace",
+        "llmd-qwen-1",
+        "--ignore-not-found=true",
+    ] in recorded_calls
+    assert [
+        "kubectl",
+        "delete",
+        "rolebindings.rbac.authorization.k8s.io",
+        "epp-binding",
+        "--namespace",
+        "llmd-qwen-1",
+        "--ignore-not-found=true",
+    ] in recorded_calls
+    assert [
+        "kubectl",
+        "delete",
+        "configmaps",
+        "vllm-config",
+        "router-config",
+        "--namespace",
+        "llmd-qwen-1",
+        "--ignore-not-found=true",
+    ] in recorded_calls
+    assert [
+        "kubectl",
+        "delete",
+        "secrets",
+        "-l",
+        "owner=helm",
+        "--namespace",
+        "llmd-qwen-1",
+        "--ignore-not-found=true",
+    ] in recorded_calls
+    assert [
+        "kubectl",
+        "delete",
+        "deployments.apps",
+        "--all",
+        "--namespace",
+        "llmd-qwen-1",
+        "--ignore-not-found=true",
+    ] in recorded_calls
+
+
+@pytest.mark.asyncio
+async def test_cleanup_in_namespace_resources_handles_only_protected_forbidden_and_401(monkeypatch):
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.deploy.capabilities import DeploymentClusterAuthError
+    from llm_d_lens.infrastructure.process import CommandResult
+
+    monkeypatch.setenv("LLM_D_BENCH_NAMESPACE_PREFIX", "llmd-")
+    monkeypatch.setattr(cluster_registry, "get_cluster", lambda _cid: None)
+    monkeypatch.setattr(cluster_registry, "cluster_kubeconfig_namespace", lambda _cid: None)
+
+    recorded_calls: list[list[str]] = []
+
+    class _OnlyProtectedRunner:
+        async def run(self, argv, *, timeout=60):
+            recorded_calls.append(list(argv))
+            if argv[:3] == ["kubectl", "get", "configmaps"]:
+                return CommandResult(
+                    tuple(argv),
+                    0,
+                    json.dumps(
+                        {
+                            "items": [
+                                {"metadata": {"name": "lens-deployment-bootstrap"}},
+                                {"metadata": {"name": "kube-root-ca.crt"}},
+                            ]
+                        }
+                    ),
+                    "",
+                )
+            if argv[:3] == ["kubectl", "get", "roles.rbac.authorization.k8s.io"]:
+                return CommandResult(
+                    tuple(argv),
+                    0,
+                    json.dumps({"items": [{"metadata": {"name": "lens-deployment-operator"}}]}),
+                    "",
+                )
+            if argv[:3] == ["kubectl", "get", "rolebindings.rbac.authorization.k8s.io"]:
+                return CommandResult(tuple(argv), 1, "", "rolebindings is forbidden")
+            return CommandResult(tuple(argv), 0, "", "")
+
+    cleaned = await orphans.cleanup_in_namespace_resources("cluster-a", "llmd-qwen-1", runner=_OnlyProtectedRunner())
+    assert "configmaps" in cleaned
+    assert "roles.rbac.authorization.k8s.io" in cleaned
+    assert "rolebindings.rbac.authorization.k8s.io" not in cleaned
+    assert not any(
+        argv[:2] == ["kubectl", "delete"]
+        and argv[2] in {"configmaps", "roles.rbac.authorization.k8s.io", "rolebindings.rbac.authorization.k8s.io"}
+        for argv in recorded_calls
+    )
+
+    class _UnauthorizedGetRunner:
+        async def run(self, argv, *, timeout=60):
+            if argv[:3] == ["kubectl", "get", "configmaps"]:
+                return CommandResult(tuple(argv), 1, "", "Unauthorized")
+            return CommandResult(tuple(argv), 0, "", "")
+
+    with pytest.raises(DeploymentClusterAuthError):
+        await orphans.cleanup_in_namespace_resources("cluster-a", "llmd-qwen-1", runner=_UnauthorizedGetRunner())
+
+    class _UnauthorizedSecretsRunner:
+        async def run(self, argv, *, timeout=60):
+            if argv[:2] == ["kubectl", "get"]:
+                return CommandResult(tuple(argv), 0, '{"items": []}', "")
+            if argv[:3] == ["kubectl", "delete", "secrets"]:
+                return CommandResult(tuple(argv), 1, "", "You must be logged in to the server (Unauthorized)")
+            return CommandResult(tuple(argv), 0, "", "")
+
+    with pytest.raises(DeploymentClusterAuthError):
+        await orphans.cleanup_in_namespace_resources("cluster-a", "llmd-qwen-1", runner=_UnauthorizedSecretsRunner())

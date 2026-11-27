@@ -364,3 +364,103 @@ def test_patch_documents_uses_selected_storage_volume_cache(read_only):
     assert environment["HF_HUB_OFFLINE"] == "1"
     assert environment["TRANSFORMERS_OFFLINE"] == "1"
     assert environment.get("HF_HOME") == (None if read_only else "/model-cache")
+
+
+@pytest.mark.asyncio
+async def test_helm_kustomize_deploy_wires_post_renderer_for_direct_and_bundle(tmp_path: Path, monkeypatch):
+    import llm_d_lens.deploy.providers.helm_kustomize as hk
+    from llm_d_lens.deploy.providers import deployment_bundle
+
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
+    spawned: list[list[str]] = []
+    spawn_envs: list[dict[str, str] | None] = []
+
+    async def fake_spawn(command, **kwargs):
+        spawned.append(command)
+        spawn_envs.append(kwargs.get("env"))
+        proc = Mock(returncode=0)
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        return proc
+
+    monkeypatch.setattr(hk, "spawn", fake_spawn)
+    monkeypatch.setattr(deployment_bundle, "resolve_helm_rbac_mode", AsyncMock(return_value=True))
+
+    async def ok_runner(_cmd):
+        return 0, "ok", ""
+
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text("kind: Deployment\n", encoding="utf-8")
+
+    # __new__-constructed adapter (no _environment)
+    adapter = HelmKustomizeGuideAdapter.__new__(HelmKustomizeGuideAdapter)
+    adapter._runner = ok_runner
+    adapter._namespace_prefix = "llmd-"
+    adapter._helm_path = Path("helm")
+    adapter._kubectl_path = Path("/opt/kubectl")
+    adapter._descriptor = SimpleNamespace(
+        guide_id="tiered-prefix-cache",
+        release_name="tiered-prefix-cache",
+        router_chart="oci://chart",
+        router_version="1.0.0",
+        router_values=(),
+        data_plane_kind="llm-d-router",
+    )
+    artifact = GuideDeploymentArtifact(
+        "tiered-prefix-cache",
+        "hash",
+        manifest_ref=str(manifest),
+        source_ref="a" * 40,
+    )
+    await adapter.deploy(
+        artifact,
+        {"namespace": "llmd-run", "provenance": {"cluster_server_id": "cluster-hk"}},
+    )
+    assert "--post-renderer" in spawned[0]
+    deployment_bundle.resolve_helm_rbac_mode.assert_awaited_with(
+        "llmd-run",
+        cluster_id="cluster-hk",
+        environment=None,
+        kubectl_path=Path("/opt/kubectl"),
+    )
+
+    bundle_commands: list[list[str]] = []
+
+    async def bundle_runner(command):
+        bundle_commands.append(command)
+        if command[1:3] == ["get", "manifest"]:
+            return 0, "kind: Deployment\n", ""
+        return 0, "kind: Deployment\n", ""
+
+    adapter._bundle_command_runner = bundle_runner
+    bundle_artifact = GuideDeploymentArtifact(
+        "tiered-prefix-cache",
+        "hash",
+        manifest_ref=str(manifest),
+        source_ref="a" * 40,
+        deployment_contract={
+            "deploymentBundle": {
+                "schemaVersion": "guide-deployment-bundle.v1",
+                "guide": "tiered-prefix-cache",
+                "sourceCommit": "a" * 40,
+                "helm": {
+                    "chart": "saved-chart",
+                    "version": "v1.0.0",
+                    "releaseName": "tiered-prefix-cache",
+                    "values": [_asset("router-effective.yaml", "router: {}\n")],
+                },
+                "resources": [],
+            }
+        },
+    )
+    await adapter.deploy(bundle_artifact, {"namespace": "llmd-run"})
+    upgrade_cmd = next(cmd for cmd in bundle_commands if cmd[1] == "upgrade")
+    assert "--post-renderer" in upgrade_cmd
+
+    # Helm v4 direct deploy wires plugin name + HELM_PLUGINS env without mutating os.environ
+    spawned.clear()
+    spawn_envs.clear()
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", lambda _helm_bin="helm": 4)
+    await adapter.deploy(artifact, {"namespace": "llmd-run"})
+    assert spawned[0][-2:] == ["--post-renderer", "strip-metrics-auth-rbac"]
+    assert spawn_envs[0] is not None
+    assert "HELM_PLUGINS" in spawn_envs[0]

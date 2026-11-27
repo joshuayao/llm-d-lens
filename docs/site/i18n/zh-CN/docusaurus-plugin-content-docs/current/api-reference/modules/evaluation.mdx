@@ -786,6 +786,9 @@ baseline replicas = (prefill replicas * prefill TP + decode replicas * decode TP
     - `benchmark_source`（`BenchmarkSource`，可选）
     - `benchmark_plans`（`BenchmarkPlan[]`，必填；1–256 项，ID 必须唯一）
     - `compare_configurations`（`boolean`，默认值 `true`）
+    - `target_namespaces`（`Record<string, string>`，可选）：用于非管理员集群的已校验目标命名空间映射（按部署组 ID 索引）。`POST /api/v1/evaluate/evaluations/{workflow_id}/confirm` 与 `POST /api/v1/evaluate/workflow-runs/{workflow_id}/retry` 同样支持该字段。
+
+    在缺少足够命名空间权限的非管理员集群上，`POST /api/v1/evaluate/evaluations`、`POST /api/v1/evaluate/evaluations/{workflow_id}/confirm` 与 `POST /api/v1/evaluate/workflow-runs/{workflow_id}/retry` 会返回 `HTTP 403`（`code: "deployment_admin_setup_required"`）及管理员引导协同负载。当命名空间内的工作负载已清理但删除命名空间需要管理员操作时，`DELETE /api/v1/evaluate/workflow-runs/{workflow_id}` 会返回 `HTTP 409`（`code: "deployment_cleanup_permission_denied"`）及清理协同负载。
 
     ```json
     {

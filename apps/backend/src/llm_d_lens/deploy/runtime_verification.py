@@ -417,6 +417,22 @@ def persist_verification(context, report):
     return report
 
 
+async def _observe_nodes(cluster_id: str) -> list[dict]:
+    from llm_d_lens.deploy.slice_capacity import (
+        ClusterInventoryForbiddenError,
+        prometheus_inventory_nodes_and_pods,
+    )
+
+    try:
+        return await inventory(cluster_id, "nodes")
+    except ClusterInventoryForbiddenError:
+        try:
+            nodes, _pods = await prometheus_inventory_nodes_and_pods(cluster_id)
+            return nodes
+        except ClusterInventoryForbiddenError:
+            return []
+
+
 async def _observe(cluster_id, namespace, desired):
     """DisaggregatedSet roles are backed by LeaderWorkerSets or Deployments, so read both ownership chains."""
     return verify_runtime(
@@ -424,7 +440,7 @@ async def _observe(cluster_id, namespace, desired):
         await inventory(cluster_id, "disaggregatedsets", namespace),
         await inventory(cluster_id, "leaderworkersets", namespace),
         await inventory(cluster_id, "pods", namespace),
-        await inventory(cluster_id, "nodes"),
+        await _observe_nodes(cluster_id),
         stateful_sets=await inventory(cluster_id, "statefulsets", namespace),
         deployments=await inventory(cluster_id, "deployments", namespace),
         replica_sets=await inventory(cluster_id, "replicasets", namespace),

@@ -1,8 +1,21 @@
 import { PaginationControls } from '../../../shared/ui/PaginationControls';
-import { resolveEvaluationTarget } from '../model/client';
+import { evaluationApi as api, resolveEvaluationTarget, retryEvaluationWorkflow } from '../model/client';
 import { editedEvaluationConfiguration } from '../model/configuration';
-import { evaluationApi as api } from '../model/client';
 import { TERMINAL_EVALUATION_STATUSES, ACTIVE_EVALUATION_STATUSES } from '../model/domain';
+import { DeploymentPermissionHandoff } from '../../deployment/ui/DeploymentPlanReview';
+import {
+    deploymentPermissionPayload,
+    formatHandoffNamespace,
+    generateDeploymentBootstrapScript,
+    isDeploymentAdminSetupError,
+    isDeploymentCleanupHandoffError,
+    mergeBootstrapRemediationTargets,
+    parseDeploymentAdminSetupError,
+    parseDeploymentCleanupHandoff,
+    verifiedTargetNamespacesMap,
+    verifyDeploymentBootstrap,
+    verifyDeploymentCleanup,
+} from '../../deployment/api/agenticDeploymentBackend';
 import { confirmDelete } from "../../../shared/ui/confirmDelete";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -289,6 +302,20 @@ export default function EvaluationDashboard({ onNavigate }) {
     const [workloadFilters, setWorkloadFilters] = useState(new Set());
     const [taskPage, setTaskPage] = useState(1);
     const [taskPageSize, setTaskPageSize] = useState(10);
+    const [handoffModal, setHandoffModal] = useState(null);
+    const mountedRef = useRef(true);
+    const handoffVersionRef = useRef(0);
+    const closeHandoffModal = useCallback(() => {
+        handoffVersionRef.current += 1;
+        setHandoffModal(null);
+    }, []);
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+            handoffVersionRef.current += 1;
+        };
+    }, []);
     const selectedArtifactObjects = artifacts.filter((artifact) => selectedArtifacts.includes(artifact.artifact_id));
     const selectedClusterSessions = [...new Set(selectedArtifactObjects.map((artifact) => artifact.deployable_configuration?.provenance?.cluster_ref?.session_id).filter(Boolean))];
     const selectedClusterNames = [...new Set(selectedArtifactObjects.map((artifact) => artifactDetails(artifact).cluster).filter(Boolean))];
@@ -699,16 +726,277 @@ export default function EvaluationDashboard({ onNavigate }) {
         }
     };
 
+    const buildDashboardBootstrapPayload = (seed, extra = {}) => {
+        const { includeExpectedDigest = false, ...restExtra } = extra;
+        const seedTargets = Array.isArray(seed?.targets) && seed.targets.length
+            ? seed.targets.map((target) => ({
+                ...target,
+                ...(includeExpectedDigest && !target.alreadySufficient && (target.expected_digest || target.expectedDigest || target.bootstrapDigest)
+                    ? { expectedDigest: target.expected_digest || target.expectedDigest || target.bootstrapDigest }
+                    : {}),
+            }))
+            : null;
+        return deploymentPermissionPayload({
+            clusterId: seed?.clusterId || seed?.run?.cluster_id || '',
+            namespace: seedTargets?.length ? null : (seed?.namespace || null),
+            ...(seedTargets ? { targets: seedTargets } : {}),
+            ...restExtra,
+        });
+    };
+
+    const generateDashboardBootstrapScript = async (overrideArg = null, seed = null, expectedVersion = handoffVersionRef.current) => {
+        const current = seed || handoffModal;
+        if (!current || current.kind !== 'bootstrap') return;
+        const override = overrideArg || current.subjectOverride || null;
+        const validOverride = override?.name?.trim()
+            ? {
+                kind: override.kind || 'ServiceAccount',
+                name: override.name.trim(),
+                ...(override.kind === 'ServiceAccount' && override.namespace?.trim()
+                    ? { namespace: override.namespace.trim() }
+                    : {}),
+            }
+            : null;
+        setHandoffModal(prev => (prev && prev.kind === 'bootstrap'
+            ? { ...prev, generating: true, error: '', ...(validOverride ? { subjectOverride: validOverride } : {}) }
+            : prev));
+        try {
+            const remediation = await generateDeploymentBootstrapScript(buildDashboardBootstrapPayload(current, {
+                subjectOverride: validOverride,
+            }));
+            if (!mountedRef.current || expectedVersion !== handoffVersionRef.current) return;
+            setHandoffModal(prev => (prev && prev.kind === 'bootstrap' ? {
+                ...prev,
+                generating: false,
+                verifyResult: null,
+                script: remediation.script || '',
+                filename: remediation.scriptFilename || remediation.filename || 'lens-deployment-bootstrap.sh',
+                instructions: remediation.instructions || '',
+                bootstrapDigest: remediation.bootstrapDigest || remediation.digest || null,
+                namespace: remediation.namespace || prev.namespace,
+                namespaces: Array.isArray(remediation.namespaces) && remediation.namespaces.length
+                    ? remediation.namespaces
+                    : prev.namespaces,
+                targets: Array.isArray(prev.targets) && prev.targets.length
+                    ? mergeBootstrapRemediationTargets(prev.targets, remediation.targets)
+                    : (Array.isArray(remediation.targets) ? remediation.targets : prev.targets),
+                identity: remediation.identity || prev.identity,
+                warnings: Array.isArray(remediation.warnings) ? remediation.warnings : prev.warnings,
+            } : prev));
+        } catch (failure) {
+            if (!mountedRef.current || expectedVersion !== handoffVersionRef.current) return;
+            setHandoffModal(prev => (prev && prev.kind === 'bootstrap'
+                ? { ...prev, generating: false, error: failure.message || 'Could not generate Orchestration administrator script.' }
+                : prev));
+        }
+    };
+
+    const openDashboardRetryHandoff = async (run, failure, context = {}) => {
+        const version = context.handoffVersion ?? ++handoffVersionRef.current;
+        if (!mountedRef.current || version !== handoffVersionRef.current) return null;
+        const parsed = parseDeploymentAdminSetupError(failure);
+        if (!parsed) return null;
+        const seed = {
+            kind: 'bootstrap',
+            run,
+            clusterId: parsed.clusterId || run.cluster_id || '',
+            report: parsed.report,
+            verifyResult: null,
+            namespace: parsed.namespace,
+            namespaces: parsed.namespaces,
+            targets: parsed.targets.length ? parsed.targets : null,
+            identity: parsed.identity,
+            subjectOverride: context.subjectOverride !== undefined
+                ? context.subjectOverride
+                : (context.preserveOverride ? (handoffModal?.subjectOverride || null) : null),
+            script: parsed.script || '',
+            filename: parsed.scriptFilename || 'lens-deployment-bootstrap.sh',
+            instructions: parsed.instructions || '',
+            bootstrapDigest: parsed.bootstrapDigest || null,
+            warnings: parsed.warnings || [],
+            generating: false,
+            verifying: false,
+            error: context.showFailureError ? (failure.message || parsed.detail || '') : '',
+        };
+        setError('');
+        setHandoffModal(seed);
+        if (!seed.script && (seed.subjectOverride?.name || (!seed.identity?.overrideRequired && seed.identity?.kind !== 'unknown'))) {
+            await generateDashboardBootstrapScript(seed.subjectOverride || null, seed, version);
+        }
+        return seed;
+    };
+
+    const verifyDashboardBootstrapAndRetry = async () => {
+        if (!handoffModal || handoffModal.kind !== 'bootstrap' || handoffModal.verifying) return;
+        const version = ++handoffVersionRef.current;
+        const snapshot = handoffModal;
+        const override = snapshot.subjectOverride?.name?.trim()
+            ? {
+                kind: snapshot.subjectOverride.kind || 'ServiceAccount',
+                name: snapshot.subjectOverride.name.trim(),
+                ...(snapshot.subjectOverride.kind === 'ServiceAccount' && snapshot.subjectOverride.namespace?.trim()
+                    ? { namespace: snapshot.subjectOverride.namespace.trim() }
+                    : {}),
+            }
+            : null;
+        setHandoffModal(prev => (prev && prev.kind === 'bootstrap' ? { ...prev, verifying: true, error: '' } : prev));
+        let verifyResult = null;
+        try {
+            const hasMultiTargets = Array.isArray(snapshot.targets) && snapshot.targets.length > 0;
+            verifyResult = await verifyDeploymentBootstrap(buildDashboardBootstrapPayload(snapshot, {
+                ...(hasMultiTargets ? { includeExpectedDigest: true } : {
+                    ...(snapshot.namespace ? { namespace: snapshot.namespace } : {}),
+                    expectedDigest: snapshot.bootstrapDigest || undefined,
+                }),
+                subjectOverride: override,
+            }));
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
+            if (verifyResult?.verified) {
+                const verifiedTargetNamespaces = verifiedTargetNamespacesMap(verifyResult, snapshot.targets);
+                await retryEvaluationWorkflow(snapshot.run.id, verifiedTargetNamespaces);
+                if (!mountedRef.current || version !== handoffVersionRef.current) return;
+                setHandoffModal(null);
+                await loadAll({ quiet: true });
+                return;
+            }
+            setHandoffModal(prev => (prev && prev.kind === 'bootstrap' ? {
+                ...prev,
+                verifying: false,
+                verifyResult,
+                namespace: verifyResult?.namespace || prev.namespace,
+                namespaces: Array.isArray(verifyResult?.namespaces) && verifyResult.namespaces.length
+                    ? verifyResult.namespaces
+                    : prev.namespaces,
+                identity: verifyResult?.identity || prev.identity,
+                warnings: Array.isArray(verifyResult?.warnings) ? verifyResult.warnings : prev.warnings,
+                error: verifyResult?.message || 'Orchestration administrator namespace setup is not yet verified. Run the script and try again.',
+            } : prev));
+        } catch (nextError) {
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
+            if (isDeploymentAdminSetupError(nextError)) {
+                await openDashboardRetryHandoff(snapshot.run, nextError, {
+                    handoffVersion: version,
+                    subjectOverride: snapshot.subjectOverride || null,
+                    preserveOverride: true,
+                    showFailureError: true,
+                });
+                return;
+            }
+            setHandoffModal(prev => (prev && prev.kind === 'bootstrap'
+                ? { ...prev, verifying: false, error: nextError.message || 'Verification failed.' }
+                : prev));
+        }
+    };
+
+    const verifyDashboardCleanupAndDelete = async ({ forceDeleteRecord = false } = {}) => {
+        if (!handoffModal || handoffModal.kind !== 'cleanup' || handoffModal.verifying) return;
+        const version = ++handoffVersionRef.current;
+        const snapshot = handoffModal;
+        const executionId = snapshot.handoff?.executionId;
+        if (!executionId) {
+            setHandoffModal(prev => (prev && prev.kind === 'cleanup'
+                ? { ...prev, error: 'Cleanup execution ID is missing for this evaluation.' }
+                : prev));
+            return;
+        }
+        setHandoffModal(prev => (prev && prev.kind === 'cleanup' ? { ...prev, verifying: true, error: '' } : prev));
+        try {
+            const result = await verifyDeploymentCleanup(executionId, {
+                cleanupDigest: snapshot.handoff.cleanupDigest,
+                deleteRecordOnVerify: true,
+                forceDeleteRecord,
+            });
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
+            if (result?.deleted || result?.verified) {
+                try {
+                    await api(`/api/v1/evaluate/workflow-runs/${encodeURIComponent(snapshot.run.id)}`, { method: 'DELETE' });
+                } catch (deleteError) {
+                    if (!mountedRef.current || version !== handoffVersionRef.current) return;
+                    if (isDeploymentCleanupHandoffError(deleteError)) {
+                        const nextHandoff = parseDeploymentCleanupHandoff(deleteError);
+                        if (nextHandoff) {
+                            setHandoffModal({
+                                kind: 'cleanup',
+                                run: snapshot.run,
+                                handoff: nextHandoff,
+                                verifying: false,
+                                confirmed: false,
+                                error: '',
+                            });
+                            return;
+                        }
+                    }
+                    throw deleteError;
+                }
+                if (!mountedRef.current || version !== handoffVersionRef.current) return;
+                setHandoffModal(null);
+                await loadAll({ quiet: true });
+                return;
+            }
+            setHandoffModal(prev => (prev && prev.kind === 'cleanup' ? {
+                ...prev,
+                verifying: false,
+                handoff: {
+                    ...prev.handoff,
+                    status: result?.status || prev.handoff.status,
+                    marker: result?.marker || prev.handoff.marker,
+                    canVerifyMarker: result?.canVerifyMarker ?? prev.handoff.canVerifyMarker,
+                    confirmRequired: (result?.canVerifyMarker ?? prev.handoff.canVerifyMarker)
+                        ? Boolean(result?.unreachable)
+                        : true,
+                    operations: prev.handoff.operations?.length
+                        ? prev.handoff.operations
+                        : (Array.isArray(result?.remainingOperations) ? result.remainingOperations : []),
+                    remainingOperations: Array.isArray(result?.remainingOperations)
+                        ? result.remainingOperations
+                        : prev.handoff.remainingOperations,
+                    warnings: Array.isArray(result?.warnings) ? result.warnings : prev.handoff.warnings,
+                    verified: Boolean(result?.verified),
+                },
+                error: result?.message || 'Orchestration administrator cleanup is not yet complete. Run the script and try again.',
+            } : prev));
+        } catch (nextError) {
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
+            setHandoffModal(prev => (prev && prev.kind === 'cleanup'
+                ? { ...prev, verifying: false, error: nextError.message || 'Failed to verify Orchestration administrator cleanup.' }
+                : prev));
+        }
+    };
+
     const action = async (run, actionName) => {
         try {
             if (actionName === "delete" && !await confirmDelete(`Delete ${run.kind === "workflow" ? "evaluation" : "endpoint benchmark"} ${run.id}? This cannot be undone.`)) return;
-            const collection = run.kind === "workflow" ? "workflow-runs" : "runs";
-            await api(`/api/v1/evaluate/${collection}/${run.id}${actionName === "delete" ? "" : `/${actionName}`}`, { method: actionName === "delete" ? "DELETE" : "POST" });
+            if (run.kind === "workflow" && actionName === "retry") {
+                await retryEvaluationWorkflow(run.id);
+            } else {
+                const collection = run.kind === "workflow" ? "workflow-runs" : "runs";
+                await api(`/api/v1/evaluate/${collection}/${encodeURIComponent(run.id)}${actionName === "delete" ? "" : `/${encodeURIComponent(actionName)}`}`, { method: actionName === "delete" ? "DELETE" : "POST" });
+            }
             await loadAll({ quiet: true });
         } catch (nextError) {
+            if (run.kind === "workflow" && actionName === "retry" && isDeploymentAdminSetupError(nextError)) {
+                await openDashboardRetryHandoff(run, nextError, { handoffVersion: ++handoffVersionRef.current });
+                return;
+            }
+            if (run.kind === "workflow" && actionName === "delete" && isDeploymentCleanupHandoffError(nextError)) {
+                const handoff = parseDeploymentCleanupHandoff(nextError);
+                if (handoff) {
+                    setError("");
+                    setHandoffModal({
+                        kind: "cleanup",
+                        run,
+                        handoff,
+                        verifying: false,
+                        confirmed: false,
+                        error: "",
+                    });
+                    return;
+                }
+            }
             setError(nextError.message);
         }
     };
+    const handoffModalBusy = Boolean(handoffModal?.verifying || handoffModal?.generating);
 
     return (
         <ModulePage className="evaluation-page" contentClassName="space-y-5">
@@ -878,6 +1166,58 @@ export default function EvaluationDashboard({ onNavigate }) {
 
                     <div ref={wizardNextRef} className="sticky -bottom-4 z-20 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-700/70 bg-[#090e18]/95 p-2.5 shadow-[0_-10px_30px_rgba(2,6,23,.6)] backdrop-blur-xl"><div className="flex items-center gap-2"><span className={`h-2 w-2 rounded-full ${mode === "deploy" ? selectedArtifacts.length && selectedClusterSessions.length === 1 ? "bg-emerald-400 shadow-[0_0_8px_#34d399]" : "bg-amber-400" : targetId && apiTokenValid ? "bg-emerald-400 shadow-[0_0_8px_#34d399]" : "bg-amber-400"}`} /><p className="text-[10px] text-slate-400">{mode === "deploy" ? `${selectedArtifacts.length} configuration${selectedArtifacts.length === 1 ? "" : "s"} selected` : targetId ? (apiTokenValid ? "Endpoint ready" : "Enter a model access token") : "Select a model service"}</p></div><div className="flex gap-2"><button onClick={() => setIsNewTaskOpen(false)} className="h-8 rounded-md border border-slate-700 px-3 text-[10px] text-slate-300 hover:bg-slate-800">Cancel</button>{wizardStep === 1 && <button onClick={() => goToWizardStep(0)} className="inline-flex h-8 items-center gap-1 rounded-md border border-slate-700 px-3 text-[10px] text-slate-300 hover:bg-slate-800"><ChevronLeft className="h-3.5 w-3.5" />Back</button>}{wizardStep === 0 ? <button disabled={mode === "deploy" ? !selectedArtifacts.length || selectedClusterSessions.length !== 1 : !targetId || !apiTokenValid} onClick={() => goToWizardStep(1)} className="inline-flex h-8 items-center gap-1.5 rounded-md bg-sky-500 px-4 text-[10px] font-bold text-white hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-40">Next<ChevronRight className="h-3.5 w-3.5" /></button> : <button disabled={busy} onClick={createTask} className="inline-flex h-8 items-center gap-1.5 rounded-md bg-sky-500 px-4 text-[10px] font-bold text-white shadow-[0_6px_18px_rgba(14,165,233,.2)] hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-40">{busy ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}Launch evaluation</button>}</div></div>
                 </div>
+            </Modal>
+
+            <Modal
+                isOpen={Boolean(handoffModal)}
+                onClose={handoffModalBusy ? undefined : closeHandoffModal}
+                title={handoffModal?.kind === "cleanup" ? "Orchestration administrator namespace cleanup" : "Orchestration administrator namespace setup"}
+                subtitle={handoffModal?.run?.name || handoffModal?.run?.id || ""}
+                size="lg"
+                closeOnBackdrop={!handoffModalBusy}
+                closeOnEscape={!handoffModalBusy}
+                footer={<Button variant="secondary" onClick={closeHandoffModal} disabled={handoffModalBusy}>Close</Button>}
+            >
+                {handoffModal?.kind === "bootstrap" && (
+                    <DeploymentPermissionHandoff
+                        mode="bootstrap"
+                        report={handoffModal.report}
+                        handoff={handoffModal.verifyResult}
+                        namespace={formatHandoffNamespace(handoffModal)}
+                        script={handoffModal.script}
+                        filename={handoffModal.filename}
+                        instructions={handoffModal.instructions}
+                        warnings={handoffModal.warnings}
+                        error={handoffModal.error}
+                        verifying={Boolean(handoffModal.verifying)}
+                        generating={Boolean(handoffModal.generating)}
+                        identity={handoffModal.identity}
+                        subjectOverride={handoffModal.subjectOverride}
+                        onSubjectOverrideChange={(next) => setHandoffModal(prev => (prev && prev.kind === "bootstrap" ? { ...prev, subjectOverride: next } : prev))}
+                        onGenerateScript={(overrideArg) => generateDashboardBootstrapScript(overrideArg)}
+                        onPrimaryAction={verifyDashboardBootstrapAndRetry}
+                        primaryActionLabel="Re-check & Retry Evaluation"
+                        onDismiss={closeHandoffModal}
+                    />
+                )}
+                {handoffModal?.kind === "cleanup" && (
+                    <DeploymentPermissionHandoff
+                        mode="cleanup"
+                        handoff={handoffModal.handoff}
+                        namespace={handoffModal.handoff?.namespace || ""}
+                        script={handoffModal.handoff?.script || ""}
+                        filename={handoffModal.handoff?.scriptFilename}
+                        instructions={handoffModal.handoff?.instructions || ""}
+                        warnings={handoffModal.handoff?.warnings || []}
+                        error={handoffModal.error}
+                        verifying={Boolean(handoffModal.verifying)}
+                        onPrimaryAction={() => verifyDashboardCleanupAndDelete({ forceDeleteRecord: false })}
+                        primaryActionLabel="Re-check & Delete"
+                        confirmed={Boolean(handoffModal.confirmed)}
+                        onConfirmChange={(checked) => setHandoffModal(prev => (prev && prev.kind === "cleanup" ? { ...prev, confirmed: checked } : prev))}
+                        onConfirmDelete={() => verifyDashboardCleanupAndDelete({ forceDeleteRecord: true })}
+                    />
+                )}
             </Modal>
         </ModulePage>
     );
