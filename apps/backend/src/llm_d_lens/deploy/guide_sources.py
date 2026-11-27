@@ -447,7 +447,13 @@ async def machine_profile(inspect=True) -> dict:
 
 
 def cluster_profile(
-    version: dict, nodes: dict, device_classes=None, resource_slices=None, runtime_classes=None
+    version: dict,
+    nodes: dict,
+    device_classes=None,
+    resource_slices=None,
+    runtime_classes=None,
+    *,
+    device_classes_verified: bool = True,
 ) -> dict:
     node_profiles, totals = [], {"cpu": 0, "memoryGiB": 0, "accelerators": {}}
     for node in nodes.get("items", []):
@@ -509,6 +515,7 @@ def cluster_profile(
         "allocatable": totals,
         "accelerator": accelerator,
         "deviceClasses": [item.get("metadata", {}).get("name") for item in (device_classes or {}).get("items", [])],
+        "deviceClassesVerified": device_classes_verified is not False,
         "runtimeClasses": [
             {"name": item.get("metadata", {}).get("name"), "handler": item.get("handler")}
             for item in (runtime_classes or {}).get("items", [])
@@ -542,8 +549,8 @@ async def discover_local_cluster(request, session_id=None):
     (
         (version, version_forbidden),
         (nodes, nodes_forbidden),
-        (classes, _),
-        (slices, _),
+        (classes, classes_forbidden),
+        (slices, slices_forbidden),
         (runtimes, _),
     ) = await asyncio.gather(
         *[
@@ -557,26 +564,86 @@ async def discover_local_cluster(request, session_id=None):
             ]
         ]
     )
-    if (nodes is None and nodes_forbidden) or (version is None and version_forbidden and nodes is None):
-        target_id = cluster_id or session_id
-        if target_id:
-            fetcher = slice_capacity.fetch_prometheus_node_inventory
-            if fetcher is None:
-                from llm_d_lens.cluster.service import fetch_prometheus_node_inventory as fetcher
+    target_id = cluster_id or session_id
+    used_prometheus = False
 
-            try:
-                inv = await fetcher(slice_capacity._resolve_cluster_id(target_id))
-            except Exception:
-                inv = None
-            if inv is not None and inv.reachable and inv.all_nodes:
-                synth_nodes, _synth_pods = slice_capacity.synthetic_inventory_from_prometheus(inv)
-                nodes = {"items": synth_nodes}
-                if version is None:
-                    git_version = str(inv.all_nodes[0].get("version") or "unknown")
-                    version = {"serverVersion": {"gitVersion": git_version}}
+    async def load_prometheus_inventory():
+        if not target_id:
+            return None
+        fetcher = slice_capacity.fetch_prometheus_node_inventory
+        if fetcher is None:
+            from llm_d_lens.cluster.service import fetch_prometheus_node_inventory as fetcher
+
+        try:
+            return await fetcher(slice_capacity._resolve_cluster_id(target_id))
+        except Exception:
+            return None
+
+    if (nodes is None and nodes_forbidden) or (version is None and version_forbidden and nodes is None):
+        inv = await load_prometheus_inventory()
+        used_prometheus = True
+        if inv is not None and inv.reachable and inv.all_nodes:
+            synth_nodes, _synth_pods = slice_capacity.synthetic_inventory_from_prometheus(inv)
+            nodes = {"items": synth_nodes}
+            if version is None:
+                git_version = str(inv.all_nodes[0].get("version") or "unknown")
+                version = {"serverVersion": {"gitVersion": git_version}}
     elif version is None and version_forbidden and nodes is not None:
         version = {"serverVersion": {"gitVersion": "unknown"}}
-    return cluster_profile(version, nodes, classes, slices, runtimes) if version and nodes else None
+
+    if not used_prometheus and nodes is not None and slices is None and slices_forbidden:
+        node_items = nodes.get("items") or []
+        has_allocatable_accelerators = any(
+            resolve_by_resource(key) and quantity_number(value) > 0
+            for node in node_items
+            for key, value in ((node.get("status") or {}).get("allocatable") or {}).items()
+        )
+        if not has_allocatable_accelerators:
+            inv = await load_prometheus_inventory()
+            if inv is not None and inv.reachable and inv.all_nodes:
+                synth_nodes, _synth_pods = slice_capacity.synthetic_inventory_from_prometheus(inv)
+                synth_by_name = {
+                    (node.get("metadata") or {}).get("name"): node
+                    for node in synth_nodes
+                    if (node.get("metadata") or {}).get("name")
+                }
+                for node in node_items:
+                    node_name = (node.get("metadata") or {}).get("name")
+                    synth = synth_by_name.get(node_name)
+                    if not synth:
+                        continue
+                    synth_alloc = (synth.get("status") or {}).get("allocatable") or {}
+                    accel_entries = {key: value for key, value in synth_alloc.items() if resolve_by_resource(key)}
+                    if not accel_entries:
+                        continue
+                    status = node.get("status")
+                    if status is None:
+                        status = {}
+                        node["status"] = status
+                    if not isinstance(status, dict):
+                        continue
+                    allocatable = status.get("allocatable")
+                    if allocatable is None:
+                        allocatable = {}
+                        status["allocatable"] = allocatable
+                    if not isinstance(allocatable, dict):
+                        continue
+                    for key, value in accel_entries.items():
+                        if key not in allocatable:
+                            allocatable[key] = value
+
+    return (
+        cluster_profile(
+            version,
+            nodes,
+            classes,
+            slices,
+            runtimes,
+            device_classes_verified=not classes_forbidden,
+        )
+        if version and nodes
+        else None
+    )
 
 
 def hardware_inspection_commands() -> list[str]:
@@ -589,6 +656,8 @@ def hardware_inspection_commands() -> list[str]:
 
 
 async def discover_remote_environment(target, credentials):
+    from . import slice_capacity
+
     commands = [
         'printf "__PRISM_HOST__\\n"; hostname',
         'printf "__PRISM_PLATFORM__\\n"; uname -srm',
@@ -603,7 +672,15 @@ async def discover_remote_environment(target, credentials):
         ("DEVICE_CLASSES", "get deviceclasses.resource.k8s.io"),
         ("RESOURCE_SLICES", "get resourceslices.resource.k8s.io"),
     ):
-        commands.append(f'printf "__PRISM_{marker}__\\n"; (kubectl {command} -o json 2>/dev/null || true)')
+        if marker == "DEVICE_CLASSES":
+            commands.append(
+                'printf "__PRISM_DEVICE_CLASSES__\\n"; '
+                "{ __prism_err=$(kubectl get deviceclasses.resource.k8s.io -o json 2>&1 1>&3 3>&-); __prism_rc=$?; } "
+                '3>&1; if [ "$__prism_rc" -ne 0 ]; then printf "\\n__PRISM_DEVICE_CLASSES_ERR__\\n%s\\n" '
+                '"$__prism_err"; fi'
+            )
+        else:
+            commands.append(f'printf "__PRISM_{marker}__\\n"; (kubectl {command} -o json 2>/dev/null || true)')
     result = await execute_remote_inspection(target, credentials, "; ".join(commands))
     parts = re.split(r"^__PRISM_([A-Z_0-9]+)__\s*$", result["stdout"], flags=re.MULTILINE)
     sections = {parts[index]: parts[index + 1].strip() for index in range(1, len(parts) - 1, 2)}
@@ -634,9 +711,21 @@ async def discover_remote_environment(target, credentials):
         "connection": "ssh",
     }
     version, nodes = parsed("K8S_VERSION"), parsed("K8S_NODES")
+    cluster = None
+    if version and nodes:
+        device_classes = parsed("DEVICE_CLASSES")
+        device_classes_err = sections.get("DEVICE_CLASSES_ERR", "")
+        if device_classes is None and slice_capacity.is_unauthorized_output("", device_classes_err):
+            raise GuideError("Cluster kubeconfig is unauthorized (401).", 401)
+        device_classes_forbidden = device_classes is None and slice_capacity.is_forbidden_output("", device_classes_err)
+        cluster = cluster_profile(
+            version,
+            nodes,
+            device_classes,
+            parsed("RESOURCE_SLICES"),
+            device_classes_verified=not device_classes_forbidden,
+        )
     return {
         "machine": machine,
-        "cluster": cluster_profile(version, nodes, parsed("DEVICE_CLASSES"), parsed("RESOURCE_SLICES"))
-        if version and nodes
-        else None,
+        "cluster": cluster,
     }

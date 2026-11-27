@@ -822,3 +822,203 @@ async def test_rdma_defaults_follow_profile_device_class_discovery(monkeypatch):
     assert await sources.rdma_accelerators("cluster") == []
     runner.run.return_value = SimpleNamespace(ok=False)
     assert await sources.rdma_accelerators("cluster") == []
+
+
+def _dra_claim_template(name: str, *device_classes: str) -> dict:
+    return {
+        "apiVersion": "resource.k8s.io/v1",
+        "kind": "ResourceClaimTemplate",
+        "metadata": {"name": name},
+        "spec": {
+            "spec": {
+                "devices": {
+                    "requests": [
+                        {"name": f"req-{index}", "exactly": {"deviceClassName": device_class, "count": 1}}
+                        for index, device_class in enumerate(device_classes)
+                    ]
+                }
+            }
+        },
+    }
+
+
+def test_dra_device_class_verification_contract(monkeypatch):
+    monkeypatch.delenv("PRISM_GPU_PCI_ALLOWLIST", raising=False)
+    monkeypatch.delenv("PRISM_K8S_TARGET_NODE", raising=False)
+    machine = {"cpu": {"logicalCores": 64}, "memoryGiB": 512, "accelerator": {"count": 4, "memoryGiB": 48}}
+    xpu_documents = [
+        disaggregated_set(),
+        _dra_claim_template("prefill-claim", "gpu.intel.com", "dranet-rdma"),
+        _dra_claim_template("decode-claim", "gpu.intel.com", "dranet-rdma"),
+    ]
+    xpu_requested = {
+        "guide": "pd-disaggregation",
+        "accelerator": "xpu",
+        "prefillReplicas": 1,
+        "decodeReplicas": 1,
+        "prefillTensorParallelSize": 2,
+        "decodeTensorParallelSize": 2,
+    }
+    base_cluster = {
+        "allocatable": {"accelerators": {"gpu.intel.com/i915": 4}},
+        "preflightPassed": True,
+    }
+
+    unverified = guide.plan_documents(
+        deepcopy(xpu_documents),
+        "Qwen/Qwen3-0.6B",
+        machine,
+        {**base_cluster, "deviceClasses": [], "deviceClassesVerified": False},
+        xpu_requested,
+    )
+    assert unverified["validation"]["errors"] == []
+    assert unverified["validation"]["status"] == "warnings"
+    assert unverified["validation"]["warnings"] == [
+        "Could not verify DRA device class gpu.intel.com in the selected cluster "
+        "(cluster-scoped DeviceClass read returned 403 Forbidden).",
+        "Could not verify DRA device class dranet-rdma in the selected cluster "
+        "(cluster-scoped DeviceClass read returned 403 Forbidden).",
+    ]
+    for template in unverified["documents"][1:]:
+        assert template["spec"]["spec"]["devices"]["requests"][0]["exactly"]["count"] == 2
+
+    verified_missing = guide.plan_documents(
+        deepcopy(xpu_documents),
+        "Qwen/Qwen3-0.6B",
+        machine,
+        {**base_cluster, "deviceClasses": [], "deviceClassesVerified": True},
+        xpu_requested,
+    )
+    assert verified_missing["validation"]["status"] == "invalid"
+    assert (
+        "DRA device class gpu.intel.com is not available in the selected cluster."
+        in verified_missing["validation"]["errors"]
+    )
+
+    for missing_flag_cluster in (
+        {**base_cluster, "deviceClasses": []},
+        {**base_cluster, "deviceClasses": [], "deviceClassesVerified": None},
+        {**base_cluster, "deviceClasses": None},
+    ):
+        fail_closed = guide.plan_documents(
+            deepcopy(xpu_documents),
+            "Qwen/Qwen3-0.6B",
+            machine,
+            missing_flag_cluster,
+            xpu_requested,
+        )
+        assert fail_closed["validation"]["status"] == "invalid"
+        assert (
+            "DRA device class gpu.intel.com is not available in the selected cluster."
+            in fail_closed["validation"]["errors"]
+        )
+
+    verified_present = guide.plan_documents(
+        deepcopy(xpu_documents),
+        "Qwen/Qwen3-0.6B",
+        machine,
+        {**base_cluster, "deviceClasses": ["gpu.intel.com", "dranet-rdma"], "deviceClassesVerified": True},
+        xpu_requested,
+    )
+    assert verified_present["validation"]["errors"] == []
+    assert verified_present["validation"]["warnings"] == []
+    assert verified_present["validation"]["status"] == "valid"
+
+    nvidia_docs = [deployment(), _dra_claim_template("gpu-claim", "gpu.nvidia.com")]
+    nvidia_requested = {
+        "guide": "optimized-baseline",
+        "accelerator": "gpu",
+        "replicas": 1,
+        "tensorParallelSize": 2,
+    }
+    nvidia_cluster = {
+        "allocatable": {"accelerators": {"nvidia.com/gpu": 4}},
+        "deviceClasses": [],
+        "deviceClassesVerified": False,
+        "preflightPassed": True,
+    }
+    nvidia_unverified = guide.plan_documents(
+        nvidia_docs,
+        "Qwen/Qwen3-0.6B",
+        machine,
+        nvidia_cluster,
+        nvidia_requested,
+    )
+    assert nvidia_unverified["validation"]["errors"] == []
+    assert nvidia_unverified["validation"]["status"] == "warnings"
+    assert nvidia_unverified["validation"]["warnings"] == [
+        "Could not verify DRA device class gpu.nvidia.com in the selected cluster "
+        "(cluster-scoped DeviceClass read returned 403 Forbidden)."
+    ]
+    assert nvidia_unverified["documents"][1]["spec"]["spec"]["devices"]["requests"][0]["exactly"]["count"] == 2
+
+
+def test_plan_route_required_mode_allows_unverified_dra_device_classes_with_warning(monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock
+
+    from fastapi.testclient import TestClient
+
+    from llm_d_lens.api.main import app
+
+    monkeypatch.delenv("PRISM_GPU_PCI_ALLOWLIST", raising=False)
+    monkeypatch.delenv("PRISM_K8S_TARGET_NODE", raising=False)
+    manifest_path = tmp_path / "model.yaml"
+    manifest_path.write_text(
+        yaml.safe_dump_all(
+            [
+                deployment(),
+                _dra_claim_template("gpu-claim", "gpu.intel.com"),
+            ]
+        )
+    )
+    router_root = tmp_path / "guides/optimized-baseline/router"
+    router_root.mkdir(parents=True)
+    (router_root / "optimized-baseline.values.yaml").write_text("router: {epp: {replicas: 1}}")
+    base_root = tmp_path / "guides/recipes/router"
+    base_root.mkdir(parents=True)
+    (base_root / "base.values.yaml").write_text("router: {}")
+    monkeypatch.setenv("PRISM_GUIDE_LOCAL_ROOTS", str(tmp_path))
+    monkeypatch.setattr(sources, "command_output", AsyncMock(return_value=""))
+    monkeypatch.setattr(
+        sources,
+        "discover_local_cluster",
+        AsyncMock(
+            return_value=sources.cluster_profile(
+                {"serverVersion": {"gitVersion": "v1.35.0"}},
+                {"items": [{"metadata": {"name": "worker"}, "status": {"allocatable": {"gpu.intel.com/i915": "4"}}}]},
+                device_classes_verified=False,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        sources,
+        "machine_profile",
+        AsyncMock(
+            return_value={
+                "cpu": {"logicalCores": 64},
+                "memoryGiB": 512,
+                "accelerator": {"count": 4, "memoryGiB": 48},
+            }
+        ),
+    )
+
+    response = TestClient(app).post(
+        "/api/guide-planning/plan",
+        json={
+            "guide": "optimized-baseline",
+            "accelerator": "xpu",
+            "modelServer": "vllm",
+            "model": "Qwen/Qwen3-0.6B",
+            "environment": {"kubernetesMode": "required"},
+            "replicas": 1,
+            "tensorParallelSize": 2,
+            "source": {"mode": "local", "path": str(manifest_path)},
+        },
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["validation"]["errors"] == []
+    assert result["validation"]["status"] == "warnings"
+    assert any("Could not verify DRA device class gpu.intel.com" in w for w in result["validation"]["warnings"])
+    assert result["plannedDeployment"]["content"]
+    assert result["deploymentBundle"]
