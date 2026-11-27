@@ -123,6 +123,12 @@ the selected Guide provides an RDMA variant, new configurations default to that
 variant. Explicit choices and saved configurations are preserved; deployment
 checks still validate the required network resources.
 
+### Non-admin cluster setup and cleanup
+
+When launching **Evaluation -> Design Configuration** on a cluster where your user lacks cluster-wide namespace creation permissions, Lens generates a single combined administrator bootstrap script covering all 1 to N target namespaces (across configurations and baselines). Download and hand off this script to a cluster administrator, then verify the namespaces in the wizard to proceed. Resumed `awaiting_review` evaluations (such as DisaggregatedSet plans) support the same administrator handoff before confirmation.
+
+During execution, non-admin cleanup runs in two phases: Lens first deletes in-namespace workloads and jobs between sequential cases so accelerators are freed immediately for the next case, while retaining the namespace for administrator deletion. If deleting or retrying a workflow run encounters remaining namespace-deletion permissions, Lens surfaces a cleanup handoff script for the administrator; retrying a workflow automatically allocates fresh target namespaces while keeping any unused bootstrapped namespaces.
+
 ### Compare Slice counts
 
 For a DisaggregatedSet Guide, **Slice Configuration** in the configuration editor has a

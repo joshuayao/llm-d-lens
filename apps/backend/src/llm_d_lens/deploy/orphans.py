@@ -258,6 +258,7 @@ _IN_NAMESPACE_RESOURCE_TYPES: tuple[str, ...] = (
     "secrets",
     "serviceaccounts",
     "persistentvolumeclaims",
+    "jobs.batch",
     "pods",
     "servicemonitors.monitoring.coreos.com",
     "podmonitors.monitoring.coreos.com",

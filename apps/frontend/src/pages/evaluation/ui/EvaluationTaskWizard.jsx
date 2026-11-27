@@ -19,7 +19,7 @@ import EvaluationConfigurationEditor from "./EvaluationConfigurationEditor";
 import BenchmarkInputs from "./evaluation/BenchmarkInputs";
 import EvaluationPlan from "./evaluation/EvaluationPlan";
 import { benchmarkIssues, benchmarkScenario, configurationContextLimit, SLICE_SWEEP_SHARED_PREFIX, SLICE_SWEEP_SLO, sliceSweepIssues } from "../model/benchmarkSettings";
-import { Badge, Button, Modal } from "../../../shared/ui";
+import { Badge, Button, Modal, Spinner } from "../../../shared/ui";
 import { PageHeading } from "../../../shared/ui/PageHeader";
 import { StorageVolumeSelect } from "../../../shared/ui/StorageVolumeSelect";
 import { listStorageVolumes } from "../../storage";
@@ -30,8 +30,12 @@ import { startLocalDeployment, prepareLocalDeployment, executePreparedDeployment
 import { DeploymentPermissionHandoff } from "../../deployment/ui/DeploymentPlanReview";
 import {
     deploymentPermissionPayload,
+    formatHandoffNamespace,
     generateDeploymentBootstrapScript,
     isDeploymentAdminSetupError,
+    mergeBootstrapRemediationTargets,
+    parseDeploymentAdminSetupError,
+    verifiedTargetNamespacesMap,
     verifyDeploymentBootstrap,
 } from "../../deployment/api/agenticDeploymentBackend";
 import { listModelNames } from "../../model-service";
@@ -301,6 +305,8 @@ export function DeploymentPlanReview({
     onClose,
     onConfirm,
     adminHandoff = null,
+    handoffNamespace = '',
+    handoffActionLabel = '',
     onVerifyBootstrap,
     onRegenerateBootstrap,
     onSubjectOverrideChange,
@@ -338,7 +344,7 @@ export function DeploymentPlanReview({
                     mode="bootstrap"
                     report={adminHandoff.report}
                     handoff={adminHandoff.verifyResult}
-                    namespace={adminHandoff.namespace}
+                    namespace={handoffNamespace || adminHandoff.namespace}
                     script={adminHandoff.script}
                     filename={adminHandoff.filename}
                     instructions={adminHandoff.instructions}
@@ -352,7 +358,7 @@ export function DeploymentPlanReview({
                     onSubjectOverrideChange={onSubjectOverrideChange}
                     onGenerateScript={onRegenerateBootstrap}
                     onPrimaryAction={onVerifyBootstrap}
-                    primaryActionLabel="Re-check & Deploy"
+                    primaryActionLabel={handoffActionLabel || 'Re-check & Deploy'}
                     onDismiss={onDismissAdminHandoff}
                 />
             )}
@@ -643,7 +649,7 @@ export default function EvaluationTaskWizard({ onNavigate }) {
             .finally(() => active && setClusterLoading(false));
 
         return () => { active = false; };
-    }, [selectedClusterId]);
+    }, [selectedClusterId, resetAdminHandoff]);
 
     useEffect(() => {
         if (!selectedClusterId || !storageVolumeId) {
@@ -785,6 +791,7 @@ export default function EvaluationTaskWizard({ onNavigate }) {
     };
 
     function buildWizardPermissionPayload(handoffSeed = null, extra = {}) {
+        const { includeExpectedDigest = false, ...restExtra } = extra;
         const activePlan = handoffSeed?.plan || preparedReview?.plan || null;
         const activeRequest = handoffSeed?.request || preparedReview?.request || null;
         const firstConfig = activeRequest?.configurations?.[0] || handoffSeed?.configurations?.[0] || null;
@@ -793,18 +800,27 @@ export default function EvaluationTaskWizard({ onNavigate }) {
             || firstConfig?.content?.officialGuide?.renderedManifest
             || '';
         const storageId = firstConfig?.content?.runtime?.storageVolumeId || storageVolumeId || null;
-        const resolvedClusterId = activeProvenance?.cluster_server_id || selectedClusterId || cluster.id || '';
+        const resolvedClusterId = activeProvenance?.cluster_server_id || handoffSeed?.clusterId || selectedClusterId || cluster.id || '';
         const resolvedDeploymentName = activeProvenance?.deployment_name || deploymentName.trim() || null;
+        const seedTargets = Array.isArray(handoffSeed?.targets) && handoffSeed.targets.length
+            ? handoffSeed.targets.map((target) => ({
+                ...target,
+                ...(includeExpectedDigest && !target.alreadySufficient && (target.expected_digest || target.expectedDigest || target.bootstrapDigest)
+                    ? { expectedDigest: target.expected_digest || target.expectedDigest || target.bootstrapDigest }
+                    : {}),
+            }))
+            : null;
         return deploymentPermissionPayload({
             clusterId: resolvedClusterId,
-            namespace: handoffSeed?.namespace || activePlan?.cases?.[0]?.namespace || null,
-            manifest,
-            preparedPlanId: activePlan?.id || null,
-            deploymentName: resolvedDeploymentName,
-            providerRef: firstConfig?.provider_ref || null,
-            storageVolumeId: storageId,
-            usesStorage: Boolean(storageId),
-            ...extra,
+            namespace: seedTargets?.length ? null : (handoffSeed?.namespace || activePlan?.cases?.[0]?.namespace || null),
+            manifest: seedTargets?.length ? '' : manifest,
+            preparedPlanId: seedTargets?.length ? null : (activePlan?.id || null),
+            deploymentName: seedTargets?.length ? null : resolvedDeploymentName,
+            providerRef: seedTargets?.length ? null : (firstConfig?.provider_ref || null),
+            storageVolumeId: seedTargets?.length ? null : storageId,
+            usesStorage: seedTargets?.length ? false : Boolean(storageId),
+            ...(seedTargets ? { targets: seedTargets } : {}),
+            ...restExtra,
         });
     }
 
@@ -829,11 +845,18 @@ export default function EvaluationTaskWizard({ onNavigate }) {
             setAdminHandoff(prev => (prev ? {
                 ...prev,
                 generating: false,
+                verifyResult: null,
                 script: remediation.script || '',
                 filename: remediation.scriptFilename || remediation.filename || 'lens-deployment-bootstrap.sh',
                 instructions: remediation.instructions || '',
                 bootstrapDigest: remediation.bootstrapDigest || remediation.digest || null,
                 namespace: remediation.namespace || prev.namespace,
+                namespaces: Array.isArray(remediation.namespaces) && remediation.namespaces.length
+                    ? remediation.namespaces
+                    : prev.namespaces,
+                targets: Array.isArray(prev.targets) && prev.targets.length
+                    ? mergeBootstrapRemediationTargets(prev.targets, remediation.targets)
+                    : (Array.isArray(remediation.targets) ? remediation.targets : prev.targets),
                 identity: remediation.identity || prev.identity,
                 warnings: Array.isArray(remediation.warnings) ? remediation.warnings : prev.warnings,
             } : prev));
@@ -846,33 +869,45 @@ export default function EvaluationTaskWizard({ onNavigate }) {
     async function openWizardAdminSetupFromError(failure, context = {}) {
         const version = context.handoffVersion ?? ++handoffVersionRef.current;
         if (!mountedRef.current || version !== handoffVersionRef.current) return null;
-        const rawBody = failure?.body && typeof failure.body === 'object' ? failure.body : {};
-        const body = rawBody.detail && typeof rawBody.detail === 'object' && !Array.isArray(rawBody.detail)
-            ? { ...rawBody.detail, ...rawBody }
-            : rawBody;
+        const parsed = parseDeploymentAdminSetupError(failure);
+        const body = parsed?.report || {};
         const fallbackNamespace = context.plan?.cases?.[0]?.namespace || preparedReview?.plan?.cases?.[0]?.namespace || '';
+        const targets = Array.isArray(parsed?.targets) && parsed.targets.length
+            ? parsed.targets
+            : (Array.isArray(context.targets) && context.targets.length ? context.targets : null);
+        const namespaces = Array.isArray(parsed?.namespaces) && parsed.namespaces.length
+            ? parsed.namespaces
+            : (targets?.length
+                ? targets.map((item) => item?.namespace).filter(Boolean)
+                : (parsed?.namespace ? [parsed.namespace] : (fallbackNamespace ? [fallbackNamespace] : [])));
         const seed = {
-            mode: context.mode || (context.plan || preparedReview?.plan ? 'prepared' : 'direct'),
+            mode: context.mode || (context.workflow ? 'evaluation-confirm' : (context.plan || preparedReview?.plan ? 'prepared' : 'direct')),
             request: context.request || preparedReview?.request || null,
             plan: context.plan || preparedReview?.plan || null,
+            workflow: context.workflow || preparedReview?.workflow || null,
+            evaluationRequest: context.evaluationRequest || null,
+            acknowledgeUnknown: context.acknowledgeUnknown ?? acknowledgeUnknown,
             configurations: context.configurations || context.request?.configurations || preparedReview?.request?.configurations || null,
             provenance: context.provenance || context.request?.provenance || preparedReview?.request?.provenance || null,
             placement: context.placement || context.request?.runtime_binding?.placement || preparedReview?.request?.runtime_binding?.placement || null,
+            clusterId: parsed?.clusterId || context.clusterId || context.provenance?.cluster_server_id || selectedClusterId || cluster.id || '',
             report: body,
             verifyResult: null,
-            namespace: body.namespace || fallbackNamespace || '',
-            identity: body.identity || null,
+            namespace: parsed?.namespace || namespaces[0] || fallbackNamespace || '',
+            namespaces,
+            targets,
+            identity: parsed?.identity || null,
             subjectOverride: context.subjectOverride !== undefined
                 ? context.subjectOverride
                 : (context.preserveOverride ? (adminHandoff?.subjectOverride || null) : null),
-            script: typeof body.script === 'string' ? body.script : '',
-            filename: body.scriptFilename || 'lens-deployment-bootstrap.sh',
-            instructions: body.instructions || '',
-            bootstrapDigest: body.bootstrapDigest || body.digest || null,
-            warnings: Array.isArray(body.warnings) ? body.warnings : [],
+            script: parsed?.script || '',
+            filename: parsed?.scriptFilename || 'lens-deployment-bootstrap.sh',
+            instructions: parsed?.instructions || '',
+            bootstrapDigest: parsed?.bootstrapDigest || null,
+            warnings: Array.isArray(parsed?.warnings) ? parsed.warnings : [],
             generating: false,
             verifying: false,
-            error: context.showFailureError ? (failure.message || (typeof body.detail === 'string' ? body.detail : '') || '') : '',
+            error: context.showFailureError ? (failure.message || parsed?.detail || '') : '',
         };
         setError('');
         setAdminHandoff(seed);
@@ -880,6 +915,43 @@ export default function EvaluationTaskWizard({ onNavigate }) {
             await generateWizardBootstrapScript(seed.subjectOverride || null, seed, version);
         }
         return seed;
+    }
+
+    async function submitEvaluationWorkflow(evaluationRequest, { version, targetNamespaces = null } = {}) {
+        const payload = targetNamespaces && Object.keys(targetNamespaces).length
+            ? { ...evaluationRequest, target_namespaces: targetNamespaces }
+            : evaluationRequest;
+        let createdWorkflow = await createEvaluation(payload);
+        if (!mountedRef.current || version !== handoffVersionRef.current) return null;
+        if (createdWorkflow.status === 'awaiting_review') {
+            setAcknowledgeUnknown(false);
+            setAdminHandoff(null);
+            const review = evaluationPlanReview(createdWorkflow);
+            setPreparedReview(review);
+            if (review.plan.preflight.status !== 'pass') return { status: 'awaiting_review', workflow: createdWorkflow };
+            try {
+                createdWorkflow = await confirmEvaluationPlans(createdWorkflow, false, targetNamespaces);
+                if (!mountedRef.current || version !== handoffVersionRef.current) return null;
+                setPreparedReview(null);
+            } catch (confirmError) {
+                if (!mountedRef.current || version !== handoffVersionRef.current) return null;
+                if (isDeploymentAdminSetupError(confirmError)) {
+                    await openWizardAdminSetupFromError(confirmError, {
+                        mode: 'evaluation-confirm',
+                        handoffVersion: version,
+                        workflow: createdWorkflow,
+                        plan: review.plan,
+                        acknowledgeUnknown: false,
+                        provenance: { cluster_server_id: createdWorkflow.cluster_id || selectedClusterId || cluster.id },
+                    });
+                    return { status: 'handoff', workflow: createdWorkflow };
+                }
+                throw confirmError;
+            }
+        }
+        window.dispatchEvent(new CustomEvent("prism:evaluation-created", { detail: { workflow: createdWorkflow } }));
+        onNavigate("optimization-evaluate");
+        return { status: 'created', workflow: createdWorkflow };
     }
 
     async function verifyWizardBootstrapAndDeploy() {
@@ -901,14 +973,46 @@ export default function EvaluationTaskWizard({ onNavigate }) {
         setAdminHandoff(prev => (prev ? { ...prev, verifying: true, error: '' } : prev));
         let verifyResult = null;
         try {
+            const hasMultiTargets = Array.isArray(handoffSnapshot.targets) && handoffSnapshot.targets.length > 0;
             verifyResult = await verifyDeploymentBootstrap(buildWizardPermissionPayload(handoffSnapshot, {
-                ...(handoffSnapshot.namespace ? { namespace: handoffSnapshot.namespace } : {}),
+                ...(hasMultiTargets ? { includeExpectedDigest: true } : {
+                    ...(handoffSnapshot.namespace ? { namespace: handoffSnapshot.namespace } : {}),
+                    expectedDigest: handoffSnapshot.bootstrapDigest || undefined,
+                }),
                 subjectOverride: override,
-                expectedDigest: handoffSnapshot.bootstrapDigest || undefined,
             }));
             if (!mountedRef.current || version !== handoffVersionRef.current) return;
             if (verifyResult?.verified) {
                 setAdminHandoff(null);
+                const verifiedTargetNamespaces = verifiedTargetNamespacesMap(verifyResult, handoffSnapshot.targets);
+                if (handoffSnapshot.mode === 'evaluation' && handoffSnapshot.evaluationRequest) {
+                    if (handoffSnapshot.provenance?.cluster_server_id && expectedClusterId && handoffSnapshot.provenance.cluster_server_id !== expectedClusterId) {
+                        throw new Error('Selected cluster changed; prepare a new Evaluation.');
+                    }
+                    await submitEvaluationWorkflow(handoffSnapshot.evaluationRequest, {
+                        version,
+                        targetNamespaces: verifiedTargetNamespaces,
+                    });
+                    return;
+                }
+                if (handoffSnapshot.mode === 'evaluation-confirm') {
+                    const activeWorkflow = preparedReview?.workflow || handoffSnapshot.workflow;
+                    const activeReviewPlan = preparedReview?.plan || handoffSnapshot.plan;
+                    const activeAcknowledge = handoffSnapshot.acknowledgeUnknown ?? acknowledgeUnknown;
+                    if (!activeWorkflow) throw new Error('Evaluation review session is no longer active.');
+                    if (activeWorkflow.cluster_id && expectedClusterId && activeWorkflow.cluster_id !== expectedClusterId) {
+                        throw new Error('Selected cluster changed; prepare a new Evaluation.');
+                    }
+                    if (activeReviewPlan?.preflight?.status === 'unknown' && !activeAcknowledge) {
+                        throw new Error('Acknowledge the unverified constraints before deploying.');
+                    }
+                    const confirmedWorkflow = await confirmEvaluationPlans(activeWorkflow, activeAcknowledge, verifiedTargetNamespaces);
+                    if (!mountedRef.current || version !== handoffVersionRef.current) return;
+                    setPreparedReview(null);
+                    window.dispatchEvent(new CustomEvent("prism:evaluation-created", { detail: { workflow: confirmedWorkflow } }));
+                    onNavigate('optimization-evaluate');
+                    return;
+                }
                 const activeRequest = preparedReview?.request || handoffSnapshot.request;
                 const activePlan = preparedReview?.plan || handoffSnapshot.plan;
                 if (activeRequest && activePlan && !preparedReview?.workflow) {
@@ -945,6 +1049,9 @@ export default function EvaluationTaskWizard({ onNavigate }) {
                 verifying: false,
                 verifyResult,
                 namespace: verifyResult?.namespace || prev.namespace,
+                namespaces: Array.isArray(verifyResult?.namespaces) && verifyResult.namespaces.length
+                    ? verifyResult.namespaces
+                    : prev.namespaces,
                 identity: verifyResult?.identity || prev.identity,
                 warnings: Array.isArray(verifyResult?.warnings) ? verifyResult.warnings : prev.warnings,
                 error: verifyResult?.message || 'Orchestration administrator namespace setup is not yet verified. Run the script and try again.',
@@ -1048,10 +1155,11 @@ export default function EvaluationTaskWizard({ onNavigate }) {
         try {
             if (preparedReview.workflow) {
                 if (preparedReview.workflow.cluster_id !== selectedClusterId) throw new Error('Selected cluster changed; prepare a new Evaluation.');
-                await confirmEvaluationPlans(preparedReview.workflow, acknowledgeUnknown);
+                const confirmedWorkflow = await confirmEvaluationPlans(preparedReview.workflow, acknowledgeUnknown);
                 if (!mountedRef.current || version !== handoffVersionRef.current) return;
                 setPreparedReview(null);
                 setAdminHandoff(null);
+                window.dispatchEvent(new CustomEvent("prism:evaluation-created", { detail: { workflow: confirmedWorkflow } }));
                 onNavigate('optimization-evaluate');
                 return;
             }
@@ -1064,7 +1172,18 @@ export default function EvaluationTaskWizard({ onNavigate }) {
             onNavigate('optimization-deployments');
         } catch (nextError) {
             if (!mountedRef.current || version !== handoffVersionRef.current) return;
-            if (!preparedReview.workflow && isDeploymentAdminSetupError(nextError)) {
+            if (isDeploymentAdminSetupError(nextError)) {
+                if (preparedReview.workflow) {
+                    await openWizardAdminSetupFromError(nextError, {
+                        mode: 'evaluation-confirm',
+                        handoffVersion: version,
+                        workflow: preparedReview.workflow,
+                        plan: preparedReview.plan,
+                        acknowledgeUnknown,
+                        provenance: { cluster_server_id: preparedReview.workflow.cluster_id || selectedClusterId || cluster.id },
+                    });
+                    return;
+                }
                 await openWizardAdminSetupFromError(nextError, {
                     mode: 'prepared',
                     handoffVersion: version,
@@ -1277,8 +1396,10 @@ export default function EvaluationTaskWizard({ onNavigate }) {
             return;
         }
         if (benchmarkErrors.length) { setError(benchmarkErrors.join(" ")); return; }
+        const version = ++handoffVersionRef.current;
         setBusy(true);
         setError("");
+        let evaluationRequest = null;
         try {
             if (targetMode === "existing") {
                 const resolvedTargetId = resolveEvaluationTarget({ targetId });
@@ -1318,7 +1439,7 @@ export default function EvaluationTaskWizard({ onNavigate }) {
                     },
                 },
             }));
-            let createdWorkflow = await createEvaluation({
+            evaluationRequest = {
                 name: name.trim(),
                 cluster_session_id: cluster.session_id,
                 runtime: {},
@@ -1333,24 +1454,25 @@ export default function EvaluationTaskWizard({ onNavigate }) {
                     preserve_deployment: preserveDeployment,
                     scenarios: tests,
                 })),
-            });
-            if (createdWorkflow.status === 'awaiting_review') {
-                setAcknowledgeUnknown(false);
-                resetAdminHandoff();
-                const review = evaluationPlanReview(createdWorkflow);
-                setPreparedReview(review);
-                if (review.plan.preflight.status !== 'pass') return;
-                createdWorkflow = await confirmEvaluationPlans(createdWorkflow, false);
-                setPreparedReview(null);
-            }
-            window.dispatchEvent(new CustomEvent("prism:evaluation-created", { detail: { workflow: createdWorkflow } }));
-            onNavigate("optimization-evaluate");
+            };
+            await submitEvaluationWorkflow(evaluationRequest, { version });
         } catch (nextError) {
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
+            if (evaluationRequest && isDeploymentAdminSetupError(nextError)) {
+                await openWizardAdminSetupFromError(nextError, {
+                    mode: 'evaluation',
+                    handoffVersion: version,
+                    evaluationRequest,
+                    provenance: { cluster_server_id: selectedClusterId || cluster.id },
+                });
+                return;
+            }
             await refreshClusterHardware().catch(() => null);
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
             setError(nextError.message || "Evaluation could not be created");
             window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "smooth" }));
         } finally {
-            setBusy(false);
+            if (mountedRef.current) setBusy(false);
         }
     };
 
@@ -1368,6 +1490,11 @@ export default function EvaluationTaskWizard({ onNavigate }) {
         clearEvaluationIntent();
         onNavigate("model-market");
     };
+
+    const handoffNamespaceBadge = formatHandoffNamespace(adminHandoff);
+    const handoffActionLabel = adminHandoff?.mode?.startsWith('evaluation')
+        ? 'Re-check & Start Evaluation'
+        : 'Re-check & Deploy';
 
     return <section className="benchmark-task-page compact-evaluation-wizard relative isolate mx-auto w-full max-w-[1500px] shrink-0 space-y-5 px-4 py-6 text-slate-100 sm:px-6 lg:px-12 lg:py-10">
         <div aria-hidden="true" className="pointer-events-none absolute inset-0 -z-10 overflow-hidden">
@@ -1519,6 +1646,8 @@ export default function EvaluationTaskWizard({ onNavigate }) {
             onClose={() => { setPreparedReview(null); resetAdminHandoff(); }}
             onConfirm={confirmPreparedDeployment}
             adminHandoff={adminHandoff}
+            handoffNamespace={handoffNamespaceBadge}
+            handoffActionLabel={handoffActionLabel}
             onVerifyBootstrap={verifyWizardBootstrapAndDeploy}
             onRegenerateBootstrap={(overrideArg) => generateWizardBootstrapScript(overrideArg)}
             onSubjectOverrideChange={(next) => setAdminHandoff(prev => (prev ? { ...prev, subjectOverride: next } : prev))}
@@ -1529,7 +1658,7 @@ export default function EvaluationTaskWizard({ onNavigate }) {
                 mode="bootstrap"
                 report={adminHandoff.report}
                 handoff={adminHandoff.verifyResult}
-                namespace={adminHandoff.namespace}
+                namespace={handoffNamespaceBadge}
                 script={adminHandoff.script}
                 filename={adminHandoff.filename}
                 instructions={adminHandoff.instructions}
@@ -1543,18 +1672,18 @@ export default function EvaluationTaskWizard({ onNavigate }) {
                 onSubjectOverrideChange={(next) => setAdminHandoff(prev => (prev ? { ...prev, subjectOverride: next } : prev))}
                 onGenerateScript={(overrideArg) => generateWizardBootstrapScript(overrideArg)}
                 onPrimaryAction={verifyWizardBootstrapAndDeploy}
-                primaryActionLabel="Re-check & Deploy"
+                primaryActionLabel={handoffActionLabel}
                 onDismiss={resetAdminHandoff}
             />
         )}
         <Modal isOpen={Boolean(yamlArtifact)} onClose={() => setYamlArtifact(null)} title="Deployment Configuration YAML" subtitle="YAML editing supports annotations and formatting. Use Edit configuration for model, topology, runtime or storage changes." size="xl" footer={<>{yamlArtifact?.deployable_configuration?.content?.officialGuide?.deploymentBundle && <a className="mr-auto text-xs text-cyan-300 hover:underline" href={`/api/v1/configurations/artifacts/${encodeURIComponent(yamlArtifact.artifact_id)}/bundle`}>Download deployment bundle</a>}<Button variant="secondary" onClick={() => setYamlArtifact(null)}>Cancel</Button><Button disabled={yamlLoading || yamlSaving || !yamlText.trim()} onClick={saveEditedYaml}>{yamlSaving ? "Saving…" : "Save YAML"}</Button></>}>
             {yamlLoading ? <div className="flex h-72 items-center justify-center"><RefreshCw className="h-5 w-5 animate-spin text-cyan-300" /></div> : <textarea aria-label="Editable deployment YAML" value={yamlText} onChange={(event) => setYamlText(event.target.value)} spellCheck={false} className="h-[60vh] w-full resize-none rounded-xl border border-slate-700 bg-black/35 p-4 font-mono text-[10px] leading-5 text-slate-300 outline-none focus:border-cyan-500" />}
         </Modal>
-        {!preparedReview && !deployOnly && !(step === 1 && (configurationEditor || deployOnPublish)) && <footer className="grid grid-cols-1 items-center gap-4 py-4 sm:grid-cols-[minmax(0,1fr)_auto]">
+        {!preparedReview && !adminHandoff && !deployOnly && !(step === 1 && (configurationEditor || deployOnPublish)) && <footer className="grid grid-cols-1 items-center gap-4 py-4 sm:grid-cols-[minmax(0,1fr)_auto]">
             <p className={`min-w-0 break-words text-xs leading-5 ${error ? "text-rose-300" : busy ? "text-cyan-300" : "text-amber-300"}`}>{error ? "Review the issue above, then retry." : (busy ? "Creating evaluation and scheduling deployment…" : step === 0 ? (!canContinue && (targetMode === "existing" ? "Select an endpoint" : `Required: ${setupIssues.join(" · ")}`)) : step === 1 ? ((!canContinue || combinationErrors.length > 0) && (combinationErrors[0] || "Add or select a valid configuration")) : step === 2 ? (canContinue ? `${tests.length ? runCount / tests.length : 0} targets × ${tests.length} tests = ${runCount} runs · Sequential` : benchmarkErrors[0] || "Benchmark Plan has no selected tests") : null)}</p>
             <div className="flex min-w-0 flex-wrap items-center justify-end gap-2 sm:max-w-lg">
             {step > 0 && <button onClick={() => setStep((current) => targetMode === "existing" && current === 2 ? 0 : current - 1)} className="inline-flex h-9 items-center gap-1 rounded-lg border border-slate-700 px-4 text-xs"><ChevronLeft className="h-4 w-4" />Back</button>}
-            {step < 3 ? <button disabled={combinationErrors.length > 0 && step > 0 || !canContinue} onClick={continueWizard} className="benchmark-continue-button inline-flex h-9 items-center gap-1 rounded-lg bg-cyan-400 px-4 text-xs font-bold text-slate-950 disabled:opacity-40">{step === 0 && configurationEditor && targetMode === "configurations" ? "Return to configuration" : step === 1 ? "Continue to Benchmark" : "Continue"}<ChevronRight className="h-4 w-4" /></button> : <button disabled={busy} onClick={create} className="benchmark-start-button inline-flex h-10 min-w-40 shrink-0 items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-cyan-300 to-sky-400 px-5 text-xs font-bold text-slate-950 shadow-lg shadow-cyan-500/15 transition hover:brightness-110 disabled:cursor-wait disabled:opacity-70">{busy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}{busy ? "Creating…" : "Start Evaluation"}</button>}
+            {step < 3 ? <button disabled={combinationErrors.length > 0 && step > 0 || !canContinue} onClick={continueWizard} className="benchmark-continue-button inline-flex h-9 items-center gap-1 rounded-lg bg-cyan-400 px-4 text-xs font-bold text-slate-950 disabled:opacity-40">{step === 0 && configurationEditor && targetMode === "configurations" ? "Return to configuration" : step === 1 ? "Continue to Benchmark" : "Continue"}<ChevronRight className="h-4 w-4" /></button> : <button disabled={busy || Boolean(adminHandoff)} onClick={create} className="benchmark-start-button inline-flex h-10 min-w-40 shrink-0 items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-cyan-300 to-sky-400 px-5 text-xs font-bold text-slate-950 shadow-lg shadow-cyan-500/15 transition hover:brightness-110 disabled:cursor-wait disabled:opacity-70">{busy ? <Spinner size="xs" /> : <Play className="h-4 w-4" />}{busy ? "Creating…" : "Start Evaluation"}</button>}
             </div>
         </footer>}
     </section>;

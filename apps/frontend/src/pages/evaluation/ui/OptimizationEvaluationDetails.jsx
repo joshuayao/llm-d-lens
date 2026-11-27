@@ -1,6 +1,17 @@
 import { downloadBlob } from '../../../shared/lib/download';
-import { evaluationApi as api, confirmEvaluationPlans, evaluationPlanReview } from '../model/client';
+import { evaluationApi as api, confirmEvaluationPlans, evaluationPlanReview, retryEvaluationWorkflow } from '../model/client';
 import { DeploymentPlanReview } from './EvaluationTaskWizard';
+import { DeploymentPermissionHandoff } from '../../deployment/ui/DeploymentPlanReview';
+import {
+    deploymentPermissionPayload,
+    formatHandoffNamespace,
+    generateDeploymentBootstrapScript,
+    isDeploymentAdminSetupError,
+    mergeBootstrapRemediationTargets,
+    parseDeploymentAdminSetupError,
+    verifiedTargetNamespacesMap,
+    verifyDeploymentBootstrap,
+} from '../../deployment/api/agenticDeploymentBackend';
 import { Badge, Button } from '../../../shared/ui';
 import { useAuth } from '../../auth';
 import { TERMINAL_EVALUATION_STATUSES as terminalStatuses, evaluationStatusTone } from '../model/domain';
@@ -8,7 +19,7 @@ import { usePolling } from '../../../shared/lib/usePolling';
 import { confirmDelete } from "../../../shared/ui/confirmDelete";
 import { PageHeading } from "../../../shared/ui/PageHeader";
 import { Panel } from "../../../shared/ui/Panel";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { historicalFlows } from "./benchmark-results/historicalFlow.js";
 import { liveDeployments } from "./benchmark-results/deploymentEvidence.js";
 import { benchmarkDetails } from "./benchmark-results/benchmarkDetails.js";
@@ -216,13 +227,246 @@ export default function OptimizationEvaluationDetails({ onNavigate }) {
     const [reviewBusy, setReviewBusy] = useState(false);
     const [reviewError, setReviewError] = useState('');
     const [acknowledgeUnknown, setAcknowledgeUnknown] = useState(false);
+    const [adminHandoff, setAdminHandoff] = useState(null);
+    const mountedRef = useRef(true);
+    const handoffVersionRef = useRef(0);
+    const resetAdminHandoff = useCallback(() => {
+        handoffVersionRef.current += 1;
+        setAdminHandoff(null);
+    }, []);
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+            handoffVersionRef.current += 1;
+        };
+    }, []);
     const { can } = useAuth();
-    async function confirmReview() {
+
+    function buildDetailsPermissionPayload(handoffSeed = null, extra = {}) {
+        const { includeExpectedDigest = false, ...restExtra } = extra;
+        const activePlan = handoffSeed?.plan || preparedReview?.plan || null;
+        const seedTargets = Array.isArray(handoffSeed?.targets) && handoffSeed.targets.length
+            ? handoffSeed.targets.map((target) => ({
+                ...target,
+                ...(includeExpectedDigest && !target.alreadySufficient && (target.expected_digest || target.expectedDigest || target.bootstrapDigest)
+                    ? { expectedDigest: target.expected_digest || target.expectedDigest || target.bootstrapDigest }
+                    : {}),
+            }))
+            : null;
+        return deploymentPermissionPayload({
+            clusterId: handoffSeed?.clusterId || details?.workflow?.cluster_id || '',
+            namespace: seedTargets?.length ? null : (handoffSeed?.namespace || activePlan?.cases?.[0]?.namespace || null),
+            manifest: seedTargets?.length ? '' : (activePlan?.cases?.[0]?.manifest || ''),
+            preparedPlanId: seedTargets?.length ? null : (activePlan?.id || null),
+            ...(seedTargets ? { targets: seedTargets } : {}),
+            ...restExtra,
+        });
+    }
+
+    async function generateDetailsBootstrapScript(overrideArg = null, seed = null, expectedVersion = handoffVersionRef.current) {
+        const current = seed || adminHandoff;
+        const override = overrideArg || current?.subjectOverride || null;
+        const validOverride = override?.name?.trim()
+            ? {
+                kind: override.kind || 'ServiceAccount',
+                name: override.name.trim(),
+                ...(override.kind === 'ServiceAccount' && override.namespace?.trim()
+                    ? { namespace: override.namespace.trim() }
+                    : {}),
+            }
+            : null;
+        setAdminHandoff(prev => (prev ? { ...prev, generating: true, error: '', ...(validOverride ? { subjectOverride: validOverride } : {}) } : prev));
+        try {
+            const remediation = await generateDeploymentBootstrapScript(buildDetailsPermissionPayload(current, {
+                subjectOverride: validOverride,
+            }));
+            if (!mountedRef.current || expectedVersion !== handoffVersionRef.current) return;
+            setAdminHandoff(prev => (prev ? {
+                ...prev,
+                generating: false,
+                verifyResult: null,
+                script: remediation.script || '',
+                filename: remediation.scriptFilename || remediation.filename || 'lens-deployment-bootstrap.sh',
+                instructions: remediation.instructions || '',
+                bootstrapDigest: remediation.bootstrapDigest || remediation.digest || null,
+                namespace: remediation.namespace || prev.namespace,
+                namespaces: Array.isArray(remediation.namespaces) && remediation.namespaces.length
+                    ? remediation.namespaces
+                    : prev.namespaces,
+                targets: Array.isArray(prev.targets) && prev.targets.length
+                    ? mergeBootstrapRemediationTargets(prev.targets, remediation.targets)
+                    : (Array.isArray(remediation.targets) ? remediation.targets : prev.targets),
+                identity: remediation.identity || prev.identity,
+                warnings: Array.isArray(remediation.warnings) ? remediation.warnings : prev.warnings,
+            } : prev));
+        } catch (failure) {
+            if (!mountedRef.current || expectedVersion !== handoffVersionRef.current) return;
+            setAdminHandoff(prev => (prev ? { ...prev, generating: false, error: failure.message || 'Could not generate Orchestration administrator script.' } : prev));
+        }
+    }
+
+    async function openDetailsAdminSetupFromError(failure, context = {}) {
+        const version = context.handoffVersion ?? ++handoffVersionRef.current;
+        if (!mountedRef.current || version !== handoffVersionRef.current) return null;
+        const parsed = parseDeploymentAdminSetupError(failure);
+        const fallbackNamespace = context.plan?.cases?.[0]?.namespace || preparedReview?.plan?.cases?.[0]?.namespace || '';
+        const targets = Array.isArray(parsed?.targets) && parsed.targets.length
+            ? parsed.targets
+            : (Array.isArray(context.targets) && context.targets.length ? context.targets : null);
+        const namespaces = Array.isArray(parsed?.namespaces) && parsed.namespaces.length
+            ? parsed.namespaces
+            : (targets?.length
+                ? targets.map((item) => item?.namespace).filter(Boolean)
+                : (parsed?.namespace ? [parsed.namespace] : (fallbackNamespace ? [fallbackNamespace] : [])));
+        const seed = {
+            mode: context.mode || (context.workflow || preparedReview?.workflow ? 'evaluation-confirm' : 'evaluation-retry'),
+            workflow: context.workflow || preparedReview?.workflow || null,
+            plan: context.plan || preparedReview?.plan || null,
+            acknowledgeUnknown: context.acknowledgeUnknown ?? acknowledgeUnknown,
+            clusterId: parsed?.clusterId || context.clusterId || context.workflow?.cluster_id || details?.workflow?.cluster_id || '',
+            report: parsed?.report || {},
+            verifyResult: null,
+            namespace: parsed?.namespace || namespaces[0] || fallbackNamespace || '',
+            namespaces,
+            targets,
+            identity: parsed?.identity || null,
+            subjectOverride: context.subjectOverride !== undefined
+                ? context.subjectOverride
+                : (context.preserveOverride ? (adminHandoff?.subjectOverride || null) : null),
+            script: parsed?.script || '',
+            filename: parsed?.scriptFilename || 'lens-deployment-bootstrap.sh',
+            instructions: parsed?.instructions || '',
+            bootstrapDigest: parsed?.bootstrapDigest || null,
+            warnings: Array.isArray(parsed?.warnings) ? parsed.warnings : [],
+            generating: false,
+            verifying: false,
+            error: context.showFailureError ? (failure.message || parsed?.detail || '') : '',
+        };
+        setReviewError('');
+        setAdminHandoff(seed);
+        if (!seed.script && (seed.subjectOverride?.name || (!seed.identity?.overrideRequired && seed.identity?.kind !== 'unknown'))) {
+            await generateDetailsBootstrapScript(seed.subjectOverride || null, seed, version);
+        }
+        return seed;
+    }
+
+    async function verifyDetailsBootstrapAndSubmit() {
+        if (!adminHandoff || adminHandoff.verifying) return;
+        const version = ++handoffVersionRef.current;
+        const handoffSnapshot = adminHandoff;
+        const override = handoffSnapshot.subjectOverride?.name?.trim()
+            ? {
+                kind: handoffSnapshot.subjectOverride.kind || 'ServiceAccount',
+                name: handoffSnapshot.subjectOverride.name.trim(),
+                ...(handoffSnapshot.subjectOverride.kind === 'ServiceAccount' && handoffSnapshot.subjectOverride.namespace?.trim()
+                    ? { namespace: handoffSnapshot.subjectOverride.namespace.trim() }
+                    : {}),
+            }
+            : null;
         setReviewBusy(true);
         setReviewError('');
-        try { await confirmEvaluationPlans(preparedReview.workflow, acknowledgeUnknown); setPreparedReview(null); await loadDetails(); }
-        catch (failure) { setReviewError(failure.message); }
-        finally { setReviewBusy(false); }
+        setError('');
+        setAdminHandoff(prev => (prev ? { ...prev, verifying: true, error: '' } : prev));
+        let verifyResult = null;
+        try {
+            const hasMultiTargets = Array.isArray(handoffSnapshot.targets) && handoffSnapshot.targets.length > 0;
+            verifyResult = await verifyDeploymentBootstrap(buildDetailsPermissionPayload(handoffSnapshot, {
+                ...(hasMultiTargets ? { includeExpectedDigest: true } : {
+                    ...(handoffSnapshot.namespace ? { namespace: handoffSnapshot.namespace } : {}),
+                    expectedDigest: handoffSnapshot.bootstrapDigest || undefined,
+                }),
+                subjectOverride: override,
+            }));
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
+            if (verifyResult?.verified) {
+                setAdminHandoff(null);
+                const verifiedTargetNamespaces = verifiedTargetNamespacesMap(verifyResult, handoffSnapshot.targets);
+                if (handoffSnapshot.mode === 'evaluation-retry') {
+                    const workflow = await retryEvaluationWorkflow(evaluationId, verifiedTargetNamespaces);
+                    if (!mountedRef.current || version !== handoffVersionRef.current) return;
+                    if (workflow?.status === 'awaiting_review') {
+                        setAcknowledgeUnknown(false);
+                        setReviewError('');
+                        setPreparedReview(evaluationPlanReview(workflow));
+                    }
+                    await loadDetails();
+                    return;
+                }
+                const activeWorkflow = preparedReview?.workflow || handoffSnapshot.workflow;
+                if (!activeWorkflow) throw new Error('Evaluation review session is no longer active.');
+                await confirmEvaluationPlans(activeWorkflow, handoffSnapshot.acknowledgeUnknown ?? acknowledgeUnknown, verifiedTargetNamespaces);
+                if (!mountedRef.current || version !== handoffVersionRef.current) return;
+                setPreparedReview(null);
+                await loadDetails();
+                return;
+            }
+            setAdminHandoff(prev => (prev ? {
+                ...prev,
+                verifying: false,
+                verifyResult,
+                namespace: verifyResult?.namespace || prev.namespace,
+                namespaces: Array.isArray(verifyResult?.namespaces) && verifyResult.namespaces.length
+                    ? verifyResult.namespaces
+                    : prev.namespaces,
+                identity: verifyResult?.identity || prev.identity,
+                warnings: Array.isArray(verifyResult?.warnings) ? verifyResult.warnings : prev.warnings,
+                error: verifyResult?.message || 'Orchestration administrator namespace setup is not yet verified. Run the script and try again.',
+            } : prev));
+        } catch (nextError) {
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
+            if (isDeploymentAdminSetupError(nextError)) {
+                await openDetailsAdminSetupFromError(nextError, {
+                    ...handoffSnapshot,
+                    handoffVersion: version,
+                    subjectOverride: handoffSnapshot.subjectOverride || null,
+                    preserveOverride: true,
+                    showFailureError: true,
+                });
+                return;
+            }
+            if (verifyResult?.verified) {
+                setAdminHandoff(null);
+                if (handoffSnapshot.mode === 'evaluation-retry' || !preparedReview?.plan) {
+                    setError(nextError.message);
+                } else {
+                    setReviewError(nextError.message);
+                }
+                return;
+            }
+            setAdminHandoff(prev => (prev ? { ...prev, verifying: false, error: nextError.message || 'Verification failed.' } : prev));
+        } finally {
+            if (mountedRef.current) setReviewBusy(false);
+        }
+    }
+
+    async function confirmReview() {
+        if (reviewBusy || !preparedReview?.workflow) return;
+        const version = ++handoffVersionRef.current;
+        setReviewBusy(true);
+        setReviewError('');
+        try {
+            await confirmEvaluationPlans(preparedReview.workflow, acknowledgeUnknown);
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
+            setPreparedReview(null);
+            setAdminHandoff(null);
+            await loadDetails();
+        } catch (failure) {
+            if (!mountedRef.current || version !== handoffVersionRef.current) return;
+            if (isDeploymentAdminSetupError(failure)) {
+                await openDetailsAdminSetupFromError(failure, {
+                    mode: 'evaluation-confirm',
+                    handoffVersion: version,
+                    workflow: preparedReview.workflow,
+                    plan: preparedReview.plan,
+                    acknowledgeUnknown,
+                });
+                return;
+            }
+            setReviewError(failure.message);
+        } finally {
+            if (mountedRef.current) setReviewBusy(false);
+        }
     }
 
     const refreshDeployments = useCallback(async (currentDetails) => {
@@ -376,9 +620,13 @@ export default function OptimizationEvaluationDetails({ onNavigate }) {
         setCaseActions((current) => ({ ...current, [key]: action }));
         setCaseActionErrors((current) => ({ ...current, [key]: "" }));
         try {
-            if (action === 'restart' && item.evaluationCase?.prepared_plan_id) {
-                const workflow = await api(`/api/v1/evaluate/workflow-runs/${encodeURIComponent(evaluationId)}/retry`, { method: 'POST' });
-                if (workflow.status === 'awaiting_review') { setAcknowledgeUnknown(false); setReviewError(''); setPreparedReview(evaluationPlanReview(workflow)); }
+            if (action === 'restart' && (item.evaluationCase?.prepared_plan_id || item.evaluationCase?.cleanup_status === 'pending_admin_cleanup')) {
+                const workflow = await retryEvaluationWorkflow(evaluationId);
+                if (workflow?.status === 'awaiting_review') {
+                    setAcknowledgeUnknown(false);
+                    setReviewError('');
+                    setPreparedReview(evaluationPlanReview(workflow));
+                }
                 await loadDetails();
                 return;
             }
@@ -400,15 +648,61 @@ export default function OptimizationEvaluationDetails({ onNavigate }) {
             if (modelToken) setRetryTokens((current) => ({ ...current, [key]: "" }));
             await loadDetails();
         } catch (nextError) {
+            if (action === 'restart' && isDeploymentAdminSetupError(nextError)) {
+                await openDetailsAdminSetupFromError(nextError, {
+                    mode: 'evaluation-retry',
+                    handoffVersion: ++handoffVersionRef.current,
+                });
+                return;
+            }
             setCaseActionErrors((current) => ({ ...current, [key]: nextError.message }));
         } finally {
             setCaseActions((current) => ({ ...current, [key]: "" }));
         }
     };
+    const handoffNamespaceBadge = formatHandoffNamespace(adminHandoff);
     return <section className="evaluation-details-page mx-auto flex w-full min-w-0 max-w-[1560px] flex-col gap-4 px-4 py-6 text-slate-100 sm:px-6 lg:px-12 lg:py-10">
         <PageHeading title={details?.workflow.name || details?.workflow.id || evaluationId || "Benchmark details"} subtitle="Benchmark" />
-        <DeploymentPlanReview preparedReview={preparedReview} busy={reviewBusy} error={reviewError} acknowledgeUnknown={acknowledgeUnknown} setAcknowledgeUnknown={setAcknowledgeUnknown} onClose={() => setPreparedReview(null)} onConfirm={confirmReview} />
-        {details?.workflow.status === 'awaiting_review' && can('evaluate:workflow:create') && <div className="flex gap-2"><Button onClick={() => { setAcknowledgeUnknown(false); setReviewError(''); setPreparedReview(evaluationPlanReview(details.workflow)); }}><FileText className="h-4 w-4" />Review deployment plans</Button></div>}
+        <DeploymentPlanReview
+            preparedReview={preparedReview}
+            busy={reviewBusy}
+            error={reviewError}
+            acknowledgeUnknown={acknowledgeUnknown}
+            setAcknowledgeUnknown={setAcknowledgeUnknown}
+            onClose={() => { setPreparedReview(null); resetAdminHandoff(); }}
+            onConfirm={confirmReview}
+            adminHandoff={adminHandoff}
+            handoffNamespace={handoffNamespaceBadge}
+            handoffActionLabel="Re-check & Start Evaluation"
+            onVerifyBootstrap={verifyDetailsBootstrapAndSubmit}
+            onRegenerateBootstrap={(overrideArg) => generateDetailsBootstrapScript(overrideArg)}
+            onSubjectOverrideChange={(next) => setAdminHandoff(prev => (prev ? { ...prev, subjectOverride: next } : prev))}
+            onDismissAdminHandoff={resetAdminHandoff}
+        />
+        {!preparedReview?.plan && adminHandoff && (
+            <DeploymentPermissionHandoff
+                mode="bootstrap"
+                report={adminHandoff.report}
+                handoff={adminHandoff.verifyResult}
+                namespace={handoffNamespaceBadge}
+                script={adminHandoff.script}
+                filename={adminHandoff.filename}
+                instructions={adminHandoff.instructions}
+                warnings={adminHandoff.warnings}
+                error={adminHandoff.error}
+                busy={reviewBusy}
+                verifying={Boolean(adminHandoff.verifying)}
+                generating={Boolean(adminHandoff.generating)}
+                identity={adminHandoff.identity}
+                subjectOverride={adminHandoff.subjectOverride}
+                onSubjectOverrideChange={(next) => setAdminHandoff(prev => (prev ? { ...prev, subjectOverride: next } : prev))}
+                onGenerateScript={(overrideArg) => generateDetailsBootstrapScript(overrideArg)}
+                onPrimaryAction={verifyDetailsBootstrapAndSubmit}
+                primaryActionLabel="Re-check & Retry Evaluation"
+                onDismiss={resetAdminHandoff}
+            />
+        )}
+        {details?.workflow.status === 'awaiting_review' && can('evaluate:workflow:create') && <div className="flex gap-2"><Button onClick={() => { setAcknowledgeUnknown(false); setReviewError(''); resetAdminHandoff(); setPreparedReview(evaluationPlanReview(details.workflow)); }}><FileText className="h-4 w-4" />Review deployment plans</Button></div>}
         <Panel padding="none" className="rounded-b-none border-b-0 shadow-none">
         <header className="grid gap-4 border-b border-theme-border p-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
             <div className="flex min-w-0 flex-1 items-start gap-3">
@@ -485,7 +779,17 @@ export default function OptimizationEvaluationDetails({ onNavigate }) {
                         <div className="flex flex-wrap items-center gap-2">{isFailed && <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-red-500/15 text-red-300"><AlertTriangle className="h-4 w-4" /></span>}<b className="min-w-0 flex-1 truncate text-sm">{item.guide || item.id}</b>{Number.isInteger(item.attempt) && <span className="rounded border border-slate-600 bg-slate-900 px-2 py-0.5 text-[10px] text-slate-300">Attempt {item.attempt}</span>}<span className="text-xs text-slate-400">Benchmark: {item.evaluationCase?.status} · {item.deploymentOwned ? "Evaluation-created service" : "Existing endpoint · service retained"}</span>{item.usedByEvaluation && <span className="rounded border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 text-[10px] text-cyan-200">Used by this evaluation</span>}<span data-status={item.status} className={`evaluation-status-label rounded border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${evaluationStatusTone(item.status)}`}>{item.status}</span>{item.deploymentStatus && item.deploymentStatus !== item.status && <span className="rounded border border-slate-700 px-2 py-0.5 text-[10px] text-slate-400">Lifecycle {item.deploymentStatus}</span>}</div>
                         <div className="mt-3 grid gap-3 text-xs text-slate-400 md:grid-cols-3"><div><span className="text-slate-600">Namespace</span><p className="mt-1 break-all font-mono text-slate-300">{item.namespace || "-"}</p></div><div><span className="text-slate-600">Endpoint</span><p className="mt-1 break-all font-mono text-slate-300">{item.endpoint || "-"}</p></div><div><span className="text-slate-600">Execution</span><p className="mt-1 font-mono text-slate-300">{item.execution_status || "-"}</p></div></div>
                         {item.status === "failed" && item.failure?.code === "model_access_failed" && <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3"><label className="text-[9px] font-bold uppercase tracking-wider text-amber-300" htmlFor={`model-token-${key}`}>Hugging Face token for this retry</label><input id={`model-token-${key}`} type="password" autoComplete="off" value={retryTokens[key] || ""} onChange={(event) => setRetryTokens((current) => ({ ...current, [key]: event.target.value }))} placeholder="hf_…" className="mt-2 h-9 w-full border border-amber-500/30 bg-slate-950 px-3 text-xs text-slate-100 outline-none focus:border-amber-400" /><p className="mt-2 text-[10px] leading-4 text-amber-100/70">Optional. Use only for a private or gated model. The token is sent to this deployment namespace for the next attempt and is not saved in the configuration artifact or retry history.</p></div>}
-                        {item.pendingDeployment ? <p className="mt-4 border-t border-slate-800 pt-3 text-xs text-amber-200">This deployment has not started because the preceding baseline case did not complete successfully.</p> : <div className="mt-4 flex flex-wrap gap-2 border-t border-slate-800 pt-3">{item.execution_id ? <button onClick={() => toggleLogs(item)} className="inline-flex h-8 items-center gap-2 border border-cyan-500/40 px-3 text-xs text-cyan-200"><FileText className="h-3.5 w-3.5" />{log?.loading ? "Loading logs..." : "Deploy logs"}{logsExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}</button> : <span className="inline-flex h-8 items-center border border-slate-700 px-3 text-xs text-slate-500">Starting deployment...</span>}{hasQueuedRetry && <span className="inline-flex h-8 items-center border border-cyan-500/40 px-3 text-xs text-cyan-200">Retry attempt is pending</span>}{item.deploymentOwned && item.status === "failed" && !hasQueuedRetry && <button title="Retry deployment" disabled={actionInProgress} onClick={() => runCaseAction(item, "restart")} className="inline-flex h-8 items-center gap-2 border border-emerald-500/40 px-3 text-xs text-emerald-200"><RotateCcw className="h-3.5 w-3.5" />Retry</button>}{item.deploymentOwned && item.status === "stopped" && !hasQueuedRetry && <button title="Redeploy this paused service" disabled={actionInProgress} onClick={() => runCaseAction(item, "restart")} className="inline-flex h-8 items-center gap-2 border border-emerald-500/40 px-3 text-xs text-emerald-200"><RotateCcw className="h-3.5 w-3.5" />Resume</button>}{(!terminalStatuses.has(item.evaluationCase?.status) || (item.deploymentOwned && ['ready','deploying','rendering','queued'].includes(item.status))) && <button title={item.deploymentOwned ? 'Cancel benchmark and its Evaluation-created deployment' : 'Cancel benchmark only; the existing service keeps running'} disabled={actionInProgress} onClick={() => runCaseAction(item, "cancel")} className="inline-flex h-8 items-center gap-2 border border-amber-500/40 px-3 text-xs text-amber-100"><Square className="h-3.5 w-3.5" />{actionInProgress === 'cancel' ? 'Cancelling…' : item.deploymentOwned ? 'Cancel benchmark & deployment' : 'Cancel benchmark'}</button>}{item.deploymentOwned && ["failed", "stopped", "cleaned", "cleaned_up"].includes(item.status) && <button title="Delete deployment and namespace" disabled={actionInProgress} onClick={() => runCaseAction(item, "delete")} className="inline-flex h-8 items-center gap-2 border border-red-500/40 px-3 text-xs text-red-200"><Trash2 className="h-3.5 w-3.5" />Delete</button>}</div>}{actionError && <p className="mt-3 border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-200">Deployment action failed: {actionError}</p>}
+                        {item.evaluationCase?.cleanup_status === "pending_admin_cleanup" && (
+                            <div className="mt-3 flex flex-wrap items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-200">
+                                <Badge tone="warning" size="xs">Pending admin cleanup</Badge>
+                                <span className="min-w-0 flex-1 leading-5">
+                                    In-namespace workloads were removed and accelerators are freed. Complete namespace deletion for{' '}
+                                    <span className="font-mono">{item.evaluationCase?.cleanup_handoff?.namespace || item.namespace || 'this case'}</span>{' '}
+                                    from Deployments when an Orchestration administrator is available.
+                                </span>
+                            </div>
+                        )}
+                        {item.pendingDeployment ? <p className="mt-4 border-t border-slate-800 pt-3 text-xs text-amber-200">This deployment has not started because the preceding baseline case did not complete successfully.</p> : <div className="mt-4 flex flex-wrap gap-2 border-t border-slate-800 pt-3">{item.execution_id ? <button onClick={() => toggleLogs(item)} className="inline-flex h-8 items-center gap-2 border border-cyan-500/40 px-3 text-xs text-cyan-200"><FileText className="h-3.5 w-3.5" />{log?.loading ? "Loading logs..." : "Deploy logs"}{logsExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}</button> : <span className="inline-flex h-8 items-center border border-slate-700 px-3 text-xs text-slate-500">Starting deployment...</span>}{hasQueuedRetry && <span className="inline-flex h-8 items-center border border-cyan-500/40 px-3 text-xs text-cyan-200">Retry attempt is pending</span>}{item.deploymentOwned && (item.status === "failed" || (item.evaluationCase?.cleanup_status === "pending_admin_cleanup" && item.evaluationCase?.status === "failed")) && !hasQueuedRetry && <button title="Retry deployment" disabled={actionInProgress} onClick={() => runCaseAction(item, "restart")} className="inline-flex h-8 items-center gap-2 border border-emerald-500/40 px-3 text-xs text-emerald-200"><RotateCcw className="h-3.5 w-3.5" />Retry</button>}{item.deploymentOwned && item.status === "stopped" && !hasQueuedRetry && <button title="Redeploy this paused service" disabled={actionInProgress} onClick={() => runCaseAction(item, "restart")} className="inline-flex h-8 items-center gap-2 border border-emerald-500/40 px-3 text-xs text-emerald-200"><RotateCcw className="h-3.5 w-3.5" />Resume</button>}{(!terminalStatuses.has(item.evaluationCase?.status) || (item.deploymentOwned && ['ready','deploying','rendering','queued'].includes(item.status))) && <button title={item.deploymentOwned ? 'Cancel benchmark and its Evaluation-created deployment' : 'Cancel benchmark only; the existing service keeps running'} disabled={actionInProgress} onClick={() => runCaseAction(item, "cancel")} className="inline-flex h-8 items-center gap-2 border border-amber-500/40 px-3 text-xs text-amber-100"><Square className="h-3.5 w-3.5" />{actionInProgress === 'cancel' ? 'Cancelling…' : item.deploymentOwned ? 'Cancel benchmark & deployment' : 'Cancel benchmark'}</button>}{item.deploymentOwned && ["failed", "stopped", "cleaned", "cleaned_up"].includes(item.status) && <button title="Delete deployment and namespace" disabled={actionInProgress} onClick={() => runCaseAction(item, "delete")} className="inline-flex h-8 items-center gap-2 border border-red-500/40 px-3 text-xs text-red-200"><Trash2 className="h-3.5 w-3.5" />Delete</button>}</div>}{actionError && <p className="mt-3 border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-200">Deployment action failed: {actionError}</p>}
                         {logsExpanded && <><>{log?.error && <div className="mt-3 flex items-center justify-between gap-3 border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-100"><span>Log retrieval failed: {log.error}</span><button onClick={() => loadLogs(item)} className="border border-amber-400/40 px-2 py-1 text-amber-100">Retry</button></div>}</>{log && !log.error && <DiagnosticBlock title="Deploy and Kubernetes logs" value={log.entries?.map((entry) => entry.message).join("\n") || "No deployment log entries are available yet."} />}<div className="mt-4 grid gap-4 xl:grid-cols-3"><DiagnosticBlock title="Kubernetes pods" value={snapshot.pods} /><DiagnosticBlock title="Kubernetes events" value={snapshot.events} /><DiagnosticBlock title="Modelserver logs" value={snapshot.modelserver_logs} /></div>{readiness && <DiagnosticBlock title="Latest readiness check" value={readiness} />}</>}
                     </article>;
                 }) : <p className="rounded-xl border border-slate-800 bg-slate-950/40 p-8 text-center text-sm text-slate-500">{cases.length ? "No deployment cases match this filter." : "No deployment cases are available for this evaluation."}</p>}

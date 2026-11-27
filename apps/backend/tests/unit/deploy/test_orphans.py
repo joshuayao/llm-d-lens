@@ -397,7 +397,11 @@ async def test_cleanup_security_hardening_and_marker_validation(monkeypatch):
     from llm_d_lens.deploy import orphans
     from llm_d_lens.infrastructure.process import CommandResult
 
-    # CRDs deleted before pods
+    # CRDs and batch jobs deleted before pods
+    assert "jobs.batch" in orphans._IN_NAMESPACE_RESOURCE_TYPES
+    assert orphans._IN_NAMESPACE_RESOURCE_TYPES.index("jobs.batch") < (
+        orphans._IN_NAMESPACE_RESOURCE_TYPES.index("pods")
+    )
     assert orphans._IN_NAMESPACE_RESOURCE_TYPES.index("leaderworkersets.leaderworkerset.x-k8s.io") < (
         orphans._IN_NAMESPACE_RESOURCE_TYPES.index("pods")
     )

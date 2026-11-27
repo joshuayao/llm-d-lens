@@ -892,6 +892,9 @@ See [Evaluation parameters](/evaluation/parameters) for override ranges.
     - `benchmark_source` (`BenchmarkSource`, optional)
     - `benchmark_plans` (`BenchmarkPlan[]`, required; 1–256 plans with unique IDs)
     - `compare_configurations` (`boolean`, default `true`)
+    - `target_namespaces` (`Record<string, string>`, optional): Verified target namespaces keyed by deployment group ID for non-admin clusters. Also accepted by `POST /api/v1/evaluate/evaluations/{workflow_id}/confirm` and `POST /api/v1/evaluate/workflow-runs/{workflow_id}/retry`.
+
+    On non-admin clusters without sufficient namespace permissions, `POST /api/v1/evaluate/evaluations`, `POST /api/v1/evaluate/evaluations/{workflow_id}/confirm`, and `POST /api/v1/evaluate/workflow-runs/{workflow_id}/retry` return `HTTP 403` with `code: "deployment_admin_setup_required"` and an administrator bootstrap handoff payload. `DELETE /api/v1/evaluate/workflow-runs/{workflow_id}` returns `HTTP 409` with `code: "deployment_cleanup_permission_denied"` and a cleanup handoff payload when in-namespace workloads are removed but namespace deletion requires administrator action.
 
     ```json
     {

@@ -321,3 +321,105 @@ def test_clean_case_propagates_cleanup_permission_denied(monkeypatch):
         asyncio.run(worker.clean_case("run-1", "case-1"))
     assert exc.value.code == "deployment_cleanup_permission_denied"
     assert exc.value.payload["executionId"] == "exec-1"
+
+
+def test_cancel_evaluation_propagates_cleanup_permission_denied_directly():
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    import pytest
+
+    from llm_d_lens.deploy.contracts import DeploymentCaseStatus, DeploymentRunStatus
+    from llm_d_lens.deploy.executions import DeploymentCleanupPermissionDenied
+
+    case = SimpleNamespace(id="case-1", execution_id="exec-1", status=DeploymentCaseStatus.READY)
+    run = SimpleNamespace(id="run-1", status=DeploymentRunStatus.CANCELLING, cases=[case], finished_at=None)
+    store = SimpleNamespace(get_run=lambda _: run, get_execution=lambda _: None, save_run=Mock())
+    worker = DeploymentRunWorker(store, SimpleNamespace())
+    worker._cancel_and_wait = AsyncMock()
+    worker.clean_case = AsyncMock(
+        side_effect=DeploymentCleanupPermissionDenied(
+            "admin needed",
+            payload={"executionId": "exec-1", "phase1Completed": True, "adminCleanup": {"detail": "admin needed"}},
+        )
+    )
+    worker.delete_run = AsyncMock()
+
+    with pytest.raises(DeploymentCleanupPermissionDenied) as exc:
+        asyncio.run(worker.cancel_evaluation_deployment("run-1"))
+    assert exc.value.code == "deployment_cleanup_permission_denied"
+    assert exc.value.payload["executionId"] == "exec-1"
+    worker.delete_run.assert_not_awaited()
+
+    # Generic errors still raise ValueError
+    worker.clean_case = AsyncMock(side_effect=RuntimeError("transient error"))
+    with pytest.raises(ValueError, match="deployment case case-1: transient error"):
+        asyncio.run(worker.cancel_evaluation_deployment("run-1"))
+
+
+def test_repeat_clean_preserves_phase1_deleted_resources(monkeypatch):
+    import asyncio
+
+    import pytest
+
+    from llm_d_lens.deploy import orphans
+    from llm_d_lens.deploy.contracts import DeploymentStatus
+    from llm_d_lens.deploy.executions import DeploymentCleanupPermissionDenied
+    from llm_d_lens.deploy.providers.guide_catalog import GuideCatalog
+    from llm_d_lens.deploy.service import GuideAdapterDeploymentService
+    from tests.unit.deploy.test_deployment_management import _execution
+
+    class _Adapter:
+        async def diagnostics(self, _exec):
+            return {"ok": True}
+
+        async def cleanup(self, _exec, _artifact, *, force=False):
+            return {"cleaned_up": False, "error": 'namespaces "llmd-repeat" is forbidden'}
+
+    catalog = GuideCatalog([])
+    monkeypatch.setattr(catalog, "get_adapter", lambda _ref: _Adapter())
+    svc = GuideAdapterDeploymentService(catalog, lambda _req: "llmd-repeat", log_archive=None)
+    monkeypatch.setattr(orphans, "is_deletable_deployment_namespace", lambda _ns, cluster_id=None: True)
+
+    calls = {"count": 0}
+
+    async def fake_prepare_handoff(**_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {
+                "executionId": "exec-repeat",
+                "clusterId": "cluster-1",
+                "namespace": "llmd-repeat",
+                "phase1Completed": True,
+                "deletedInNamespace": ["deployments.apps", "jobs.batch", "rolebindings.rbac.authorization.k8s.io"],
+                "adminCleanup": {
+                    "detail": "Namespace cleanup requires admin",
+                    "completedOperations": [{"id": "cleanup.in_namespace.deployments.apps"}],
+                },
+            }
+        raise AssertionError("prepare_deployment_cleanup_handoff must not overwrite prior phase1 result")
+
+    monkeypatch.setattr(orphans, "prepare_deployment_cleanup_handoff", fake_prepare_handoff)
+
+    execution = _execution("exec-repeat", DeploymentStatus.READY, "llmd-repeat")
+
+    with pytest.raises(DeploymentCleanupPermissionDenied) as first_exc:
+        asyncio.run(svc.clean(execution))
+    assert first_exc.value.payload["deletedInNamespace"] == [
+        "deployments.apps",
+        "jobs.batch",
+        "rolebindings.rbac.authorization.k8s.io",
+    ]
+
+    persisted = svc._executions.get("exec-repeat")
+    assert persisted is not None
+    with pytest.raises(DeploymentCleanupPermissionDenied) as repeat_exc:
+        asyncio.run(svc.clean(persisted))
+    assert repeat_exc.value.payload["deletedInNamespace"] == [
+        "deployments.apps",
+        "jobs.batch",
+        "rolebindings.rbac.authorization.k8s.io",
+    ]
+    assert repeat_exc.value.payload["adminCleanup"]["completedOperations"] == [
+        {"id": "cleanup.in_namespace.deployments.apps"}
+    ]

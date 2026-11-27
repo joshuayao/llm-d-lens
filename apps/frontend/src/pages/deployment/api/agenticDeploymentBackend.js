@@ -201,6 +201,48 @@ export function previewOptimizations({ model, objective = 'balanced', maxAcceler
     });
 }
 
+function normalizePermissionTarget(target = {}, targetNamespaces = null, { includeBootstrapDigest = false } = {}) {
+    const key = target.key || target.deployment_group_id || target.deploymentGroupId || '';
+    const namespace = target.namespace || (key && targetNamespaces?.[key]) || null;
+    const deploymentName = target.deployment_name ?? target.deploymentName ?? null;
+    const providerRef = target.provider_ref ?? target.providerRef ?? null;
+    const preparedPlanId = target.prepared_plan_id ?? target.preparedPlanId ?? null;
+    const preparedRequestId = target.prepared_request_id ?? target.preparedRequestId ?? null;
+    const storageVolumeId = target.storage_volume_id ?? target.storageVolumeId ?? null;
+    const usesStorage = target.uses_storage ?? target.usesStorage ?? Boolean(storageVolumeId);
+    const usesLws = target.uses_lws !== undefined ? target.uses_lws : target.usesLws;
+    const usesRouter = target.uses_router !== undefined ? target.uses_router : target.usesRouter;
+    const eppServiceAccounts = Array.isArray(target.epp_service_accounts)
+        ? target.epp_service_accounts
+        : (Array.isArray(target.eppServiceAccounts) ? target.eppServiceAccounts : null);
+    const namespaceLabels = target.namespace_labels ?? target.namespaceLabels ?? null;
+    const hasLabels = namespaceLabels && typeof namespaceLabels === 'object' && Object.keys(namespaceLabels).length > 0;
+    const expectedDigest = target.alreadySufficient
+        ? null
+        : (
+            target.expected_digest
+            ?? target.expectedDigest
+            ?? (includeBootstrapDigest ? target.bootstrapDigest : null)
+            ?? null
+        );
+    return {
+        ...(key ? { key } : {}),
+        ...(namespace ? { namespace } : {}),
+        ...(deploymentName ? { deployment_name: deploymentName } : {}),
+        ...(providerRef ? { provider_ref: providerRef } : {}),
+        ...(preparedPlanId ? { prepared_plan_id: preparedPlanId } : {}),
+        ...(preparedRequestId ? { prepared_request_id: preparedRequestId } : {}),
+        ...(storageVolumeId ? { storage_volume_id: storageVolumeId } : {}),
+        uses_storage: Boolean(usesStorage || storageVolumeId),
+        ...(usesLws !== undefined ? { uses_lws: Boolean(usesLws) } : {}),
+        ...(usesRouter !== undefined ? { uses_router: Boolean(usesRouter) } : {}),
+        ...(eppServiceAccounts && eppServiceAccounts.length ? { epp_service_accounts: eppServiceAccounts } : {}),
+        ...(target.manifest ? { manifest: target.manifest } : {}),
+        ...(hasLabels ? { namespace_labels: namespaceLabels } : {}),
+        ...(expectedDigest ? { expected_digest: expectedDigest } : {}),
+    };
+}
+
 export function deploymentPermissionPayload({
     clusterId,
     namespace = null,
@@ -217,8 +259,17 @@ export function deploymentPermissionPayload({
     eppServiceAccounts,
     subjectOverride = null,
     expectedDigest = null,
+    targets = null,
+    targetNamespaces = null,
+    target_namespaces = null,
 } = {}) {
     const hasLabels = namespaceLabels && typeof namespaceLabels === 'object' && Object.keys(namespaceLabels).length > 0;
+    const resolvedTargetNamespaces = targetNamespaces ?? target_namespaces ?? null;
+    const hasTargetNamespaces = resolvedTargetNamespaces
+        && typeof resolvedTargetNamespaces === 'object'
+        && Object.keys(resolvedTargetNamespaces).length > 0;
+    const hasTargets = Array.isArray(targets) && targets.length > 0;
+    const isMultiTarget = hasTargets && targets.length > 1;
     return {
         cluster_id: clusterId,
         ...(namespace ? { namespace } : {}),
@@ -234,7 +285,9 @@ export function deploymentPermissionPayload({
         ...(usesRouter !== undefined ? { uses_router: Boolean(usesRouter) } : {}),
         ...(Array.isArray(eppServiceAccounts) && eppServiceAccounts.length ? { epp_service_accounts: eppServiceAccounts } : {}),
         ...(subjectOverride ? { subject_override: subjectOverride } : {}),
-        ...(expectedDigest ? { expected_digest: expectedDigest } : {}),
+        ...(expectedDigest && !isMultiTarget ? { expected_digest: expectedDigest } : {}),
+        ...(hasTargets ? { targets: targets.map((target) => normalizePermissionTarget(target, resolvedTargetNamespaces)) } : {}),
+        ...(hasTargetNamespaces && !hasTargets ? { target_namespaces: resolvedTargetNamespaces } : {}),
     };
 }
 
@@ -243,10 +296,25 @@ export function checkDeploymentPermissions(payload) {
 }
 
 export function generateDeploymentBootstrapScript(payload) {
+    if (Array.isArray(payload?.targets) && payload.targets.length > 0) {
+        return postJson('/api/v1/deployments/permission-remediation', {
+            ...payload,
+            targets: payload.targets.map((target) => normalizePermissionTarget(target)),
+        });
+    }
     return postJson('/api/v1/deployments/permission-remediation', payload);
 }
 
 export function verifyDeploymentBootstrap(payload) {
+    if (Array.isArray(payload?.targets) && payload.targets.length > 0) {
+        const isMultiTarget = payload.targets.length > 1;
+        const { expected_digest: topLevelDigest, ...rest } = payload;
+        return postJson('/api/v1/deployments/admin-handoff/verify', {
+            ...rest,
+            ...(!isMultiTarget && topLevelDigest ? { expected_digest: topLevelDigest } : {}),
+            targets: payload.targets.map((target) => normalizePermissionTarget(target, null, { includeBootstrapDigest: true })),
+        });
+    }
     return postJson('/api/v1/deployments/admin-handoff/verify', payload);
 }
 
@@ -257,6 +325,103 @@ export function verifyDeploymentCleanup(executionId, payload = {}) {
 export function isDeploymentAdminSetupError(error) {
     const code = error?.code || error?.body?.code || error?.body?.detail?.code || '';
     return (error?.status === 403 || error?.status === 409) && code === 'deployment_admin_setup_required';
+}
+
+export function parseDeploymentAdminSetupError(error) {
+    if (!isDeploymentAdminSetupError(error)) return null;
+    const rawBody = error?.body && typeof error.body === 'object' ? error.body : {};
+    const body = rawBody.detail && typeof rawBody.detail === 'object' && !Array.isArray(rawBody.detail)
+        ? { ...rawBody.detail, ...rawBody }
+        : rawBody;
+    const targets = Array.isArray(body.targets) ? body.targets : [];
+    const namespaces = Array.isArray(body.namespaces) && body.namespaces.length
+        ? body.namespaces.filter(Boolean)
+        : (targets.length
+            ? targets.map((item) => item?.namespace).filter(Boolean)
+            : (body.namespace ? [body.namespace] : []));
+    const targetNamespaces = {};
+    if (body.target_namespaces && typeof body.target_namespaces === 'object') {
+        Object.assign(targetNamespaces, body.target_namespaces);
+    } else if (body.targetNamespaces && typeof body.targetNamespaces === 'object') {
+        Object.assign(targetNamespaces, body.targetNamespaces);
+    } else {
+        for (const target of targets) {
+            if (target?.key && target?.namespace) {
+                targetNamespaces[target.key] = target.namespace;
+            }
+        }
+    }
+    return {
+        code: 'deployment_admin_setup_required',
+        detail: (typeof body.detail === 'string' && body.detail) || error?.message || '',
+        clusterId: body.clusterId ?? body.cluster_id ?? null,
+        namespace: body.namespace || namespaces[0] || '',
+        namespaces,
+        targets,
+        targetNamespaces,
+        identity: body.identity || null,
+        adminOperations: Array.isArray(body.adminOperations) ? body.adminOperations : [],
+        userOperations: Array.isArray(body.userOperations) ? body.userOperations : [],
+        missing: Array.isArray(body.missing) ? body.missing : [],
+        warnings: Array.isArray(body.warnings) ? body.warnings : [],
+        marker: body.marker && typeof body.marker === 'object' ? body.marker : null,
+        script: typeof body.script === 'string' ? body.script : '',
+        scriptFilename: body.scriptFilename || body.filename || 'lens-deployment-bootstrap.sh',
+        instructions: body.instructions || '',
+        bootstrapDigest: body.bootstrapDigest || body.digest || null,
+        report: body,
+    };
+}
+
+export function formatHandoffNamespace(adminHandoff) {
+    const namespaces = Array.isArray(adminHandoff?.namespaces)
+        ? adminHandoff.namespaces.filter(Boolean)
+        : (Array.isArray(adminHandoff?.targets)
+            ? adminHandoff.targets.map((target) => target?.namespace).filter(Boolean)
+            : []);
+    if (namespaces.length > 1) {
+        return `${namespaces[0]} (+${namespaces.length - 1} more)`;
+    }
+    return namespaces[0] || adminHandoff?.namespace || '';
+}
+
+export function mergeBootstrapRemediationTargets(existingTargets = [], remediationTargets = []) {
+    if (!Array.isArray(remediationTargets) || !remediationTargets.length) {
+        return Array.isArray(existingTargets) ? existingTargets : [];
+    }
+    if (!Array.isArray(existingTargets) || !existingTargets.length) {
+        return remediationTargets;
+    }
+    return existingTargets.map((target) => {
+        const match = remediationTargets.find((candidate) => (
+            (target.key && candidate.key === target.key)
+            || (target.namespace && candidate.namespace === target.namespace)
+        ));
+        if (!match) return target;
+        const nextDigest = match.alreadySufficient
+            ? null
+            : (match.bootstrapDigest !== undefined ? match.bootstrapDigest : target.bootstrapDigest);
+        const merged = {
+            ...target,
+            ...match,
+            ...(nextDigest !== undefined ? { bootstrapDigest: nextDigest } : {}),
+        };
+        if (match.alreadySufficient) {
+            delete merged.expected_digest;
+            delete merged.expectedDigest;
+        }
+        return merged;
+    });
+}
+
+export function verifiedTargetNamespacesMap(verifyResult, fallbackTargets = []) {
+    const sourceTargets = Array.isArray(verifyResult?.targets) && verifyResult.targets.length
+        ? verifyResult.targets
+        : (Array.isArray(fallbackTargets) ? fallbackTargets : []);
+    const entries = sourceTargets
+        .filter((target) => target?.key && target?.namespace)
+        .map((target) => [target.key, target.namespace]);
+    return entries.length ? Object.fromEntries(entries) : null;
 }
 
 export function isDeploymentCleanupHandoffError(error) {

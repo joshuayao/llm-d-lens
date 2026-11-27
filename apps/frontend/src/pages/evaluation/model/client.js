@@ -19,6 +19,8 @@ export function evaluationApi(path, options = {}) {
             const error = new Error(problemMessage(payload, response.status));
             error.status = response.status;
             error.details = payload?.detail || payload?.error;
+            error.body = payload;
+            error.code = payload?.code || payload?.detail?.code || null;
             return error;
         },
     });
@@ -28,12 +30,34 @@ export const listEvaluationWorkflows = () => evaluationApi("/api/v1/evaluate/wor
 export const listBenchmarkRuns = () => evaluationApi("/api/v1/evaluate/runs");
 
 export function createEvaluation(request) {
-    return evaluationApi("/api/v1/evaluate/evaluations", { method: "POST", body: JSON.stringify(request) });
+    const { target_namespaces: targetNamespaces, ...rest } = request || {};
+    const hasTargetNamespaces = targetNamespaces && typeof targetNamespaces === 'object' && Object.keys(targetNamespaces).length > 0;
+    return evaluationApi("/api/v1/evaluate/evaluations", {
+        method: "POST",
+        body: JSON.stringify({
+            ...rest,
+            ...(hasTargetNamespaces ? { target_namespaces: targetNamespaces } : {}),
+        }),
+    });
 }
 
-export function confirmEvaluationPlans(workflow, acknowledgeUnknown) {
+export function confirmEvaluationPlans(workflow, acknowledgeUnknown, targetNamespaces = null) {
+    const hasTargetNamespaces = targetNamespaces && typeof targetNamespaces === 'object' && Object.keys(targetNamespaces).length > 0;
     return evaluationApi(`/api/v1/evaluate/evaluations/${encodeURIComponent(workflow.id)}/confirm`, {
-        method: 'POST', body: JSON.stringify({ plan_digests: Object.fromEntries(workflow.prepared_plans.map(plan => [plan.id, plan.digest])), acknowledge_unknown: acknowledgeUnknown }),
+        method: 'POST',
+        body: JSON.stringify({
+            plan_digests: Object.fromEntries((workflow.prepared_plans || []).map(plan => [plan.id, plan.digest])),
+            acknowledge_unknown: acknowledgeUnknown,
+            ...(hasTargetNamespaces ? { target_namespaces: targetNamespaces } : {}),
+        }),
+    });
+}
+
+export function retryEvaluationWorkflow(workflowId, targetNamespaces = null) {
+    const hasTargetNamespaces = targetNamespaces && typeof targetNamespaces === 'object' && Object.keys(targetNamespaces).length > 0;
+    return evaluationApi(`/api/v1/evaluate/workflow-runs/${encodeURIComponent(workflowId)}/retry`, {
+        method: 'POST',
+        ...(hasTargetNamespaces ? { body: JSON.stringify({ target_namespaces: targetNamespaces }) } : {}),
     });
 }
 

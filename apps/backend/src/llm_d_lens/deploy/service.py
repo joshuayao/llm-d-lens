@@ -899,6 +899,29 @@ class GuideAdapterDeploymentService:
                 and execution.namespace
                 and is_deletable_deployment_namespace(execution.namespace, cluster_id=cluster_id)
             ):
+                existing_diag = (
+                    execution.diagnostics.value
+                    if execution.diagnostics is not None and isinstance(execution.diagnostics.value, dict)
+                    else {}
+                )
+                existing_cleanup = (
+                    existing_diag.get("cleanup") if isinstance(existing_diag.get("cleanup"), dict) else {}
+                )
+                existing_phase1 = (
+                    existing_cleanup.get("phase1") if isinstance(existing_cleanup.get("phase1"), dict) else None
+                )
+                if (
+                    existing_phase1 is not None
+                    and existing_phase1.get("phase1Completed") is True
+                    and existing_phase1.get("namespace") == execution.namespace
+                    and existing_phase1.get("clusterId") == cluster_id
+                    and isinstance(existing_phase1.get("adminCleanup"), dict)
+                ):
+                    detail = str(
+                        existing_phase1["adminCleanup"].get("detail")
+                        or "Namespace cleanup requires Orchestration administrator privileges."
+                    )
+                    raise DeploymentCleanupPermissionDenied(detail, payload=existing_phase1)
                 storage_volume_id: str | None = None
                 if execution.configuration_artifacts:
                     try:

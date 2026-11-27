@@ -98,11 +98,14 @@ class DeploymentRunWorker:
 
     async def cancel_evaluation_deployment(self, run_id: str) -> None:
         """Settle provisioning, then remove resources owned by a cancelled evaluation."""
+        from llm_d_lens.deploy.executions import DeploymentCleanupPermissionDenied
+
         await self._cancel_and_wait(run_id)
         run = self._store.get_run(run_id)
         if run is None:
             return
-        errors = []
+        errors: list[str] = []
+        permission_denied: list[DeploymentCleanupPermissionDenied] = []
         for case in list(run.cases):
             if not case.execution_id or case.status in {
                 DeploymentCaseStatus.CLEANED,
@@ -120,10 +123,14 @@ class DeploymentRunWorker:
                 _case, cleaned = await self.clean_case(run_id, case.id)
                 if cleaned.status not in {DeploymentStatus.CLEANED, DeploymentStatus.CLEANED_UP}:
                     raise ValueError("cleanup did not confirm resource removal")
+            except DeploymentCleanupPermissionDenied as error:
+                permission_denied.append(error)
             except Exception as error:
                 errors.append(f"deployment case {case.id}: {error}")
         if errors:
             raise ValueError("; ".join(errors))
+        if permission_denied:
+            raise permission_denied[0]
         run = self._store.get_run(run_id)
         if run is not None:
             run.status = DeploymentRunStatus.CANCELLED
