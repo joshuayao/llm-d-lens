@@ -774,9 +774,11 @@ async def test_precise_routing_deploy_and_calibration_wire_post_renderer(tmp_pat
 
     monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
     helm_commands: list[tuple[str, ...]] = []
+    helm_envs: list[dict[str, str] | None] = []
 
-    async def fake_exec(*command, **_kwargs):
+    async def fake_exec(*command, **kwargs):
         helm_commands.append(command)
+        helm_envs.append(kwargs.get("env"))
         proc = Mock(returncode=0)
         proc.communicate = AsyncMock(return_value=(b"", b""))
         return proc
@@ -847,3 +849,18 @@ async def test_precise_routing_deploy_and_calibration_wire_post_renderer(tmp_pat
         environment=None,
         kubectl_path=None,
     )
+
+    # Helm v4 direct deploy + calibration wire plugin name + HELM_PLUGINS env
+    helm_commands.clear()
+    helm_envs.clear()
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", lambda _helm_bin="helm": 4)
+    v4_exec = await adapter.deploy(artifact, {"namespace": "llmd-run"})
+    assert helm_commands[0][-2:] == ("--post-renderer", "strip-metrics-auth-rbac")
+    assert helm_envs[0] is not None
+    assert "HELM_PLUGINS" in helm_envs[0]
+    helm_commands.clear()
+    helm_envs.clear()
+    await adapter._apply_calibrated_router_values(v4_exec, 4321)
+    assert helm_commands[0][-2:] == ("--post-renderer", "strip-metrics-auth-rbac")
+    assert helm_envs[0] is not None
+    assert "HELM_PLUGINS" in helm_envs[0]

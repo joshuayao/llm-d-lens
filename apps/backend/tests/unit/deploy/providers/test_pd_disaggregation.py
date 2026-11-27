@@ -496,9 +496,11 @@ async def test_pd_disaggregation_deploy_wires_post_renderer_for_bundle_and_direc
     manifest.write_text("kind: Deployment\n", encoding="utf-8")
 
     helm_commands: list[tuple[str, ...]] = []
+    helm_envs: list[dict[str, str] | None] = []
 
-    async def fake_exec(*command, **_kwargs):
+    async def fake_exec(*command, **kwargs):
         helm_commands.append(command)
+        helm_envs.append(kwargs.get("env"))
         proc = Mock(returncode=0)
         proc.communicate = AsyncMock(return_value=(b"", b""))
         return proc
@@ -564,3 +566,12 @@ async def test_pd_disaggregation_deploy_wires_post_renderer_for_bundle_and_direc
     await adapter.deploy(bundle_artifact, {"namespace": "llm-d-bench-run"})
     upgrade_cmd = next(cmd for cmd in bundle_commands if cmd[1] == "upgrade")
     assert "--post-renderer" in upgrade_cmd
+
+    # Helm v4 direct deploy wires plugin name + HELM_PLUGINS env
+    helm_commands.clear()
+    helm_envs.clear()
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", lambda _helm_bin="helm": 4)
+    await adapter.deploy(artifact, {"namespace": "llm-d-bench-run"})
+    assert helm_commands[0][-2:] == ("--post-renderer", "strip-metrics-auth-rbac")
+    assert helm_envs[0] is not None
+    assert "HELM_PLUGINS" in helm_envs[0]

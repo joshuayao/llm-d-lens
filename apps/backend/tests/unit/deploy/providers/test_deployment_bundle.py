@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import stat
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
@@ -15,8 +18,11 @@ import yaml
 from llm_d_lens.deploy import capabilities
 from llm_d_lens.deploy.providers import deployment_bundle
 from llm_d_lens.deploy.providers.deployment_bundle import (
+    HelmPostRenderer,
+    _helm_major_version,
     _is_metrics_auth_binding,
     _is_metrics_auth_role,
+    active_helm_post_renderer_plugins_dir,
     filter_helm_manifest_yaml,
     freeze_deployment_bundle,
     helm_metrics_auth_post_renderer,
@@ -24,6 +30,7 @@ from llm_d_lens.deploy.providers.deployment_bundle import (
     install_deployment_bundle,
     resolve_helm_rbac_mode,
     strip_validated_metrics_auth_rbac,
+    subprocess_bundle_runner,
     validate_deployment_bundle,
     validate_frozen_bundle,
 )
@@ -322,9 +329,60 @@ def test_filter_helm_manifest_yaml_rejects_empty_after_stripping():
         filter_helm_manifest_yaml(manifest, "llmd-run")
 
 
+def test_helm_major_version_detection_and_caching(monkeypatch):
+    _helm_major_version.cache_clear()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        if cmd == ["/opt/helm3/helm", "version", "--template={{.Version}}"]:
+            return SimpleNamespace(returncode=0, stdout="v3.19.0\n", stderr="")
+        if cmd == ["/opt/helm4/helm", "version", "--template={{.Version}}"]:
+            return SimpleNamespace(returncode=0, stdout="v4.0.0\n", stderr="")
+        if cmd == ["/opt/helm4-build/helm", "version", "--template={{.Version}}"]:
+            return SimpleNamespace(returncode=0, stdout="v4.1.2+g1234\n", stderr="")
+        if cmd == ["/opt/fallback/helm", "version", "--template={{.Version}}"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="unknown flag")
+        if cmd == ["/opt/fallback/helm", "version", "--short"]:
+            return SimpleNamespace(returncode=0, stdout="v4.0.1+gabcd\n", stderr="")
+        if cmd == ["/opt/garbage/helm", "version", "--template={{.Version}}"]:
+            return SimpleNamespace(returncode=0, stdout="unparseable", stderr="")
+        if cmd == ["/opt/garbage/helm", "version", "--short"]:
+            return SimpleNamespace(returncode=0, stdout="still-weird", stderr="")
+        if cmd[0] == "/opt/missing/helm":
+            raise FileNotFoundError("no such binary")
+        if cmd[0] == "/opt/timeout/helm":
+            raise subprocess.TimeoutExpired(cmd, 5)
+        return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(deployment_bundle.subprocess, "run", fake_run)
+    try:
+        assert _helm_major_version("/opt/helm3/helm") == 3
+        assert _helm_major_version(Path("/opt/helm3/helm")) == 3  # normalized cache hit
+        assert calls == [["/opt/helm3/helm", "version", "--template={{.Version}}"]]
+
+        assert _helm_major_version("/opt/helm4/helm") == 4
+        assert _helm_major_version("/opt/helm4-build/helm") == 4
+        assert _helm_major_version("/opt/fallback/helm") == 4
+        assert _helm_major_version("/opt/garbage/helm") == 3
+        assert _helm_major_version("/opt/missing/helm") == 3
+        assert _helm_major_version("/opt/timeout/helm") == 3
+    finally:
+        _helm_major_version.cache_clear()
+
+
 def test_helm_post_renderer_permissions_and_cleanup(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
-    with helm_metrics_auth_post_renderer("llmd-run") as wrapper:
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", lambda _helm_bin="helm": 3)
+    with helm_metrics_auth_post_renderer("llmd-run") as post_renderer:
+        assert isinstance(post_renderer, HelmPostRenderer)
+        wrapper = post_renderer.script_path
+        assert str(post_renderer) == str(wrapper)
+        assert post_renderer.helm_args() == ["--post-renderer", str(wrapper)]
+        assert post_renderer.plugins_dir is None
+        assert post_renderer.subprocess_env() is None
+        assert post_renderer.subprocess_env({"KUBECONFIG": "/k"}) == {"KUBECONFIG": "/k"}
+        assert active_helm_post_renderer_plugins_dir() is None
         assert wrapper.name == "strip-metrics-auth-rbac"
         assert wrapper.is_file()
         assert wrapper.parent.is_relative_to(helm_post_renderer_root())
@@ -337,6 +395,97 @@ def test_helm_post_renderer_permissions_and_cleanup(tmp_path: Path, monkeypatch)
 
     with pytest.raises(ValueError, match="DNS-1123"), helm_metrics_auth_post_renderer("INVALID_NS"):
         pass
+
+
+def test_helm_v4_post_renderer_plugin_manifest_env_and_context_cleanup(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", lambda _helm_bin="helm": 4)
+    monkeypatch.setenv("HELM_PLUGINS", "/ambient/evil-plugins")
+    base_env = {"KUBECONFIG": "/tmp/kubeconfig", "HELM_PLUGINS": "/external/plugins"}
+
+    assert active_helm_post_renderer_plugins_dir() is None
+    with helm_metrics_auth_post_renderer("llmd-run", helm_bin="/opt/helm4") as post_renderer:
+        assert str(post_renderer) == "strip-metrics-auth-rbac"
+        assert post_renderer.helm_args() == ["--post-renderer", "strip-metrics-auth-rbac"]
+        plugins_dir = post_renderer.plugins_dir
+        assert plugins_dir is not None
+        assert active_helm_post_renderer_plugins_dir() == plugins_dir
+        assert plugins_dir.parent == post_renderer.script_path.parent
+        assert stat.S_IMODE(plugins_dir.stat().st_mode) == 0o700
+        plugin_dir = plugins_dir / "strip-metrics-auth-rbac"
+        assert stat.S_IMODE(plugin_dir.stat().st_mode) == 0o700
+        plugin_yaml = plugin_dir / "plugin.yaml"
+        assert stat.S_IMODE(plugin_yaml.stat().st_mode) == 0o600
+        manifest = yaml.safe_load(plugin_yaml.read_text(encoding="utf-8"))
+        assert manifest == {
+            "apiVersion": "v1",
+            "type": "postrenderer/v1",
+            "name": "strip-metrics-auth-rbac",
+            "version": "0.1.0",
+            "description": (
+                "Strip validated EPP metrics-auth ClusterRole and ClusterRoleBinding "
+                "for bootstrapped non-admin installs."
+            ),
+            "runtime": "subprocess",
+            "runtimeConfig": {"platformCommand": [{"command": str(post_renderer.script_path)}]},
+        }
+
+        scoped_env = post_renderer.subprocess_env(base_env)
+        assert scoped_env == {"KUBECONFIG": "/tmp/kubeconfig", "HELM_PLUGINS": str(plugins_dir)}
+        assert base_env["HELM_PLUGINS"] == "/external/plugins"
+        default_env = post_renderer.subprocess_env()
+        assert default_env is not None
+        assert default_env["HELM_PLUGINS"] == str(plugins_dir)
+        assert os.environ["HELM_PLUGINS"] == "/ambient/evil-plugins"
+
+        parent_dir = post_renderer.script_path.parent
+    assert not parent_dir.exists()
+    assert active_helm_post_renderer_plugins_dir() is None
+
+    # ContextVar also resets when an exception escapes the context block
+    with pytest.raises(RuntimeError, match="boom"), helm_metrics_auth_post_renderer("llmd-run"):
+        assert active_helm_post_renderer_plugins_dir() is not None
+        raise RuntimeError("boom")
+    assert active_helm_post_renderer_plugins_dir() is None
+
+
+def test_post_renderer_preserves_helm4_postrender_filename_annotation(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", lambda _helm_bin="helm": 4)
+
+    role = _metrics_auth_role()
+    role["metadata"]["annotations"] = {"postrenderer.helm.sh/postrender-filename": "templates/rbac.yaml"}
+    binding = _metrics_auth_binding()
+    binding["metadata"]["annotations"] = {"postrenderer.helm.sh/postrender-filename": "templates/rbac.yaml"}
+    service = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": "epp",
+            "namespace": "llmd-run",
+            "annotations": {
+                "postrenderer.helm.sh/postrender-filename": "templates/service.yaml",
+                "custom.io/keep": "yes",
+            },
+        },
+    }
+    raw_yaml = yaml.safe_dump_all([role, binding, service], sort_keys=False)
+
+    filtered_py = filter_helm_manifest_yaml(raw_yaml, "llmd-run")
+    kept_py = [doc for doc in yaml.safe_load_all(filtered_py) if doc is not None]
+    assert kept_py == [service]
+
+    with helm_metrics_auth_post_renderer("llmd-run") as post_renderer:
+        completed = subprocess.run(
+            [str(post_renderer.script_path)],
+            input=raw_yaml,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        kept_script = [doc for doc in yaml.safe_load_all(completed.stdout) if doc is not None]
+        assert kept_script == [service]
 
 
 def _write_local_router_chart(chart_dir: Path) -> None:
@@ -478,9 +627,10 @@ def test_real_helm_post_renderer_strips_metrics_auth_rbac_and_preserves_epp_auth
     raw_docs = [doc for doc in yaml.safe_load_all(raw.stdout) if doc is not None]
     assert [doc["kind"] for doc in raw_docs] == ["ClusterRole", "ClusterRoleBinding", "Service", "Deployment"]
 
-    with helm_metrics_auth_post_renderer("llmd-run") as post_renderer:
-        cmd = [*raw_cmd, "--post-renderer", str(post_renderer)]
-        completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    with helm_metrics_auth_post_renderer("llmd-run", helm_bin=helm_bin) as post_renderer:
+        cmd = [*raw_cmd, *post_renderer.helm_args()]
+        env = post_renderer.subprocess_env()
+        completed = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
         assert completed.returncode == 0, completed.stderr
         docs = [doc for doc in yaml.safe_load_all(completed.stdout) if doc is not None]
         assert [doc["kind"] for doc in docs] == ["Service", "Deployment"]
@@ -490,6 +640,7 @@ def test_real_helm_post_renderer_strips_metrics_auth_rbac_and_preserves_epp_auth
 
         failing = subprocess.run(
             [*cmd, "--set", "router.extraUnexpected=true"],
+            env=env,
             capture_output=True,
             text=True,
             check=False,
@@ -604,6 +755,7 @@ async def test_resolve_helm_rbac_mode_propagates_auth_and_unavailable_and_ignore
 @pytest.mark.asyncio
 async def test_install_and_validate_frozen_bundle_attach_post_renderer_when_stripping(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "scratch")
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", lambda _helm_bin="helm": 3)
     rendered_with_rbac = yaml.safe_dump_all(
         [
             _metrics_auth_role(),
@@ -684,3 +836,67 @@ async def test_install_and_validate_frozen_bundle_attach_post_renderer_when_stri
             command_runner=drifted_runner,
             strip_metrics_auth_rbac=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_subprocess_bundle_runner_helm_v4_env_isolation(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "scratch")
+    detected_helm_bins: list[str | Path] = []
+
+    def fake_major(helm_bin="helm"):
+        detected_helm_bins.append(helm_bin)
+        return 4
+
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", fake_major)
+
+    spawned: list[tuple[list[str], dict[str, str] | None]] = []
+    rendered_with_rbac = yaml.safe_dump_all(
+        [
+            _metrics_auth_role(),
+            _metrics_auth_binding(),
+            {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "epp"}},
+        ],
+        sort_keys=False,
+    )
+    rendered_without_rbac = "---\napiVersion: v1\nkind: Service\nmetadata:\n  name: epp\n---\n"
+
+    async def fake_spawn(command, **kwargs):
+        spawned.append((command, kwargs.get("env")))
+        if command[1] == "template":
+            out = rendered_with_rbac.encode()
+        elif command[1] == "install":
+            out = json.dumps({"manifest": rendered_without_rbac}).encode()
+        elif command[1:3] == ["get", "manifest"]:
+            out = rendered_without_rbac.encode()
+        else:
+            out = b"ok"
+        return SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(out, b"")))
+
+    monkeypatch.setattr(deployment_bundle, "spawn", fake_spawn)
+
+    monkeypatch.delenv("HELM_PLUGINS", raising=False)
+    base_env = {"KUBECONFIG": "/tmp/kubeconfig"}
+    runner = subprocess_bundle_runner(Path("/opt/helm4/helm"), Path("/opt/kubectl"), base_env)
+    assert runner._helm_path == Path("/opt/helm4/helm")
+
+    await install_deployment_bundle(
+        _bundle(),
+        guide="optimized-baseline",
+        source_commit="a" * 40,
+        namespace="llmd-run",
+        command_runner=runner,
+        output_root=tmp_path / "out",
+        strip_metrics_auth_rbac=True,
+    )
+    assert detected_helm_bins == [Path("/opt/helm4/helm")]
+    template_call = next(item for item in spawned if item[0][:2] == ["/opt/helm4/helm", "template"])
+    upgrade_call = next(item for item in spawned if item[0][:2] == ["/opt/helm4/helm", "upgrade"])
+    get_call = next(item for item in spawned if item[0][:3] == ["/opt/helm4/helm", "get", "manifest"])
+    assert template_call[1] == base_env
+    assert get_call[1] == base_env
+    assert upgrade_call[0][-2:] == ["--post-renderer", "strip-metrics-auth-rbac"]
+    assert upgrade_call[1] is not None
+    assert upgrade_call[1]["KUBECONFIG"] == "/tmp/kubeconfig"
+    assert "HELM_PLUGINS" in upgrade_call[1]
+    assert "HELM_PLUGINS" not in base_env
+    assert "HELM_PLUGINS" not in os.environ

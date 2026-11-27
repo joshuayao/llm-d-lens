@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import contextvars
+import functools
 import hashlib
 import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
 from collections.abc import Awaitable, Callable, Iterator, Mapping
@@ -372,9 +375,86 @@ if __name__ == "__main__":
 """
 
 
+_ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "_ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR",
+    default=None,
+)
+
+
+def active_helm_post_renderer_plugins_dir() -> Path | None:
+    """Return the task-local Helm v4 post-renderer plugins directory when active."""
+    return _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.get()
+
+
+def _parse_helm_major_version(raw: str) -> int | None:
+    match = re.search(r"(?:^|\bv)(\d+)\.\d+", raw.strip())
+    if match:
+        return int(match.group(1))
+    return None
+
+
+@functools.lru_cache(maxsize=16)
+def _helm_major_version_cached(helm_bin: str) -> int:
+    for args in (["version", "--template={{.Version}}"], ["version", "--short"]):
+        try:
+            completed = subprocess.run(
+                [helm_bin, *args],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if completed.returncode == 0:
+            major = _parse_helm_major_version(completed.stdout or "")
+            if major is not None:
+                return major
+    return 3
+
+
+def _helm_major_version(helm_bin: str | Path = "helm") -> int:
+    """Detect and cache the Helm CLI major version (defaults to 3 when unavailable)."""
+    normalized = str(helm_bin or "helm").strip() or "helm"
+    return _helm_major_version_cached(normalized)
+
+
+_helm_major_version.cache_clear = _helm_major_version_cached.cache_clear  # type: ignore[attr-defined]
+_helm_major_version.cache_info = _helm_major_version_cached.cache_info  # type: ignore[attr-defined]
+
+
+@dataclass(frozen=True)
+class HelmPostRenderer:
+    """Handle for an active Helm metrics-auth RBAC post-renderer (Helm v3 path or Helm v4 plugin)."""
+
+    argument: str
+    script_path: Path
+    plugins_dir: Path | None = None
+    major_version: int = 3
+
+    def __str__(self) -> str:
+        return self.argument
+
+    def helm_args(self) -> list[str]:
+        return ["--post-renderer", self.argument]
+
+    def subprocess_env(self, base_env: Mapping[str, str] | None = None) -> dict[str, str] | None:
+        """Return per-invocation env with ``HELM_PLUGINS`` isolated to ``plugins_dir`` on Helm v4.
+
+        Strictly sets ``HELM_PLUGINS`` to ``str(self.plugins_dir)`` instead of
+        appending external directories so no ambient plugin can shadow
+        ``strip-metrics-auth-rbac``. Never mutates ``os.environ`` or ``base_env``.
+        """
+        if self.plugins_dir is None:
+            return dict(base_env) if base_env is not None else None
+        env = dict(os.environ if base_env is None else base_env)
+        env["HELM_PLUGINS"] = str(self.plugins_dir)
+        return env
+
+
 @contextlib.contextmanager
-def helm_metrics_auth_post_renderer(namespace: str) -> Iterator[Path]:
-    """Yield an owner-only executable Helm ``--post-renderer`` scoped to ``namespace``."""
+def helm_metrics_auth_post_renderer(namespace: str, *, helm_bin: str | Path = "helm") -> Iterator[HelmPostRenderer]:
+    """Yield an owner-only Helm ``--post-renderer`` handle scoped to ``namespace``."""
     if not isinstance(namespace, str) or not _DNS1123_LABEL.fullmatch(namespace):
         raise ValueError("Helm post-renderer namespace must be a valid DNS-1123 label")
     root = helm_post_renderer_root()
@@ -392,7 +472,50 @@ def helm_metrics_auth_post_renderer(namespace: str) -> Iterator[Path]:
             encoding="utf-8",
         )
         os.chmod(wrapper, 0o700)
-        yield wrapper
+        major = _helm_major_version(helm_bin)
+        if major >= 4:
+            plugins_dir = tmpdir / "plugins"
+            plugins_dir.mkdir(mode=0o700)
+            os.chmod(plugins_dir, 0o700)
+            plugin_dir = plugins_dir / "strip-metrics-auth-rbac"
+            plugin_dir.mkdir(mode=0o700)
+            os.chmod(plugin_dir, 0o700)
+            plugin_yaml = plugin_dir / "plugin.yaml"
+            plugin_manifest = {
+                "apiVersion": "v1",
+                "type": "postrenderer/v1",
+                "name": "strip-metrics-auth-rbac",
+                "version": "0.1.0",
+                "description": (
+                    "Strip validated EPP metrics-auth ClusterRole and ClusterRoleBinding "
+                    "for bootstrapped non-admin installs."
+                ),
+                "runtime": "subprocess",
+                "runtimeConfig": {"platformCommand": [{"command": str(wrapper)}]},
+            }
+            plugin_yaml.write_text(yaml.safe_dump(plugin_manifest, sort_keys=False), encoding="utf-8")
+            os.chmod(plugin_yaml, 0o600)
+            token = _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.set(plugins_dir)
+            try:
+                yield HelmPostRenderer(
+                    argument="strip-metrics-auth-rbac",
+                    script_path=wrapper,
+                    plugins_dir=plugins_dir,
+                    major_version=major,
+                )
+            finally:
+                _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.reset(token)
+        else:
+            token = _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.set(None)
+            try:
+                yield HelmPostRenderer(
+                    argument=str(wrapper),
+                    script_path=wrapper,
+                    plugins_dir=None,
+                    major_version=major,
+                )
+            finally:
+                _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.reset(token)
 
 
 class _KubectlSubprocessRunner:
@@ -604,8 +727,9 @@ async def validate_frozen_bundle(
         "json",
     ]
     if strip_metrics_auth_rbac:
-        with helm_metrics_auth_post_renderer(namespace) as post_renderer:
-            status, stdout, stderr = await command_runner([*command, "--post-renderer", str(post_renderer)])
+        helm_bin = getattr(command_runner, "_helm_path", "helm")
+        with helm_metrics_auth_post_renderer(namespace, helm_bin=helm_bin) as post_renderer:
+            status, stdout, stderr = await command_runner([*command, *post_renderer.helm_args()])
     else:
         status, stdout, stderr = await command_runner(command)
     if status:
@@ -635,9 +759,17 @@ def subprocess_bundle_runner(
 
     async def run(command: list[str]) -> tuple[int, str, str]:
         executable = helm_path if command[0] == "helm" else kubectl_path
+        spawn_env = environment
+        plugins_dir = active_helm_post_renderer_plugins_dir()
+        has_post_renderer = "--post-renderer" in command or any(item.startswith("--post-renderer=") for item in command)
+        if command and command[0] == "helm" and has_post_renderer and plugins_dir is not None:
+            spawn_env = {
+                **(os.environ if environment is None else environment),
+                "HELM_PLUGINS": str(plugins_dir),
+            }
         process = await spawn(
             [str(executable), *command[1:]],
-            env=environment,
+            env=spawn_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -648,6 +780,7 @@ def subprocess_bundle_runner(
             stderr.decode(errors="replace"),
         )
 
+    run._helm_path = helm_path  # type: ignore[attr-defined]
     return run
 
 
@@ -828,8 +961,9 @@ async def install_deployment_bundle(
     frozen_options = ["--skip-crds", "--no-hooks"] if bundle.get("frozen") else []
     install_command = ["helm", "upgrade", "--install", *helm_common, *frozen_options]
     if strip_metrics_auth_rbac:
-        with helm_metrics_auth_post_renderer(namespace) as post_renderer:
-            status, stdout, stderr = await command_runner([*install_command, "--post-renderer", str(post_renderer)])
+        helm_bin = getattr(command_runner, "_helm_path", "helm")
+        with helm_metrics_auth_post_renderer(namespace, helm_bin=helm_bin) as post_renderer:
+            status, stdout, stderr = await command_runner([*install_command, *post_renderer.helm_args()])
     else:
         status, stdout, stderr = await command_runner(install_command)
     if status != 0:

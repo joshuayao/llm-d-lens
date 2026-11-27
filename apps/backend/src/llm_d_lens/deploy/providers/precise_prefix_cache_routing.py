@@ -328,12 +328,13 @@ class PrecisePrefixCacheRoutingAdapter:
                 *router_data_plane_args(execution_context),
             ]
             if strip_rbac:
-                with deployment_bundle.helm_metrics_auth_post_renderer(namespace) as post_renderer:
+                with deployment_bundle.helm_metrics_auth_post_renderer(
+                    namespace, helm_bin=self._helm_path
+                ) as post_renderer:
                     helm = await asyncio.create_subprocess_exec(
                         *helm_command,
-                        "--post-renderer",
-                        str(post_renderer),
-                        env=environment,
+                        *post_renderer.helm_args(),
+                        env=post_renderer.subprocess_env(environment),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
@@ -609,9 +610,12 @@ class PrecisePrefixCacheRoutingAdapter:
             if status != 0:
                 raise RuntimeError((stderr or stdout or "calibrated Router Helm render failed").strip())
             if strip_rbac:
-                with deployment_bundle.helm_metrics_auth_post_renderer(execution["namespace"]) as post_renderer:
+                helm_bin = getattr(self._bundle_command_runner, "_helm_path", getattr(self, "_helm_path", "helm"))
+                with deployment_bundle.helm_metrics_auth_post_renderer(
+                    execution["namespace"], helm_bin=helm_bin
+                ) as post_renderer:
                     status, stdout, stderr = await self._bundle_command_runner(
-                        ["helm", "upgrade", "--install", *common, "--post-renderer", str(post_renderer)]
+                        ["helm", "upgrade", "--install", *common, *post_renderer.helm_args()]
                     )
             else:
                 status, stdout, stderr = await self._bundle_command_runner(["helm", "upgrade", "--install", *common])
@@ -658,12 +662,13 @@ class PrecisePrefixCacheRoutingAdapter:
                 *router_data_plane_args(execution),
             ]
             if strip_rbac:
-                with deployment_bundle.helm_metrics_auth_post_renderer(execution["namespace"]) as post_renderer:
+                with deployment_bundle.helm_metrics_auth_post_renderer(
+                    execution["namespace"], helm_bin=self._helm_path
+                ) as post_renderer:
                     helm = await asyncio.create_subprocess_exec(
                         *helm_command,
-                        "--post-renderer",
-                        str(post_renderer),
-                        env=environment,
+                        *post_renderer.helm_args(),
+                        env=post_renderer.subprocess_env(environment),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )

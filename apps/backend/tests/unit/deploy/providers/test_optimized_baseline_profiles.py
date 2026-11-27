@@ -838,3 +838,30 @@ async def test_optimized_baseline_and_prepared_router_wire_post_renderer_when_no
         environment=None,
         kubectl_path=None,
     )
+
+    # Helm v4 passes plugin name and sets active HELM_PLUGINS context for runner
+    commands.clear()
+    seen_plugins_dirs: list[Path | None] = []
+
+    async def recording_v4_runner(command):
+        commands.append(command)
+        seen_plugins_dirs.append(deployment_bundle.active_helm_post_renderer_plugins_dir())
+        return 0, "kind: Deployment\n", ""
+
+    recording_v4_runner._helm_path = Path("/opt/helm4")
+    adapter._command_runner = recording_v4_runner
+    seen_bins: list[object] = []
+
+    def fake_v4(helm_bin="helm"):
+        seen_bins.append(helm_bin)
+        return 4
+
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", fake_v4)
+    await adapter.install_published_router(
+        GuideDeploymentArtifact("optimized-baseline", "hash", manifest_ref=str(overlay), source_ref="a" * 40),
+        {"namespace": "test-run"},
+    )
+    assert seen_bins == [Path("/opt/helm4")]
+    assert commands[0][-2:] == ["--post-renderer", "strip-metrics-auth-rbac"]
+    assert seen_plugins_dirs == [seen_plugins_dirs[0]] and seen_plugins_dirs[0] is not None
+    assert deployment_bundle.active_helm_post_renderer_plugins_dir() is None

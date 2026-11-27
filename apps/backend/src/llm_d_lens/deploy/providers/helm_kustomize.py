@@ -251,10 +251,12 @@ class HelmKustomizeGuideAdapter:
                 helm_command.extend(["--values", str(values)])
             helm_command.extend(self._data_plane_args(execution_context))
             if strip_rbac:
-                with deployment_bundle.helm_metrics_auth_post_renderer(namespace) as post_renderer:
+                with deployment_bundle.helm_metrics_auth_post_renderer(
+                    namespace, helm_bin=self._helm_path
+                ) as post_renderer:
                     helm = await spawn(
-                        [*helm_command, "--post-renderer", str(post_renderer)],
-                        env=environment,
+                        [*helm_command, *post_renderer.helm_args()],
+                        env=post_renderer.subprocess_env(environment),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )

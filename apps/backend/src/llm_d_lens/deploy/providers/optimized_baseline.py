@@ -248,8 +248,9 @@ class OptimizedBaselineGuideAdapter(GuideAdapter):
             *self._gateway_mode_args(execution_context),
         ]
         if strip_rbac:
-            with deployment_bundle.helm_metrics_auth_post_renderer(namespace) as post_renderer:
-                status, stdout, stderr = await self._command_runner([*command, "--post-renderer", str(post_renderer)])
+            helm_bin = getattr(self._command_runner, "_helm_path", "helm")
+            with deployment_bundle.helm_metrics_auth_post_renderer(namespace, helm_bin=helm_bin) as post_renderer:
+                status, stdout, stderr = await self._command_runner([*command, *post_renderer.helm_args()])
         else:
             status, stdout, stderr = await self._command_runner(command)
         if status != 0:
@@ -319,10 +320,9 @@ class OptimizedBaselineGuideAdapter(GuideAdapter):
             *self._gateway_mode_args(execution_context),
         ]
         if strip_rbac:
-            with deployment_bundle.helm_metrics_auth_post_renderer(namespace) as post_renderer:
-                status, stdout, stderr = await self._command_runner(
-                    [*helm_command, "--post-renderer", str(post_renderer)]
-                )
+            helm_bin = getattr(self._command_runner, "_helm_path", "helm")
+            with deployment_bundle.helm_metrics_auth_post_renderer(namespace, helm_bin=helm_bin) as post_renderer:
+                status, stdout, stderr = await self._command_runner([*helm_command, *post_renderer.helm_args()])
         else:
             status, stdout, stderr = await self._command_runner(helm_command)
         if status != 0:

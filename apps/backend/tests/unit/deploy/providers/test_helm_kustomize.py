@@ -373,9 +373,11 @@ async def test_helm_kustomize_deploy_wires_post_renderer_for_direct_and_bundle(t
 
     monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
     spawned: list[list[str]] = []
+    spawn_envs: list[dict[str, str] | None] = []
 
-    async def fake_spawn(command, **_kwargs):
+    async def fake_spawn(command, **kwargs):
         spawned.append(command)
+        spawn_envs.append(kwargs.get("env"))
         proc = Mock(returncode=0)
         proc.communicate = AsyncMock(return_value=(b"", b""))
         return proc
@@ -453,3 +455,12 @@ async def test_helm_kustomize_deploy_wires_post_renderer_for_direct_and_bundle(t
     await adapter.deploy(bundle_artifact, {"namespace": "llmd-run"})
     upgrade_cmd = next(cmd for cmd in bundle_commands if cmd[1] == "upgrade")
     assert "--post-renderer" in upgrade_cmd
+
+    # Helm v4 direct deploy wires plugin name + HELM_PLUGINS env without mutating os.environ
+    spawned.clear()
+    spawn_envs.clear()
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", lambda _helm_bin="helm": 4)
+    await adapter.deploy(artifact, {"namespace": "llmd-run"})
+    assert spawned[0][-2:] == ["--post-renderer", "strip-metrics-auth-rbac"]
+    assert spawn_envs[0] is not None
+    assert "HELM_PLUGINS" in spawn_envs[0]
