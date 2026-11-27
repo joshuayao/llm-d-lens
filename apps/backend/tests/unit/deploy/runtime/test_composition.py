@@ -619,3 +619,83 @@ async def test_published_deployment_names_scope_commands(tmp_path):
         )
     with pytest.raises(RuntimeConfigurationError):
         runner.register_published_deployments("default", ["published-decode"])
+
+
+def test_registered_guide_helm_validates_post_renderer_allowlist(tmp_path: Path, monkeypatch):
+    from llm_d_lens.deploy.providers import deployment_bundle
+
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
+    namespace = "llm-d-bench-router"
+    guide = RegisteredGuideRuntime(
+        guide_id="optimized-baseline",
+        source_ref="main",
+        content_hash="test",
+        maturity="supported",
+        manifest_path=tmp_path / "kustomization.yaml",
+        router_chart="oci://charts/router",
+        router_chart_version="1.0.0",
+        router_release_name="optimized-baseline",
+        router_base_values_path=tmp_path / "base.yaml",
+        router_values_path=tmp_path / "optimized.yaml",
+        neutral_router_values_path=tmp_path / "neutral.yaml",
+    )
+    runner = RegisteredGuideCommandRunner(
+        kubectl_path=tmp_path / "kubectl",
+        helm_path=tmp_path / "helm",
+        namespace_prefix="llm-d-bench-",
+        guide=guide,
+        timeout_seconds=30,
+        rendered_overlay_root=tmp_path,
+    )
+    install = [
+        "helm",
+        "upgrade",
+        "--install",
+        guide.router_release_name,
+        guide.router_chart,
+        "--namespace",
+        namespace,
+        "--version",
+        guide.router_chart_version,
+        "--values",
+        str(guide.router_base_values_path),
+        "--values",
+        str(guide.router_values_path),
+    ]
+    neutral_install = [*install[:-1], str(guide.neutral_router_values_path)]
+    uninstall = ["helm", "uninstall", guide.router_release_name, "--namespace", namespace]
+
+    with deployment_bundle.helm_metrics_auth_post_renderer(namespace) as script:
+        runner._validate_helm([*install, "--post-renderer", str(script)])
+        runner._validate_helm(
+            [*neutral_install, "--values", str(PLAINTEXT_EPP_VALUES_PATH), "--post-renderer", str(script)]
+        )
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*uninstall, "--post-renderer", str(script)])
+
+        # World-readable permissions rejected
+        script.chmod(0o755)
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*install, "--post-renderer", str(script)])
+        script.chmod(0o700)
+
+        # Symlink inside post-renderer root rejected
+        symlink_script = script.parent.parent / "symlink-dir"
+        symlink_script.mkdir(exist_ok=True)
+        symlink_path = symlink_script / "strip-metrics-auth-rbac"
+        symlink_path.symlink_to("/bin/sh")
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*install, "--post-renderer", str(symlink_path)])
+
+    # Arbitrary / outside-root / nonexistent scripts rejected
+    outside = tmp_path / "strip-metrics-auth-rbac"
+    outside.write_text("#!/bin/sh\n", encoding="utf-8")
+    outside.chmod(0o700)
+    with pytest.raises(RuntimeConfigurationError):
+        runner._validate_helm([*install, "--post-renderer", str(outside)])
+    with pytest.raises(RuntimeConfigurationError):
+        runner._validate_helm([*install, "--post-renderer", "/bin/sh"])
+    with pytest.raises(RuntimeConfigurationError):
+        runner._validate_helm(
+            [*install, "--post-renderer", str(tmp_path / "post-renderers/missing/strip-metrics-auth-rbac")]
+        )

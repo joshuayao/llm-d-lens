@@ -928,10 +928,30 @@ class RegisteredGuideCommandRunner:
                 for provider in ("istio", "gke")
             ),
         )
-        if command != uninstall and not any(
-            command == [*base, *suffix] for base in (install, neutral_install) for suffix in suffixes
-        ):
+        if command == uninstall:
+            return
+        candidate_command = command
+        if len(command) >= 2 and command[-2] == "--post-renderer":
+            self._validate_post_renderer(command[-1])
+            candidate_command = command[:-2]
+        if not any(candidate_command == [*base, *suffix] for base in (install, neutral_install) for suffix in suffixes):
             raise RuntimeConfigurationError("Helm command operation is outside the registered Guide plan")
+
+    @staticmethod
+    def _validate_post_renderer(candidate: str) -> None:
+        from llm_d_lens.deploy.providers.deployment_bundle import helm_post_renderer_root
+
+        path = Path(candidate)
+        if path.is_symlink() or path.name != "strip-metrics-auth-rbac":
+            raise RuntimeConfigurationError("Helm post-renderer script is outside the registered Guide plan")
+        root = helm_post_renderer_root().resolve()
+        try:
+            resolved = path.resolve(strict=True)
+            mode = os.stat(path).st_mode
+        except OSError as error:
+            raise RuntimeConfigurationError("Helm post-renderer script is unavailable") from error
+        if not path.is_file() or not resolved.is_relative_to(root) or resolved == root or (mode & 0o077) != 0:
+            raise RuntimeConfigurationError("Helm post-renderer script is outside the registered Guide plan")
 
     def _take_kubectl_evidence(self) -> list[CommandEvidence]:
         refs = self._kubectl.take_evidence_refs()

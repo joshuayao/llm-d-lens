@@ -510,3 +510,38 @@ async def test_cleanup_security_hardening_and_marker_validation(monkeypatch):
         runner=_VerifyRunner(valid_marker_doc, '{"items": null}'),
     )
     assert bad_pods_res["verified"] is False
+
+
+@pytest.mark.asyncio
+async def test_scan_orphan_namespaces_surfaces_403_and_401_and_covers_router_kinds(monkeypatch):
+    from llm_d_lens.deploy.capabilities import DeploymentClusterAuthError
+
+    monkeypatch.setenv("LLM_D_BENCH_NAMESPACE_PREFIX", "llmd-")
+
+    monkeypatch.setattr(
+        orphans,
+        "scoped_runner",
+        lambda _cid: _Runner(
+            namespaces=_Result(returncode=1, stderr='namespaces is forbidden: cannot list resource "namespaces"')
+        ),
+    )
+    with pytest.raises(orphans.OrphanScanPermissionDeniedError, match="forbidden"):
+        await orphans.scan_orphan_namespaces("cluster-a", store=_Store([]))
+
+    monkeypatch.setattr(
+        orphans,
+        "scoped_runner",
+        lambda _cid: _Runner(
+            namespaces=_Result(returncode=1, stderr="You must be logged in to the server (Unauthorized)")
+        ),
+    )
+    with pytest.raises(DeploymentClusterAuthError):
+        await orphans.scan_orphan_namespaces("cluster-a", store=_Store([]))
+
+    # Router chart in-namespace resource kinds are included, with workloads/autoscalers deleted before pods
+    pods_idx = orphans._IN_NAMESPACE_RESOURCE_TYPES.index("pods")
+    for kind in ("statefulsets.apps", "horizontalpodautoscalers.autoscaling"):
+        assert kind in orphans._IN_NAMESPACE_RESOURCE_TYPES
+        assert orphans._IN_NAMESPACE_RESOURCE_TYPES.index(kind) < pods_idx
+    assert "inferenceobjectives.llm-d.ai" in orphans._IN_NAMESPACE_RESOURCE_TYPES
+    assert "leases.coordination.k8s.io" in orphans._IN_NAMESPACE_RESOURCE_TYPES

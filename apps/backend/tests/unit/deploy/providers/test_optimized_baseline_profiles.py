@@ -751,3 +751,90 @@ def test_deploy_providers_reject_invalid_or_untagged_images(tmp_path, invalid_im
                 "runtime": {"image": invalid_image},
             }
         )
+
+
+@pytest.mark.asyncio
+async def test_optimized_baseline_and_prepared_router_wire_post_renderer_when_non_admin(tmp_path, monkeypatch):
+    from llm_d_lens.deploy.providers import deployment_bundle
+
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
+    adapter, overlay = _adapter(tmp_path)
+    commands: list[list[str]] = []
+
+    async def recording_runner(command):
+        commands.append(command)
+        return 0, "kind: Deployment\n", ""
+
+    adapter._command_runner = recording_runner
+    adapter._bundle_command_runner = recording_runner
+
+    monkeypatch.setattr(deployment_bundle, "resolve_helm_rbac_mode", AsyncMock(return_value=True))
+    artifact = GuideDeploymentArtifact(
+        "optimized-baseline",
+        "hash",
+        manifest_ref=str(overlay),
+        source_ref="a" * 40,
+        deployment_contract={"deploymentBundle": _bundle()},
+    )
+    await adapter.install_published_router(
+        artifact,
+        {"namespace": "test-run", "provenance": {"cluster_server_id": "cluster-1"}},
+    )
+    upgrade_cmd = next(cmd for cmd in commands if cmd[1] == "upgrade")
+    assert "--post-renderer" in upgrade_cmd
+    deployment_bundle.resolve_helm_rbac_mode.assert_awaited_with(
+        "test-run",
+        cluster_id="cluster-1",
+        environment=None,
+        kubectl_path=None,
+    )
+
+    commands.clear()
+    await adapter.install_published_router(
+        GuideDeploymentArtifact("optimized-baseline", "hash", manifest_ref=str(overlay), source_ref="a" * 40),
+        {"namespace": "test-run"},
+    )
+    assert "--post-renderer" in commands[0]
+
+    commands.clear()
+    from llm_d_lens.core.hashing import stable_hash
+    from llm_d_lens.deploy.providers.optimized_baseline import _tree_checksum
+
+    manifest_checksum = stable_hash(
+        {
+            "overlay": _tree_checksum(adapter._policy.overlay_path),
+            "router_values": adapter._policy.router_values_path.read_text(encoding="utf-8"),
+        }
+    )
+    await adapter.deploy(
+        GuideDeploymentArtifact(
+            "optimized-baseline",
+            "hash",
+            manifest_ref=str(overlay),
+            source_ref="source",
+            guide_content_hash="hash",
+            manifest_checksum=manifest_checksum,
+        ),
+        {"namespace": "test-run"},
+    )
+    helm_cmd = next(cmd for cmd in commands if cmd[0] == "helm")
+    apply_cmd = next(cmd for cmd in commands if cmd[:2] == ["kubectl", "apply"])
+    assert "--post-renderer" in helm_cmd
+    assert "--post-renderer" not in apply_cmd
+
+    # __new__-constructed adapter and ConfigurationManifestAdapter.validate_prepared_router(..., cluster_id=...)
+    validate_frozen = AsyncMock()
+    monkeypatch.setattr(deployment_bundle, "validate_frozen_bundle", validate_frozen)
+    bare_delegate = OptimizedBaselineGuideAdapter.__new__(OptimizedBaselineGuideAdapter)
+    bare_delegate._bundle_command_runner = recording_runner
+    manifest_adapter = ConfigurationManifestAdapter.__new__(ConfigurationManifestAdapter)
+    manifest_adapter._delegate = bare_delegate
+    await manifest_adapter.validate_prepared_router(artifact, "test-run", cluster_id="cluster-2")
+    validate_frozen.assert_awaited_once()
+    assert validate_frozen.call_args.kwargs["strip_metrics_auth_rbac"] is True
+    deployment_bundle.resolve_helm_rbac_mode.assert_awaited_with(
+        "test-run",
+        cluster_id="cluster-2",
+        environment=None,
+        kubectl_path=None,
+    )

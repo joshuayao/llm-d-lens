@@ -902,7 +902,7 @@ def _parse_manifest_hints(manifest: str | None) -> dict[str, Any]:
         kind = str(doc.get("kind") or "")
         if kind in {"LeaderWorkerSet", "DisaggregatedSet"}:
             uses_lws = True
-        if kind in {"InferencePool", "InferenceModelRewrite", "HTTPRoute", "ReferenceGrant"}:
+        if kind in {"InferencePool", "InferenceObjective", "InferenceModelRewrite", "HTTPRoute", "ReferenceGrant"}:
             uses_router = True
         if kind == "PersistentVolumeClaim":
             uses_storage = True
@@ -1354,6 +1354,7 @@ async def read_bootstrap_marker(
     marker_status = data.get("status") if isinstance(data.get("status"), str) else ""
     bootstrap_digest = data.get("bootstrapDigest") if isinstance(data.get("bootstrapDigest"), str) else None
     epp_auth_delegator = data.get("eppAuthDelegator") if isinstance(data.get("eppAuthDelegator"), str) else None
+    epp_subject_scope = data.get("eppSubjectScope") if isinstance(data.get("eppSubjectScope"), str) else None
     prepared_request = data.get("preparedRequest") if isinstance(data.get("preparedRequest"), str) else None
     subject_kind = data.get("subjectKind") if isinstance(data.get("subjectKind"), str) else None
     subject_name = data.get("subjectName") if isinstance(data.get("subjectName"), str) else None
@@ -1364,7 +1365,8 @@ async def read_bootstrap_marker(
         else []
     )
     cluster_mismatch = marker_cluster is not None and (
-        not isinstance(marker_cluster, str) or (bool(marker_cluster) and marker_cluster != cluster_id)
+        not isinstance(marker_cluster, str)
+        or (bool(cluster_id) and bool(marker_cluster) and marker_cluster != cluster_id)
     )
     namespace_mismatch = marker_namespace is not None and (
         not isinstance(marker_namespace, str) or (bool(marker_namespace) and marker_namespace != namespace)
@@ -1387,6 +1389,7 @@ async def read_bootstrap_marker(
         "verified": present,
         "bootstrapDigest": bootstrap_digest,
         "eppAuthDelegator": epp_auth_delegator,
+        "eppSubjectScope": epp_subject_scope,
         "eppServiceAccounts": epp_sas,
         "preparedRequest": prepared_request,
         "subjectKind": subject_kind,
@@ -1550,7 +1553,10 @@ def _ssar_operation_specs(
     if uses_router:
         marker_epp_applied = bool(marker.get("present")) and marker.get("eppAuthDelegator") == "applied"
         marker_sas = set(marker.get("eppServiceAccounts") or ())
-        all_epp_covered = marker_epp_applied and (not marker_sas or set(epp_service_accounts).issubset(marker_sas))
+        marker_ns_wide = marker.get("eppSubjectScope") == "namespace_serviceaccounts"
+        all_epp_covered = marker_epp_applied and (
+            marker_ns_wide or not marker_sas or set(epp_service_accounts).issubset(marker_sas)
+        )
         operations.append(
             {
                 "id": "deploy.epp_auth_delegator",
@@ -2059,6 +2065,7 @@ def _deployment_role_manifest(namespace: str) -> dict[str, Any]:
                     "monitoring.coreos.com",
                     "keda.sh",
                     "autoscaling",
+                    "coordination.k8s.io",
                 ],
                 "resources": ["*"],
                 "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"],
@@ -2094,6 +2101,16 @@ def _deployment_role_binding_manifest(namespace: str, identity: Mapping[str, Any
 def _epp_auth_delegator_crb_manifest(namespace: str, service_accounts: Sequence[str]) -> dict[str, Any]:
     from llm_d_lens.monitoring.deployment.service import AUTH_DELEGATOR_ROLE, _epp_auth_delegator_binding_name
 
+    subjects: list[dict[str, Any]] = [
+        {"kind": "ServiceAccount", "name": sa_name, "namespace": namespace} for sa_name in service_accounts
+    ]
+    subjects.append(
+        {
+            "kind": "Group",
+            "apiGroup": "rbac.authorization.k8s.io",
+            "name": f"system:serviceaccounts:{namespace}",
+        }
+    )
     return {
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "ClusterRoleBinding",
@@ -2110,9 +2127,7 @@ def _epp_auth_delegator_crb_manifest(namespace: str, service_accounts: Sequence[
             "kind": "ClusterRole",
             "name": AUTH_DELEGATOR_ROLE,
         },
-        "subjects": [
-            {"kind": "ServiceAccount", "name": sa_name, "namespace": namespace} for sa_name in service_accounts
-        ],
+        "subjects": subjects,
     }
 
 
@@ -2201,7 +2216,7 @@ def _build_target_bootstrap_spec(
     )
     epp_yaml = (
         yaml.safe_dump(_epp_auth_delegator_crb_manifest(validated_ns, validated_sas), sort_keys=False)
-        if uses_router and validated_sas
+        if uses_router
         else None
     )
     storage_yaml = (
@@ -2241,7 +2256,8 @@ def _append_target_bootstrap_commands(
             f"TARGET_NAMESPACE={shlex.quote(validated_ns)}",
             f"BOOTSTRAP_DIGEST={shlex.quote(bootstrap_digest)}",
             f"BOOTSTRAP_DIGEST16={shlex.quote(bootstrap_digest[:16])}",
-            f"EPP_AUTH_DELEGATOR={shlex.quote('applied' if (uses_router and validated_sas) else 'not_required')}",
+            f"EPP_AUTH_DELEGATOR={shlex.quote('applied' if uses_router else 'not_required')}",
+            f"EPP_SUBJECT_SCOPE={shlex.quote('namespace_serviceaccounts' if uses_router else 'none')}",
             f"EPP_SERVICE_ACCOUNTS={shlex.quote(','.join(validated_sas))}",
             f"SATELLITE_STORAGE={shlex.quote('applied' if satellite_storage else 'not_required')}",
             f"PREPARED_REQUEST={shlex.quote(clean_prepared_req)}",
@@ -2307,6 +2323,7 @@ def _append_target_bootstrap_commands(
             '  --from-literal="subjectKind=$SUBJECT_KIND" \\',
             '  --from-literal="subjectName=$SUBJECT_NAME" \\',
             '  --from-literal="eppAuthDelegator=$EPP_AUTH_DELEGATOR" \\',
+            '  --from-literal="eppSubjectScope=$EPP_SUBJECT_SCOPE" \\',
             '  --from-literal="eppServiceAccounts=$EPP_SERVICE_ACCOUNTS" \\',
             '  --from-literal="satelliteStorage=$SATELLITE_STORAGE" \\',
             '  --from-literal="preparedRequest=$PREPARED_REQUEST" \\',

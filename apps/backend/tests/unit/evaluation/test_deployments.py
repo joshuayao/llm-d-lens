@@ -1988,3 +1988,17 @@ async def test_stale_bootstrap_marker_rejected_in_preflight_and_execute_without_
     assert "requires Orchestration administrator bootstrap" in final_wf["error"]
     assert recorded == []
     assert start_calls == []
+
+
+def test_epp_service_accounts_from_bundle_truncates_and_lowercases() -> None:
+    import importlib
+
+    eval_router = importlib.import_module("llm_d_lens.evaluation.router")
+
+    long_release = "  Very-Long-Release-Name-Exceeding-Forty-Characters-XYZ  "
+    assert eval_router._epp_service_accounts_from_bundle({"helm": {"releaseName": long_release}}) == [
+        f"{long_release.strip().lower()[:40]}-epp"
+    ]
+    assert len(eval_router._epp_service_accounts_from_bundle({"helm": {"releaseName": long_release}})[0]) == 44
+    assert eval_router._epp_service_accounts_from_bundle({"helm": {"releaseName": "  "}}) == []
+    assert eval_router._epp_service_accounts_from_bundle({}) == []

@@ -1945,7 +1945,7 @@ def _epp_service_accounts_from_bundle(bundle: Any) -> list[str]:
         return []
     release_name = helm.get("releaseName")
     if isinstance(release_name, str) and release_name.strip():
-        return [f"{release_name.strip()}-epp"]
+        return [f"{release_name.strip().lower()[:40]}-epp"]
     return []
 
 

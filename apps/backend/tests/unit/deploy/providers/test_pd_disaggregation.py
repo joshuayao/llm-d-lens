@@ -478,3 +478,89 @@ def test_vllm_alias_uses_an_existing_generic_entry(tmp_path, accelerator, varian
         assert "vllm" not in sources
     else:
         assert sources["vllm"] == source_root / expected
+
+
+@pytest.mark.asyncio
+async def test_pd_disaggregation_deploy_wires_post_renderer_for_bundle_and_direct(tmp_path: Path, monkeypatch):
+    import llm_d_lens.deploy.providers.pd_disaggregation as pd
+    from llm_d_lens.deploy.providers import deployment_bundle
+
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
+    base = tmp_path / "guides/recipes/router/base.values.yaml"
+    guide = tmp_path / "guides/pd-disaggregation/router/pd-disaggregation.values.yaml"
+    base.parent.mkdir(parents=True)
+    guide.parent.mkdir(parents=True)
+    base.write_text("router: {}\n", encoding="utf-8")
+    guide.write_text("router: {}\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text("kind: Deployment\n", encoding="utf-8")
+
+    helm_commands: list[tuple[str, ...]] = []
+
+    async def fake_exec(*command, **_kwargs):
+        helm_commands.append(command)
+        proc = Mock(returncode=0)
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        return proc
+
+    monkeypatch.setattr(pd.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(deployment_bundle, "resolve_helm_rbac_mode", AsyncMock(return_value=True))
+
+    # Direct deploy with __new__-constructed adapter (no _environment attribute set)
+    adapter = PdDisaggregationAdapter.__new__(PdDisaggregationAdapter)
+    adapter._runner = _ReadinessRunner()
+    adapter._namespace_prefix = "llm-d-bench-"
+    adapter._guide_root = tmp_path
+    adapter._helm_path = Path("helm")
+    artifact = GuideDeploymentArtifact("pd-disaggregation", "hash", manifest_ref=str(manifest))
+    await adapter.deploy(
+        artifact,
+        {"namespace": "llm-d-bench-run", "provenance": {"cluster_server_id": "cluster-pd"}},
+    )
+    assert "--post-renderer" in helm_commands[0]
+    deployment_bundle.resolve_helm_rbac_mode.assert_awaited_with(
+        "llm-d-bench-run",
+        cluster_id="cluster-pd",
+        environment=None,
+        kubectl_path=None,
+    )
+
+    # Bundle deploy path
+    bundle_commands: list[list[str]] = []
+
+    async def bundle_runner(command):
+        bundle_commands.append(command)
+        if command[1:3] == ["get", "manifest"]:
+            return 0, "kind: Deployment\n", ""
+        return 0, "kind: Deployment\n", ""
+
+    adapter._bundle_command_runner = bundle_runner
+    values = "router: {}\n"
+    bundle = {
+        "schemaVersion": "guide-deployment-bundle.v1",
+        "guide": "pd-disaggregation",
+        "sourceCommit": "a" * 40,
+        "helm": {
+            "chart": "saved-chart",
+            "version": "v1.0.0",
+            "releaseName": "pd-disaggregation",
+            "values": [
+                {
+                    "name": "router-effective.yaml",
+                    "content": values,
+                    "checksum": f"sha256:{hashlib.sha256(values.encode()).hexdigest()}",
+                }
+            ],
+        },
+        "resources": [],
+    }
+    bundle_artifact = GuideDeploymentArtifact(
+        "pd-disaggregation",
+        "hash",
+        manifest_ref=str(manifest),
+        source_ref="a" * 40,
+        deployment_contract={"deploymentBundle": bundle},
+    )
+    await adapter.deploy(bundle_artifact, {"namespace": "llm-d-bench-run"})
+    upgrade_cmd = next(cmd for cmd in bundle_commands if cmd[1] == "upgrade")
+    assert "--post-renderer" in upgrade_cmd

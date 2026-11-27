@@ -1659,3 +1659,65 @@ async def test_deploy_and_agentic_approve_map_admin_setup_required_to_403_and_al
     with pytest.raises(ForbiddenError, match="cluster access revoked"):
         await router.create_run(revoked_req, None)
     assert checked_clusters == ["cluster-revoked"]
+
+
+@pytest.mark.asyncio
+async def test_list_orphan_namespaces_and_clean_case_map_403_409_and_401(monkeypatch):
+    import json
+
+    from fastapi.responses import JSONResponse
+
+    from llm_d_lens.deploy import orphans, router
+    from llm_d_lens.deploy.capabilities import DeploymentClusterAuthError
+    from llm_d_lens.deploy.executions import DeploymentCleanupPermissionDenied
+
+    monkeypatch.setattr(router, "current_principal", lambda _req: None)
+    monkeypatch.setattr(router, "require_cluster_access", lambda _p, _cid: None)
+
+    async def fail_scan_forbidden(_cid):
+        raise orphans.OrphanScanPermissionDeniedError("Cluster-wide namespace listing is forbidden (403)")
+
+    monkeypatch.setattr(router, "scan_orphan_namespaces", fail_scan_forbidden)
+    resp_403 = await router.list_orphan_namespaces("cluster-a")
+    assert isinstance(resp_403, JSONResponse)
+    assert resp_403.status_code == 403
+    assert json.loads(resp_403.body)["code"] == "orphan_scan_forbidden"
+
+    async def fail_scan_401(_cid):
+        raise DeploymentClusterAuthError("401 Unauthorized")
+
+    monkeypatch.setattr(router, "scan_orphan_namespaces", fail_scan_401)
+    resp_401 = await router.list_orphan_namespaces("cluster-a")
+    assert isinstance(resp_401, JSONResponse)
+    assert resp_401.status_code == 401
+    assert json.loads(resp_401.body)["code"] == "kubeconfig_unauthorized"
+
+    monkeypatch.setattr(router._store, "get_run", lambda _rid: None)
+    handoff_payload = {
+        "phase1Completed": True,
+        "namespace": "llmd-case-1",
+        "adminCleanup": {"detail": "Admin cleanup needed", "script": "kubectl delete ns llmd-case-1"},
+    }
+
+    class _Worker409:
+        async def clean_case(self, _run_id, _case_id, *, preserve_rendered_overlay=False):
+            raise DeploymentCleanupPermissionDenied("Admin cleanup needed", payload=handoff_payload)
+
+    monkeypatch.setattr(router.deployment_run_manager, "worker_for_run", lambda _rid: _Worker409())
+    case_resp_409 = await router.clean_case("run-1", "case-1", router.CleanCaseRequest())
+    assert isinstance(case_resp_409, JSONResponse)
+    assert case_resp_409.status_code == 409
+    case_body = json.loads(case_resp_409.body)
+    assert case_body["code"] == "deployment_cleanup_permission_denied"
+    assert case_body["phase1Completed"] is True
+    assert case_body["namespace"] == "llmd-case-1"
+
+    class _Worker401:
+        async def clean_case(self, _run_id, _case_id, *, preserve_rendered_overlay=False):
+            raise DeploymentClusterAuthError("401 Unauthorized")
+
+    monkeypatch.setattr(router.deployment_run_manager, "worker_for_run", lambda _rid: _Worker401())
+    case_resp_401 = await router.clean_case("run-1", "case-1", router.CleanCaseRequest())
+    assert isinstance(case_resp_401, JSONResponse)
+    assert case_resp_401.status_code == 401
+    assert json.loads(case_resp_401.body)["code"] == "kubeconfig_unauthorized"

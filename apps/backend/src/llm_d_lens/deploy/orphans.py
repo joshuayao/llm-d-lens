@@ -35,6 +35,10 @@ class OrphanCleanupError(Exception):
     """Orphan namespace scan or cleanup failed."""
 
 
+class OrphanScanPermissionDeniedError(OrphanCleanupError):
+    """Cluster-wide namespace listing was denied (403 Forbidden)."""
+
+
 @dataclass(frozen=True)
 class OrphanNamespace:
     name: str
@@ -139,6 +143,14 @@ async def scan_orphan_namespaces(
     except (FileNotFoundError, TimeoutError, OSError) as error:
         raise OrphanCleanupError(f"kubectl unavailable: {_redact_error(str(error))}") from error
     if result.returncode != 0:
+        from llm_d_lens.cluster.service import _is_forbidden_output
+
+        _raise_if_unauthorized(result)
+        if _is_forbidden_output(result):
+            raise OrphanScanPermissionDeniedError(
+                "Cluster-wide namespace listing is forbidden (403); orphan namespace scanning requires "
+                "cluster-scoped list namespaces permission."
+            )
         raise OrphanCleanupError(_redact_error((result.stderr or result.stdout or "kubectl failed").strip()))
     try:
         items = json.loads(result.stdout or "{}").get("items", [])
@@ -251,6 +263,8 @@ _K8S_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _IN_NAMESPACE_RESOURCE_TYPES: tuple[str, ...] = (
     "deployments.apps",
+    "statefulsets.apps",
+    "horizontalpodautoscalers.autoscaling",
     "leaderworkersets.leaderworkerset.x-k8s.io",
     "disaggregatedsets.disaggregatedset.x-k8s.io",
     "services",
@@ -266,6 +280,8 @@ _IN_NAMESPACE_RESOURCE_TYPES: tuple[str, ...] = (
     "referencegrants.gateway.networking.k8s.io",
     "httproutes.gateway.networking.k8s.io",
     "inferencemodelrewrites.llm-d.ai",
+    "inferenceobjectives.llm-d.ai",
+    "leases.coordination.k8s.io",
     "roles.rbac.authorization.k8s.io",
     "rolebindings.rbac.authorization.k8s.io",
 )

@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ import yaml
 from llm_d_lens.cluster.registry import validate_container_image_ref
 from llm_d_lens.core.hashing import stable_hash
 from llm_d_lens.deploy.data_plane import router_data_plane_args, router_data_plane_effective_values
+from llm_d_lens.deploy.providers import deployment_bundle
 from llm_d_lens.deploy.providers.deployment_bundle import (
     install_deployment_bundle,
     subprocess_bundle_runner,
@@ -208,6 +210,15 @@ class HelmKustomizeGuideAdapter:
         model_secret = (execution_context.get("deployment_policy") or {}).get("model_secret") or {}
         if "endpoint" not in artifact.deployment_contract and model_secret.get("mode") == "existing-secret":
             await self._runner.copy_model_secret(namespace, model_secret["sourceNamespace"], model_secret["sourceName"])
+        provenance = execution_context.get("provenance")
+        cluster_id = provenance.get("cluster_server_id") if isinstance(provenance, Mapping) else None
+        environment, kubectl_path = deployment_bundle.adapter_kubectl_context(self)
+        strip_rbac = await deployment_bundle.resolve_helm_rbac_mode(
+            namespace,
+            cluster_id=cluster_id,
+            environment=environment,
+            kubectl_path=kubectl_path,
+        )
         bundle = artifact.deployment_contract.get("deploymentBundle")
         reproducibility = {}
         if bundle is not None:
@@ -222,6 +233,7 @@ class HelmKustomizeGuideAdapter:
                     bundle["helm"]["values"][-1]["content"], execution_context
                 ),
                 effective_values_name=f"router-effective-{artifact.guide_id}.yaml",
+                strip_metrics_auth_rbac=strip_rbac,
             )
         else:
             helm_command = [
@@ -238,13 +250,23 @@ class HelmKustomizeGuideAdapter:
             for values in self._descriptor.router_values:
                 helm_command.extend(["--values", str(values)])
             helm_command.extend(self._data_plane_args(execution_context))
-            helm = await spawn(
-                helm_command,
-                env=self._environment,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            helm_stdout, helm_stderr = await helm.communicate()
+            if strip_rbac:
+                with deployment_bundle.helm_metrics_auth_post_renderer(namespace) as post_renderer:
+                    helm = await spawn(
+                        [*helm_command, "--post-renderer", str(post_renderer)],
+                        env=environment,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    helm_stdout, helm_stderr = await helm.communicate()
+            else:
+                helm = await spawn(
+                    helm_command,
+                    env=environment,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                helm_stdout, helm_stderr = await helm.communicate()
             if helm.returncode:
                 raise RuntimeError((helm_stderr or helm_stdout).decode(errors="replace").strip())
         status, stdout, stderr = await self._runner(

@@ -1510,6 +1510,140 @@ async def test_start_run_ignores_unverified_target_namespace_and_enforces_owner_
 
 
 @pytest.mark.asyncio
+async def test_failed_and_killed_deployments_clean_in_namespace_on_403_and_pass_cluster_id(monkeypatch, tmp_path):
+    from llm_d_lens.deploy import orphans, prepared_plans
+    from llm_d_lens.deploy import service as service_mod
+    from llm_d_lens.deploy.contracts import DeploymentKillRequest
+    from llm_d_lens.deploy.providers import storage_mount
+    from llm_d_lens.deploy.providers.guide_adapter import GuideDeploymentArtifact
+    from llm_d_lens.deploy.providers.guide_catalog import GuideCatalog
+
+    cleaned_namespaces: list[tuple[str, str]] = []
+    validated_calls: list[tuple[str, str | None]] = []
+
+    async def fake_in_namespace_cleanup(cluster_id: str, namespace: str, *, runner=None):
+        cleaned_namespaces.append((cluster_id, namespace))
+        return ["deployments.apps", "pods"]
+
+    monkeypatch.setattr(orphans, "is_deletable_deployment_namespace", lambda _ns, cluster_id=None: True)
+    monkeypatch.setattr(orphans, "cleanup_in_namespace_resources", fake_in_namespace_cleanup)
+    monkeypatch.setattr(storage_mount, "require_cached_model", lambda *_a, **_kw: _async_val(None))
+    monkeypatch.setattr(service_mod, "resolve_data_plane", lambda *_a, **_kw: _async_val(("standalone_router", None)))
+    monkeypatch.setattr(service_mod, "ensure_router_crds", lambda _cid: _async_val({"ok": True}))
+
+    async def _async_val(value):
+        return value
+
+    class _FakeAdapter:
+        def __init__(self, *, mode: str) -> None:
+            self.mode = mode
+
+        def discover(self):
+            return SimpleNamespace(provider_ref="optimized-baseline")
+
+        def validate_inputs(self, _def, _snap, _ovr):
+            return SimpleNamespace(accepted=True, reasons=[])
+
+        async def render(self, _def, _ovr):
+            return GuideDeploymentArtifact(
+                guide_id="optimized-baseline",
+                artifact_hash="hash-1",
+                manifest_ref=str(tmp_path / "m.yaml"),
+                manifest_checksum="sha256:abc",
+                source_ref="a" * 40,
+                deployment_contract={"data_plane_kind": "standalone_router"},
+            )
+
+        async def validate_prepared_router(self, _artifact, namespace: str, *, cluster_id: str | None = None):
+            validated_calls.append((namespace, cluster_id))
+
+        async def deploy(self, _artifact, ctx):
+            return {"namespace": ctx["namespace"], "endpoint_url": "http://router.local"}
+
+        async def diagnostics(self, _exec):
+            return {"pods": []}
+
+        async def readiness(self, _exec):
+            if self.mode == "readiness_fail":
+                return SimpleNamespace(accepted=False, reasons=["CrashLoopBackOff"])
+            if self.mode == "create_exception":
+                raise RuntimeError("boom during readiness")
+            return SimpleNamespace(accepted=True, reasons=[])
+
+        async def cleanup(self, _exec, _artifact, *, force=False):
+            return {"cleaned_up": False, "error": 'namespaces "llmd-test-ns" is forbidden'}
+
+    archive = service_mod.ExecutionLogArchive(tmp_path / "logs")
+
+    # 1. Prepared plan passes cluster_id to validate_prepared_router, and readiness failure runs Phase-1 cleanup
+    adapter_fail = _FakeAdapter(mode="readiness_fail")
+    catalog_fail = GuideCatalog([])
+    monkeypatch.setattr(catalog_fail, "get_adapter", lambda _ref: adapter_fail)
+    svc_fail = service_mod.GuideAdapterDeploymentService(catalog_fail, lambda _req: "llmd-test-ns", log_archive=archive)
+    prepared_artifact = await adapter_fail.render(None, {})
+    monkeypatch.setattr(
+        prepared_plans,
+        "execution_artifact",
+        lambda _req: _async_val(
+            (prepared_artifact, {"namespace": "llmd-test-ns", "runtime": {}, "data_plane": "standalone_router"})
+        ),
+    )
+    json_artifact = _artifact().model_copy(update={"media_type": "application/json"})
+    req_prepared = DeploymentCreateRequest(
+        configuration_artifacts=[json_artifact],
+        deployment_policy=VersionedPayload(schema_version="v1", value={"deployment_name": "qwen-1"}),
+        provenance={"cluster_server_id": "cluster-42", "_prepared_plan_id": "plan-1"},
+    )
+    failed_exec = await svc_fail.create(req_prepared)
+    assert validated_calls == [("llmd-test-ns", "cluster-42")]
+    assert failed_exec.status == DeploymentStatus.FAILED
+    cleanup_diag = failed_exec.diagnostics.value["cleanup"]
+    assert cleanup_diag["cleaned_up"] is False
+    assert cleanup_diag["in_namespace_cleaned"] is True
+    assert cleanup_diag["deleted_in_namespace"] == ["deployments.apps", "pods"]
+
+    # 2. Exception during create() also runs Phase-1 cleanup
+    adapter_exc = _FakeAdapter(mode="create_exception")
+    catalog_exc = GuideCatalog([])
+    monkeypatch.setattr(catalog_exc, "get_adapter", lambda _ref: adapter_exc)
+    svc_exc = service_mod.GuideAdapterDeploymentService(catalog_exc, lambda _req: "llmd-exc-ns", log_archive=archive)
+    req_exc = DeploymentCreateRequest(
+        configuration_artifacts=[json_artifact],
+        deployment_policy=VersionedPayload(schema_version="v1", value={"deployment_name": "qwen-2"}),
+        provenance={"cluster_server_id": "cluster-42"},
+    )
+    exc_exec = await svc_exc.create(req_exc)
+    assert exc_exec.status == DeploymentStatus.FAILED
+    assert exc_exec.diagnostics.value["cleanup"]["in_namespace_cleaned"] is True
+    assert exc_exec.diagnostics.value["cleanup"]["cleaned_up"] is False
+
+    # 3. kill() on READY execution also runs Phase-1 cleanup on 403 delete namespace
+    adapter_ok = _FakeAdapter(mode="ready")
+    catalog_ok = GuideCatalog([])
+    monkeypatch.setattr(catalog_ok, "get_adapter", lambda _ref: adapter_ok)
+    svc_ok = service_mod.GuideAdapterDeploymentService(catalog_ok, lambda _req: "llmd-kill-ns", log_archive=archive)
+    req_ok = DeploymentCreateRequest(
+        configuration_artifacts=[json_artifact],
+        deployment_policy=VersionedPayload(schema_version="v1", value={"deployment_name": "qwen-3"}),
+        provenance={"cluster_server_id": "cluster-42"},
+    )
+    ready_exec = await svc_ok.create(req_ok)
+    assert ready_exec.status == DeploymentStatus.READY
+    killed_exec = await svc_ok.kill(
+        DeploymentKillRequest(execution_id=ready_exec.execution_id, reason="cancelled"),
+        ready_exec,
+    )
+    assert killed_exec.status == DeploymentStatus.FAILED
+    assert killed_exec.diagnostics.value["cleanup"]["in_namespace_cleaned"] is True
+    assert killed_exec.diagnostics.value["cleanup"]["cleaned_up"] is False
+    assert cleaned_namespaces == [
+        ("cluster-42", "llmd-test-ns"),
+        ("cluster-42", "llmd-exc-ns"),
+        ("cluster-42", "llmd-kill-ns"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_cleanup_verify_enforces_stored_digest_and_marker_requirement(deployment_store, monkeypatch):
     from llm_d_lens.deploy import executions as deploy_executions
     from llm_d_lens.deploy import orphans

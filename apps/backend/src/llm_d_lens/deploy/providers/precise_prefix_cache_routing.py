@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from llm_d_lens.cluster.registry import validate_container_image_ref
 from llm_d_lens.configuration.manifest_facts import _invocation_tokens, _model_argument, _option
 from llm_d_lens.core.hashing import stable_hash
 from llm_d_lens.deploy.data_plane import router_data_plane_args, router_data_plane_effective_values
+from llm_d_lens.deploy.providers import deployment_bundle
 from llm_d_lens.deploy.providers.deployment_bundle import (
     install_deployment_bundle,
     subprocess_bundle_runner,
@@ -265,6 +267,15 @@ class PrecisePrefixCacheRoutingAdapter:
         model_secret = (execution_context.get("deployment_policy") or {}).get("model_secret") or {}
         if "endpoint" not in artifact.deployment_contract and model_secret.get("mode") == "existing-secret":
             await self._runner.copy_model_secret(namespace, model_secret["sourceNamespace"], model_secret["sourceName"])
+        provenance = execution_context.get("provenance")
+        cluster_id = provenance.get("cluster_server_id") if isinstance(provenance, Mapping) else None
+        environment, kubectl_path = deployment_bundle.adapter_kubectl_context(self)
+        strip_rbac = await deployment_bundle.resolve_helm_rbac_mode(
+            namespace,
+            cluster_id=cluster_id,
+            environment=environment,
+            kubectl_path=kubectl_path,
+        )
         bundle = artifact.deployment_contract.get("deploymentBundle")
         reproducibility = {}
         if bundle is not None:
@@ -279,6 +290,7 @@ class PrecisePrefixCacheRoutingAdapter:
                     bundle["helm"]["values"][-1]["content"], execution_context
                 ),
                 effective_values_name="router-effective-precise-routing.yaml",
+                strip_metrics_auth_rbac=strip_rbac,
             )
             router_values_path = Path(reproducibility["router_values_path"])
             calibration_path = reproducibility.get("calibration_script_path")
@@ -299,7 +311,7 @@ class PrecisePrefixCacheRoutingAdapter:
                 if status != 0:
                     raise RuntimeError((stderr or stdout).strip())
             router_values_path = self._resolve_router_values(artifact)
-            helm = await asyncio.create_subprocess_exec(
+            helm_command = [
                 str(self._helm_path),
                 "upgrade",
                 "--install",
@@ -314,11 +326,26 @@ class PrecisePrefixCacheRoutingAdapter:
                 "--values",
                 str(router_values_path),
                 *router_data_plane_args(execution_context),
-                env=self._environment,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            helm_stdout, helm_stderr = await helm.communicate()
+            ]
+            if strip_rbac:
+                with deployment_bundle.helm_metrics_auth_post_renderer(namespace) as post_renderer:
+                    helm = await asyncio.create_subprocess_exec(
+                        *helm_command,
+                        "--post-renderer",
+                        str(post_renderer),
+                        env=environment,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    helm_stdout, helm_stderr = await helm.communicate()
+            else:
+                helm = await asyncio.create_subprocess_exec(
+                    *helm_command,
+                    env=environment,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                helm_stdout, helm_stderr = await helm.communicate()
             if helm.returncode:
                 raise RuntimeError((helm_stderr or helm_stdout).decode(errors="replace").strip())
         status, stdout, stderr = await self._runner(
@@ -556,6 +583,15 @@ class PrecisePrefixCacheRoutingAdapter:
             ),
             encoding="utf-8",
         )
+        provenance = execution.get("provenance")
+        cluster_id = provenance.get("cluster_server_id") if isinstance(provenance, Mapping) else None
+        environment, kubectl_path = deployment_bundle.adapter_kubectl_context(self)
+        strip_rbac = await deployment_bundle.resolve_helm_rbac_mode(
+            execution["namespace"],
+            cluster_id=cluster_id,
+            environment=environment,
+            kubectl_path=kubectl_path,
+        )
         if execution.get("router_chart"):
             release_name = str(execution["router_release_name"])
             common = [
@@ -572,7 +608,13 @@ class PrecisePrefixCacheRoutingAdapter:
             status, stdout, stderr = await self._bundle_command_runner(["helm", "template", *common])
             if status != 0:
                 raise RuntimeError((stderr or stdout or "calibrated Router Helm render failed").strip())
-            status, stdout, stderr = await self._bundle_command_runner(["helm", "upgrade", "--install", *common])
+            if strip_rbac:
+                with deployment_bundle.helm_metrics_auth_post_renderer(execution["namespace"]) as post_renderer:
+                    status, stdout, stderr = await self._bundle_command_runner(
+                        ["helm", "upgrade", "--install", *common, "--post-renderer", str(post_renderer)]
+                    )
+            else:
+                status, stdout, stderr = await self._bundle_command_runner(["helm", "upgrade", "--install", *common])
             if status != 0:
                 raise RuntimeError((stderr or stdout or "router calibration upgrade failed").strip())
             status, rendered, stderr = await self._bundle_command_runner(
@@ -599,7 +641,7 @@ class PrecisePrefixCacheRoutingAdapter:
                 }
             )
         else:
-            helm = await asyncio.create_subprocess_exec(
+            helm_command = [
                 str(self._helm_path),
                 "upgrade",
                 "--install",
@@ -614,11 +656,26 @@ class PrecisePrefixCacheRoutingAdapter:
                 "--values",
                 str(calibrated_path),
                 *router_data_plane_args(execution),
-                env=self._environment,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await helm.communicate()
+            ]
+            if strip_rbac:
+                with deployment_bundle.helm_metrics_auth_post_renderer(execution["namespace"]) as post_renderer:
+                    helm = await asyncio.create_subprocess_exec(
+                        *helm_command,
+                        "--post-renderer",
+                        str(post_renderer),
+                        env=environment,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, stderr = await helm.communicate()
+            else:
+                helm = await asyncio.create_subprocess_exec(
+                    *helm_command,
+                    env=environment,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await helm.communicate()
             if helm.returncode:
                 raise RuntimeError(
                     (stderr or stdout).decode(errors="replace").strip() or "router calibration upgrade failed"

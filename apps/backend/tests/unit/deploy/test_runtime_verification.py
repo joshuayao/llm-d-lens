@@ -200,3 +200,79 @@ def test_metrics_only_reads_counters_without_smoke_or_persistence(monkeypatch):
     assert report["metrics"] == {"pod-a": {"vllm:prompt_tokens_total": 7.0}}
     assert report["metricsCollectedAt"]
     assert "inference" not in report and "lastProbe" not in report
+
+
+def test_observe_falls_back_to_prometheus_or_empty_nodes_on_403_and_preserves_401(monkeypatch):
+    import asyncio
+
+    import pytest
+
+    from llm_d_lens.deploy import runtime_verification as verification
+    from llm_d_lens.deploy import slice_capacity
+
+    desired = [
+        {
+            "kind": "DisaggregatedSet",
+            "metadata": {"name": "pd"},
+            "spec": {"slices": 1, "roles": [{"name": "decode", "spec": {"replicas": 1}}]},
+        }
+    ]
+    actual = {"metadata": {"name": "pd", "uid": "ds", "generation": 1}, "status": {"observedGeneration": 1}}
+    deployment = {
+        "metadata": {
+            "name": "pd-0-decode",
+            "uid": "deploy",
+            "ownerReferences": [{"uid": "ds", "controller": True}],
+            "labels": {"disaggregatedset.x-k8s.io/role": "decode", "disaggregatedset.x-k8s.io/slice": "0"},
+        }
+    }
+    replica_set = {"metadata": {"name": "rs", "uid": "rs", "ownerReferences": [{"uid": "deploy", "controller": True}]}}
+    pod = {
+        "metadata": {"name": "pod", "uid": "pod", "ownerReferences": [{"uid": "rs", "controller": True}]},
+        "spec": {"nodeName": "node-1"},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+    }
+
+    # 1. 403 on nodes inventory falls back to Prometheus node inventory -> pass
+    async def fake_inv_403(cluster_id, resource, namespace=None):
+        if resource == "nodes":
+            raise slice_capacity.ClusterInventoryForbiddenError("nodes is forbidden (403)")
+        return {
+            "disaggregatedsets": [actual],
+            "leaderworkersets": [],
+            "pods": [pod],
+            "statefulsets": [],
+            "deployments": [deployment],
+            "replicasets": [replica_set],
+        }[resource]
+
+    prom_calls = []
+
+    async def fake_prom_pass(cluster_id):
+        prom_calls.append(cluster_id)
+        return ([{"metadata": {"name": "node-1", "labels": {}}}], [])
+
+    monkeypatch.setattr(verification, "inventory", fake_inv_403)
+    monkeypatch.setattr(slice_capacity, "prometheus_inventory_nodes_and_pods", fake_prom_pass)
+    prom_report = asyncio.run(verification._observe("cluster-1", "llmd-ns", desired))
+    assert prom_calls == ["cluster-1"]
+    assert prom_report["kubernetes"]["status"] == "pass"
+
+    # 2. 403 on both nodes inventory and Prometheus degrades to nodes=[] -> status "unknown"
+    async def fake_prom_403(_cluster_id):
+        raise slice_capacity.ClusterInventoryForbiddenError("prometheus unavailable")
+
+    monkeypatch.setattr(slice_capacity, "prometheus_inventory_nodes_and_pods", fake_prom_403)
+    degraded_report = asyncio.run(verification._observe("cluster-1", "llmd-ns", desired))
+    assert degraded_report["kubernetes"]["status"] == "unknown"
+    assert degraded_report["placement"]["status"] == "unknown"
+
+    # 3. 401 ClusterInventoryAuthError is never swallowed
+    async def fake_inv_401(cluster_id, resource, namespace=None):
+        if resource == "nodes":
+            raise slice_capacity.ClusterInventoryAuthError("Unauthorized (401)")
+        return []
+
+    monkeypatch.setattr(verification, "inventory", fake_inv_401)
+    with pytest.raises(slice_capacity.ClusterInventoryAuthError):
+        asyncio.run(verification._observe("cluster-1", "llmd-ns", desired))

@@ -3,14 +3,31 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import shutil
+import stat
+import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
+from llm_d_lens.deploy import capabilities
+from llm_d_lens.deploy.providers import deployment_bundle
 from llm_d_lens.deploy.providers.deployment_bundle import (
+    _is_metrics_auth_binding,
+    _is_metrics_auth_role,
+    filter_helm_manifest_yaml,
+    freeze_deployment_bundle,
+    helm_metrics_auth_post_renderer,
+    helm_post_renderer_root,
     install_deployment_bundle,
+    resolve_helm_rbac_mode,
+    strip_validated_metrics_auth_rbac,
     validate_deployment_bundle,
+    validate_frozen_bundle,
 )
+from llm_d_lens.infrastructure.process import CommandResult
 
 
 def _asset(name: str, content: str) -> dict[str, str]:
@@ -154,4 +171,516 @@ async def test_install_rejects_empty_installed_helm_manifest(tmp_path: Path):
             namespace="llmd-run",
             command_runner=runner,
             output_root=tmp_path,
+        )
+
+
+def _metrics_auth_role(name: str = "router-epp-metrics", *, with_prometheus: bool = False) -> dict:
+    rules: list[dict] = [
+        {"apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"]},
+        {"apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"]},
+    ]
+    if with_prometheus:
+        rules.append({"nonResourceURLs": ["/metrics"], "verbs": ["get"]})
+    return {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": {"name": name},
+        "rules": rules,
+    }
+
+
+def _metrics_auth_binding(
+    name: str = "router-epp-metrics-binding",
+    *,
+    role_name: str = "router-epp-metrics",
+    namespace: str = "llmd-run",
+    sa_name: str = "router-epp",
+    extra_subject: dict | None = None,
+) -> dict:
+    subjects = [{"kind": "ServiceAccount", "name": sa_name, "namespace": namespace}]
+    if extra_subject is not None:
+        subjects.append(extra_subject)
+    return {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": {"name": name},
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": role_name,
+        },
+        "subjects": subjects,
+    }
+
+
+def test_metrics_auth_predicates_and_strip_fail_closed():
+    assert _is_metrics_auth_role(_metrics_auth_role())
+    assert _is_metrics_auth_role(_metrics_auth_role(with_prometheus=True))
+    assert not _is_metrics_auth_role(
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "metrics-only"},
+            "rules": [{"nonResourceURLs": ["/metrics"], "verbs": ["get"]}],
+        }
+    )
+    assert not _is_metrics_auth_role(
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "too-broad"},
+            "rules": [
+                {"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]},
+                {"apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"]},
+            ],
+        }
+    )
+
+    roles = {"router-epp-metrics"}
+    assert _is_metrics_auth_binding(_metrics_auth_binding(), "llmd-run", roles)
+    assert _is_metrics_auth_binding(
+        _metrics_auth_binding(
+            extra_subject={"kind": "ServiceAccount", "apiGroup": "", "name": "other-epp", "namespace": "llmd-run"}
+        ),
+        "llmd-run",
+        roles,
+    )
+    assert not _is_metrics_auth_binding(
+        _metrics_auth_binding(
+            extra_subject={
+                "kind": "ServiceAccount",
+                "apiGroup": "rbac.authorization.k8s.io",
+                "name": "other-epp",
+                "namespace": "llmd-run",
+            }
+        ),
+        "llmd-run",
+        roles,
+    )
+    assert not _is_metrics_auth_binding(_metrics_auth_binding(namespace="other-ns"), "llmd-run", roles)
+
+    docs = [
+        None,
+        _metrics_auth_role(with_prometheus=True),
+        _metrics_auth_binding(),
+        {
+            "kind": "List",
+            "items": [
+                {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "epp", "namespace": "llmd-run"}},
+                {
+                    "apiVersion": "llm-d.ai/v1alpha2",
+                    "kind": "InferenceObjective",
+                    "metadata": {"name": "obj"},
+                },
+                {"apiVersion": "coordination.k8s.io/v1", "kind": "Lease", "metadata": {"name": "epp-lease"}},
+                {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "epp-token"}},
+            ],
+        },
+    ]
+    kept, stripped = strip_validated_metrics_auth_rbac(docs, "llmd-run")
+    assert [item["kind"] for item in stripped] == ["ClusterRole", "ClusterRoleBinding"]
+    assert [item["kind"] for item in kept] == ["Service", "InferenceObjective", "Lease", "Secret"]
+
+
+@pytest.mark.parametrize(
+    "bad_doc",
+    [
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "evil"},
+            "rules": [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]}],
+        },
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "evil-crb"},
+            "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "cluster-admin"},
+            "subjects": [{"kind": "ServiceAccount", "name": "epp", "namespace": "llmd-run"}],
+        },
+        {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "llmd-other"}},
+        {
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "foo.example.com"},
+        },
+        {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "svc", "namespace": "other-ns"}},
+    ],
+)
+def test_filter_helm_manifest_yaml_rejects_unexpected_or_cross_namespace_resources(bad_doc):
+    manifest = yaml.safe_dump_all(
+        [{"apiVersion": "v1", "kind": "Service", "metadata": {"name": "ok"}}, bad_doc],
+        sort_keys=False,
+    )
+    with pytest.raises(ValueError):
+        filter_helm_manifest_yaml(manifest, "llmd-run")
+
+
+def test_filter_helm_manifest_yaml_rejects_empty_after_stripping():
+    manifest = yaml.safe_dump_all([_metrics_auth_role(), _metrics_auth_binding()], sort_keys=False)
+    with pytest.raises(ValueError, match="no remaining resources"):
+        filter_helm_manifest_yaml(manifest, "llmd-run")
+
+
+def test_helm_post_renderer_permissions_and_cleanup(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
+    with helm_metrics_auth_post_renderer("llmd-run") as wrapper:
+        assert wrapper.name == "strip-metrics-auth-rbac"
+        assert wrapper.is_file()
+        assert wrapper.parent.is_relative_to(helm_post_renderer_root())
+        assert stat.S_IMODE(wrapper.stat().st_mode) == 0o700
+        assert stat.S_IMODE(wrapper.parent.stat().st_mode) == 0o700
+        filter_py = wrapper.parent / "filter.py"
+        assert stat.S_IMODE(filter_py.stat().st_mode) == 0o600
+        parent_dir = wrapper.parent
+    assert not parent_dir.exists()
+
+    with pytest.raises(ValueError, match="DNS-1123"), helm_metrics_auth_post_renderer("INVALID_NS"):
+        pass
+
+
+def _write_local_router_chart(chart_dir: Path) -> None:
+    templates = chart_dir / "templates"
+    templates.mkdir(parents=True)
+    (chart_dir / "Chart.yaml").write_text(
+        "apiVersion: v2\nname: llm-d-router-standalone\nversion: 1.0.0\n",
+        encoding="utf-8",
+    )
+    (chart_dir / "values.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "router": {
+                    "monitoring": {
+                        "prometheus": {
+                            "enabled": False,
+                            "auth": {"enabled": True},
+                        },
+                        "prometheusoperator": False,
+                    },
+                    "extraUnexpected": False,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (templates / "_helpers.tpl").write_text(
+        '{{- define "llm-d-router.name" -}}{{ .Release.Name | default "default-pool" | lower | trim | trunc 40 }}-epp{{- end -}}\n'
+        '{{- define "llm-d-router.cluster-rbac-name" -}}{{ printf "%s-%s-epp" (include "llm-d-router.name" . | trunc 40) (.Release.Namespace | trunc 40) | trunc 84 }}{{- end -}}\n',
+        encoding="utf-8",
+    )
+    (templates / "rbac.yaml").write_text(
+        """{{- if .Values.router.monitoring.prometheus.auth.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "llm-d-router.cluster-rbac-name" . }}
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+{{- if and .Values.router.monitoring.prometheus.enabled .Values.router.monitoring.prometheusoperator }}
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "llm-d-router.cluster-rbac-name" . }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "llm-d-router.cluster-rbac-name" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "llm-d-router.name" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+""",
+        encoding="utf-8",
+    )
+    (templates / "deployment.yaml").write_text(
+        """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "llm-d-router.name" . }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  template:
+    spec:
+      serviceAccountName: {{ include "llm-d-router.name" . }}
+      containers:
+        - name: epp
+          args:
+            {{- if not .Values.router.monitoring.prometheus.auth.enabled }}
+            - --metrics-endpoint-auth=false
+            {{- end }}
+            - --grpc-port=9002
+""",
+        encoding="utf-8",
+    )
+    (templates / "service.yaml").write_text(
+        """apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "llm-d-router.name" . }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  ports:
+    - name: grpc
+      port: 9002
+""",
+        encoding="utf-8",
+    )
+    (templates / "unexpected.yaml").write_text(
+        """{{- if .Values.router.extraUnexpected }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unexpected-secrets-reader
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+{{- end }}
+""",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("with_prometheus", [False, True])
+def test_real_helm_post_renderer_strips_metrics_auth_rbac_and_preserves_epp_auth(
+    tmp_path: Path, monkeypatch, with_prometheus: bool
+):
+    helm_bin = shutil.which("helm")
+    if not helm_bin:
+        pytest.skip("helm binary not installed")
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
+    chart_dir = tmp_path / "chart"
+    _write_local_router_chart(chart_dir)
+    release = "very-long-release-name-that-exceeds-forty-chars"
+
+    raw_cmd = [helm_bin, "template", release, str(chart_dir), "--namespace", "llmd-run"]
+    if with_prometheus:
+        raw_cmd.extend(
+            [
+                "--set",
+                "router.monitoring.prometheus.enabled=true",
+                "--set",
+                "router.monitoring.prometheusoperator=true",
+            ]
+        )
+    raw = subprocess.run(raw_cmd, capture_output=True, text=True, check=False)
+    assert raw.returncode == 0, raw.stderr
+    raw_docs = [doc for doc in yaml.safe_load_all(raw.stdout) if doc is not None]
+    assert [doc["kind"] for doc in raw_docs] == ["ClusterRole", "ClusterRoleBinding", "Service", "Deployment"]
+
+    with helm_metrics_auth_post_renderer("llmd-run") as post_renderer:
+        cmd = [*raw_cmd, "--post-renderer", str(post_renderer)]
+        completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        assert completed.returncode == 0, completed.stderr
+        docs = [doc for doc in yaml.safe_load_all(completed.stdout) if doc is not None]
+        assert [doc["kind"] for doc in docs] == ["Service", "Deployment"]
+        deployment = next(doc for doc in docs if doc["kind"] == "Deployment")
+        args = deployment["spec"]["template"]["spec"]["containers"][0]["args"]
+        assert "--metrics-endpoint-auth=false" not in args
+
+        failing = subprocess.run(
+            [*cmd, "--set", "router.extraUnexpected=true"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert failing.returncode != 0
+        assert "unexpected cluster-scoped RBAC" in failing.stderr
+
+
+def _ssar_response(allowed_map: dict[tuple[str, str], bool]) -> str:
+    items = []
+    for resource in ("clusterroles", "clusterrolebindings"):
+        for verb in ("get", "create", "patch", "delete"):
+            items.append(
+                {
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "kind": "SelfSubjectAccessReview",
+                    "spec": {
+                        "resourceAttributes": {
+                            "verb": verb,
+                            "group": "rbac.authorization.k8s.io",
+                            "resource": resource,
+                        }
+                    },
+                    "status": {"allowed": allowed_map.get((verb, resource), True)},
+                }
+            )
+    return json.dumps({"apiVersion": "v1", "kind": "List", "items": items})
+
+
+@pytest.mark.asyncio
+async def test_resolve_helm_rbac_mode_admin_non_admin_and_failures():
+    class _FakeRunner:
+        def __init__(self, allowed_map: dict[tuple[str, str], bool], marker_data: dict | None):
+            self.allowed_map = allowed_map
+            self.marker_data = marker_data
+
+        async def run(self, argv, *, input=None, timeout=15):  # noqa: A002 - CommandRunner contract
+            if argv[:2] == ["kubectl", "create"]:
+                return CommandResult(tuple(argv), 0, _ssar_response(self.allowed_map), "")
+            if argv[:3] == ["kubectl", "get", "configmap"]:
+                if self.marker_data is None:
+                    return CommandResult(tuple(argv), 0, "", "")
+                return CommandResult(
+                    tuple(argv),
+                    0,
+                    json.dumps({"apiVersion": "v1", "kind": "ConfigMap", "data": self.marker_data}),
+                    "",
+                )
+            raise AssertionError(f"unexpected command: {argv}")
+
+    assert not await resolve_helm_rbac_mode("llmd-run", ssar_runner=_FakeRunner({}, None))
+
+    non_admin_denied = {("create", "clusterrolebindings"): False}
+    assert await resolve_helm_rbac_mode(
+        "llmd-run",
+        ssar_runner=_FakeRunner(
+            non_admin_denied,
+            {"status": "completed", "namespace": "llmd-run", "eppAuthDelegator": "applied"},
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="eppAuthDelegator=applied"):
+        await resolve_helm_rbac_mode("llmd-run", ssar_runner=_FakeRunner(non_admin_denied, None))
+
+    with pytest.raises(RuntimeError, match="eppAuthDelegator=applied"):
+        await resolve_helm_rbac_mode(
+            "llmd-run",
+            ssar_runner=_FakeRunner(
+                non_admin_denied,
+                {"status": "completed", "namespace": "llmd-run", "eppAuthDelegator": "not_required"},
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_helm_rbac_mode_propagates_auth_and_unavailable_and_ignores_ambient_env(monkeypatch):
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+    monkeypatch.setenv("KUBECONFIG", "/nonexistent/ambient")
+    assert not await resolve_helm_rbac_mode("llmd-run", cluster_id=None, environment=None)
+
+    class _AuthFailRunner:
+        async def run(self, argv, *, input=None, timeout=15):  # noqa: A002 - CommandRunner contract
+            return CommandResult(tuple(argv), 1, "", "error: You must be logged in to the server (Unauthorized)")
+
+    with pytest.raises(capabilities.DeploymentClusterAuthError):
+        await resolve_helm_rbac_mode("llmd-run", ssar_runner=_AuthFailRunner())
+
+    class _UnavailableRunner:
+        async def run(self, argv, *, input=None, timeout=15):  # noqa: A002 - CommandRunner contract
+            return CommandResult(tuple(argv), 1, "", "connection refused")
+
+    with pytest.raises(capabilities.DeploymentCapabilityUnavailableError):
+        await resolve_helm_rbac_mode("llmd-run", ssar_runner=_UnavailableRunner())
+
+    called = {}
+
+    async def _fake_shell_run(command, *, env=None, input=None, timeout=None):  # noqa: A002 - CommandRunner contract
+        called["command"] = command
+        called["env"] = env
+        return CommandResult(tuple(command), 0, _ssar_response({}), "")
+
+    monkeypatch.setattr(deployment_bundle.shell, "run", _fake_shell_run)
+    assert not await resolve_helm_rbac_mode(
+        "llmd-run",
+        environment={"KUBECONFIG": "/tmp/explicit-kubeconfig"},
+        kubectl_path=Path("/opt/bin/kubectl"),
+    )
+    assert called["command"][0] == "/opt/bin/kubectl"
+    assert called["env"] == {"KUBECONFIG": "/tmp/explicit-kubeconfig"}
+
+
+@pytest.mark.asyncio
+async def test_install_and_validate_frozen_bundle_attach_post_renderer_when_stripping(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "scratch")
+    rendered_with_rbac = yaml.safe_dump_all(
+        [
+            _metrics_auth_role(),
+            _metrics_auth_binding(),
+            {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "epp"}},
+        ],
+        sort_keys=False,
+    )
+    rendered_without_rbac = "---\napiVersion: v1\nkind: Service\nmetadata:\n  name: epp\n---\n"
+    commands: list[list[str]] = []
+    seen_exists: list[bool] = []
+
+    async def runner(command: list[str]) -> tuple[int, str, str]:
+        commands.append(command)
+        if "--post-renderer" in command:
+            script = Path(command[command.index("--post-renderer") + 1])
+            seen_exists.append(script.is_file() and stat.S_IMODE(script.stat().st_mode) == 0o700)
+        if command[1] == "pull":
+            (Path(command[-1]) / "router.tgz").write_bytes(b"frozen")
+            return 0, "", ""
+        if command[1] == "template":
+            return 0, rendered_with_rbac, ""
+        if command[1] == "install":
+            return 0, json.dumps({"manifest": rendered_without_rbac}), ""
+        if command[1:3] == ["get", "manifest"]:
+            return 0, rendered_without_rbac, ""
+        return 0, "ok", ""
+
+    frozen = await freeze_deployment_bundle(
+        _bundle(),
+        guide="optimized-baseline",
+        source_commit="a" * 40,
+        namespace="llmd-run",
+        command_runner=runner,
+        effective_values="router:\n  setting: saved\n",
+    )
+
+    await validate_frozen_bundle(
+        frozen,
+        guide="optimized-baseline",
+        source_commit="a" * 40,
+        namespace="llmd-run",
+        command_runner=runner,
+        strip_metrics_auth_rbac=True,
+    )
+    dry_run_cmd = next(cmd for cmd in commands if cmd[1] == "install")
+    assert "--post-renderer" in dry_run_cmd
+
+    commands.clear()
+    await install_deployment_bundle(
+        frozen,
+        guide="optimized-baseline",
+        source_commit="a" * 40,
+        namespace="llmd-run",
+        command_runner=runner,
+        output_root=tmp_path / "out",
+        strip_metrics_auth_rbac=True,
+    )
+    template_cmd = next(cmd for cmd in commands if cmd[1] == "template")
+    upgrade_cmd = next(cmd for cmd in commands if cmd[1] == "upgrade")
+    get_cmd = next(cmd for cmd in commands if cmd[1:3] == ["get", "manifest"])
+    assert "--post-renderer" not in template_cmd
+    assert "--post-renderer" in upgrade_cmd
+    assert "--post-renderer" not in get_cmd
+    assert seen_exists == [True, True]
+    assert not Path(upgrade_cmd[upgrade_cmd.index("--post-renderer") + 1]).exists()
+
+    # Drift in a kept document still fails even with strip_metrics_auth_rbac=True
+    async def drifted_runner(command: list[str]) -> tuple[int, str, str]:
+        return 0, json.dumps({"manifest": "apiVersion: v1\nkind: Service\nmetadata:\n  name: changed\n"}), ""
+
+    with pytest.raises(ValueError, match="differs from the reviewed plan"):
+        await validate_frozen_bundle(
+            frozen,
+            guide="optimized-baseline",
+            source_commit="a" * 40,
+            namespace="llmd-run",
+            command_runner=drifted_runner,
+            strip_metrics_auth_rbac=True,
         )

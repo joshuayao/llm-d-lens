@@ -64,6 +64,7 @@ from llm_d_lens.deploy.executions import (
 )
 from llm_d_lens.deploy.orphans import (
     OrphanCleanupError,
+    OrphanScanPermissionDeniedError,
     clean_orphan_namespaces,
     namespace_prefix,
     scan_orphan_namespaces,
@@ -1418,8 +1419,14 @@ async def list_orphan_namespaces(cluster_id: str, request: Request = None) -> di
     require_cluster_access(principal, cluster_id)
     try:
         orphans = await scan_orphan_namespaces(cluster_id)
+    except OrphanScanPermissionDeniedError as error:
+        return problem(403, "Orphan scan forbidden", str(error), "orphan_scan_forbidden")
     except OrphanCleanupError as error:
         return problem(502, "Orphan scan failed", str(error), "orphan_scan_failed")
+    except Exception as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        raise
     return {
         "clusterId": cluster_id,
         "prefix": namespace_prefix(),
@@ -1693,10 +1700,23 @@ async def clean_case(run_id: str, case_id: str, request: CleanCaseRequest, http_
         case, execution = await deployment_run_manager.worker_for_run(run_id).clean_case(
             run_id, case_id, preserve_rendered_overlay=request.preserve_rendered_overlay
         )
+    except DeploymentCleanupPermissionDenied as error:
+        logger.info("event=deployment_case_clean_admin_handoff run_id=%s case_id=%s", run_id, case_id)
+        return problem(
+            409,
+            "Deployment cleanup requires Orchestration administrator action",
+            str(error),
+            "deployment_cleanup_permission_denied",
+            extra=error.payload,
+        )
     except DeploymentInUseError as error:
         return problem(409, "Deployment is in use", str(error), "deployment_in_use")
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+    except Exception as error:
+        if _is_cluster_auth_error(error):
+            return problem(401, "Kubeconfig unauthorized", str(error), "kubeconfig_unauthorized")
+        if isinstance(error, ValueError):
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        raise
     return _case_response(case, execution)
 
 

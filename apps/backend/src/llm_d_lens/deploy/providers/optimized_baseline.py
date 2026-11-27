@@ -19,6 +19,7 @@ from llm_d_lens.cluster.registry import validate_container_image_ref
 from llm_d_lens.configuration.service import CONFIGURATION_OUTPUT_DIR
 from llm_d_lens.core.hashing import stable_hash
 from llm_d_lens.deploy.data_plane import router_data_plane_args, router_data_plane_effective_values
+from llm_d_lens.deploy.providers import deployment_bundle
 from llm_d_lens.deploy.providers.deployment_bundle import (
     install_deployment_bundle,
     subprocess_bundle_runner,
@@ -194,6 +195,15 @@ class OptimizedBaselineGuideAdapter(GuideAdapter):
     ) -> None:
         """Install the routed data plane before an exact published manifest is applied."""
         namespace = self._namespace(execution_context)
+        provenance = execution_context.get("provenance")
+        cluster_id = provenance.get("cluster_server_id") if isinstance(provenance, Mapping) else None
+        environment, kubectl_path = deployment_bundle.adapter_kubectl_context(self)
+        strip_rbac = await deployment_bundle.resolve_helm_rbac_mode(
+            namespace,
+            cluster_id=cluster_id,
+            environment=environment,
+            kubectl_path=kubectl_path,
+        )
         profile = artifact.deployment_contract.get("routerProfile", "optimized-baseline")
         bundle = artifact.deployment_contract.get("deploymentBundle")
         if bundle is not None:
@@ -216,6 +226,7 @@ class OptimizedBaselineGuideAdapter(GuideAdapter):
                 output_root=output_root,
                 effective_values_content=effective_values,
                 effective_values_name=f"router-effective-{profile}.yaml",
+                strip_metrics_auth_rbac=strip_rbac,
             )
             execution_context.update(result)
             return
@@ -236,7 +247,11 @@ class OptimizedBaselineGuideAdapter(GuideAdapter):
             str(values),
             *self._gateway_mode_args(execution_context),
         ]
-        status, stdout, stderr = await self._command_runner(command)
+        if strip_rbac:
+            with deployment_bundle.helm_metrics_auth_post_renderer(namespace) as post_renderer:
+                status, stdout, stderr = await self._command_runner([*command, "--post-renderer", str(post_renderer)])
+        else:
+            status, stdout, stderr = await self._command_runner(command)
         if status != 0:
             raise RuntimeError((stderr or stdout or "Router deployment failed").strip())
 
@@ -273,34 +288,50 @@ class OptimizedBaselineGuideAdapter(GuideAdapter):
             if not callable(create_secret):
                 raise RuntimeError("registered guide runner cannot provision the required model secret")
             await create_secret(namespace, self._policy.model_token_file)
-        plan = [
-            [
-                "helm",
-                "upgrade",
-                "--install",
-                self._policy.router_release_name,
-                self._policy.router_chart,
-                "--namespace",
-                namespace,
-                "--version",
-                self._policy.router_chart_version,
-                "--values",
-                str(self._policy.router_base_values_path),
-                "--values",
-                str(
-                    self._router_values_for_profile(
-                        artifact.deployment_contract.get("routerProfile", "optimized-baseline"),
-                        rendered_overlay,
-                    )
-                ),
-                *self._gateway_mode_args(execution_context),
-            ],
-            ["kubectl", "apply", "--namespace", namespace, "--kustomize", str(rendered_overlay)],
+        provenance = execution_context.get("provenance")
+        cluster_id = provenance.get("cluster_server_id") if isinstance(provenance, Mapping) else None
+        environment, kubectl_path = deployment_bundle.adapter_kubectl_context(self)
+        strip_rbac = await deployment_bundle.resolve_helm_rbac_mode(
+            namespace,
+            cluster_id=cluster_id,
+            environment=environment,
+            kubectl_path=kubectl_path,
+        )
+        helm_command = [
+            "helm",
+            "upgrade",
+            "--install",
+            self._policy.router_release_name,
+            self._policy.router_chart,
+            "--namespace",
+            namespace,
+            "--version",
+            self._policy.router_chart_version,
+            "--values",
+            str(self._policy.router_base_values_path),
+            "--values",
+            str(
+                self._router_values_for_profile(
+                    artifact.deployment_contract.get("routerProfile", "optimized-baseline"),
+                    rendered_overlay,
+                )
+            ),
+            *self._gateway_mode_args(execution_context),
         ]
-        for command in plan:
-            status, stdout, stderr = await self._command_runner(command)
-            if status != 0:
-                raise RuntimeError((stderr or stdout or "registered guide deployment failed").strip())
+        if strip_rbac:
+            with deployment_bundle.helm_metrics_auth_post_renderer(namespace) as post_renderer:
+                status, stdout, stderr = await self._command_runner(
+                    [*helm_command, "--post-renderer", str(post_renderer)]
+                )
+        else:
+            status, stdout, stderr = await self._command_runner(helm_command)
+        if status != 0:
+            raise RuntimeError((stderr or stdout or "registered guide deployment failed").strip())
+        status, stdout, stderr = await self._command_runner(
+            ["kubectl", "apply", "--namespace", namespace, "--kustomize", str(rendered_overlay)]
+        )
+        if status != 0:
+            raise RuntimeError((stderr or stdout or "registered guide deployment failed").strip())
         execution = {"namespace": namespace, "artifact_hash": artifact.artifact_hash}
         take_evidence_refs = getattr(self._command_runner, "take_evidence_refs", None)
         if callable(take_evidence_refs):

@@ -1605,3 +1605,180 @@ def test_multi_target_bootstrap_script_includes_stale_marker_even_when_sufficien
     assert stale_target["marker"]["bootstrapDigest"] == stale_target["bootstrapDigest"]
     assert "TARGET_NAMESPACE=llmd-stale-ns" in remediation["script"]
     assert "TARGET_NAMESPACE=llmd-valid-ns" not in remediation["script"]
+
+
+def test_epp_auth_delegator_namespace_group_bootstrap_digest_compat_and_hints(monkeypatch) -> None:
+    import asyncio
+    import hashlib
+    import json
+    from types import SimpleNamespace
+
+    from llm_d_lens.cluster import egress as cluster_egress
+    from llm_d_lens.cluster import registry as cluster_registry
+    from llm_d_lens.deploy import capabilities as caps
+    from llm_d_lens.deploy import executions as deploy_executions
+    from llm_d_lens.infrastructure.process import CommandResult
+
+    monkeypatch.setenv("LLM_D_BENCH_NAMESPACE_PREFIX", "llmd-")
+    monkeypatch.setattr(cluster_egress, "validate_stored_cluster_egress", lambda _cid: None)
+    monkeypatch.setattr(cluster_registry, "get_cluster", lambda _cid: None)
+    monkeypatch.setattr(cluster_registry, "cluster_kubeconfig_namespace", lambda _cid: None)
+    monkeypatch.setattr(deploy_executions, "_store", SimpleNamespace(list_executions=lambda: []))
+
+    # 1. _epp_auth_delegator_crb_manifest keeps explicit ServiceAccounts AND appends namespace SA Group
+    crb_with_sa = caps._epp_auth_delegator_crb_manifest("llmd-ns", ["custom-epp"])
+    assert crb_with_sa["subjects"] == [
+        {"kind": "ServiceAccount", "name": "custom-epp", "namespace": "llmd-ns"},
+        {
+            "kind": "Group",
+            "apiGroup": "rbac.authorization.k8s.io",
+            "name": "system:serviceaccounts:llmd-ns",
+        },
+    ]
+    crb_empty_sa = caps._epp_auth_delegator_crb_manifest("llmd-ns", ())
+    assert crb_empty_sa["subjects"] == [
+        {
+            "kind": "Group",
+            "apiGroup": "rbac.authorization.k8s.io",
+            "name": "system:serviceaccounts:llmd-ns",
+        }
+    ]
+
+    # 2. _deployment_role_manifest permits coordination.k8s.io (for HA leader-election leases)
+    role_manifest = caps._deployment_role_manifest("llmd-ns")
+    assert any("coordination.k8s.io" in rule.get("apiGroups", []) for rule in role_manifest["rules"])
+
+    # 3. _parse_manifest_hints treats InferenceObjective as uses_router=True
+    hints = caps._parse_manifest_hints(
+        "apiVersion: llm-d.ai/v1alpha1\nkind: InferenceObjective\nmetadata:\n  name: obj-1\n"
+    )
+    assert hints["uses_router"] is True
+
+    # 4. bootstrapDigest stays identical to pre-t121 canonical payload even with eppSubjectScope
+    identity = {"kind": "User", "name": "alice", "subject": "alice", "overrideRequired": False}
+    expected_canonical = {
+        "clusterId": "cluster-a",
+        "namespace": "llmd-ns",
+        "namespaceLabels": {},
+        "subject": "alice",
+        "eppServiceAccounts": ["optimized-baseline-epp"],
+        "usesRouter": True,
+        "usesLws": False,
+        "usesStorage": False,
+        "satelliteVolumeId": None,
+        "preparedRequest": "",
+    }
+    expected_digest = hashlib.sha256(
+        json.dumps(expected_canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    rendered_router = caps.render_deployment_bootstrap_script(
+        cluster_id="cluster-a",
+        namespace="llmd-ns",
+        identity=identity,
+        epp_service_accounts=["optimized-baseline-epp"],
+        uses_router=True,
+    )
+    assert rendered_router["bootstrapDigest"] == expected_digest
+    assert "EPP_AUTH_DELEGATOR=applied" in rendered_router["script"]
+    assert "EPP_SUBJECT_SCOPE=namespace_serviceaccounts" in rendered_router["script"]
+    assert '--from-literal="eppSubjectScope=$EPP_SUBJECT_SCOPE"' in rendered_router["script"]
+    assert "name: system:serviceaccounts:llmd-ns" in rendered_router["script"]
+
+    # uses_router=True with empty epp_service_accounts still emits eppYaml and namespace_serviceaccounts scope
+    rendered_empty_sa = caps.render_deployment_bootstrap_script(
+        cluster_id="cluster-a",
+        namespace="llmd-ns",
+        identity=identity,
+        epp_service_accounts=(),
+        uses_router=True,
+    )
+    assert "EPP_AUTH_DELEGATOR=applied" in rendered_empty_sa["script"]
+    assert "EPP_SUBJECT_SCOPE=namespace_serviceaccounts" in rendered_empty_sa["script"]
+    assert "<<'LENS_EPP_EOF'" in rendered_empty_sa["script"]
+
+    rendered_non_router = caps.render_deployment_bootstrap_script(
+        cluster_id="cluster-a",
+        namespace="llmd-ns",
+        identity=identity,
+        uses_router=False,
+    )
+    assert "EPP_AUTH_DELEGATOR=not_required" in rendered_non_router["script"]
+    assert "EPP_SUBJECT_SCOPE=none" in rendered_non_router["script"]
+
+    # 5. read_bootstrap_marker parses eppSubjectScope and allows empty cluster_id fallback
+    class _ScopeMarkerRunner:
+        def __init__(self, marker_data):
+            self.marker_data = marker_data
+
+        async def run(self, argv, *, input=None, timeout=15):  # noqa: A002
+            return CommandResult(tuple(argv), 0, json.dumps({"data": self.marker_data}), "")
+
+    scope_data = {
+        "status": "completed",
+        "clusterId": "cluster-a",
+        "namespace": "llmd-ns",
+        "eppAuthDelegator": "applied",
+        "eppSubjectScope": "namespace_serviceaccounts",
+        "eppServiceAccounts": "optimized-baseline-epp",
+    }
+    parsed = asyncio.run(caps.read_bootstrap_marker("", "llmd-ns", runner=_ScopeMarkerRunner(scope_data)))
+    assert parsed["present"] is True
+    assert parsed["eppSubjectScope"] == "namespace_serviceaccounts"
+
+    mismatch = asyncio.run(caps.read_bootstrap_marker("cluster-b", "llmd-ns", runner=_ScopeMarkerRunner(scope_data)))
+    assert mismatch["present"] is False
+    assert mismatch["status"] == "stale"
+
+    # 6. _ssar_operation_specs: namespace_serviceaccounts covers arbitrary truncated SA; legacy marker checks SA list
+    ns_wide_ops = caps._ssar_operation_specs(
+        namespace="llmd-ns",
+        uses_storage=False,
+        uses_router=True,
+        uses_lws=False,
+        namespace_exists=True,
+        marker={
+            "present": True,
+            "eppAuthDelegator": "applied",
+            "eppSubjectScope": "namespace_serviceaccounts",
+            "eppServiceAccounts": ["optimized-baseline-epp"],
+        },
+        epp_service_accounts=["very-long-truncated-release-name-epp"],
+        satellite_storage=None,
+    )
+    epp_op = next(op for op in ns_wide_ops if op["id"] == "deploy.epp_auth_delegator")
+    assert epp_op["required"] is False
+    # leases are NOT added to SSAR specs so existing bootstrapped namespaces remain sufficient
+    rbac_op = next(op for op in ns_wide_ops if op["id"] == "deploy.rbac")
+    assert all(key[2] != "leases" for key in rbac_op["keys"])
+
+    legacy_match_ops = caps._ssar_operation_specs(
+        namespace="llmd-ns",
+        uses_storage=False,
+        uses_router=True,
+        uses_lws=False,
+        namespace_exists=True,
+        marker={
+            "present": True,
+            "eppAuthDelegator": "applied",
+            "eppServiceAccounts": ["optimized-baseline-epp"],
+        },
+        epp_service_accounts=["optimized-baseline-epp"],
+        satellite_storage=None,
+    )
+    assert next(op for op in legacy_match_ops if op["id"] == "deploy.epp_auth_delegator")["required"] is False
+
+    legacy_mismatch_ops = caps._ssar_operation_specs(
+        namespace="llmd-ns",
+        uses_storage=False,
+        uses_router=True,
+        uses_lws=False,
+        namespace_exists=True,
+        marker={
+            "present": True,
+            "eppAuthDelegator": "applied",
+            "eppServiceAccounts": ["optimized-baseline-epp"],
+        },
+        epp_service_accounts=["other-epp"],
+        satellite_storage=None,
+    )
+    assert next(op for op in legacy_mismatch_ops if op["id"] == "deploy.epp_auth_delegator")["required"] is True

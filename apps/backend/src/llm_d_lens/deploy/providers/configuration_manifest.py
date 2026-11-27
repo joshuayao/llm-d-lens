@@ -913,17 +913,28 @@ class ConfigurationManifestAdapter:
         )
         return replace(artifact, deployment_contract={**artifact.deployment_contract, "deploymentBundle": frozen})
 
-    async def validate_prepared_router(self, artifact: GuideDeploymentArtifact, namespace: str) -> None:
-        from llm_d_lens.deploy.providers.deployment_bundle import validate_frozen_bundle
+    async def validate_prepared_router(
+        self, artifact: GuideDeploymentArtifact, namespace: str, *, cluster_id: str | None = None
+    ) -> None:
+        from llm_d_lens.deploy.providers import deployment_bundle
 
         if artifact.guide_id == "source-composition" and "deploymentBundle" not in artifact.deployment_contract:
             return
-        await validate_frozen_bundle(
+        delegate = getattr(self, "_delegate", None)
+        environment, kubectl_path = deployment_bundle.adapter_kubectl_context(delegate)
+        strip_rbac = await deployment_bundle.resolve_helm_rbac_mode(
+            namespace,
+            cluster_id=cluster_id,
+            environment=environment,
+            kubectl_path=kubectl_path,
+        )
+        await deployment_bundle.validate_frozen_bundle(
             artifact.deployment_contract["deploymentBundle"],
             guide=artifact.guide_id,
             source_commit=str(artifact.source_ref or ""),
             namespace=namespace,
             command_runner=self._delegate._bundle_command_runner,
+            strip_metrics_auth_rbac=strip_rbac,
         )
 
     async def _create_namespace(
