@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -223,15 +224,18 @@ def helm_post_renderer_root() -> Path:
     return prism_temp_root("helm-post-renderers")
 
 
-def _build_post_renderer_filter_script(namespace: str) -> str:
+def _build_post_renderer_filter_script(namespace: str, last_error_path: Path | None = None) -> str:
     allowed_json = json.dumps({key: sorted(value) for key, value in _POST_RENDERER_ALLOWED_NAMESPACED.items()})
     rules_json = json.dumps([list(item) for item in sorted(_METRICS_AUTH_RULES)])
     namespace_json = json.dumps(namespace)
+    last_error_literal = "None" if last_error_path is None else json.dumps(str(last_error_path))
     return f"""import json
+import os
 import sys
 import yaml
 
 TARGET_NAMESPACE = {namespace_json}
+LAST_ERROR_PATH = {last_error_literal}
 ALLOWED_NAMESPACED = {{k: set(v) for k, v in json.loads({allowed_json!r}).items()}}
 METRICS_AUTH_RULES = {{tuple(item) for item in json.loads({rules_json!r})}}
 
@@ -361,12 +365,36 @@ def filter_manifest(raw_yaml):
     return yaml.safe_dump_all(kept, sort_keys=False)
 
 
+def _fail(message):
+    if LAST_ERROR_PATH and not os.path.islink(LAST_ERROR_PATH):
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(LAST_ERROR_PATH, flags, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                handle = os.fdopen(fd, "w", encoding="utf-8")
+            except Exception:
+                os.close(fd)
+                raise
+            with handle:
+                handle.write(message)
+        except OSError:
+            pass
+    sys.stderr.write(f"{{message}}\\n")
+    return 1
+
+
 def main():
+    if LAST_ERROR_PATH:
+        try:
+            if os.path.lexists(LAST_ERROR_PATH) and not os.path.islink(LAST_ERROR_PATH):
+                os.unlink(LAST_ERROR_PATH)
+        except OSError:
+            pass
     try:
         sys.stdout.write(filter_manifest(sys.stdin.read()))
     except Exception as error:
-        sys.stderr.write(f"{{error}}\\n")
-        return 1
+        return _fail(str(error))
     return 0
 
 
@@ -375,10 +403,19 @@ if __name__ == "__main__":
 """
 
 
+_ACTIVE_HELM_POST_RENDERER: contextvars.ContextVar[HelmPostRenderer | None] = contextvars.ContextVar(
+    "_ACTIVE_HELM_POST_RENDERER",
+    default=None,
+)
 _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
     "_ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR",
     default=None,
 )
+
+
+def active_helm_post_renderer() -> HelmPostRenderer | None:
+    """Return the active task-local Helm post-renderer handle when active."""
+    return _ACTIVE_HELM_POST_RENDERER.get()
 
 
 def active_helm_post_renderer_plugins_dir() -> Path | None:
@@ -431,12 +468,37 @@ class HelmPostRenderer:
     script_path: Path
     plugins_dir: Path | None = None
     major_version: int = 3
+    error_path: Path | None = None
 
     def __str__(self) -> str:
         return self.argument
 
     def helm_args(self) -> list[str]:
         return ["--post-renderer", self.argument]
+
+    def last_error(self) -> str | None:
+        """Return the recorded post-renderer failure message, if any, without following symlinks."""
+        if self.error_path is None:
+            return None
+        try:
+            if self.error_path.is_symlink():
+                return None
+            fd = os.open(self.error_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            return None
+        try:
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                return None
+            with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
+                fd = -1
+                text = handle.read().strip()
+        except OSError:
+            return None
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        return text or None
 
     def subprocess_env(self, base_env: Mapping[str, str] | None = None) -> dict[str, str] | None:
         """Return per-invocation env with ``HELM_PLUGINS`` isolated to ``plugins_dir`` on Helm v4.
@@ -463,8 +525,12 @@ def helm_metrics_auth_post_renderer(namespace: str, *, helm_bin: str | Path = "h
     with tempfile.TemporaryDirectory(prefix="rbac-strip-", dir=root) as directory:
         tmpdir = Path(directory)
         os.chmod(tmpdir, 0o700)
+        last_error_path = tmpdir / "last-error.txt"
         filter_py = tmpdir / "filter.py"
-        filter_py.write_text(_build_post_renderer_filter_script(namespace), encoding="utf-8")
+        filter_py.write_text(
+            _build_post_renderer_filter_script(namespace, last_error_path=last_error_path),
+            encoding="utf-8",
+        )
         os.chmod(filter_py, 0o600)
         wrapper = tmpdir / "strip-metrics-auth-rbac"
         wrapper.write_text(
@@ -473,6 +539,8 @@ def helm_metrics_auth_post_renderer(namespace: str, *, helm_bin: str | Path = "h
         )
         os.chmod(wrapper, 0o700)
         major = _helm_major_version(helm_bin)
+        plugins_dir: Path | None = None
+        argument = str(wrapper)
         if major >= 4:
             plugins_dir = tmpdir / "plugins"
             plugins_dir.mkdir(mode=0o700)
@@ -491,27 +559,22 @@ def helm_metrics_auth_post_renderer(namespace: str, *, helm_bin: str | Path = "h
             }
             plugin_yaml.write_text(yaml.safe_dump(plugin_manifest, sort_keys=False), encoding="utf-8")
             os.chmod(plugin_yaml, 0o600)
-            token = _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.set(plugins_dir)
-            try:
-                yield HelmPostRenderer(
-                    argument="strip-metrics-auth-rbac",
-                    script_path=wrapper,
-                    plugins_dir=plugins_dir,
-                    major_version=major,
-                )
-            finally:
-                _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.reset(token)
-        else:
-            token = _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.set(None)
-            try:
-                yield HelmPostRenderer(
-                    argument=str(wrapper),
-                    script_path=wrapper,
-                    plugins_dir=None,
-                    major_version=major,
-                )
-            finally:
-                _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.reset(token)
+            argument = "strip-metrics-auth-rbac"
+
+        post_renderer = HelmPostRenderer(
+            argument=argument,
+            script_path=wrapper,
+            plugins_dir=plugins_dir,
+            major_version=major,
+            error_path=last_error_path,
+        )
+        plugins_token = _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.set(plugins_dir)
+        renderer_token = _ACTIVE_HELM_POST_RENDERER.set(post_renderer)
+        try:
+            yield post_renderer
+        finally:
+            _ACTIVE_HELM_POST_RENDERER.reset(renderer_token)
+            _ACTIVE_HELM_POST_RENDERER_PLUGINS_DIR.reset(plugins_token)
 
 
 class _KubectlSubprocessRunner:
@@ -697,6 +760,18 @@ def frozen_chart(bundle: dict, directory: Path, namespace: str) -> Path:
     return path
 
 
+def _with_post_renderer_error(
+    detail: str,
+    stderr: str,
+    stdout: str,
+    post_renderer: HelmPostRenderer,
+) -> str:
+    recorded_error = post_renderer.last_error()
+    if recorded_error and recorded_error not in stderr and recorded_error not in stdout:
+        return f"{detail} ({recorded_error})" if detail else recorded_error
+    return detail
+
+
 async def validate_frozen_bundle(
     bundle: dict,
     *,
@@ -726,10 +801,13 @@ async def validate_frozen_bundle(
         helm_bin = getattr(command_runner, "_helm_path", "helm")
         with helm_metrics_auth_post_renderer(namespace, helm_bin=helm_bin) as post_renderer:
             status, stdout, stderr = await command_runner([*command, *post_renderer.helm_args()])
+            if status:
+                detail = _with_post_renderer_error((stderr or stdout).strip(), stderr, stdout, post_renderer)
+                raise ValueError(f"Prepared Router server dry run failed: {detail}")
     else:
         status, stdout, stderr = await command_runner(command)
-    if status:
-        raise ValueError(f"Prepared Router server dry run failed: {(stderr or stdout).strip()}")
+        if status:
+            raise ValueError(f"Prepared Router server dry run failed: {(stderr or stdout).strip()}")
     release = json.loads(stdout)
     if release.get("hooks"):
         raise ValueError("Prepared deployments do not execute unreviewed Helm hooks")
@@ -770,10 +848,17 @@ def subprocess_bundle_runner(
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await process.communicate()
+        stdout_text = stdout.decode(errors="replace")
+        stderr_text = stderr.decode(errors="replace")
+        if command and command[0] == "helm" and has_post_renderer and process.returncode != 0:
+            post_renderer = active_helm_post_renderer()
+            recorded_error = post_renderer.last_error() if post_renderer is not None else None
+            if recorded_error and recorded_error not in stderr_text:
+                stderr_text = f"{stderr_text.rstrip()} ({recorded_error})" if stderr_text.strip() else recorded_error
         return (
             process.returncode,
-            stdout.decode(errors="replace"),
-            stderr.decode(errors="replace"),
+            stdout_text,
+            stderr_text,
         )
 
     run._helm_path = helm_path  # type: ignore[attr-defined]
@@ -960,10 +1045,13 @@ async def install_deployment_bundle(
         helm_bin = getattr(command_runner, "_helm_path", "helm")
         with helm_metrics_auth_post_renderer(namespace, helm_bin=helm_bin) as post_renderer:
             status, stdout, stderr = await command_runner([*install_command, *post_renderer.helm_args()])
+            if status != 0:
+                detail = _with_post_renderer_error((stderr or stdout).strip(), stderr, stdout, post_renderer)
+                raise RuntimeError(detail or "saved Router deployment failed")
     else:
         status, stdout, stderr = await command_runner(install_command)
-    if status != 0:
-        raise RuntimeError((stderr or stdout or "saved Router deployment failed").strip())
+        if status != 0:
+            raise RuntimeError((stderr or stdout or "saved Router deployment failed").strip())
     status, rendered, stderr = await command_runner(
         [
             "helm",

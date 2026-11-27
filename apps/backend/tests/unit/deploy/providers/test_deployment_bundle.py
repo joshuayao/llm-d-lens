@@ -22,6 +22,7 @@ from llm_d_lens.deploy.providers.deployment_bundle import (
     _helm_major_version,
     _is_metrics_auth_binding,
     _is_metrics_auth_role,
+    active_helm_post_renderer,
     active_helm_post_renderer_plugins_dir,
     filter_helm_manifest_yaml,
     freeze_deployment_bundle,
@@ -383,6 +384,9 @@ def test_helm_post_renderer_permissions_and_cleanup(tmp_path: Path, monkeypatch)
         assert post_renderer.subprocess_env() is None
         assert post_renderer.subprocess_env({"KUBECONFIG": "/k"}) == {"KUBECONFIG": "/k"}
         assert active_helm_post_renderer_plugins_dir() is None
+        assert active_helm_post_renderer() is post_renderer
+        assert post_renderer.error_path == wrapper.parent / "last-error.txt"
+        assert post_renderer.last_error() is None
         assert wrapper.name == "strip-metrics-auth-rbac"
         assert wrapper.is_file()
         assert wrapper.parent.is_relative_to(helm_post_renderer_root())
@@ -438,12 +442,15 @@ def test_helm_v4_post_renderer_plugin_manifest_env_and_context_cleanup(tmp_path:
 
         parent_dir = post_renderer.script_path.parent
     assert not parent_dir.exists()
+    assert active_helm_post_renderer() is None
     assert active_helm_post_renderer_plugins_dir() is None
 
     # ContextVar also resets when an exception escapes the context block
     with pytest.raises(RuntimeError, match="boom"), helm_metrics_auth_post_renderer("llmd-run"):
+        assert active_helm_post_renderer() is not None
         assert active_helm_post_renderer_plugins_dir() is not None
         raise RuntimeError("boom")
+    assert active_helm_post_renderer() is None
     assert active_helm_post_renderer_plugins_dir() is None
 
 
@@ -644,7 +651,10 @@ def test_real_helm_post_renderer_strips_metrics_auth_rbac_and_preserves_epp_auth
             check=False,
         )
         assert failing.returncode != 0
-        assert "unexpected cluster-scoped RBAC" in failing.stderr
+        assert "unexpected cluster-scoped RBAC" in (post_renderer.last_error() or "")
+        if post_renderer.major_version >= 4:
+            assert "strip-metrics-auth-rbac" in failing.stderr
+        assert "unexpected cluster-scoped RBAC" in failing.stderr or "strip-metrics-auth-rbac" in failing.stderr
 
 
 def _ssar_response(allowed_map: dict[tuple[str, str], bool]) -> str:
@@ -898,3 +908,208 @@ async def test_subprocess_bundle_runner_helm_v4_env_isolation(tmp_path: Path, mo
     assert "HELM_PLUGINS" in upgrade_call[1]
     assert "HELM_PLUGINS" not in base_env
     assert "HELM_PLUGINS" not in os.environ
+
+
+def test_post_renderer_records_error_mode_clears_stale_and_refuses_symlinks(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "post-renderers")
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", lambda _helm_bin="helm": 4)
+
+    bad_manifest = yaml.safe_dump_all(
+        [
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "ClusterRole",
+                "metadata": {"name": "unexpected-secrets-reader"},
+                "rules": [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]}],
+            }
+        ],
+        sort_keys=False,
+    )
+    good_manifest = yaml.safe_dump_all(
+        [{"apiVersion": "v1", "kind": "Service", "metadata": {"name": "epp", "namespace": "llmd-run"}}],
+        sort_keys=False,
+    )
+
+    with helm_metrics_auth_post_renderer("llmd-run") as post_renderer:
+        error_path = post_renderer.error_path
+        assert error_path is not None
+        assert post_renderer.last_error() is None
+
+        failed = subprocess.run(
+            [str(post_renderer.script_path)],
+            input=bad_manifest,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert failed.returncode == 1
+        expected = "Non-admin Helm post-renderer rejected unexpected cluster-scoped RBAC: ClusterRole/unexpected-secrets-reader"
+        assert expected in failed.stderr
+        assert error_path.is_file()
+        assert stat.S_IMODE(error_path.stat().st_mode) == 0o600
+        assert post_renderer.last_error() == expected
+
+        # A subsequent valid run clears the stale error file.
+        succeeded = subprocess.run(
+            [str(post_renderer.script_path)],
+            input=good_manifest,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert succeeded.returncode == 0, succeeded.stderr
+        assert not error_path.exists()
+        assert post_renderer.last_error() is None
+
+        # Symlink at last-error.txt must never be followed on write or read, and must not mask stderr/exit 1.
+        target = tmp_path / "outside-target.txt"
+        target.write_text("do-not-overwrite", encoding="utf-8")
+        error_path.symlink_to(target)
+
+        assert post_renderer.last_error() is None
+        symlink_run = subprocess.run(
+            [str(post_renderer.script_path)],
+            input=bad_manifest,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert symlink_run.returncode == 1
+        assert expected in symlink_run.stderr
+        assert target.read_text(encoding="utf-8") == "do-not-overwrite"
+        assert post_renderer.last_error() is None
+
+
+@pytest.mark.asyncio
+async def test_subprocess_bundle_runner_and_install_append_helm_v4_post_renderer_error_without_duplication(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(deployment_bundle, "prism_temp_root", lambda *args: tmp_path / "scratch")
+    monkeypatch.setattr(deployment_bundle, "_helm_major_version", lambda _helm_bin="helm": 4)
+
+    rendered_with_rbac = yaml.safe_dump_all(
+        [
+            _metrics_auth_role(),
+            _metrics_auth_binding(),
+            {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "epp"}},
+        ],
+        sort_keys=False,
+    )
+    swallowed_helm4_stderr = (
+        b"Error: error while running post render on files: failed to invoke post-renderer plugin "
+        b'"strip-metrics-auth-rbac": plugin "strip-metrics-auth-rbac" exited with error\n'
+    )
+    expected_detail = "Non-admin Helm post-renderer rejected unexpected cluster-scoped RBAC: ClusterRole/unexpected"
+
+    mode = {"case": "swallowed"}
+
+    async def fake_spawn(command, **_kwargs):
+        if command[1] == "template":
+            return SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(rendered_with_rbac.encode(), b"")))
+        if command[1] in {"upgrade", "install"}:
+            active = active_helm_post_renderer()
+            assert active is not None and active.error_path is not None
+            active.error_path.write_text(expected_detail, encoding="utf-8")
+            os.chmod(active.error_path, 0o600)
+            if mode["case"] == "swallowed":
+                stderr_bytes = swallowed_helm4_stderr
+            elif mode["case"] == "empty":
+                stderr_bytes = b""
+            else:
+                stderr_bytes = f"helm: {expected_detail}\n".encode()
+            return SimpleNamespace(returncode=1, communicate=AsyncMock(return_value=(b"", stderr_bytes)))
+        return SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(b"ok", b"")))
+
+    monkeypatch.setattr(deployment_bundle, "spawn", fake_spawn)
+    runner = subprocess_bundle_runner(Path("/opt/helm4/helm"), Path("/opt/kubectl"))
+
+    # 1) subprocess_bundle_runner appends recorded error when Helm v4 swallows stderr, and install does not duplicate.
+    with pytest.raises(RuntimeError) as exc_info:
+        await install_deployment_bundle(
+            _bundle(),
+            guide="optimized-baseline",
+            source_commit="a" * 40,
+            namespace="llmd-run",
+            command_runner=runner,
+            output_root=tmp_path / "out-swallowed",
+            strip_metrics_auth_rbac=True,
+        )
+    message = str(exc_info.value)
+    assert "strip-metrics-auth-rbac" in message
+    assert message.count(expected_detail) == 1
+
+    # 2) When Helm emits empty stderr, subprocess_bundle_runner returns recorded_error directly.
+    mode["case"] = "empty"
+    with pytest.raises(RuntimeError) as empty_exc:
+        await install_deployment_bundle(
+            _bundle(),
+            guide="optimized-baseline",
+            source_commit="a" * 40,
+            namespace="llmd-run",
+            command_runner=runner,
+            output_root=tmp_path / "out-empty",
+            strip_metrics_auth_rbac=True,
+        )
+    assert str(empty_exc.value) == expected_detail
+
+    # 3) When stderr already includes the detail (e.g. Helm v3), neither runner nor install duplicates it.
+    mode["case"] = "already-present"
+    with pytest.raises(RuntimeError) as dup_exc:
+        await install_deployment_bundle(
+            _bundle(),
+            guide="optimized-baseline",
+            source_commit="a" * 40,
+            namespace="llmd-run",
+            command_runner=runner,
+            output_root=tmp_path / "out-present",
+            strip_metrics_auth_rbac=True,
+        )
+    assert str(dup_exc.value).count(expected_detail) == 1
+
+    # 4) Custom runner (bypassing subprocess_bundle_runner) still gets post_renderer.last_error() inside validate & install.
+    async def custom_helm4_runner(command: list[str]) -> tuple[int, str, str]:
+        if command[1] == "pull":
+            (Path(command[-1]) / "router.tgz").write_bytes(b"frozen")
+            return 0, "", ""
+        if command[1] == "template":
+            return 0, rendered_with_rbac, ""
+        if command[1] in {"install", "upgrade"}:
+            active = active_helm_post_renderer()
+            assert active is not None and active.error_path is not None
+            active.error_path.write_text(expected_detail, encoding="utf-8")
+            os.chmod(active.error_path, 0o600)
+            return 1, "", swallowed_helm4_stderr.decode()
+        return 0, "ok", ""
+
+    frozen = await freeze_deployment_bundle(
+        _bundle(),
+        guide="optimized-baseline",
+        source_commit="a" * 40,
+        namespace="llmd-run",
+        command_runner=custom_helm4_runner,
+        effective_values="router:\n  setting: saved\n",
+    )
+    with pytest.raises(ValueError) as dry_run_exc:
+        await validate_frozen_bundle(
+            frozen,
+            guide="optimized-baseline",
+            source_commit="a" * 40,
+            namespace="llmd-run",
+            command_runner=custom_helm4_runner,
+            strip_metrics_auth_rbac=True,
+        )
+    assert str(dry_run_exc.value).count(expected_detail) == 1
+    assert "strip-metrics-auth-rbac" in str(dry_run_exc.value)
+
+    with pytest.raises(RuntimeError) as custom_install_exc:
+        await install_deployment_bundle(
+            _bundle(),
+            guide="optimized-baseline",
+            source_commit="a" * 40,
+            namespace="llmd-run",
+            command_runner=custom_helm4_runner,
+            output_root=tmp_path / "out-custom",
+            strip_metrics_auth_rbac=True,
+        )
+    assert str(custom_install_exc.value).count(expected_detail) == 1
+    assert "strip-metrics-auth-rbac" in str(custom_install_exc.value)
