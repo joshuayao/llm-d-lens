@@ -829,6 +829,27 @@ async def test_registered_guide_helm_v4_validates_plugin_and_passes_env(tmp_path
         plugin_yaml.write_text(yaml.safe_dump(tampered, sort_keys=False), encoding="utf-8")
         with pytest.raises(RuntimeConfigurationError):
             runner._validate_helm([*install, "--post-renderer", "strip-metrics-auth-rbac"])
+
+        # Unknown top-level keys (such as description), unknown runtimeConfig keys,
+        # and empty/whitespace/non-string version are rejected
+        tampered = yaml.safe_load(original_manifest)
+        tampered["description"] = "unexpected"
+        plugin_yaml.write_text(yaml.safe_dump(tampered, sort_keys=False), encoding="utf-8")
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*install, "--post-renderer", "strip-metrics-auth-rbac"])
+
+        tampered = yaml.safe_load(original_manifest)
+        tampered["runtimeConfig"]["extra"] = True
+        plugin_yaml.write_text(yaml.safe_dump(tampered, sort_keys=False), encoding="utf-8")
+        with pytest.raises(RuntimeConfigurationError):
+            runner._validate_helm([*install, "--post-renderer", "strip-metrics-auth-rbac"])
+
+        for bad_version in ("", "   ", 1, None):
+            tampered = yaml.safe_load(original_manifest)
+            tampered["version"] = bad_version
+            plugin_yaml.write_text(yaml.safe_dump(tampered, sort_keys=False), encoding="utf-8")
+            with pytest.raises(RuntimeConfigurationError):
+                runner._validate_helm([*install, "--post-renderer", "strip-metrics-auth-rbac"])
         plugin_yaml.write_text(original_manifest, encoding="utf-8")
 
         # Symlink plugin.yaml rejected

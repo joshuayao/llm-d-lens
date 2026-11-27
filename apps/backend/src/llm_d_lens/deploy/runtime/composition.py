@@ -1021,10 +1021,15 @@ class RegisteredGuideCommandRunner:
             platform_commands = runtime_config.get("platformCommand") if isinstance(runtime_config, dict) else None
             if (
                 not isinstance(manifest, dict)
+                or set(manifest.keys()) != {"apiVersion", "type", "name", "version", "runtime", "runtimeConfig"}
                 or manifest.get("apiVersion") != "v1"
                 or manifest.get("type") != "postrenderer/v1"
                 or manifest.get("name") != "strip-metrics-auth-rbac"
+                or not isinstance(manifest.get("version"), str)
+                or not manifest["version"].strip()
                 or manifest.get("runtime") != "subprocess"
+                or not isinstance(runtime_config, dict)
+                or set(runtime_config.keys()) != {"platformCommand"}
                 or not isinstance(platform_commands, list)
                 or len(platform_commands) != 1
                 or not isinstance(platform_commands[0], dict)

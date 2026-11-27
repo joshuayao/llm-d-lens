@@ -486,10 +486,6 @@ def helm_metrics_auth_post_renderer(namespace: str, *, helm_bin: str | Path = "h
                 "type": "postrenderer/v1",
                 "name": "strip-metrics-auth-rbac",
                 "version": "0.1.0",
-                "description": (
-                    "Strip validated EPP metrics-auth ClusterRole and ClusterRoleBinding "
-                    "for bootstrapped non-admin installs."
-                ),
                 "runtime": "subprocess",
                 "runtimeConfig": {"platformCommand": [{"command": str(wrapper)}]},
             }

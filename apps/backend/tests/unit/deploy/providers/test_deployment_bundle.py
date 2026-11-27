@@ -417,15 +417,13 @@ def test_helm_v4_post_renderer_plugin_manifest_env_and_context_cleanup(tmp_path:
         plugin_yaml = plugin_dir / "plugin.yaml"
         assert stat.S_IMODE(plugin_yaml.stat().st_mode) == 0o600
         manifest = yaml.safe_load(plugin_yaml.read_text(encoding="utf-8"))
+        assert "description" not in manifest
+        assert set(manifest.keys()) == {"apiVersion", "type", "name", "version", "runtime", "runtimeConfig"}
         assert manifest == {
             "apiVersion": "v1",
             "type": "postrenderer/v1",
             "name": "strip-metrics-auth-rbac",
             "version": "0.1.0",
-            "description": (
-                "Strip validated EPP metrics-auth ClusterRole and ClusterRoleBinding "
-                "for bootstrapped non-admin installs."
-            ),
             "runtime": "subprocess",
             "runtimeConfig": {"platformCommand": [{"command": str(post_renderer.script_path)}]},
         }
