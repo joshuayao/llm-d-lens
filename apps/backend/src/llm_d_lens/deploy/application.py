@@ -193,11 +193,19 @@ class DeploymentRunManager:
             raise
         return True
 
+    @staticmethod
+    def _worker_has_active_tasks(worker: object | None, run_id: str) -> bool:
+        for attr in ("_active_tasks", "_retry_tasks"):
+            task_map = getattr(worker, attr, None)
+            if isinstance(task_map, dict) and any(not task.done() for task in (task_map.get(run_id) or ())):
+                return True
+        return False
+
     def worker_for_run(self, run_id: str) -> DeploymentRunWorker:
         cached = self._run_workers.get(run_id)
         if cached is not None:
             if not getattr(cached, "_lifecycle_error", None) and (
-                self.is_run_active(run_id) or self._cached_worker_session_is_active(run_id)
+                self._cached_worker_session_is_active(run_id) or self.is_run_active(run_id)
             ):
                 return cached
             self._run_workers.pop(run_id, None)
@@ -208,10 +216,25 @@ class DeploymentRunManager:
         self._run_workers[run_id] = worker
         return worker
 
+    def worker_for_local_delete(
+        self, run_id: str, *, store: JsonDeploymentRunStore | None = None
+    ) -> DeploymentRunWorker:
+        """Return a worker for local-only record deletion without validating kubeconfig or runtime."""
+        cached = self._run_workers.get(run_id)
+        if (
+            cached is not None
+            and callable(getattr(cached, "delete_case_execution", None))
+            and (store is None or getattr(cached, "_store", store) is store)
+        ):
+            return cached
+        return DeploymentRunWorker(store if store is not None else self.store, SimpleNamespace())
+
     def is_run_active(self, run_id: str) -> bool:
         """Whether this process is still executing the deployment operation."""
         task = self._run_tasks.get(run_id)
-        return task is not None and not task.done()
+        if task is not None and not task.done():
+            return True
+        return self._worker_has_active_tasks(self._run_workers.get(run_id), run_id)
 
     async def start_run(self, request: DeploymentRunCreateRequest, *, owner_user_id: str | None = None):
         from llm_d_lens.deploy.prepared_plans import consume, requires_prepared_plan
