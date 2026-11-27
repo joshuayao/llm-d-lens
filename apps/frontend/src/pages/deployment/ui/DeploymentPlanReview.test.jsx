@@ -239,9 +239,12 @@ test('DeploymentPermissionHandoff renders bootstrap setup, collapsible details, 
     assert.match(html, /Copy script/);
     assert.match(html, /Re-check &amp; Deploy/);
     assert.match(html, /View operation details/);
+    assert.match(html, /data-permission-handoff=""/);
     assert.match(html, /<details class="group\/details[^"]*" open="">/);
-    assert.match(html, /<details class="group">/);
-    assert.doesNotMatch(html, /<details class="group"[^>]*open/);
+    assert.match(html, /<details class="group\/handoff-op">/);
+    assert.match(html, /group-open\/handoff-op:rotate-90/);
+    assert.doesNotMatch(html, /<details class="group"/);
+    assert.doesNotMatch(html, /<details class="group\/handoff-op"[^>]*open/);
     assert.match(html, /Create namespace and RBAC/);
     assert.match(html, /Apply deployment manifests/);
     assert.match(html, /create namespaces/);
@@ -282,8 +285,9 @@ test('DeploymentPermissionHandoff hides subject override when identity is detect
     assert.match(verifiableCleanup, /Re-check &amp; Delete/);
     assert.doesNotMatch(verifiableCleanup, /Confirm &amp; Delete Record/);
     assert.match(verifiableCleanup, /<details class="group\/details[^"]*" open="">/);
-    assert.match(verifiableCleanup, /<details class="group">/);
-    assert.doesNotMatch(verifiableCleanup, /<details class="group"[^>]*open/);
+    assert.match(verifiableCleanup, /<details class="group\/handoff-op">/);
+    assert.doesNotMatch(verifiableCleanup, /<details class="group"/);
+    assert.doesNotMatch(verifiableCleanup, /<details class="group\/handoff-op"[^>]*open/);
 
     const unconfirmableCleanup = renderToStaticMarkup(
         <DeploymentPermissionHandoff
@@ -302,9 +306,25 @@ test('DeploymentPermissionHandoff hides subject override when identity is detect
     assert.match(unconfirmableCleanup, /Unconfirmed/);
     assert.match(unconfirmableCleanup, /Confirm &amp; Delete Record/);
     assert.match(unconfirmableCleanup, /<details class="group\/details[^"]*" open="">/);
-    assert.match(unconfirmableCleanup, /<details class="group">/);
-    assert.doesNotMatch(unconfirmableCleanup, /<details class="group"[^>]*open/);
+    assert.match(unconfirmableCleanup, /<details class="group\/handoff-op">/);
+    assert.doesNotMatch(unconfirmableCleanup, /<details class="group"/);
+    assert.doesNotMatch(unconfirmableCleanup, /<details class="group\/handoff-op"[^>]*open/);
     assert.doesNotMatch(unconfirmableCleanup, /\(s\)/);
+});
+
+test('DeploymentPermissionHandoff rows avoid generic details.group hijacking and index.css scopes disclosure gradients by theme', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const cssPath = path.resolve(import.meta.dirname, '../../../app/styles/index.css');
+    const css = fs.readFileSync(cssPath, 'utf8');
+    assert.doesNotMatch(css, /^main\s+details\.group/m);
+    assert.doesNotMatch(css, /^\[data-evaluation-configuration-editor\]\s+details\.group/m);
+    assert.match(css, /\.dark\s+\[data-evaluation-configuration-editor\]\s+details\.group/);
+    assert.match(css, /html:not\(\.dark\)\s+\[data-evaluation-configuration-editor\]\s+details\.group/);
+    assert.match(css, /html:not\(\.dark\)\s+\[data-permission-handoff\]/);
+    assert.match(css, /html:not\(\.dark\)\s+\.benchmark-task-page\s+\[data-permission-handoff\]/);
+    assert.match(css, /\[class~="border-rose-300"\]/);
+    assert.doesNotMatch(css, /\[data-permission-handoff\]\s+\[class\*=/);
 });
 
 test('DeploymentPermissionHandoff collapses operation details when verified in bootstrap and cleanup modes', () => {

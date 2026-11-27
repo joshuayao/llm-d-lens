@@ -192,8 +192,10 @@ test('DeleteDeploymentModal intercepts 409 deployment_cleanup_permission_denied 
     assert.doesNotMatch(handoffHtml, />Done</);
     assert.doesNotMatch(handoffHtml, /Confirm &amp; Delete Record/);
     assert.match(handoffHtml, /<details class="group\/details[^"]*" open="">/);
-    assert.match(handoffHtml, /<details class="group">/);
-    assert.doesNotMatch(handoffHtml, /<details class="group"[^>]*open/);
+    assert.match(handoffHtml, /<details class="group\/handoff-op">/);
+    assert.match(handoffHtml, /group-open\/handoff-op:rotate-90/);
+    assert.doesNotMatch(handoffHtml, /<details class="group"/);
+    assert.doesNotMatch(handoffHtml, /<details class="group\/handoff-op"[^>]*open/);
 
     const partialRecheckHtml = renderToStaticMarkup(
         React.createElement(DeleteDeploymentModal, {
@@ -214,8 +216,9 @@ test('DeleteDeploymentModal intercepts 409 deployment_cleanup_permission_denied 
     assert.match(partialRecheckHtml, />Done</);
     assert.match(partialRecheckHtml, />Remaining</);
     assert.match(partialRecheckHtml, /<details class="group\/details[^"]*" open="">/);
-    assert.match(partialRecheckHtml, /<details class="group">/);
-    assert.doesNotMatch(partialRecheckHtml, /<details class="group"[^>]*open/);
+    assert.match(partialRecheckHtml, /<details class="group\/handoff-op">/);
+    assert.doesNotMatch(partialRecheckHtml, /<details class="group"/);
+    assert.doesNotMatch(partialRecheckHtml, /<details class="group\/handoff-op"[^>]*open/);
 
     const fallbackHtml = renderToStaticMarkup(
         React.createElement(DeleteDeploymentModal, {
@@ -232,8 +235,9 @@ test('DeleteDeploymentModal intercepts 409 deployment_cleanup_permission_denied 
     );
     assert.match(fallbackHtml, /Confirm &amp; Delete Record/);
     assert.match(fallbackHtml, /<details class="group\/details[^"]*" open="">/);
-    assert.match(fallbackHtml, /<details class="group">/);
-    assert.doesNotMatch(fallbackHtml, /<details class="group"[^>]*open/);
+    assert.match(fallbackHtml, /<details class="group\/handoff-op">/);
+    assert.doesNotMatch(fallbackHtml, /<details class="group"/);
+    assert.doesNotMatch(fallbackHtml, /<details class="group\/handoff-op"[^>]*open/);
 
     let genericError = '';
     const errOutcome = await executeDeploymentDeleteAction({

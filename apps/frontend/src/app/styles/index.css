@@ -126,19 +126,47 @@
   display: none !important;
 }
 
-[data-evaluation-configuration-editor] details.group {
+/* Scope legacy configuration disclosure gradient to dark mode and explicit
+   configuration containers so generic <details class="group"> elements
+   (such as permission handoff rows) are never hijacked in light or dark mode. */
+.dark [data-evaluation-configuration-editor] details.group,
+.dark .configuration-editor details.group,
+.dark .configuration-saved-panel {
   border-color: rgb(34 211 238 / 0.55) !important;
   background: linear-gradient(135deg, rgb(8 145 178 / 0.14), rgb(2 6 23 / 0.9)) !important;
   box-shadow: 0 0 24px rgb(34 211 238 / 0.08);
 }
 
-[data-evaluation-configuration-editor] details.group > summary {
+.dark [data-evaluation-configuration-editor] details.group > summary,
+.dark .configuration-editor details.group > summary,
+.dark .configuration-saved-panel > summary {
   min-height: 4.25rem;
   padding: 1rem !important;
 }
 
-[data-evaluation-configuration-editor] details.group > summary span.block:first-child {
+.dark [data-evaluation-configuration-editor] details.group > summary span.block:first-child,
+.dark .configuration-editor details.group > summary span.block:first-child {
   color: rgb(207 250 254) !important;
+  font-size: 0.875rem !important;
+  font-weight: 700 !important;
+}
+
+html:not(.dark) [data-evaluation-configuration-editor] details.group,
+html:not(.dark) .configuration-editor details.group {
+  border-color: #d1d5db !important;
+  background: var(--bg-card) !important;
+  box-shadow: none;
+}
+
+html:not(.dark) [data-evaluation-configuration-editor] details.group > summary,
+html:not(.dark) .configuration-editor details.group > summary {
+  min-height: 4.25rem;
+  padding: 1rem !important;
+}
+
+html:not(.dark) [data-evaluation-configuration-editor] details.group > summary span.block:first-child,
+html:not(.dark) .configuration-editor details.group > summary span.block:first-child {
+  color: var(--text-primary) !important;
   font-size: 0.875rem !important;
   font-weight: 700 !important;
 }
@@ -150,26 +178,6 @@
   color: rgb(8 15 30) !important;
   font-weight: 700 !important;
   box-shadow: 0 8px 24px rgb(8 145 178 / 0.25);
-}
-
-/* Configuration editor hierarchy: keep capacity guidance compact and make the
-   optional tuning path plus final YAML action impossible to overlook. */
-main details.group:has(summary span:first-child) {
-  border-color: rgb(34 211 238 / 0.5) !important;
-  background: linear-gradient(135deg, rgb(8 145 178 / 0.13), rgb(2 6 23 / 0.92)) !important;
-  box-shadow: 0 0 22px rgb(34 211 238 / 0.08);
-}
-
-
-main details.group > summary {
-  min-height: 4.25rem;
-  padding: 1rem !important;
-}
-
-main details.group > summary span.block:first-child {
-  color: rgb(207 250 254) !important;
-  font-size: 0.875rem !important;
-  font-weight: 700 !important;
 }
 
 main button:has(> svg.lucide-wand-sparkles) {
@@ -1038,6 +1046,60 @@ html:not(.dark) .deployment-page h1 {
 /* Light mode: New Benchmark Task uses gray structural borders. */
 html:not(.dark) .benchmark-task-page * {
   border-color: #d1d5db !important;
+}
+
+/* Light mode: Permission handoff panels preserve structural borders and semantic status accents. */
+html:not(.dark) [data-permission-handoff] {
+  border-color: var(--border-color) !important;
+  background-color: var(--bg-card) !important;
+}
+html:not(.dark) .benchmark-task-page [data-permission-handoff] {
+  border-color: #d1d5db !important;
+}
+html:not(.dark) [data-permission-handoff].border-l-amber-500,
+html:not(.dark) .benchmark-task-page [data-permission-handoff].border-l-amber-500,
+html:not(.dark) [data-permission-handoff] [class~="border-amber-500"],
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-amber-500"],
+html:not(.dark) [data-permission-handoff] [class~="border-amber-500/80"],
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-amber-500/80"],
+html:not(.dark) [data-permission-handoff] [class~="border-l-amber-500"],
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-l-amber-500"] {
+  border-left-color: #d97706 !important;
+}
+html:not(.dark) [data-permission-handoff].border-l-emerald-500,
+html:not(.dark) .benchmark-task-page [data-permission-handoff].border-l-emerald-500,
+html:not(.dark) [data-permission-handoff] [class~="border-emerald-500"],
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-emerald-500"],
+html:not(.dark) [data-permission-handoff] [class~="border-emerald-500/70"],
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-emerald-500/70"],
+html:not(.dark) [data-permission-handoff] [class~="border-l-emerald-500"],
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-l-emerald-500"] {
+  border-left-color: #059669 !important;
+}
+html:not(.dark) [data-permission-handoff].border-l-rose-500,
+html:not(.dark) .benchmark-task-page [data-permission-handoff].border-l-rose-500,
+html:not(.dark) [data-permission-handoff] [class~="border-rose-500"],
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-rose-500"],
+html:not(.dark) [data-permission-handoff] [class~="border-rose-500/80"],
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-rose-500/80"],
+html:not(.dark) [data-permission-handoff] [class~="border-l-rose-500"],
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-l-rose-500"] {
+  border-left-color: #e11d48 !important;
+}
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-amber-300"],
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-amber-500/30"] {
+  border-color: #d97706 !important;
+}
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-emerald-500/30"] {
+  border-color: #059669 !important;
+}
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-rose-300"],
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-red-500/30"],
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-rose-500/30"] {
+  border-color: #e11d48 !important;
+}
+html:not(.dark) .benchmark-task-page [data-permission-handoff] [class~="border-transparent"] {
+  border-color: transparent !important;
 }
 html:not(.dark) .benchmark-task-page .benchmark-blue-button {
   background-color: #037ffc !important;

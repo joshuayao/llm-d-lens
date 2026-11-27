@@ -1433,6 +1433,7 @@ export function ModelServiceHandoffPanel({
         <Panel
             padding="sm"
             tone="soft"
+            data-permission-handoff=""
             className={cn('border-l-4 shadow-none', statusMeta.border)}
             title={(
                 <span className="flex items-center gap-2">

@@ -271,7 +271,7 @@ function HandoffOperationRow({ entry, tone = 'danger', statusLabel, ariaLabel, r
                     ? 'border-amber-500/80'
                     : 'border-rose-500/80',
         )}>
-            <details className="group">
+            <details className="group/handoff-op">
                 <summary
                     title="Expand for details"
                     className="-ml-3 flex cursor-pointer list-none items-start gap-2 py-1 pl-3 pr-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 [&::-webkit-details-marker]:hidden"
@@ -308,7 +308,7 @@ function HandoffOperationRow({ entry, tone = 'danger', statusLabel, ariaLabel, r
                     <ChevronRight
                         size={13}
                         aria-hidden="true"
-                        className="mt-0.5 shrink-0 text-theme-muted transition-transform motion-reduce:transition-none group-open:rotate-90"
+                        className="mt-0.5 shrink-0 text-theme-muted transition-transform motion-reduce:transition-none group-open/handoff-op:rotate-90"
                     />
                 </summary>
                 <div className="pb-2">
@@ -498,6 +498,7 @@ export function DeploymentPermissionHandoff({
         <Panel
             padding="sm"
             tone="soft"
+            data-permission-handoff=""
             className={cn(
                 'border-l-4 shadow-none',
                 verified
