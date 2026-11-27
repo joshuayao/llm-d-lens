@@ -466,9 +466,7 @@ class DeploymentAdminSetupRequiredError(Exception):
         if isinstance(targets, list) and targets:
             if "namespaces" not in payload:
                 payload["namespaces"] = [
-                    str(item["namespace"])
-                    for item in targets
-                    if isinstance(item, Mapping) and item.get("namespace")
+                    str(item["namespace"]) for item in targets if isinstance(item, Mapping) and item.get("namespace")
                 ]
             if "target_namespaces" not in payload:
                 payload["target_namespaces"] = {
@@ -626,8 +624,7 @@ def _active_execution_namespaces() -> set[str]:
     return {
         execution.namespace
         for execution in store.list_executions()
-        if execution.namespace
-        and execution.status not in {DeploymentStatus.CLEANED, DeploymentStatus.CLEANED_UP}
+        if execution.namespace and execution.status not in {DeploymentStatus.CLEANED, DeploymentStatus.CLEANED_UP}
     }
 
 
@@ -678,13 +675,7 @@ def _resolve_target_namespace_for_entry(
             )
         return validated_ns
 
-    seed_source = (
-        target.key
-        or target.prepared_plan_id
-        or target.deployment_name
-        or target.provider_ref
-        or "deployment"
-    )
+    seed_source = target.key or target.prepared_plan_id or target.deployment_name or target.provider_ref or "deployment"
     slug = re.sub(r"[^a-z0-9-]+", "-", seed_source.lower()).strip("-") or "deploy"
     digest = hashlib.sha256(
         json.dumps(
@@ -2849,9 +2840,7 @@ async def _verify_multi_target_deployment_bootstrap(
     target_reports = list(report.get("targets") or ())
     targets_by_key = {t.key.strip(): t for t in targets}
     dep_name_counts = Counter(
-        t.deployment_name.strip()
-        for t in targets
-        if isinstance(t.deployment_name, str) and t.deployment_name.strip()
+        t.deployment_name.strip() for t in targets if isinstance(t.deployment_name, str) and t.deployment_name.strip()
     )
 
     warnings = list(report["warnings"])

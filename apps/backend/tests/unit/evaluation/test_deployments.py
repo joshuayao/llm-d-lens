@@ -1328,10 +1328,7 @@ async def test_confirm_evaluation_plans_preflights_frozen_ds_namespace_403_then_
     assert confirmed["status"] == "queued"
     await tasks[workflow["id"]]
     assert confirmed["cases"][0]["target_namespace"] == frozen_ns
-    assert (
-        capabilities.peek_verified_namespace("cluster-1", prepared_plan_id="plan-ds-1")
-        == frozen_ns
-    )
+    assert capabilities.peek_verified_namespace("cluster-1", prepared_plan_id="plan-ds-1") == frozen_ns
     # Prepared cases never receive target_namespace or agentic_deployment_run_id in provenance
     ds_req = router._evaluation_deployment_request(confirmed, confirmed["cases"][0])
     assert "target_namespace" not in ds_req.provenance
@@ -1402,12 +1399,32 @@ async def test_execute_evaluation_binds_unique_eval_case_id_and_handles_cleanup_
 
     started_bindings = []
     ready_case_map = {
-        "dep-guide-1": SimpleNamespace(id="dc-1", status=SimpleNamespace(value="ready"), execution_id="exec-1", attempt=1, provider_ref="optimized-baseline"),
-        "dep-baseline-1": SimpleNamespace(id="dc-2", status=SimpleNamespace(value="ready"), execution_id="exec-2", attempt=1, provider_ref="baseline-vllm"),
+        "dep-guide-1": SimpleNamespace(
+            id="dc-1",
+            status=SimpleNamespace(value="ready"),
+            execution_id="exec-1",
+            attempt=1,
+            provider_ref="optimized-baseline",
+        ),
+        "dep-baseline-1": SimpleNamespace(
+            id="dc-2",
+            status=SimpleNamespace(value="ready"),
+            execution_id="exec-2",
+            attempt=1,
+            provider_ref="baseline-vllm",
+        ),
     }
     executions = {
-        "exec-1": SimpleNamespace(status=router.DeploymentStatus.READY, namespace="llmd-guide-ns", endpoint=SimpleNamespace(url="http://g", baseline_url=None)),
-        "exec-2": SimpleNamespace(status=router.DeploymentStatus.READY, namespace="llmd-base-ns", endpoint=SimpleNamespace(url="http://b", baseline_url=None)),
+        "exec-1": SimpleNamespace(
+            status=router.DeploymentStatus.READY,
+            namespace="llmd-guide-ns",
+            endpoint=SimpleNamespace(url="http://g", baseline_url=None),
+        ),
+        "exec-2": SimpleNamespace(
+            status=router.DeploymentStatus.READY,
+            namespace="llmd-base-ns",
+            endpoint=SimpleNamespace(url="http://b", baseline_url=None),
+        ),
     }
 
     async def fake_start_run(deploy_req, owner_user_id=None):
@@ -1512,7 +1529,15 @@ async def test_shared_pods_baseline_records_cleanup_handoff_and_excludes_phase1_
     dep_run = SimpleNamespace(
         id="dep-1",
         created_at="2026-01-01T00:00:00Z",
-        cases=[SimpleNamespace(id="dc-1", status=SimpleNamespace(value="ready"), execution_id="exec-1", attempt=1, create_request=SimpleNamespace(provenance={}))],
+        cases=[
+            SimpleNamespace(
+                id="dc-1",
+                status=SimpleNamespace(value="ready"),
+                execution_id="exec-1",
+                attempt=1,
+                create_request=SimpleNamespace(provenance={}),
+            )
+        ],
     )
     monkeypatch.setattr(
         router,

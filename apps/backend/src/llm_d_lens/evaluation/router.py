@@ -1904,9 +1904,7 @@ def _clear_owned_case_namespace(
     target_ns = case.get("target_namespace")
     had_cleanup_handoff = case.get("cleanup_status") == "pending_admin_cleanup"
     has_active_ns = (
-        isinstance(target_ns, str)
-        and bool(target_ns.strip())
-        and _namespace_has_active_execution(target_ns.strip())
+        isinstance(target_ns, str) and bool(target_ns.strip()) and _namespace_has_active_execution(target_ns.strip())
     )
     clear_namespace = group_id not in requested_namespaces and (had_cleanup_handoff or has_active_ns)
     for sibling in workflow.get("cases", []):
@@ -1956,8 +1954,7 @@ def _manifest_has_lws(manifest: str | None) -> bool:
         return False
     try:
         return any(
-            isinstance(doc, Mapping) and doc.get("kind") == "LeaderWorkerSet"
-            for doc in yaml.safe_load_all(manifest)
+            isinstance(doc, Mapping) and doc.get("kind") == "LeaderWorkerSet" for doc in yaml.safe_load_all(manifest)
         )
     except yaml.YAMLError:
         return False
@@ -2232,9 +2229,7 @@ async def _preflight_evaluation_permissions(
         group_id = case.get("deployment_group_id") or case["id"]
         plan_key = f"{group_id}:{plan_id}" if plan_id else None
         resolved_ns = (
-            resolved_by_key.get(plan_key)
-            if plan_key and plan_key in resolved_by_key
-            else resolved_by_key.get(group_id)
+            resolved_by_key.get(plan_key) if plan_key and plan_key in resolved_by_key else resolved_by_key.get(group_id)
         )
         if not resolved_ns:
             continue
@@ -2480,9 +2475,7 @@ async def _execute_evaluation(workflow_id: str) -> None:
                             if not marker_ok:
                                 live_targets = _deployment_group_permission_targets(
                                     {**workflow, "cases": [case]},
-                                    requested_namespaces={
-                                        case.get("deployment_group_id") or case["id"]: target_ns
-                                    },
+                                    requested_namespaces={case.get("deployment_group_id") or case["id"]: target_ns},
                                     include_prepared_plans=False,
                                 )
                                 live_report = await capabilities.check_deployment_permissions(

@@ -1249,11 +1249,7 @@ def test_multi_target_permission_check_validation_batching_and_error_payload(mon
     }
     assert len(admin_report["targets"]) == 2
     # Identity SelfSubjectReview ran only once across all targets
-    ssr_calls = [
-        call
-        for call in admin_runner.calls
-        if call[:4] == ["kubectl", "create", "-o", "json"]
-    ]
+    ssr_calls = [call for call in admin_runner.calls if call[:4] == ["kubectl", "create", "-o", "json"]]
     # 1 SelfSubjectReview + batched SSAR chunks (total >50 keys -> 2 chunks)
     assert len(ssr_calls) >= 2
 
