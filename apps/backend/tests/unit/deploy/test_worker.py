@@ -413,8 +413,12 @@ def test_repeat_clean_preserves_phase1_deleted_resources(monkeypatch):
 
     persisted = svc._executions.get("exec-repeat")
     assert persisted is not None
+    assert persisted.status == DeploymentStatus.ROLLED_BACK
+    assert persisted.endpoint is None
+    # Simulate an older persisted Phase-1 execution still marked READY -> repeat clean transitions it to ROLLED_BACK
+    legacy_ready = persisted.model_copy(update={"status": DeploymentStatus.READY, "endpoint": execution.endpoint})
     with pytest.raises(DeploymentCleanupPermissionDenied) as repeat_exc:
-        asyncio.run(svc.clean(persisted))
+        asyncio.run(svc.clean(legacy_ready))
     assert repeat_exc.value.payload["deletedInNamespace"] == [
         "deployments.apps",
         "jobs.batch",
@@ -423,3 +427,146 @@ def test_repeat_clean_preserves_phase1_deleted_resources(monkeypatch):
     assert repeat_exc.value.payload["adminCleanup"]["completedOperations"] == [
         {"id": "cleanup.in_namespace.deployments.apps"}
     ]
+    updated_repeat = svc._executions.get("exec-repeat")
+    assert updated_repeat is not None
+    assert updated_repeat.status == DeploymentStatus.ROLLED_BACK
+    assert updated_repeat.endpoint is None
+
+
+def test_delete_case_execution_phase1_handoff_behavior_and_cancel_cleanup(tmp_path):
+    import asyncio
+    from uuid import uuid4
+
+    import pytest
+
+    from llm_d_lens.auth.records import RoleRecord, UserRecord, UserRoleBindingRecord
+    from llm_d_lens.auth.service import default_service
+    from llm_d_lens.db.dao.cluster import ClusterDao
+    from llm_d_lens.db.dao.role import RoleDao
+    from llm_d_lens.db.dao.user import UserDao
+    from llm_d_lens.deploy.contracts import (
+        DeployableConfiguration,
+        DeploymentCaseStatus,
+        DeploymentRun,
+        DeploymentRunStatus,
+        DeploymentStatus,
+    )
+    from llm_d_lens.deploy.executions import DeploymentCleanupPermissionDenied
+    from llm_d_lens.deploy.run_store import JsonDeploymentRunStore
+    from tests.unit.deploy.test_deployment_management import _case, _execution
+
+    class _Phase1Service:
+        async def clean(self, execution, *, preserve_rendered_overlay: bool = False):
+            del preserve_rendered_overlay
+            raise DeploymentCleanupPermissionDenied(
+                "Namespace cleanup requires Orchestration administrator action.",
+                payload={
+                    "executionId": execution.execution_id,
+                    "clusterId": "cluster-1",
+                    "namespace": execution.namespace,
+                    "phase1Completed": True,
+                    "deletedInNamespace": ["deployments.apps", "pods"],
+                    "adminCleanup": {"detail": "Admin required", "cleanupDigest": "a" * 64},
+                },
+            )
+
+    def _seed_run(store, suffix: str, *, two_cases: bool = False):
+        run_id = f"run-{suffix}"
+        exec_id = f"exec-{suffix}"
+        cases = [_case(run_id, 0, exec_id, DeploymentCaseStatus.READY).model_copy(update={"id": f"case-{suffix}-0"})]
+        store.save_execution(_execution(exec_id, DeploymentStatus.READY, f"llmd-{suffix}"))
+        if two_cases:
+            sibling_id = f"exec-{suffix}-sibling"
+            cases.append(
+                _case(run_id, 1, sibling_id, DeploymentCaseStatus.READY).model_copy(update={"id": f"case-{suffix}-1"})
+            )
+            store.save_execution(_execution(sibling_id, DeploymentStatus.READY, f"llmd-{suffix}-sib"))
+        store.create_run(
+            DeploymentRun(
+                id=run_id,
+                status=DeploymentRunStatus.SUCCEEDED,
+                cases=cases,
+                source_configurations=[
+                    DeployableConfiguration(
+                        type="optimized-baseline",
+                        format="helm",
+                        provider_ref="optimized-baseline",
+                        checksum="checksum",
+                    )
+                ],
+                provenance={"cluster_server_id": "cluster-1"},
+            )
+        )
+        return run_id, exec_id
+
+    async def check():
+        store = JsonDeploymentRunStore(tmp_path)
+        auth_service = default_service()
+        role = RoleDao().create(RoleRecord(name="worker-phase1-role"))
+        cluster = ClusterDao().create(f"c-{uuid4().hex[:6]}", "", "apiVersion: v1\nkind: Config")
+        user = UserDao().create(UserRecord(username=f"u-{uuid4().hex[:6]}"))
+
+        def add_share(resource_type: str, resource_id: str) -> None:
+            auth_service.user_binding_dao.create(
+                UserRoleBindingRecord(
+                    user_id=user.id,
+                    role_id=role.id,
+                    scope_type="resource",
+                    scope_cluster_id=cluster.id,
+                    scope_resource_type=resource_type,
+                    scope_resource_id=resource_id,
+                )
+            )
+
+        worker = DeploymentRunWorker(store, _Phase1Service())
+
+        # 1. Standalone delete (remove_records_on_phase1_handoff=False): keeps records & transitions to ROLLED_BACK / STOPPED
+        run_keep, exec_keep = _seed_run(store, "keep")
+        add_share("deployment_execution", exec_keep)
+        add_share("deployment_run", run_keep)
+        with pytest.raises(DeploymentCleanupPermissionDenied) as keep_exc:
+            await worker.delete_case_execution(run_keep, "case-keep-0")
+        assert keep_exc.value.payload["phase1Completed"] is True
+        retained_exec = store.get_execution(exec_keep)
+        assert retained_exec is not None
+        assert retained_exec.status == DeploymentStatus.ROLLED_BACK
+        assert retained_exec.endpoint is None
+        assert retained_exec.diagnostics.value["cleanup"]["phase1"]["phase1Completed"] is True
+        retained_run = store.get_run(run_keep)
+        assert retained_run is not None
+        assert retained_run.cases[0].status == DeploymentCaseStatus.STOPPED
+        assert len(auth_service.list_resource_shares("deployment_execution", exec_keep)) == 1
+
+        # 2. Evaluation auto-cleanup (remove_records_on_phase1_handoff=True): drops run/exec & revokes shares, then re-raises
+        run_eval, exec_eval = _seed_run(store, "eval")
+        add_share("deployment_execution", exec_eval)
+        add_share("deployment_run", run_eval)
+        with pytest.raises(DeploymentCleanupPermissionDenied) as eval_exc:
+            await worker.delete_case_execution(run_eval, "case-eval-0", remove_records_on_phase1_handoff=True)
+        assert eval_exc.value.payload["phase1Completed"] is True
+        assert store.get_execution(exec_eval) is None
+        assert store.get_run(run_eval) is None
+        assert auth_service.list_resource_shares("deployment_execution", exec_eval) == []
+        assert auth_service.list_resource_shares("deployment_run", run_eval) == []
+
+        # 3. Multi-case run with remove_records_on_phase1_handoff=True drops only that case/execution
+        run_multi, exec_multi = _seed_run(store, "multi", two_cases=True)
+        with pytest.raises(DeploymentCleanupPermissionDenied):
+            await worker.delete_case_execution(run_multi, "case-multi-0", remove_records_on_phase1_handoff=True)
+        assert store.get_execution(exec_multi) is None
+        assert store.get_execution(f"{exec_multi}-sibling") is not None
+        assert [c.id for c in store.get_run(run_multi).cases] == ["case-multi-1"]
+
+        # 4. Evaluation cancel with Phase-1 403 drops ghost run/execution & revokes shares, then propagates handoff
+        run_cancel, exec_cancel = _seed_run(store, "cancel")
+        add_share("deployment_execution", exec_cancel)
+        add_share("deployment_run", run_cancel)
+        with pytest.raises(DeploymentCleanupPermissionDenied) as cancel_exc:
+            await worker.cancel_evaluation_deployment(run_cancel)
+        assert cancel_exc.value.payload["phase1Completed"] is True
+        assert store.get_execution(exec_cancel) is None
+        assert store.get_run(run_cancel) is None
+        assert auth_service.list_resource_shares("deployment_execution", exec_cancel) == []
+        assert auth_service.list_resource_shares("deployment_run", run_cancel) == []
+
+    asyncio.run(check())

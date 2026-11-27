@@ -285,6 +285,11 @@ _IN_NAMESPACE_RESOURCE_TYPES: tuple[str, ...] = (
     "roles.rbac.authorization.k8s.io",
     "rolebindings.rbac.authorization.k8s.io",
 )
+_PROTECTED_IN_NAMESPACE_RESOURCES: dict[str, frozenset[str]] = {
+    "roles.rbac.authorization.k8s.io": frozenset({"lens-deployment-operator"}),
+    "rolebindings.rbac.authorization.k8s.io": frozenset({"lens-deployment-operator"}),
+    "configmaps": frozenset({"lens-deployment-bootstrap", "kube-root-ca.crt"}),
+}
 
 
 def protected_deployment_namespaces(cluster_id: str | None = None) -> frozenset[str]:
@@ -350,6 +355,70 @@ def _raise_if_unauthorized(result: CommandResult) -> None:
         raise DeploymentClusterAuthError("Kubernetes cluster rejected kubeconfig credentials (401 Unauthorized).")
 
 
+async def _cleanup_non_protected_named_resources(
+    active_runner: Any,
+    resource_type: str,
+    target_ns: str,
+    protected_names: frozenset[str],
+) -> bool:
+    """List ``resource_type`` in ``target_ns`` and delete only non-protected items."""
+    try:
+        list_result = await active_runner.run(
+            ["kubectl", "get", resource_type, "--namespace", target_ns, "-o", "json"],
+            timeout=60,
+        )
+    except (FileNotFoundError, TimeoutError, OSError):
+        return False
+    if not isinstance(list_result, CommandResult):
+        return False
+    _raise_if_unauthorized(list_result)
+    if list_result.returncode != 0:
+        return False
+    try:
+        payload = json.loads(list_result.stdout or "")
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return False
+
+    deletable_names: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        metadata = item.get("metadata")
+        name = metadata.get("name") if isinstance(metadata, Mapping) else None
+        if isinstance(name, str) and name not in protected_names and name not in seen and _K8S_NAME_RE.fullmatch(name):
+            seen.add(name)
+            deletable_names.append(name)
+
+    if not deletable_names:
+        return True
+
+    try:
+        delete_result = await active_runner.run(
+            [
+                "kubectl",
+                "delete",
+                resource_type,
+                *deletable_names,
+                "--namespace",
+                target_ns,
+                "--ignore-not-found=true",
+            ],
+            timeout=60,
+        )
+    except (FileNotFoundError, TimeoutError, OSError):
+        return False
+    if not isinstance(delete_result, CommandResult):
+        return False
+    _raise_if_unauthorized(delete_result)
+    return delete_result.returncode == 0
+
+
 async def cleanup_in_namespace_resources(
     cluster_id: str,
     namespace: str,
@@ -361,19 +430,41 @@ async def cleanup_in_namespace_resources(
     active_runner = runner if runner is not None else scoped_runner(cluster_id)
     cleaned: list[str] = []
     for resource_type in _IN_NAMESPACE_RESOURCE_TYPES:
+        protected_names = _PROTECTED_IN_NAMESPACE_RESOURCES.get(resource_type)
+        if protected_names is not None:
+            if await _cleanup_non_protected_named_resources(
+                active_runner,
+                resource_type,
+                target_ns,
+                protected_names,
+            ):
+                cleaned.append(resource_type)
+            continue
+
+        if resource_type == "secrets":
+            argv = [
+                "kubectl",
+                "delete",
+                "secrets",
+                "-l",
+                "owner=helm",
+                "--namespace",
+                target_ns,
+                "--ignore-not-found=true",
+            ]
+        else:
+            argv = [
+                "kubectl",
+                "delete",
+                resource_type,
+                "--all",
+                "--namespace",
+                target_ns,
+                "--ignore-not-found=true",
+            ]
+
         try:
-            result = await active_runner.run(
-                [
-                    "kubectl",
-                    "delete",
-                    resource_type,
-                    "--all",
-                    "--namespace",
-                    target_ns,
-                    "--ignore-not-found=true",
-                ],
-                timeout=60,
-            )
+            result = await active_runner.run(argv, timeout=60)
         except (FileNotFoundError, TimeoutError, OSError):
             continue
         if isinstance(result, CommandResult):

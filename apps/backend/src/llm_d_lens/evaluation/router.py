@@ -2323,6 +2323,7 @@ async def _execute_shared_pods_baseline_case(workflow: dict, case: dict) -> None
                     await deployment_run_manager.worker_for_run(deployment_run_id).delete_case_execution(
                         deployment_run_id,
                         deployment_case_id,
+                        remove_records_on_phase1_handoff=True,
                     )
             except DeploymentCleanupPermissionDenied as cleanup_handoff_error:
                 _record_case_cleanup_handoff(workflow, guide_case, cleanup_handoff_error)
@@ -2549,7 +2550,9 @@ async def _execute_evaluation(workflow_id: str) -> None:
                     try:
                         with _deployment_cleanup_guard(ready_case.execution_id):
                             await deployment_run_manager.worker_for_run(deployment.id).delete_case_execution(
-                                deployment.id, ready_case.id
+                                deployment.id,
+                                ready_case.id,
+                                remove_records_on_phase1_handoff=True,
                             )
                     except DeploymentCleanupPermissionDenied as cleanup_handoff_error:
                         _record_case_cleanup_handoff(workflow, case, cleanup_handoff_error)
@@ -7390,6 +7393,17 @@ async def _cancel_evaluation(workflow: dict, case_id: str | None = None) -> dict
         }
         errors = []
         for deployment_id in deployment_ids:
+            matching_owned_cases = [
+                case
+                for case in targets
+                if case.get("deployment_run_id") == deployment_id and _deployment_owned(workflow, case)
+            ]
+            if (
+                matching_owned_cases
+                and any(case.get("cleanup_status") == "pending_admin_cleanup" for case in matching_owned_cases)
+                and _store.get_run(deployment_id) is None
+            ):
+                continue
             try:
                 # The cancelling cases and runs are still unfinished here and would make the evaluate
                 # usage probe block the very cleanup this cancellation performs.

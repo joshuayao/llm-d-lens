@@ -1721,3 +1721,195 @@ async def test_list_orphan_namespaces_and_clean_case_map_403_409_and_401(monkeyp
     assert isinstance(case_resp_401, JSONResponse)
     assert case_resp_401.status_code == 401
     assert json.loads(case_resp_401.body)["code"] == "kubeconfig_unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_get_execution_pods_403_phase1_cleanup_and_prometheus_fallback(monkeypatch):
+    from llm_d_lens.deploy import router, slice_capacity
+    from llm_d_lens.infrastructure.process import CommandResult
+
+    async def kubectl_403(*_a, **_kw):
+        return CommandResult(("kubectl",), 1, "", 'pods is forbidden: User cannot list resource "pods" (HTTP 403)')
+
+    monkeypatch.setattr("llm_d_lens.infrastructure.kubernetes.run_kubectl", kubectl_403)
+
+    # 1. Phase 1 cleanup completed via context.execution.diagnostics -> clean empty pods, no error
+    phase1_diag = SimpleNamespace(value={"cleanup": {"phase1": {"phase1Completed": True}}})
+    cleaned_ctx = SimpleNamespace(
+        execution_id="exec-cleaned",
+        namespace="llmd-cleaned",
+        cluster_id="cluster-1",
+        cluster_session_id=None,
+        execution=SimpleNamespace(diagnostics=phase1_diag),
+    )
+    monkeypatch.setattr(router, "find_execution_context", lambda _eid: cleaned_ctx)
+
+    async def prom_should_not_run(_cid):
+        raise AssertionError("prometheus_inventory_nodes_and_pods should not run after phase1 cleanup")
+
+    monkeypatch.setattr(slice_capacity, "prometheus_inventory_nodes_and_pods", prom_should_not_run)
+
+    res_cleaned = await router.get_execution_pods("exec-cleaned")
+    assert res_cleaned == {"execution_id": "exec-cleaned", "namespace": "llmd-cleaned", "pods": []}
+    assert "error" not in res_cleaned
+
+    # 2. Phase 1 cleanup completed resolved via _store.get_execution fallback when context lacks .execution
+    store_ctx = SimpleNamespace(
+        execution_id="exec-cleaned-store",
+        namespace="llmd-cleaned-store",
+        cluster_id="cluster-1",
+        cluster_session_id=None,
+    )
+    monkeypatch.setattr(router, "find_execution_context", lambda _eid: store_ctx)
+    monkeypatch.setattr(router._store, "get_execution", lambda _eid: SimpleNamespace(diagnostics=phase1_diag))
+
+    res_store_cleaned = await router.get_execution_pods("exec-cleaned-store")
+    assert res_store_cleaned == {"execution_id": "exec-cleaned-store", "namespace": "llmd-cleaned-store", "pods": []}
+    assert "error" not in res_store_cleaned
+
+    # 3. Not cleaned + Prometheus succeeds -> filter to context.namespace and map into pod schema
+    active_ctx = SimpleNamespace(
+        execution_id="exec-active",
+        namespace="llmd-active",
+        cluster_id="cluster-1",
+        cluster_session_id=None,
+        execution=SimpleNamespace(diagnostics=None),
+    )
+    monkeypatch.setattr(router, "find_execution_context", lambda _eid: active_ctx)
+
+    prom_pods = [
+        {
+            "metadata": {"name": "prometheus-allocated-node-1", "namespace": "default"},
+            "spec": {"nodeName": "node-1", "containers": [{"name": "allocated", "resources": {"requests": {}}}]},
+            "status": {"phase": "Running"},
+        },
+        {
+            "metadata": {
+                "name": "vllm-decode-0",
+                "namespace": "llmd-active",
+                "labels": {"app": "vllm"},
+                "creationTimestamp": "2026-11-27T00:00:00Z",
+            },
+            "spec": {"nodeName": "node-2"},
+            "status": {"phase": "Running", "podIP": "10.0.0.8"},
+        },
+    ]
+
+    async def prom_ok(_cid):
+        return [], prom_pods
+
+    monkeypatch.setattr(slice_capacity, "prometheus_inventory_nodes_and_pods", prom_ok)
+
+    res_prom = await router.get_execution_pods("exec-active")
+    assert "error" not in res_prom
+    assert res_prom["execution_id"] == "exec-active"
+    assert res_prom["namespace"] == "llmd-active"
+    assert res_prom["pods"] == [
+        {
+            "name": "vllm-decode-0",
+            "namespace": "llmd-active",
+            "labels": {"app": "vllm"},
+            "phase": "Running",
+            "ready": False,
+            "pod_ip": "10.0.0.8",
+            "node_name": "node-2",
+            "restarts": 0,
+            "status_reason": "Running",
+            "containers": [],
+            "creation_timestamp": "2026-11-27T00:00:00Z",
+        }
+    ]
+
+    # 4. Prometheus succeeds with only synthetic "default" pods -> fall through to clean RBAC error
+    async def prom_default_only(_cid):
+        return [], [
+            {
+                "metadata": {"name": "prometheus-allocated-node-1", "namespace": "default"},
+                "spec": {"nodeName": "node-1", "containers": [{"name": "allocated", "resources": {"requests": {}}}]},
+                "status": {"phase": "Running"},
+            }
+        ]
+
+    monkeypatch.setattr(slice_capacity, "prometheus_inventory_nodes_and_pods", prom_default_only)
+    res_prom_default_only = await router.get_execution_pods("exec-active")
+    assert res_prom_default_only == {
+        "execution_id": "exec-active",
+        "namespace": "llmd-active",
+        "pods": [],
+        "error": "Pod status is restricted by cluster RBAC permissions for this namespace.",
+    }
+    assert "Forbidden" not in res_prom_default_only["error"]
+    assert "403" not in res_prom_default_only["error"]
+
+    # 5. Prometheus fails -> clean RBAC error (never raw Forbidden / HTTP 403)
+    async def prom_fail(_cid):
+        raise slice_capacity.ClusterInventoryForbiddenError("Prometheus inventory unavailable")
+
+    monkeypatch.setattr(slice_capacity, "prometheus_inventory_nodes_and_pods", prom_fail)
+    res_rbac_err = await router.get_execution_pods("exec-active")
+    assert res_rbac_err == {
+        "execution_id": "exec-active",
+        "namespace": "llmd-active",
+        "pods": [],
+        "error": "Pod status is restricted by cluster RBAC permissions for this namespace.",
+    }
+    assert "Forbidden" not in res_rbac_err["error"]
+    assert "403" not in res_rbac_err["error"]
+
+    # 6. Missing cluster_id -> clean RBAC error without calling Prometheus
+    no_cluster_ctx = SimpleNamespace(
+        execution_id="exec-no-cluster",
+        namespace="llmd-no-cluster",
+        cluster_id=None,
+        cluster_session_id=None,
+        execution=SimpleNamespace(diagnostics=None),
+    )
+    monkeypatch.setattr(router, "find_execution_context", lambda _eid: no_cluster_ctx)
+    res_no_cluster = await router.get_execution_pods("exec-no-cluster")
+    assert res_no_cluster == {
+        "execution_id": "exec-no-cluster",
+        "namespace": "llmd-no-cluster",
+        "pods": [],
+        "error": "Pod status is restricted by cluster RBAC permissions for this namespace.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_execution_pod_logs_403_graceful_messages(monkeypatch):
+    from llm_d_lens.deploy import router
+    from llm_d_lens.infrastructure.process import CommandResult
+
+    async def kubectl_403(*_a, **_kw):
+        return CommandResult(("kubectl",), 1, "", "Kubernetes get failed (Forbidden, HTTP 403)")
+
+    monkeypatch.setattr("llm_d_lens.infrastructure.kubernetes.run_kubectl", kubectl_403)
+
+    active_ctx = SimpleNamespace(
+        execution_id="exec-active",
+        namespace="llmd-active",
+        cluster_id="cluster-1",
+        cluster_session_id=None,
+        execution=SimpleNamespace(diagnostics=None),
+    )
+    monkeypatch.setattr(router, "find_execution_context", lambda _eid: active_ctx)
+    res_rbac = await router.get_execution_pod_logs("exec-active", "pod-1")
+    assert res_rbac["success"] is False
+    assert "RBAC" in res_rbac["logs"]
+    assert "Forbidden" not in res_rbac["logs"]
+    assert "403" not in res_rbac["logs"]
+
+    cleaned_ctx = SimpleNamespace(
+        execution_id="exec-cleaned",
+        namespace="llmd-cleaned",
+        cluster_id="cluster-1",
+        cluster_session_id=None,
+        execution=SimpleNamespace(
+            diagnostics=SimpleNamespace(value={"cleanup": {"phase1": {"phase1Completed": True}}})
+        ),
+    )
+    monkeypatch.setattr(router, "find_execution_context", lambda _eid: cleaned_ctx)
+    res_cleaned = await router.get_execution_pod_logs("exec-cleaned", "pod-1")
+    assert res_cleaned["success"] is False
+    assert "cleaned up" in res_cleaned["logs"]
+    assert "Forbidden" not in res_cleaned["logs"]
+    assert "403" not in res_cleaned["logs"]

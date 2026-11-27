@@ -1299,6 +1299,18 @@ async def test_delete_execution_and_delete_run_return_409_cleanup_handoff(
     assert exec_body["phase1Completed"] is True
     assert exec_body["adminCleanup"]["cleanupDigest"] == "a" * 64
 
+    # Standalone manual delete retains the record AND marks execution ROLLED_BACK / case STOPPED
+    retained_exec = deployment_store.get_execution("execution-ready")
+    assert retained_exec is not None
+    assert retained_exec.status == DeploymentStatus.ROLLED_BACK
+    assert retained_exec.endpoint is None
+    assert retained_exec.diagnostics.value["cleanup"]["phase1"]["phase1Completed"] is True
+    retained_run = deployment_store.get_run("run-1")
+    assert retained_run.cases[0].status == DeploymentCaseStatus.STOPPED
+    listed = await router.list_executions()
+    listed_ready = next(item for item in listed["items"] if item["execution_id"] == "execution-ready")
+    assert listed_ready["status"] == "rolled_back"
+
     run = deployment_store.get_run("run-1")
     run.status = DeploymentRunStatus.SUCCEEDED
     deployment_store.save_run(run)

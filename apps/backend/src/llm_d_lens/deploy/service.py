@@ -985,6 +985,20 @@ class GuideAdapterDeploymentService:
                     and existing_phase1.get("clusterId") == cluster_id
                     and isinstance(existing_phase1.get("adminCleanup"), dict)
                 ):
+                    if execution.status not in {
+                        DeploymentStatus.ROLLED_BACK,
+                        DeploymentStatus.CLEANED,
+                        DeploymentStatus.CLEANED_UP,
+                    }:
+                        self._store(
+                            execution.model_copy(
+                                update={
+                                    "status": DeploymentStatus.ROLLED_BACK,
+                                    "endpoint": None,
+                                    "updated_at": datetime.now(UTC),
+                                }
+                            )
+                        )
                     detail = str(
                         existing_phase1["adminCleanup"].get("detail")
                         or "Namespace cleanup requires Orchestration administrator privileges."
@@ -1007,9 +1021,17 @@ class GuideAdapterDeploymentService:
                     router_rbac=router_rbac,
                     storage_volume_id=storage_volume_id,
                 )
+                phase1_completed = handoff.get("phase1Completed") is True
                 self._store(
                     execution.model_copy(
                         update={
+                            "status": (
+                                DeploymentStatus.ROLLED_BACK
+                                if phase1_completed
+                                and execution.status not in {DeploymentStatus.CLEANED, DeploymentStatus.CLEANED_UP}
+                                else execution.status
+                            ),
+                            "endpoint": None if phase1_completed else execution.endpoint,
                             "diagnostics": VersionedPayload(
                                 schema_version="deploy-diagnostics.v1",
                                 value={"snapshot": diagnostics, "cleanup": {**sanitized_cleanup, "phase1": handoff}},

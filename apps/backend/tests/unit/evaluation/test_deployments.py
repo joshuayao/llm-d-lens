@@ -560,7 +560,8 @@ async def test_workflow_completes_before_final_deployment_cleanup(monkeypatch, c
         case.update(status="succeeded", finished_at=router._now())
 
     class Worker:
-        async def delete_case_execution(self, run_id, _case_id):
+        async def delete_case_execution(self, run_id, _case_id, *, remove_records_on_phase1_handoff: bool = False):
+            del remove_records_on_phase1_handoff
             cleaned.append(run_id)
             if len(cleaned) < case_count:
                 assert saved[-1]["status"] == "running"
@@ -1447,7 +1448,8 @@ async def test_execute_evaluation_binds_unique_eval_case_id_and_handles_cleanup_
         case.update(status="succeeded", finished_at=router._now())
 
     class _CleanupWorker:
-        async def delete_case_execution(self, _run_id, case_id):
+        async def delete_case_execution(self, _run_id, case_id, *, remove_records_on_phase1_handoff: bool = False):
+            assert remove_records_on_phase1_handoff is True
             if case_id == "dc-1":
                 raise router.DeploymentCleanupPermissionDenied(
                     "delete namespace forbidden",
@@ -1556,7 +1558,8 @@ async def test_shared_pods_baseline_records_cleanup_handoff_and_excludes_phase1_
         case.update(status="succeeded")
 
     class _CleanupWorker:
-        async def delete_case_execution(self, _run_id, _case_id):
+        async def delete_case_execution(self, _run_id, _case_id, *, remove_records_on_phase1_handoff: bool = False):
+            assert remove_records_on_phase1_handoff is True
             raise router.DeploymentCleanupPermissionDenied(
                 "namespace deletion requires admin",
                 payload={"executionId": "exec-1", "namespace": "llmd-guide-ns", "phase1Completed": True},
@@ -2002,3 +2005,275 @@ def test_epp_service_accounts_from_bundle_truncates_and_lowercases() -> None:
     assert len(eval_router._epp_service_accounts_from_bundle({"helm": {"releaseName": long_release}})[0]) == 44
     assert eval_router._epp_service_accounts_from_bundle({"helm": {"releaseName": "  "}}) == []
     assert eval_router._epp_service_accounts_from_bundle({}) == []
+
+
+@pytest.mark.asyncio
+async def test_evaluation_phase1_cleanup_and_cancel_drop_ghost_deployments_and_allow_workflow_delete(
+    monkeypatch, tmp_path
+):
+    from uuid import uuid4
+
+    from llm_d_lens.auth.records import RoleRecord, UserRecord, UserRoleBindingRecord
+    from llm_d_lens.auth.service import default_service
+    from llm_d_lens.db.dao.cluster import ClusterDao
+    from llm_d_lens.db.dao.role import RoleDao
+    from llm_d_lens.db.dao.user import UserDao
+    from llm_d_lens.deploy.contracts import (
+        ConfigurationArtifact,
+        DeployableConfiguration,
+        DeploymentArtifact,
+        DeploymentCase,
+        DeploymentCaseStatus,
+        DeploymentCreateRequest,
+        DeploymentEndpoint,
+        DeploymentExecution,
+        DeploymentRun,
+        DeploymentRunStatus,
+        DeploymentStatus,
+        VersionedPayload,
+    )
+    from llm_d_lens.deploy.run_store import JsonDeploymentRunStore
+    from llm_d_lens.deploy.worker import DeploymentRunWorker
+
+    monkeypatch.setenv("LENS_DATA_DIR", str(tmp_path))
+    store = JsonDeploymentRunStore(tmp_path)
+    auth_service = default_service()
+    role = RoleDao().create(RoleRecord(name="eval-phase1-role"))
+    cluster = ClusterDao().create(f"eval-c-{uuid4().hex[:6]}", "", "apiVersion: v1\nkind: Config")
+    user = UserDao().create(UserRecord(username=f"eval-u-{uuid4().hex[:6]}"))
+
+    class _Phase1CleanService:
+        async def clean(self, execution, *, preserve_rendered_overlay: bool = False):
+            del preserve_rendered_overlay
+            raise router.DeploymentCleanupPermissionDenied(
+                "namespace deletion requires admin",
+                payload={
+                    "executionId": execution.execution_id,
+                    "clusterId": cluster.id,
+                    "namespace": execution.namespace,
+                    "phase1Completed": True,
+                    "deletedInNamespace": ["deployments.apps", "services"],
+                    "adminCleanup": {"detail": "admin needed", "cleanupDigest": "b" * 64},
+                },
+            )
+
+    worker = DeploymentRunWorker(store, _Phase1CleanService())
+
+    def _seed_deployment(suffix: str) -> tuple[DeploymentRun, DeploymentCase]:
+        run_id = f"dep-{suffix}"
+        exec_id = f"exec-{suffix}"
+        ns = f"llmd-{suffix}"
+        cfg = _sample_guide_config("optimized-baseline", deployment_name=f"dep-{suffix}")
+        art = ConfigurationArtifact(
+            schema_version="v1",
+            kind="helm-values",
+            provider_ref="optimized-baseline",
+            checksum="checksum",
+            content='{"model": {"name": "Qwen/Qwen3-0.6B"}}',
+        )
+        case = DeploymentCase(
+            id=f"dc-{suffix}",
+            run_id=run_id,
+            ordinal=0,
+            source_configuration_ordinal=0,
+            provider_ref="optimized-baseline",
+            component="modelservice",
+            create_request=DeploymentCreateRequest(
+                configuration_artifacts=[art],
+                deployment_policy=VersionedPayload(schema_version="v1", value={"deployment_name": f"dep-{suffix}"}),
+            ),
+            status=DeploymentCaseStatus.READY,
+            execution_id=exec_id,
+        )
+        dep_run = DeploymentRun(
+            id=run_id,
+            status=DeploymentRunStatus.SUCCEEDED,
+            cases=[case],
+            source_configurations=[
+                DeployableConfiguration(
+                    type="optimized-baseline",
+                    format="helm",
+                    provider_ref="optimized-baseline",
+                    checksum=cfg.checksum,
+                )
+            ],
+            provenance={"cluster_server_id": cluster.id, "evaluate_workflow": True},
+        )
+        store.create_run(dep_run)
+        store.save_execution(
+            DeploymentExecution(
+                execution_id=exec_id,
+                request_id=f"req-{suffix}",
+                status=DeploymentStatus.READY,
+                artifact=DeploymentArtifact(
+                    artifact_hash="hash",
+                    configuration_artifact_ids=[art.artifact_id],
+                    manifest_ref="vllm/manifest.yaml",
+                    rendered_payload=VersionedPayload(schema_version="v1"),
+                ),
+                endpoint=DeploymentEndpoint(url=f"http://vllm.{ns}.svc:8000"),
+                namespace=ns,
+                configuration_artifacts=[art],
+                provenance={"cluster_server_id": cluster.id, "evaluate_workflow": True},
+            )
+        )
+        for rtype, rid in [("deployment_run", run_id), ("deployment_execution", exec_id)]:
+            auth_service.user_binding_dao.create(
+                UserRoleBindingRecord(
+                    user_id=user.id,
+                    role_id=role.id,
+                    scope_type="resource",
+                    scope_cluster_id=cluster.id,
+                    scope_resource_type=rtype,
+                    scope_resource_id=rid,
+                )
+            )
+        return dep_run, case
+
+    monkeypatch.setattr(router, "_store", store)
+    monkeypatch.setattr(router, "_runtime_binding", lambda _wf: router.RuntimeBinding(cluster_session_id="s1"))
+    monkeypatch.setattr(router, "_ordered_evaluation_cases", lambda cases: cases)
+    monkeypatch.setattr(router, "_comparison_report", lambda _wf: {"ok": True})
+    monkeypatch.setattr(router, "_has_pending_suite_scenario", lambda _wf, _c: False)
+    monkeypatch.setattr(router, "_restore_deployment_links", lambda _wf: False)
+
+    # 1. Post-benchmark evaluation cleanup drops ghost deployment records & shares while recording handoff
+    dep_eval, case_eval = _seed_deployment("eval-auto")
+    wf_eval_id = "00000000-0000-4000-8000-000000000251"
+    wf_eval = {
+        "kind": "workflow",
+        "id": wf_eval_id,
+        "status": "queued",
+        "cluster_id": cluster.id,
+        "cluster_session_id": "00000000-0000-4000-8000-000000000299",
+        "cases": [
+            {
+                "id": "guide-1",
+                "kind": "guide",
+                "status": "queued",
+                "preserve_deployment": False,
+                "deployment_configuration": _sample_guide_config("optimized-baseline").model_dump(mode="json"),
+            }
+        ],
+    }
+    router._save(wf_eval)
+
+    async def fake_start_run(_deploy_req, owner_user_id=None):
+        del owner_user_id
+        return dep_eval
+
+    async def fake_wait(_dep_id):
+        return dep_eval, case_eval
+
+    async def fake_benchmark(_wf, case, _exec_id):
+        case.update(status="succeeded", finished_at=router._now())
+
+    monkeypatch.setattr(
+        router,
+        "deployment_run_manager",
+        SimpleNamespace(start_run=fake_start_run, worker_for_run=lambda *_: worker),
+    )
+    monkeypatch.setattr(router, "_wait_for_deployment", fake_wait)
+    monkeypatch.setattr(router, "_run_case_benchmark", fake_benchmark)
+
+    await router._execute_evaluation(wf_eval_id)
+
+    final_eval = router._get("workflow", wf_eval_id)
+    assert final_eval["status"] == "succeeded"
+    assert final_eval["cases"][0]["cleanup_status"] == "pending_admin_cleanup"
+    assert final_eval["cases"][0]["cleanup_handoff"]["executionId"] == case_eval.execution_id
+    assert final_eval["pending_admin_cleanups"][0]["executionId"] == case_eval.execution_id
+    assert store.get_run(dep_eval.id) is None
+    assert store.get_execution(case_eval.execution_id) is None
+    assert auth_service.list_resource_shares("deployment_run", dep_eval.id) == []
+    assert auth_service.list_resource_shares("deployment_execution", case_eval.execution_id) == []
+
+    # Deleting the terminal workflow succeeds (204) cleanly when deployment run was already Phase-1 dropped
+    assert await router.delete_workflow_run(wf_eval_id) is None
+    assert router._get("workflow", wf_eval_id) is None
+
+    # 2. Cancelling an evaluation workflow drops ghost deployment records & shares while recording handoff
+    dep_cancel, case_cancel = _seed_deployment("eval-cancel")
+    wf_cancel_id = "00000000-0000-4000-8000-000000000252"
+    router._save(
+        {
+            "kind": "workflow",
+            "id": wf_cancel_id,
+            "status": "running",
+            "cluster_id": cluster.id,
+            "cases": [
+                {
+                    "id": "guide-1",
+                    "kind": "guide",
+                    "status": "benchmarking",
+                    "deployment_run_id": dep_cancel.id,
+                    "deployment_case_id": case_cancel.id,
+                    "execution_id": case_cancel.execution_id,
+                }
+            ],
+        }
+    )
+
+    cancel_resp = await router._cancel_evaluation(router._get("workflow", wf_cancel_id))
+    assert cancel_resp["status"] == "cancelled"
+    cancelled_wf = router._get("workflow", wf_cancel_id)
+    assert cancelled_wf["cases"][0]["cleanup_status"] == "pending_admin_cleanup"
+    assert cancelled_wf["pending_admin_cleanups"][0]["executionId"] == case_cancel.execution_id
+    assert store.get_run(dep_cancel.id) is None
+    assert store.get_execution(case_cancel.execution_id) is None
+    assert auth_service.list_resource_shares("deployment_run", dep_cancel.id) == []
+    assert auth_service.list_resource_shares("deployment_execution", case_cancel.execution_id) == []
+
+    # Retrying cancel when cleanup_status is already pending_admin_cleanup and deployment run was dropped is idempotent
+    retry_cancel = await router._cancel_evaluation(router._get("workflow", wf_cancel_id))
+    assert retry_cancel["status"] == "cancelled"
+    assert await router.delete_workflow_run(wf_cancel_id) is None
+    assert router._get("workflow", wf_cancel_id) is None
+
+    # 3. Multi-scenario suite arm: only the final scenario has pending_admin_cleanup while earlier
+    # succeeded scenarios share the same already-dropped deployment_run_id; cancelling with an
+    # uncached DeploymentRunManager skips that dropped run instead of raising deployment run not found.
+    from llm_d_lens.deploy.application import DeploymentRunManager
+
+    uncached_manager = DeploymentRunManager(store)
+    monkeypatch.setattr(router, "deployment_run_manager", uncached_manager)
+    wf_suite_id = "00000000-0000-4000-8000-000000000253"
+    router._save(
+        {
+            "kind": "workflow",
+            "id": wf_suite_id,
+            "status": "running",
+            "cluster_id": cluster.id,
+            "cases": [
+                {
+                    "id": "suite-s1",
+                    "kind": "guide",
+                    "status": "succeeded",
+                    "deployment_group_id": "arm-1",
+                    "deployment_run_id": "dep-already-dropped",
+                    "execution_id": "exec-already-dropped",
+                },
+                {
+                    "id": "suite-s2",
+                    "kind": "guide",
+                    "status": "succeeded",
+                    "deployment_group_id": "arm-1",
+                    "deployment_run_id": "dep-already-dropped",
+                    "execution_id": "exec-already-dropped",
+                    "cleanup_status": "pending_admin_cleanup",
+                },
+                {
+                    "id": "suite-other",
+                    "kind": "baseline",
+                    "status": "queued",
+                    "deployment_group_id": "arm-2",
+                },
+            ],
+        }
+    )
+    suite_cancel = await router._cancel_evaluation(router._get("workflow", wf_suite_id))
+    assert suite_cancel["status"] == "cancelled"
+    cancelled_suite = router._get("workflow", wf_suite_id)
+    assert cancelled_suite["status"] == "cancelled"
+    assert cancelled_suite["cases"][2]["status"] == "cancelled"
+    assert await router.delete_workflow_run(wf_suite_id) is None
