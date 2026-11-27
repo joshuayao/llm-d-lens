@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import re
 import time
 from collections.abc import AsyncIterator, Mapping
@@ -22,6 +23,7 @@ from uuid import uuid4
 
 from llm_d_lens.db.dao.cluster import ClusterDao
 from llm_d_lens.infrastructure.process import CommandResult
+from llm_d_lens.model_service import gateway_providers as _gateway_providers
 
 from . import gateway_crds as _gateway_crds
 from . import remediation as _remediation
@@ -33,6 +35,8 @@ from .remediation import (
     validate_field_manager,
 )
 
+ensure_istioctl = _gateway_providers.ensure_istioctl
+_DEFAULT_ENSURE_ISTIOCTL = _gateway_providers.ensure_istioctl
 resolve_chart_crds = _remediation.resolve_chart_crds
 _DEFAULT_RESOLVE_CHART_CRDS = _remediation.resolve_chart_crds
 invalidate_cluster_discovery_cache = _gateway_crds.invalidate_cluster_discovery_cache
@@ -871,6 +875,103 @@ async def _wait_for_operation(runner: Any, operation: Any, wait: Any) -> None:
         await asyncio.sleep(1)
 
 
+def _validate_argv(operation_id: str, raw_argv: Any) -> list[str]:
+    if isinstance(raw_argv, (str, bytes)) or raw_argv is None:
+        argv: list[Any] = []
+    else:
+        try:
+            argv = list(raw_argv)
+        except TypeError:
+            argv = []
+    if not argv or any(not isinstance(arg, str) for arg in argv) or not argv[0].strip():
+        raise OperationExecutionError(
+            f"operation {operation_id!r} has an empty or invalid command argv",
+            status_code=400,
+            code="operation_invalid",
+            operation_id=operation_id,
+        )
+    return argv
+
+
+def _reject_unexpected_tool(operation_id: str, apply: Any) -> None:
+    if getattr(apply, "tool", None) is not None or getattr(apply, "tool_version", None) is not None:
+        raise OperationExecutionError(
+            f"operation {operation_id!r} does not support tool resolution for apply kind {apply.kind!r}",
+            status_code=400,
+            code="operation_invalid",
+            operation_id=operation_id,
+        )
+
+
+async def _resolve_command_argv(operation_id: str, apply: Any) -> list[str]:
+    argv = _validate_argv(operation_id, getattr(apply, "argv", None))
+    tool = getattr(apply, "tool", None)
+    tool_version = getattr(apply, "tool_version", None)
+    if tool is None:
+        if tool_version is not None:
+            raise OperationExecutionError(
+                f"operation {operation_id!r} specifies tool_version without tool",
+                status_code=400,
+                code="operation_invalid",
+                operation_id=operation_id,
+            )
+        return argv
+    if tool != "istioctl":
+        raise OperationExecutionError(
+            f"operation {operation_id!r} requires unsupported tool {tool!r}",
+            status_code=400,
+            code="operation_invalid",
+            operation_id=operation_id,
+        )
+    if argv[0] != "istioctl":
+        raise OperationExecutionError(
+            f"operation {operation_id!r} tool {tool!r} does not match command {argv[0]!r}",
+            status_code=400,
+            code="operation_invalid",
+            operation_id=operation_id,
+        )
+    try:
+        version = _gateway_providers.validate_istioctl_version(tool_version)
+    except ValueError as error:
+        raise OperationExecutionError(
+            f"operation {operation_id!r} has invalid {tool} version {tool_version!r}: {error}",
+            status_code=400,
+            code="operation_invalid",
+            operation_id=operation_id,
+        ) from error
+    istioctl_resolver = (
+        ensure_istioctl if ensure_istioctl is not _DEFAULT_ENSURE_ISTIOCTL else _gateway_providers.ensure_istioctl
+    )
+    try:
+        resolved = await asyncio.to_thread(istioctl_resolver, version)
+    except OperationExecutionError:
+        raise
+    except Exception as error:
+        raise OperationExecutionError(
+            f"operation {operation_id!r} could not obtain {tool} {version}: {error}",
+            status_code=502,
+            code="operation_failed",
+            operation_id=operation_id,
+        ) from error
+    if not isinstance(resolved, (str, os.PathLike)):
+        raise OperationExecutionError(
+            f"operation {operation_id!r} could not obtain {tool} {version}: invalid path {resolved!r}",
+            status_code=502,
+            code="operation_failed",
+            operation_id=operation_id,
+        )
+    binary = os.fspath(resolved)
+    if not isinstance(binary, str) or not binary.strip():
+        raise OperationExecutionError(
+            f"operation {operation_id!r} could not obtain {tool} {version}: empty path",
+            status_code=502,
+            code="operation_failed",
+            operation_id=operation_id,
+        )
+    argv[0] = binary
+    return argv
+
+
 async def _execute_operation_apply(
     cluster_id: str,
     operation: Any,
@@ -884,21 +985,27 @@ async def _execute_operation_apply(
 
     apply = operation.apply
     if apply.kind == "command":
+        argv = await _resolve_command_argv(operation.id, apply)
         configured_timeout = (
             int(apply.apply_options.timeout_seconds)
             if apply.apply_options is not None and apply.apply_options.timeout_seconds > 0
             else None
         )
-        timeout = configured_timeout or (900 if apply.argv and apply.argv[0] == "helm" else 300)
+        is_long_command = getattr(apply, "tool", None) == "istioctl" or (
+            bool(apply.argv) and apply.argv[0] in {"helm", "istioctl"}
+        )
+        timeout = configured_timeout or (900 if is_long_command else 300)
         await _run_operation_command(
             runner,
-            list(apply.argv),
+            argv,
             operation_id=operation.id,
             input=apply.stdin,
             timeout=timeout,
         )
         return
     if apply.kind == "helm":
+        _reject_unexpected_tool(operation.id, apply)
+        argv = _validate_argv(operation.id, getattr(apply, "argv", None))
         configured_timeout = (
             int(apply.apply_options.timeout_seconds)
             if apply.apply_options is not None and apply.apply_options.timeout_seconds > 0
@@ -907,13 +1014,14 @@ async def _execute_operation_apply(
         timeout = configured_timeout or 900
         await _run_operation_command(
             runner,
-            list(apply.argv),
+            argv,
             operation_id=operation.id,
             input=apply.stdin,
             timeout=timeout,
         )
         return
     if apply.kind == "manifests_from_chart":
+        _reject_unexpected_tool(operation.id, apply)
         source = apply.manifests_source
         if source is None:
             raise OperationExecutionError(
@@ -982,6 +1090,7 @@ async def _execute_operation_apply(
             code="operation_invalid",
             operation_id=operation.id,
         )
+    _reject_unexpected_tool(operation.id, apply)
     documents = copy.deepcopy(list(apply.manifests))
     if not documents:
         raise OperationExecutionError(

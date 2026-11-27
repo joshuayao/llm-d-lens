@@ -3345,3 +3345,482 @@ def test_istio_gateway_nodeport_fallback_propagates_401_and_403_errors(stage, st
     with pytest.raises(expected_exc) as exc_info:
         asyncio.run(execution.execute_user_operation(cluster.id, gw_op, runner=_AuthFailureRunner()))
     assert exc_info.value.operation_id == "gateway.manifests"
+
+
+def _make_istioctl_tar_gz(entries: list[tuple[str, bytes, int, str]]) -> bytes:
+    """Build an in-memory ``.tar.gz`` from ``(name, data, tar_type, linkname)`` tuples."""
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, data, tar_type, linkname in entries:
+            info = tarfile.TarInfo(name=name)
+            info.type = tar_type
+            info.size = len(data) if tar_type == tarfile.REGTYPE else 0
+            info.linkname = linkname
+            info.mode = 0o755 if tar_type == tarfile.DIRTYPE else 0o644
+            tar.addfile(info, io.BytesIO(data) if tar_type == tarfile.REGTYPE else None)
+    return buf.getvalue()
+
+
+def _install_fake_httpx(monkeypatch, handler):
+    import httpx
+
+    class _FakeResponse:
+        def __init__(self, content: bytes, status_code: int = 200):
+            self.content = content
+            self.status_code = status_code
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                request = httpx.Request("GET", "https://example.invalid/istioctl.tar.gz")
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError("http error", request=request, response=response)
+
+    class _FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get(self, url: str):
+            payload = handler(url)
+            if isinstance(payload, int):
+                return _FakeResponse(b"", status_code=payload)
+            return _FakeResponse(payload)
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+
+
+def test_executor_istio_provider_resolves_istioctl_in_worker_thread_and_executes_api(monkeypatch, tmp_path):
+    import asyncio
+    import threading
+
+    from llm_d_lens.model_service import gateway_providers
+    from llm_d_lens.versions import gateway_provider_version
+
+    expected_version = gateway_provider_version("istio")
+    assert expected_version
+    resolved_bin = tmp_path / "istioctl-bin"
+    resolved_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    main_thread = threading.get_ident()
+    resolver_calls: list[tuple[str, int]] = []
+
+    def fake_ensure_istioctl(version: str):
+        resolver_calls.append((version, threading.get_ident()))
+        return resolved_bin
+
+    monkeypatch.setattr(execution, "ensure_istioctl", fake_ensure_istioctl)
+
+    cluster = _cluster("istio-provider-unit")
+    state = _store_plan_state(
+        cluster,
+        gateway={"provider": "istio", "namespace": "lens-gateway", "name": "lens-gateway"},
+    )
+    provider_op = next(
+        op for op in cluster_router.build_operations(state.plan, cluster_id=cluster.id) if op.id == "gateway.provider.0"
+    )
+    assert provider_op.apply.kind == "command"
+    assert provider_op.apply.tool == "istioctl"
+    assert provider_op.apply.tool_version == expected_version
+
+    runner = _OperationRunner()
+    asyncio.run(execution.execute_user_operation(cluster.id, provider_op, runner=runner))
+
+    assert resolver_calls == [(expected_version, resolver_calls[0][1])]
+    assert resolver_calls[0][1] != main_thread
+    assert len(runner.calls) == 2
+    install_call, rollout_call = runner.calls
+    assert install_call["argv"] == (str(resolved_bin), *provider_op.apply.argv[1:])
+    assert install_call["timeout"] == 900
+    assert rollout_call["argv"][:4] == ("kubectl", "rollout", "status", "deployment/istiod")
+
+    # Explicit apply_options.timeout_seconds overrides the 900s default.
+    override_op = _custom_operation(
+        "gateway.provider.override",
+        apply=OperationApply(
+            kind="command",
+            argv=("istioctl", "install", "-y"),
+            tool="istioctl",
+            tool_version=expected_version,
+            apply_options=ApplyOptions(timeout_seconds=120),
+        ),
+    )
+    override_runner = _OperationRunner()
+    asyncio.run(execution.execute_user_operation(cluster.id, override_op, runner=override_runner))
+    assert override_runner.calls[0]["timeout"] == 120
+
+    # Patching gateway_providers.ensure_istioctl directly also works when execution.ensure_istioctl is default.
+    monkeypatch.setattr(execution, "ensure_istioctl", execution._DEFAULT_ENSURE_ISTIOCTL)
+    gw_calls: list[str] = []
+    gw_bin = tmp_path / "istioctl-gw-seam"
+    gw_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    def fake_gw_ensure(version: str):
+        gw_calls.append(version)
+        return gw_bin
+
+    monkeypatch.setattr(gateway_providers, "ensure_istioctl", fake_gw_ensure)
+    seam_runner = _OperationRunner()
+    asyncio.run(execution.execute_user_operation(cluster.id, provider_op, runner=seam_runner))
+    assert gw_calls == [expected_version]
+    assert seam_runner.calls[0]["argv"][0] == str(gw_bin)
+
+    # Full /operations/gateway.provider.0/execute API happy path.
+    api_cluster = _cluster("istio-provider-api")
+    with TestClient(app) as client:
+        stored = _store_plan(
+            client,
+            api_cluster,
+            gateway={"provider": "istio", "namespace": "lens-gateway", "name": "lens-gateway"},
+        )
+        api_state = _stored_state(api_cluster.id)
+        _mock_plan_evaluation(monkeypatch, _operation_report(api_state, user_ids=("gateway.provider.0",)))
+        api_runner = _OperationRunner()
+        monkeypatch.setattr(execution, "_operation_runner", lambda _cid: api_runner)
+
+        resp = client.post(
+            f"/api/cluster/clusters/{api_cluster.id}/operations/gateway.provider.0/execute",
+            headers=_headers(stored["planHash"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "user_done"
+        assert api_runner.calls[0]["argv"][0] == str(gw_bin)
+        assert api_runner.calls[0]["timeout"] == 900
+
+
+def test_executor_tool_validation_fails_closed_without_invoking_resolver_or_runner(monkeypatch):
+    import asyncio
+
+    cluster = _cluster("executor-tool-validation")
+    resolver_calls: list[str] = []
+    monkeypatch.setattr(execution, "ensure_istioctl", lambda v: resolver_calls.append(v) or "/tmp/istioctl")
+    runner = _OperationRunner()
+
+    invalid_applies = [
+        # Unknown / empty / non-str tool on command
+        OperationApply(kind="command", argv=("istioctl", "install"), tool="foo", tool_version="1.29.4"),
+        OperationApply(kind="command", argv=("istioctl", "install"), tool="", tool_version="1.29.4"),
+        OperationApply(kind="command", argv=("istioctl", "install"), tool=123, tool_version="1.29.4"),  # type: ignore[arg-type]
+        # tool="istioctl" with missing or invalid tool_version
+        OperationApply(kind="command", argv=("istioctl", "install"), tool="istioctl", tool_version=None),
+        OperationApply(kind="command", argv=("istioctl", "install"), tool="istioctl", tool_version=""),
+        OperationApply(kind="command", argv=("istioctl", "install"), tool="istioctl", tool_version="v1.29.4"),
+        OperationApply(kind="command", argv=("istioctl", "install"), tool="istioctl", tool_version="../1.29.4"),
+        OperationApply(kind="command", argv=("istioctl", "install"), tool="istioctl", tool_version="1.29.4\n"),
+        # tool="istioctl" with mismatched argv[0]
+        OperationApply(kind="command", argv=("kubectl", "get", "pods"), tool="istioctl", tool_version="1.29.4"),
+        # tool=None with unexpected tool_version
+        OperationApply(kind="command", argv=("kubectl", "get", "pods"), tool=None, tool_version="1.29.4"),
+        # Empty / invalid argv on command and helm
+        OperationApply(kind="command", argv=()),
+        OperationApply(kind="command", argv=("   ",)),
+        OperationApply(kind="command", argv=("istioctl", 123)),  # type: ignore[arg-type]
+        OperationApply(kind="helm", argv=()),
+        OperationApply(kind="helm", argv=("",)),
+        # tool or tool_version set on non-command kinds
+        OperationApply(kind="helm", argv=("helm", "list"), tool="istioctl"),
+        OperationApply(kind="helm", argv=("helm", "list"), tool_version="1.29.4"),
+        OperationApply(
+            kind="manifests",
+            manifests=({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "x"}},),
+            tool="istioctl",
+        ),
+        OperationApply(
+            kind="manifests",
+            manifests=({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "x"}},),
+            tool_version="1.29.4",
+        ),
+        OperationApply(kind="manifests_from_chart", tool="istioctl"),
+        OperationApply(kind="manifests_from_chart", tool_version="1.29.4"),
+    ]
+
+    for index, bad_apply in enumerate(invalid_applies):
+        op = _custom_operation(f"invalid.tool.{index}", apply=bad_apply)
+        with pytest.raises(execution.OperationExecutionError) as exc_info:
+            asyncio.run(execution.execute_user_operation(cluster.id, op, runner=runner))
+        assert exc_info.value.status_code == 400, f"case {index} failed: {bad_apply}"
+        assert exc_info.value.code == "operation_invalid"
+        assert exc_info.value.operation_id == op.id
+
+    # Unsupported kind="lens" preserves 409 operation_invalid.
+    lens_op = _custom_operation("unsupported.lens", apply=OperationApply(kind="lens", tool="istioctl"))
+    with pytest.raises(execution.OperationExecutionError) as lens_exc:
+        asyncio.run(execution.execute_user_operation(cluster.id, lens_op, runner=runner))
+    assert lens_exc.value.status_code == 409
+    assert lens_exc.value.code == "operation_invalid"
+
+    assert resolver_calls == []
+    assert runner.calls == []
+
+
+def test_executor_istioctl_resolution_runtime_failures_return_502(monkeypatch):
+    import asyncio
+
+    cluster = _cluster("executor-istioctl-502")
+    runner = _OperationRunner()
+    op = _custom_operation(
+        "gateway.provider.0",
+        apply=OperationApply(
+            kind="command",
+            argv=("istioctl", "install", "-y"),
+            tool="istioctl",
+            tool_version="1.29.4",
+        ),
+    )
+
+    def fail_download(_version: str):
+        raise RuntimeError("github unreachable")
+
+    monkeypatch.setattr(execution, "ensure_istioctl", fail_download)
+    with pytest.raises(execution.OperationExecutionError) as fail_exc:
+        asyncio.run(execution.execute_user_operation(cluster.id, op, runner=runner))
+    assert fail_exc.value.status_code == 502
+    assert fail_exc.value.code == "operation_failed"
+    assert fail_exc.value.operation_id == "gateway.provider.0"
+    assert "could not obtain istioctl 1.29.4" in fail_exc.value.message
+    assert runner.calls == []
+
+    for bad_return in (None, "", "   ", 123, b"/tmp/istioctl"):
+        monkeypatch.setattr(execution, "ensure_istioctl", lambda _v, _r=bad_return: _r)
+        with pytest.raises(execution.OperationExecutionError) as bad_exc:
+            asyncio.run(execution.execute_user_operation(cluster.id, op, runner=runner))
+        assert bad_exc.value.status_code == 502
+        assert bad_exc.value.code == "operation_failed"
+        assert runner.calls == []
+
+    # Direct OperationExecutionError from resolver is preserved rather than wrapped.
+    def fail_exec(_version: str):
+        raise execution.OperationExecutionError(
+            "custom error",
+            status_code=503,
+            code="admin_script_source_unavailable",
+            operation_id="gateway.provider.0",
+        )
+
+    monkeypatch.setattr(execution, "ensure_istioctl", fail_exec)
+    with pytest.raises(execution.OperationExecutionError) as direct_exc:
+        asyncio.run(execution.execute_user_operation(cluster.id, op, runner=runner))
+    assert direct_exc.value.status_code == 503
+    assert direct_exc.value.code == "admin_script_source_unavailable"
+
+    # /execute API endpoint maps resolver runtime failure to 502 operation_failed.
+    monkeypatch.setattr(execution, "ensure_istioctl", fail_download)
+    api_cluster = _cluster("istio-provider-502-api")
+    with TestClient(app) as client:
+        stored = _store_plan(
+            client,
+            api_cluster,
+            gateway={"provider": "istio", "namespace": "lens-gateway", "name": "lens-gateway"},
+        )
+        api_state = _stored_state(api_cluster.id)
+        _mock_plan_evaluation(monkeypatch, _operation_report(api_state, user_ids=("gateway.provider.0",)))
+        api_runner = _OperationRunner()
+        monkeypatch.setattr(execution, "_operation_runner", lambda _cid: api_runner)
+
+        resp = client.post(
+            f"/api/cluster/clusters/{api_cluster.id}/operations/gateway.provider.0/execute",
+            headers=_headers(stored["planHash"]),
+        )
+        assert resp.status_code == 502, resp.text
+        assert resp.json()["code"] == "operation_failed"
+        assert api_runner.calls == []
+
+
+def test_validate_istioctl_version_and_ensure_istioctl_rejects_bad_versions_before_http(monkeypatch, tmp_path):
+    from llm_d_lens.model_service.gateway_providers import ensure_istioctl, validate_istioctl_version
+
+    monkeypatch.setenv("LENS_CACHE_DIR", str(tmp_path / "cache"))
+    http_calls: list[str] = []
+    _install_fake_httpx(monkeypatch, lambda url: http_calls.append(url) or b"")
+
+    for valid in ("1.29.4", "1.29.0-alpha.0", "1.29.0-rc1", "1.29.0-beta.1.2"):
+        assert validate_istioctl_version(valid) == valid
+
+    for invalid in (
+        None,
+        123,
+        "",
+        "   ",
+        "v1.29.4",
+        "1.29",
+        "1.29.4\n",
+        "../1.29.4",
+        "1.29.4/foo",
+        "1.29.4\\foo",
+        "1.29.4?a=1",
+        "1.29.4#frag",
+        "1.29.4%20",
+        "1.29.4-",
+        "1.29.4-rc..1",
+        "1.29." + "0" * 60,
+    ):
+        with pytest.raises(ValueError, match="invalid istioctl version"):
+            validate_istioctl_version(invalid)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="invalid istioctl version"):
+            ensure_istioctl(invalid)  # type: ignore[arg-type]
+
+    assert http_calls == []
+
+
+def test_ensure_istioctl_extracts_single_binary_caches_and_rejects_symlinks(monkeypatch, tmp_path):
+    import os
+    import tarfile
+
+    from llm_d_lens.infrastructure.hostos import current_host
+    from llm_d_lens.model_service.gateway_providers import ensure_istioctl
+
+    exe_suffix = current_host().tool_platform("go").exe_suffix
+    expected_name = f"istioctl{exe_suffix}"
+
+    for index, archive_entry_name in enumerate((expected_name, f"./{expected_name}")):
+        cache_dir = tmp_path / f"cache-{index}"
+        monkeypatch.setenv("LENS_CACHE_DIR", str(cache_dir))
+        payload = f"binary-content-{index}".encode()
+        archive_bytes = _make_istioctl_tar_gz(
+            [
+                ("README.md", b"ignored extra file", tarfile.REGTYPE, ""),
+                (archive_entry_name, payload, tarfile.REGTYPE, ""),
+            ]
+        )
+        http_calls: list[str] = []
+        _install_fake_httpx(monkeypatch, lambda url, _b=archive_bytes, _c=http_calls: _c.append(url) or _b)
+
+        binary_path = ensure_istioctl("1.29.4")
+        assert binary_path.is_file()
+        assert binary_path.read_bytes() == payload
+        assert os.access(binary_path, os.X_OK)
+        assert [p.name for p in binary_path.parent.iterdir()] == [expected_name]
+        assert len(http_calls) == 1
+
+        # Cache hit skips HTTP download.
+        cached_path = ensure_istioctl("1.29.4")
+        assert cached_path == binary_path
+        assert len(http_calls) == 1
+
+    # Symlinked binary (broken or valid) and symlinked cache root are rejected.
+    sym_cache = tmp_path / "sym-cache"
+    monkeypatch.setenv("LENS_CACHE_DIR", str(sym_cache))
+    root = sym_cache / "tools" / "istioctl" / "1.29.4"
+    root.mkdir(parents=True)
+    target = tmp_path / "outside"
+    target.write_text("evil", encoding="utf-8")
+    (root / expected_name).symlink_to(target)
+    with pytest.raises(RuntimeError, match="symlink"):
+        ensure_istioctl("1.29.4")
+
+    sym_root_cache = tmp_path / "sym-root-cache"
+    monkeypatch.setenv("LENS_CACHE_DIR", str(sym_root_cache))
+    parent = sym_root_cache / "tools" / "istioctl"
+    parent.mkdir(parents=True)
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    symlink_root = parent / "1.29.4"
+    symlink_root.symlink_to(outside_dir)
+    with pytest.raises(ValueError, match="escapes its root"):
+        ensure_istioctl("1.29.4")
+
+    from llm_d_lens.infrastructure.storage import paths as storage_paths
+
+    monkeypatch.setattr(storage_paths, "storage_path", lambda *_args: symlink_root)
+    with pytest.raises(RuntimeError, match="symlink"):
+        ensure_istioctl("1.29.4")
+
+
+def test_ensure_istioctl_rejects_malicious_and_malformed_archives(monkeypatch, tmp_path):
+    import gzip
+    import tarfile
+
+    from llm_d_lens.infrastructure.hostos import current_host
+    from llm_d_lens.model_service.gateway_providers import ensure_istioctl
+
+    exe_suffix = current_host().tool_platform("go").exe_suffix
+    expected_name = f"istioctl{exe_suffix}"
+
+    bad_archives: list[bytes] = [
+        _make_istioctl_tar_gz([("../evil", b"x", tarfile.REGTYPE, ""), (expected_name, b"ok", tarfile.REGTYPE, "")]),
+        _make_istioctl_tar_gz(
+            [("sub/../../evil", b"x", tarfile.REGTYPE, ""), (expected_name, b"ok", tarfile.REGTYPE, "")]
+        ),
+        _make_istioctl_tar_gz([("/abs/path", b"x", tarfile.REGTYPE, ""), (expected_name, b"ok", tarfile.REGTYPE, "")]),
+        _make_istioctl_tar_gz([(r"bad\name", b"x", tarfile.REGTYPE, ""), (expected_name, b"ok", tarfile.REGTYPE, "")]),
+        _make_istioctl_tar_gz([(expected_name, b"", tarfile.SYMTYPE, "/bin/sh")]),
+        _make_istioctl_tar_gz([(expected_name, b"", tarfile.LNKTYPE, "/bin/sh")]),
+        _make_istioctl_tar_gz([("README.md", b"no binary", tarfile.REGTYPE, "")]),
+        _make_istioctl_tar_gz(
+            [
+                (expected_name, b"one", tarfile.REGTYPE, ""),
+                (f"./{expected_name}", b"two", tarfile.REGTYPE, ""),
+            ]
+        ),
+        _make_istioctl_tar_gz([(expected_name, b"", tarfile.DIRTYPE, "")]),
+        _make_istioctl_tar_gz([(expected_name, b"", tarfile.REGTYPE, "")]),
+    ]
+
+    # Add an archive whose TarInfo header claims >512 MiB without allocating 512 MiB.
+    oversized_info = tarfile.TarInfo(name=expected_name)
+    oversized_info.type = tarfile.REGTYPE
+    oversized_info.size = 512 * 1024 * 1024 + 1
+    bad_archives.append(gzip.compress(oversized_info.tobuf() + b"\x00" * 1024))
+
+    for index, archive_bytes in enumerate(bad_archives):
+        cache_dir = tmp_path / f"bad-cache-{index}"
+        monkeypatch.setenv("LENS_CACHE_DIR", str(cache_dir))
+        _install_fake_httpx(monkeypatch, lambda _url, _b=archive_bytes: _b)
+        with pytest.raises((RuntimeError, tarfile.TarError, EOFError)):
+            ensure_istioctl("1.29.4")
+        version_dir = cache_dir / "tools" / "istioctl" / "1.29.4"
+        assert not version_dir.exists()
+
+    # Truncated compressed stream after valid tar header leaves no binary and no leftover .tmp files.
+    valid_bytes = _make_istioctl_tar_gz([(expected_name, b"A" * 4096, tarfile.REGTYPE, "")])
+    truncated_bytes = valid_bytes[: len(valid_bytes) // 2]
+    trunc_cache = tmp_path / "trunc-cache"
+    monkeypatch.setenv("LENS_CACHE_DIR", str(trunc_cache))
+    _install_fake_httpx(monkeypatch, lambda _url: truncated_bytes)
+    with pytest.raises((RuntimeError, tarfile.TarError, EOFError, OSError)):
+        ensure_istioctl("1.29.4")
+    version_dir = trunc_cache / "tools" / "istioctl" / "1.29.4"
+    if version_dir.exists():
+        assert list(version_dir.iterdir()) == []
+
+
+def test_ensure_istioctl_concurrent_downloads_succeed_cleanly(monkeypatch, tmp_path):
+    import os
+    import tarfile
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from llm_d_lens.infrastructure.hostos import current_host
+    from llm_d_lens.model_service.gateway_providers import ensure_istioctl
+
+    exe_suffix = current_host().tool_platform("go").exe_suffix
+    expected_name = f"istioctl{exe_suffix}"
+    payload = b"concurrent-istioctl-binary"
+    archive_bytes = _make_istioctl_tar_gz([(expected_name, payload, tarfile.REGTYPE, "")])
+
+    cache_dir = tmp_path / "concurrent-cache"
+    monkeypatch.setenv("LENS_CACHE_DIR", str(cache_dir))
+
+    barrier = threading.Barrier(2, timeout=5)
+
+    def concurrent_get(_url: str) -> bytes:
+        barrier.wait()
+        return archive_bytes
+
+    _install_fake_httpx(monkeypatch, concurrent_get)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(ensure_istioctl, ["1.29.4", "1.29.4"]))
+
+    assert first == second
+    assert first.is_file()
+    assert first.read_bytes() == payload
+    assert os.access(first, os.X_OK)
+    assert [entry.name for entry in first.parent.iterdir()] == [expected_name]

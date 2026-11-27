@@ -12,11 +12,14 @@ sections 5, 10.
 
 from __future__ import annotations
 
+import io
 import os
 import re
+import tarfile
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 import yaml
@@ -838,6 +841,53 @@ def render_node_inotify_daemonset(limit: int, namespace: str, image: str | None 
     return yaml.safe_dump(manifest, sort_keys=False)
 
 
+_ISTIO_VERSION_RE = re.compile(r"\A[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?\Z")
+_ISTIO_VERSION_MAX_LENGTH = 64
+_ISTIOCTL_MAX_BYTES = 512 * 1024 * 1024
+_ISTIOCTL_CHUNK_BYTES = 64 * 1024
+
+
+def validate_istioctl_version(version: str) -> str:
+    """Validate an Istio release version for safe URL construction and cache paths."""
+    if (
+        not isinstance(version, str)
+        or len(version) > _ISTIO_VERSION_MAX_LENGTH
+        or not _ISTIO_VERSION_RE.fullmatch(version)
+    ):
+        raise ValueError(f"invalid istioctl version: {version!r}")
+    return version
+
+
+def _select_istioctl_member(tar: tarfile.TarFile, expected_name: str) -> tarfile.TarInfo:
+    """Validate every archive member and return the single top-level ``istioctl`` file."""
+    selected_member: tarfile.TarInfo | None = None
+    for member in tar.getmembers():
+        raw_name = member.name
+        posix_path = PurePosixPath(raw_name)
+        if (
+            "\x00" in raw_name
+            or "\\" in raw_name
+            or posix_path.is_absolute()
+            or ".." in posix_path.parts
+            or member.issym()
+            or member.islnk()
+        ):
+            raise RuntimeError(f"istioctl archive contains unsafe member: {raw_name!r}")
+        normalized_parts = tuple(part for part in posix_path.parts if part not in ("", "."))
+        if normalized_parts != (expected_name,):
+            continue
+        if not member.isreg():
+            raise RuntimeError(f"istioctl archive entry {raw_name!r} is not a regular file")
+        if selected_member is not None:
+            raise RuntimeError(f"istioctl archive contains duplicate {expected_name} entries")
+        if member.size <= 0 or member.size > _ISTIOCTL_MAX_BYTES:
+            raise RuntimeError(f"istioctl archive entry {raw_name!r} has invalid size: {member.size}")
+        selected_member = member
+    if selected_member is None:
+        raise RuntimeError(f"istioctl archive did not contain {expected_name}")
+    return selected_member
+
+
 def ensure_istioctl(version: str) -> Path:
     """Return a local ``istioctl`` for ``version``, downloading it once.
 
@@ -846,29 +896,68 @@ def ensure_istioctl(version: str) -> Path:
     no leading ``v`` (e.g. ``1.29.2``); the download is cached under the Lens
     cache and reused.
     """
-    import tarfile  # noqa: PLC0415
-    from pathlib import Path as _Path  # noqa: PLC0415
-
     import httpx  # noqa: PLC0415
 
     from llm_d_lens.infrastructure.storage.paths import storage_path  # noqa: PLC0415
 
+    version = validate_istioctl_version(version)
     tool_platform = current_host().tool_platform("go")
-    root = _Path(storage_path("cache", "tools", "istioctl", version))
-    binary = root / f"istioctl{tool_platform.exe_suffix}"
+    root = Path(storage_path("cache", "tools", "istioctl", version))
+    expected_name = f"istioctl{tool_platform.exe_suffix}"
+    binary = root / expected_name
+    if root.is_symlink():
+        raise RuntimeError(f"istioctl cache directory must not be a symlink: {root}")
+    if binary.is_symlink():
+        raise RuntimeError(f"cached istioctl binary must not be a symlink: {binary}")
     if binary.is_file() and os.access(binary, os.X_OK):
         return binary
-    root.mkdir(parents=True, exist_ok=True)
+
     url = (
         f"https://github.com/istio/istio/releases/download/{version}/istioctl-{version}-{tool_platform.joined()}.tar.gz"
     )
-    archive = root / "istioctl.tar.gz"
     with httpx.Client(follow_redirects=True, timeout=180) as client:
         response = client.get(url)
         response.raise_for_status()
-        archive.write_bytes(response.content)
-    with tarfile.open(archive) as tar:
-        tar.extractall(root)  # noqa: S202 - trusted Istio release archive
-    current_host().make_executable(binary, private=False)
-    archive.unlink(missing_ok=True)
+        archive_bytes = response.content
+
+    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as tar:
+        selected_member = _select_istioctl_member(tar, expected_name)
+        extracted = tar.extractfile(selected_member)
+        if extracted is None:
+            raise RuntimeError(f"istioctl archive entry {selected_member.name!r} could not be read")
+
+        if root.is_symlink():
+            raise RuntimeError(f"istioctl cache directory must not be a symlink: {root}")
+        root.mkdir(parents=True, exist_ok=True)
+        tmp_path: Path | None = None
+        try:
+            total_bytes = 0
+            with (
+                extracted,
+                tempfile.NamedTemporaryFile(
+                    dir=root,
+                    prefix=f".{expected_name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle,
+            ):
+                tmp_path = Path(handle.name)
+                while True:
+                    chunk = extracted.read(_ISTIOCTL_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    if total_bytes > _ISTIOCTL_MAX_BYTES:
+                        raise RuntimeError(f"istioctl archive entry {selected_member.name!r} exceeds size limit")
+                    handle.write(chunk)
+            if total_bytes <= 0 or total_bytes != selected_member.size:
+                raise RuntimeError(f"istioctl archive entry {selected_member.name!r} was truncated")
+            if binary.is_symlink():
+                raise RuntimeError(f"cached istioctl binary must not be a symlink: {binary}")
+            current_host().make_executable(tmp_path, private=False)
+            os.replace(tmp_path, binary)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
     return binary
